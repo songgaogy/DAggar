@@ -1,0 +1,1 @@
+python robosuite/demos/demo_random_action.py
