@@ -27,7 +27,8 @@ class AsyncFailureDetectionModule(FailureDetectionModule, ABC):
 
     @abstractmethod
     def handle_async_task(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process a single asynchronous task.
+        """
+        Process a single asynchronous task.
 
         Subclasses must implement this to handle different `task_type`s
         and return an optional result dict to be enqueued into

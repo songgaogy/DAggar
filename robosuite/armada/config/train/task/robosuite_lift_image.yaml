@@ -5,7 +5,7 @@ image_shape: [3, 224, 224]
 shape_meta: &shape_meta
   obs:
     agentview_image:
-      shape: ${task.image_shape}
+      shape: ${....image_shape}
       type: rgb
     robot0_eef_pos:
       shape: [3]
@@ -19,7 +19,7 @@ shape_meta: &shape_meta
     robot0_joint_pos:
       shape: [7]
       type: low_dim
-    # every task should have this!
+    # every task should have this, set manually
     ee_pose:
       shape: [7]
       type: low_dim
@@ -28,6 +28,7 @@ shape_meta: &shape_meta
 
 env_runner:
   _target_: env_runner.robosuite_image_runner.robosuiteImageRunner
+  max_steps: 600
 
 env_runner_dummy:
   _target_: diffusion_policy.env_runner.dummy_runner.DummyRunner
@@ -47,7 +48,7 @@ dataset:
   color_jitter: True
   image_shape: ${..image_shape}
 
-collect:
+env:
   output: "/home/dodo/Documents/DAggar/robosuite/robosuite/armada/data/tmp/${name}"
   
   environment: "Lift"

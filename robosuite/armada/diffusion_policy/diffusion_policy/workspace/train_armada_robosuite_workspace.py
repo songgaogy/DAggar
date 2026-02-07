@@ -10,6 +10,7 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
+import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from omegaconf import OmegaConf
@@ -49,7 +50,8 @@ class TrainArmadaRobosuiteWorkspace(BaseWorkspace):
 
         self.model: BaseImagePolicy = hydra.utils.instantiate(cfg.policy).to(device)
         self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-        self.model = DDP(self.model, device_ids=[device_id], find_unused_parameters=True)
+        if dist.is_available() and dist.is_initialized():
+            self.model = DDP(self.model, device_ids=[device_id], find_unused_parameters=True)
 
         # ema
         self.ema_model: BaseImagePolicy = None

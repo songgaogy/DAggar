@@ -81,10 +81,12 @@ def find_matching_expert_demo(
         all_transport_costs.append(transport_cost)
 
     all_transport_costs = torch.stack(all_transport_costs, dim=0)
-    _, candidate_expert_indices = torch.topk(all_transport_costs, 
-                                                k=min(len(all_transport_costs), num_expert_candidates), 
-                                                largest=False, 
-                                                sorted=True)
+    _, candidate_expert_indices = torch.topk(
+        all_transport_costs, 
+        k=min(len(all_transport_costs), num_expert_candidates), 
+        largest=False, 
+        sorted=True
+    )
     
     return candidate_expert_indices
 

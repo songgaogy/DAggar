@@ -129,3 +129,4 @@ robosuite/models/assets/demonstrations_private
 
 *.zarr
 robosuite/armada/outputs
+.vscode/

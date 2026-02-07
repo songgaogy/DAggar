@@ -1,0 +1,4 @@
+HUMAN = 0
+ROBOT = 1
+INTV = 2
+INTV_END = 3

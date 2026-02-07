@@ -1,4 +1,5 @@
-# (gaoyuan):  update requirements
+# (gaoyuan): update requirements
+# you may re-install torch and cuda dependencied after running this
 
 dependencies:
   - python=3.10

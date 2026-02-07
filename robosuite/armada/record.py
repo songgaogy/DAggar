@@ -135,7 +135,7 @@ def main(cfg: DictConfig):
     if 'collect' not in cfg:
         raise ValueError("Config file must contain a 'collect' section!")
 
-    args = cfg.collect
+    args = cfg.env
     
     resolution = list(args.resolution)
     if len(resolution) == 1:

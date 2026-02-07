@@ -10,31 +10,33 @@ from collections import OrderedDict
 import tqdm
 
 from .async_failure_detector import AsyncFailureDetectionModule
-from float.util import find_matching_expert_demo, cosine_distance, optimal_transport_plan, rematch_expert_episode, OTVisualizationModule
-from armada.utils.episode_manager import EpisodeManager
-from armada.diffusion_policy.diffusion_policy.common.replay_buffer import ReplayBuffer
-from hardware.my_device.macros import INTV, HUMAN
+from failure_detector.util import find_matching_expert_demo, cosine_distance, optimal_transport_plan, rematch_expert_episode, OTVisualizationModule
+from ..utils.episode_manager import EpisodeManager
+from ..diffusion_policy.diffusion_policy.common.replay_buffer import ReplayBuffer
+from ..utils.macros import HUMAN, INTV_END, INTV, ROBOT
 
 
 class FLOAT(AsyncFailureDetectionModule):
-    """Failure detection module (FLOAT) using optimal transport matching only."""
-
-    def __init__(self, 
-                 max_queue_size: int = 3,
-                 num_samples: int = 4,
-                 num_expert_candidates: int = 50,
-                 ot_percentile: float = 95,
-                 soft_ot_ratio: float = 0.2,
-                 update_stats: bool = False,
-                 Ta: int = 8,
-                 train_dataset_path: str = None,
-                 save_buffer_path: str = None,
-                 output_dir: str = None,
-                 enable_visualization: bool = False,
-                 To: int = 2,
-                 ee_pose_dim: List[int] = None,
-                 image_shape: List[int] = None
-                 ) -> None:
+    """
+    Failure detection module (FLOAT) using optimal transport(OT) matching.
+    """
+    def __init__(
+            self, 
+            max_queue_size: int = 3,
+            num_samples: int = 4,
+            num_expert_candidates: int = 50,
+            ot_percentile: float = 95,
+            soft_ot_ratio: float = 0.2,
+            update_stats: bool = False,
+            Ta: int = 8,
+            train_dataset_path: str = None,
+            save_buffer_path: str = None,
+            output_dir: str = None,
+            enable_visualization: bool = False,
+            To: int = 2,
+            ee_pose_dim: List[int] = None,
+            image_shape: List[int] = None
+        ) -> None:
         super().__init__(max_queue_size=max_queue_size)
 
         self.device: Optional[torch.device] = None
@@ -87,7 +89,7 @@ class FLOAT(AsyncFailureDetectionModule):
         self.expert_ot_threshold: Optional[float] = None
         self.success_ot_values: np.ndarray = np.zeros((0,))
 
-    # ===================== Async handler =====================
+    # Async handler
     def handle_async_task(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         task_type = task.get("task_type")
 
@@ -95,7 +97,6 @@ class FLOAT(AsyncFailureDetectionModule):
             try:
                 idx: int = task["idx"]
                 rollout_latent: torch.Tensor = task["rollout_latent"]
-
                 candidate_expert_indices: List[int] = task["candidate_expert_indices"]
                 candidate_expert_latents: List[torch.Tensor] = task["candidate_expert_latents"]
                 human_demo_indices: List[int] = task["human_demo_indices"]
@@ -105,7 +106,7 @@ class FLOAT(AsyncFailureDetectionModule):
                 Ta: int = task["Ta"]
                 max_episode_length: int = task["max_episode_length"]
 
-                # Rematch expert episode for better alignment
+                # Rematch expert episode for better alignment, sorting
                 candidate_expert_indices = rematch_expert_episode(
                     candidate_expert_latents,
                     candidate_expert_indices,
@@ -119,10 +120,8 @@ class FLOAT(AsyncFailureDetectionModule):
                 # Greedy OT matching using current rollout trajectory and the matched expert trajectory
                 partial_dist_mat = torch.cat((
                     cosine_distance(human_latent, rollout_latent[:idx + 1]).to(device).detach(),
-                    torch.full((demo_len // Ta, max_episode_length // Ta - idx - 1), 0, device=device)
-                ), 1)
-
-                partial_ot_plan = optimal_transport_plan(
+                    torch.full((demo_len // Ta, max_episode_length // Ta - idx - 1), 0, device=device)), 1)
+                partial_ot_plan = optimal_transport_plan(   # compute OT matrix
                     human_latent,
                     torch.cat((
                         rollout_latent[:idx + 1, :],
@@ -131,7 +130,8 @@ class FLOAT(AsyncFailureDetectionModule):
                     partial_dist_mat
                 )
 
-                expert_weight = torch.ones((demo_len // Ta,), device=device) / float(demo_len // Ta) - torch.sum(partial_ot_plan[:, :idx + 1], dim=1)
+                expert_weight = torch.ones((demo_len // Ta,), device=device) / float(demo_len // Ta) \
+                                - torch.sum(partial_ot_plan[:, :idx + 1], dim=1)
                 expert_indices = torch.nonzero(expert_weight)[:, 0]
 
                 greedy_ot_plan = torch.cat((
@@ -141,8 +141,7 @@ class FLOAT(AsyncFailureDetectionModule):
 
                 greedy_ot_cost = torch.cat((
                     torch.sum(partial_ot_plan[:, :idx + 1] * partial_dist_mat[:, :idx + 1], dim=0),
-                    torch.zeros((max_episode_length // Ta - idx - 1,), device=device)
-                ), 0)
+                    torch.zeros((max_episode_length // Ta - idx - 1,), device=device)), 0)
 
                 return {
                     "task_type": "ot_matching",
@@ -155,6 +154,7 @@ class FLOAT(AsyncFailureDetectionModule):
                     "greedy_ot_cost": greedy_ot_cost,
                     "idx": idx
                 }
+            
             except Exception as e:
                 print(f"Error in ot_matching task: {e}")
                 import traceback
@@ -162,6 +162,7 @@ class FLOAT(AsyncFailureDetectionModule):
                 return None
 
         if task_type == "failure_detection":
+            # filter using threshold
             try:
                 greedy_ot_cost: torch.Tensor = task["greedy_ot_cost"]
                 idx: int = task["idx"]
@@ -188,14 +189,15 @@ class FLOAT(AsyncFailureDetectionModule):
 
         return None
 
-    # ===================== Public API (FailureDetectionModule) =====================
-    def runtime_initialize(self, 
-                           device: torch.device, 
-                           policy: torch.nn.Module,
-                           replay_buffer: ReplayBuffer,
-                           episode_manager: EpisodeManager,
-                           max_episode_length: int
-                           ) -> None:
+    # Public API (FailureDetectionModule)
+    def runtime_initialize(
+            self, 
+            device: torch.device, 
+            policy: torch.nn.Module,
+            replay_buffer: ReplayBuffer,
+            episode_manager: EpisodeManager,
+            max_episode_length: int
+        ) -> None:
         self.device = device
         self.policy = policy
         self.replay_buffer = replay_buffer
@@ -276,8 +278,12 @@ class FLOAT(AsyncFailureDetectionModule):
         return failure_flag, failure_reason, self.latest_result_idx
 
     def process_step(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
+        """(gaoyuan)
+        Main process logic, submit computation task to background thread
+        """
         step_type = step_data['step_type']
 
+        # use few transitions(just the first few in one episode) to filter human demo candidates
         if step_type == 'episode_start':
             self.failure_logs = OrderedDict()
 
@@ -302,7 +308,8 @@ class FLOAT(AsyncFailureDetectionModule):
             self.expert_indices = torch.arange(self.demo_len // self.Ta, device=self.device)
             self.greedy_ot_plan = torch.zeros((self.demo_len // self.Ta, self.max_episode_length // self.Ta), device=self.device)
             self.greedy_ot_cost = torch.zeros((self.max_episode_length // self.Ta,), device=self.device)
-            self.rollout_latent = torch.zeros((self.max_episode_length // self.Ta, int(self.To * self.obs_feature_dim)), device=self.device)
+            self.rollout_latent = torch.zeros(
+                (self.max_episode_length // self.Ta, int(self.To * self.obs_feature_dim)), device=self.device)
             self.latest_result_idx = 0
 
         elif step_type == 'policy_step':
@@ -312,7 +319,7 @@ class FLOAT(AsyncFailureDetectionModule):
             if 'robot_state' in step_data:
                 self._current_robot_state = step_data['robot_state']
 
-            idx = timestep // self.Ta - 1
+            idx = timestep // self.Ta - 1       # 0..Ta -> idx=0
 
             if idx >= 0 and curr_latent is not None:
                 self.rollout_latent[idx] = curr_latent[0].reshape(-1)
@@ -350,6 +357,9 @@ class FLOAT(AsyncFailureDetectionModule):
         return failure_flag, failure_reason, self.latest_result_idx
 
     def finalize_episode(self, episode: Dict[str, Any]) -> Dict[str, Any]:
+        """(gaoyuan)
+        update threshold using FN/FP
+        """
         j = episode['action_mode'].shape[0] # episode length
         success = INTV not in episode['action_mode']
 
@@ -447,7 +457,7 @@ class FLOAT(AsyncFailureDetectionModule):
         if self.ot_visualizer is not None:
             self.ot_visualizer.cleanup()
 
-    # ===================== Thresholds/Stats =====================
+    # Thresholds/Stats
     def update_thresholds(self, greedy_ot_cost: Optional[torch.Tensor] = None, timesteps: Optional[int] = None):
         if greedy_ot_cost is not None and timesteps is not None:
             self.success_ot_values = np.concatenate((
@@ -481,8 +491,13 @@ class FLOAT(AsyncFailureDetectionModule):
             'ot_percentile': self.ot_percentile
         }
 
-    # ===================== Internal helpers =====================
+    # Internal helpers
     def _prepare_human_demo_data(self) -> None:
+        """(gaoyuan)
+        create human/expert demonstration embedding \Tau_{e,n}
+        """
+        # find episodes that are human demos
+        # NOTE(gaoyuan): replay buffer is constructed in a long list
         self.human_demo_indices = []
         for i in range(self.replay_buffer.n_episodes):
             episode_start = self.replay_buffer.episode_ends[i - 1] if i > 0 else 0
@@ -494,13 +509,16 @@ class FLOAT(AsyncFailureDetectionModule):
 
         from torchvision.transforms import CenterCrop
         for i in tqdm.tqdm(self.human_demo_indices, desc="Obtaining latent for human demo"):
+            # image pre-process
             human_episode = self.replay_buffer.get_episode(i)
             side_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
             wrist_img_processor = CenterCrop((self.img_shape[1], self.img_shape[2]))
+            eps_side_img = (
+                side_img_processor(torch.from_numpy(human_episode['side_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
+            eps_wrist_img = (
+                wrist_img_processor(torch.from_numpy(human_episode['wrist_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
 
-            eps_side_img = (side_img_processor(torch.from_numpy(human_episode['side_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
-            eps_wrist_img = (wrist_img_processor(torch.from_numpy(human_episode['wrist_cam']).permute(0, 3, 1, 2)) / 255.0).to(self.device)
-
+            # action pre-process
             if 'tcp_pose' in human_episode:
                 eps_state = np.zeros((human_episode['tcp_pose'].shape[0], self.ee_pose_dim))
                 eps_state[:, :3] = human_episode['tcp_pose'][:, :3]
@@ -514,9 +532,13 @@ class FLOAT(AsyncFailureDetectionModule):
             eps_state = torch.from_numpy(eps_state).to(self.device)
             demo_len = human_episode['action'].shape[0]
 
-            human_latent = torch.zeros((self.max_episode_length // self.Ta, int(self.To * self.obs_feature_dim)), device=self.device)
+            # downsampling
+            human_latent = torch.zeros(
+                (self.max_episode_length // self.Ta, int(self.To * self.obs_feature_dim)), device=self.device
+            )
             for idx in range(self.max_episode_length // self.Ta):
                 human_demo_idx = min(idx * self.Ta, (demo_len // self.Ta - 1) * self.Ta)
+                # create chunks in length To
                 if human_demo_idx < self.To - 1:
                     indices = [0] * (self.To - 1 - human_demo_idx) + list(range(human_demo_idx + 1))
                     obs_dict = {

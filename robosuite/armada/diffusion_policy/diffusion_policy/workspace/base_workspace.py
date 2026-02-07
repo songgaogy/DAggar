@@ -86,9 +86,15 @@ class BaseWorkspace:
         if include_keys is None:
             include_keys = payload['pickles'].keys()
 
-        for key, value in payload['state_dicts'].items():
-            if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+        for key, value in payload["state_dicts"].items():
+            if key in exclude_keys:
+                continue
+            obj = self.__dict__[key]
+            if isinstance(value, dict) and len(value) > 0:
+                if all(k.startswith("module.") for k in value.keys()):
+                    value = {k[len("module."):]: v for k, v in value.items()}
+            obj.load_state_dict(value, **kwargs)
+            
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

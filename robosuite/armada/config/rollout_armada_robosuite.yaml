@@ -1,0 +1,41 @@
+defaults:
+  - _self_
+  - train: train_armada_robosuite
+
+_target_: env_runner.RobosuiteRunner
+
+Ta: 8
+seed: 42
+
+output_root: /home/dodo/Documents/DAggar/robosuite/robosuite/armada/outputs/rollout
+
+hydra:
+  run:
+    dir: ${output_root}/${train.task.name}/${now:%Y-%m-%d_%H-%M-%S}
+
+save_buffer_path: ${output_root}/${train.task.name}/${now:%Y-%m-%d_%H-%M-%S}
+
+# NOTE: training config loads 'dataset_path' for training. 
+# For rollout, we need a 'save_buffer_path' to store new rollouts.
+###########################################################################
+# CHANGE ME
+checkpoint_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/armada/outputs/train/lift_image/20260206_205148/checkpoints/epoch=0003-train_loss=1.132.ckpt" 
+output_dir: "/home/dodo/Documents/DAggar/robosuite/robosuite/armada/outputs"
+###########################################################################
+
+failure_detection:
+  _target_: robosuite.armada.failure_detector.float.FLOAT
+  max_queue_size: 3
+  num_samples: 1
+  num_expert_candidates: 50
+  ot_percentile: 95
+  soft_ot_ratio: 0.2
+  update_stats: False
+  Ta: ${Ta}
+  train_dataset_path: ${train.dataset_path}
+  save_buffer_path: ${save_buffer_path}
+  output_dir: ${output_dir}
+  enable_visualization: True
+  To: ${train.n_obs_steps}
+  ee_pose_dim: ${train.task.shape_meta.obs.ee_pose.shape}
+  image_shape: ${train.task.image_shape}

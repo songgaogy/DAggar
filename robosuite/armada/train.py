@@ -60,12 +60,12 @@ if __name__ == "__main__":
     config_name = sys.argv[1]
     print(f"Loading configuration: {config_name}")
 
-    with hydra.initialize(version_base=None, config_path='./config'):
+    with hydra.initialize(version_base=None, config_path='./config/train'):
         cfg = hydra.compose(config_name=config_name)
 
     # output
     run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.abspath(os.path.join(ROOT_DIR, "outputs", cfg.task_name, run_id))
+    run_dir = os.path.abspath(os.path.join(ROOT_DIR, "outputs/train", cfg.task_name, run_id))
     os.makedirs(run_dir, exist_ok=True)
     with open_dict(cfg):
         cfg.output_dir = run_dir
