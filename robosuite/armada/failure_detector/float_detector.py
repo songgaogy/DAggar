@@ -10,7 +10,7 @@ from collections import OrderedDict
 import tqdm
 
 from .async_failure_detector import AsyncFailureDetectionModule
-from failure_detector.util import find_matching_expert_demo, cosine_distance, optimal_transport_plan, rematch_expert_episode, OTVisualizationModule
+from .FLOAT.util import find_matching_expert_demo, cosine_distance, optimal_transport_plan, rematch_expert_episode, OTVisualizationModule
 from ..utils.episode_manager import EpisodeManager
 from ..diffusion_policy.diffusion_policy.common.replay_buffer import ReplayBuffer
 from ..utils.macros import HUMAN, INTV_END, INTV, ROBOT

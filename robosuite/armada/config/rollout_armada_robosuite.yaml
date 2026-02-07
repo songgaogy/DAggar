@@ -24,7 +24,7 @@ output_dir: "/home/dodo/Documents/DAggar/robosuite/robosuite/armada/outputs"
 ###########################################################################
 
 failure_detection:
-  _target_: robosuite.armada.failure_detector.float.FLOAT
+  _target_: robosuite.armada.failure_detector.float_detector.FLOAT
   max_queue_size: 3
   num_samples: 1
   num_expert_candidates: 50
