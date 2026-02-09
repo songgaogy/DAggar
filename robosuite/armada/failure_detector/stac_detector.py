@@ -12,7 +12,7 @@ import torch
 
 from .async_failure_detector import AsyncFailureDetectionModule
 from ..utils.macros import INTV
-from .STAC.error_utils import compute_temporal_error, CONSISTENCY_ERROR_FNS, CONSISTENCY_DIST_ERROR_FNS
+from .STAC.error_utils import compute_temporal_error
 
 
 class STAC(AsyncFailureDetectionModule):

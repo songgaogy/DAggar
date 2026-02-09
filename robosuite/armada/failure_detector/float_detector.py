@@ -91,6 +91,9 @@ class FLOAT(AsyncFailureDetectionModule):
 
     # Async handler
     def handle_async_task(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """(gaoyuan)
+        Main processing logic
+        """
         task_type = task.get("task_type")
 
         if task_type == "ot_matching":
@@ -211,7 +214,7 @@ class FLOAT(AsyncFailureDetectionModule):
         # Load thresholds/statistics from previous round if applicable
         self._load_success_statistics()
 
-        # Start async thread
+        # Start async thread: infinite while loop
         self.start_async_processing()
 
     def detect_failure(self, **kwargs) -> Tuple[bool, Optional[str], int]:
@@ -279,7 +282,7 @@ class FLOAT(AsyncFailureDetectionModule):
 
     def process_step(self, step_data: Dict[str, Any]) -> Dict[str, Any]:
         """(gaoyuan)
-        Main process logic, submit computation task to background thread
+        submit computation task to background thread
         """
         step_type = step_data['step_type']
 

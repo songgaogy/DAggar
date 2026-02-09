@@ -486,6 +486,7 @@ class RobosuiteRunner(BaseEnvRunner):
                 }
                 self.failure_detection_module.process_step(step_data)
                 
+                # call background thread, submit task, get results from queue, which is fast
                 failure_flag, failure_reason, _ = self.failure_detection_module.detect_failure(
                     timestep=self.j,
                     max_episode_length=self.max_episode_length
