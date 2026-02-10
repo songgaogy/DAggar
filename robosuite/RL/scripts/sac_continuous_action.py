@@ -27,6 +27,23 @@ from gymnasium import spaces
 from gymnasium.vector import AsyncVectorEnv
 
 
+def get_render_gpu_device_id(prefer_last=True):
+    """
+    Automatically choose a valid render GPU id
+    after CUDA_VISIBLE_DEVICES remapping.
+    """
+    if not torch.cuda.is_available():
+        return None
+
+    visible_count = torch.cuda.device_count()
+    assert visible_count > 0
+
+    if prefer_last:
+        return visible_count - 1   # e.g. use cuda:1 if CVD=2,3
+    else:
+        return 0                   # always use cuda:0
+
+
 class DictReplayBuffer:
     def __init__(self, buffer_size, observation_space, action_space, device, n_envs=1):
         self.buffer_size = buffer_size
@@ -80,7 +97,7 @@ class DictReplayBuffer:
 
 
 class SingleRobosuiteEnv(gym.Env):
-    def __init__(self, env_id, seed, image_size: int = 224, render_device_id: int = 1, max_episode_steps: int = 500):
+    def __init__(self, env_id, seed, image_size: int = 224, max_episode_steps: int = 500):
         self.image_size = image_size
         self.max_episode_steps = max_episode_steps
         self.step_count = 0
@@ -96,7 +113,6 @@ class SingleRobosuiteEnv(gym.Env):
             has_renderer=False,
             has_offscreen_renderer=True,
             renderer=args.renderer,
-            render_gpu_device_id=render_device_id,
             use_camera_obs=True,
             use_object_obs=False,
             camera_names=["agentview", "robot0_eye_in_hand"],
@@ -223,7 +239,7 @@ class Args:
     """frequency of episodes to record video"""
     eval_freq: int = 100
     """frequency of steps to eval"""
-    max_episode_steps: int = 500
+    max_episode_steps: int = 250
     """max steps in one episode"""
 
     # Algorithm specific arguments
@@ -265,10 +281,10 @@ class Args:
     """Path to the manually downloaded resnet weights (e.g., ./resnet18.pth)"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name, args: Args, output_path: str, render_device_id: int = 1):
+def make_env(env_id, seed, idx, capture_video, run_name, args: Args, output_path: str):
     def thunk():
         env = SingleRobosuiteEnv(env_id=env_id, seed=seed+idx, image_size=args.image_size, 
-                                 render_device_id=render_device_id, max_episode_steps=args.max_episode_steps)
+                                 max_episode_steps=args.max_episode_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
         if capture_video and idx == 0:
@@ -515,27 +531,28 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
     torch.backends.cudnn.benchmark = True
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    # gpu setup
+    training_gpu_id = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
+    # envs setup
     envs = AsyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args, output_path, render_device_id=1) 
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args, output_path) 
          for i in range(args.num_envs)],
         context="spawn",
         shared_memory=True
     )
     eval_envs = gym.vector.SyncVectorEnv([
-        make_env(args.env_id, args.seed + 1000, 0, args.capture_video, f"{run_name}/eval", args, output_path, render_device_id=1)
+        make_env(args.env_id, args.seed + 1000, 0, args.capture_video, f"{run_name}/eval", args, output_path)
     ])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs, pretrained_path=args.pretrained_path).to(device)
-    qf1 = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(device)
-    qf2 = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(device)
-    qf1_target = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(device)
-    qf2_target = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(device)
+    actor = Actor(envs, pretrained_path=args.pretrained_path).to(training_gpu_id)
+    qf1 = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(training_gpu_id)
+    qf2 = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(training_gpu_id)
+    qf1_target = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(training_gpu_id)
+    qf2_target = SoftQNetwork(envs, pretrained_path=args.pretrained_path).to(training_gpu_id)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
@@ -543,8 +560,8 @@ if __name__ == "__main__":
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(training_gpu_id)).item()
+        log_alpha = torch.zeros(1, requires_grad=True, device=training_gpu_id)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
@@ -557,7 +574,7 @@ if __name__ == "__main__":
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        device,
+        training_gpu_id,
         n_envs=args.num_envs,
     )
     start_time = time.time()
@@ -570,7 +587,7 @@ if __name__ == "__main__":
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             # Dict[numpy.ndarray] -> Dict[torch.Tensor]
-            obs_tensor = {k: torch.tensor(v).to(device) for k, v in obs.items()}
+            obs_tensor = {k: torch.tensor(v).to(training_gpu_id) for k, v in obs.items()}
             with torch.no_grad():
                 actions, _, _ = actor.get_action(obs_tensor)
             actions = actions.cpu().numpy()
@@ -718,7 +735,7 @@ if __name__ == "__main__":
                     
                     while not eval_done:
                         with torch.no_grad():
-                            eval_obs_tensor = {k: torch.tensor(v).to(device) for k, v in eval_obs.items()}
+                            eval_obs_tensor = {k: torch.tensor(v).to(training_gpu_id) for k, v in eval_obs.items()}
                             eval_action = actor.get_eval_action(eval_obs_tensor)
                             eval_action = eval_action.cpu().numpy()
                         

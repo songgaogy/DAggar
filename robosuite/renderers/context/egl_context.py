@@ -49,12 +49,17 @@ def create_initialized_egl_device_display(device_id=0):
             device_idx = device_id
     else:
         if not selected_device.isdigit():
-            device_inds = [int(x) for x in selected_device.split(",")]
+            device_inds = [int(x) for x in selected_device.split(",") if x.strip() != ""]
             if device_id == -1:
                 device_idx = device_inds[0]
             else:
-                assert device_id in device_inds, "specified device id is not made visible in environment variables."
-                device_idx = device_id
+                assert 0 <= device_id < len(device_inds), (
+                    "render_gpu_device_id must be a relative index into CUDA_VISIBLE_DEVICES "
+                    f"(0..{len(device_inds)-1}), got {device_id}"
+                )
+                device_idx = device_inds[device_id]
+
+            print("[EGL DEBUG] selected_device =", selected_device, " device_id =", device_id, " device_idx =", device_idx, " total =", len(all_devices))
         else:
             device_idx = int(selected_device)
         if not 0 <= device_idx < len(all_devices):
