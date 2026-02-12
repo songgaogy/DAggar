@@ -5,7 +5,7 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=1
 
 cd /home/gy/Documents/DAgger/robosuite/RL
-python "${REPO_ROOT}/scripts/sac_continuous_action.py" \
+python "${REPO_ROOT}/scripts/sac_lift_image.py" \
     --env-id "PandaLiftImage" \
     --pretrained-path "/home/gy/Documents/DAgger/robosuite/RL/models/resnet18-f37072fd.pth" \
     --wandb-mode "offline" \

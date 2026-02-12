@@ -1,9 +1,85 @@
 import os
+import h5py
+import glob
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+
+
+def print_args(args):
+    print("=" * 40)
+    print(f"Experiment: {args.env_id}")
+    print("Hyperparameters:")
+    for k, v in vars(args).items():
+        print(f"  {k:25}: {v}")
+    print("=" * 40)
+
+
+def load_demonstrations(buffer, data_dir, target_image_size):
+    """
+    Load HDF5 demonstrations into the ReplayBuffer.
+    """
+    hdf5_files = glob.glob(os.path.join(data_dir, "*.hdf5"))
+    print(f"[Data Loading] Found {len(hdf5_files)} files in {data_dir}")
+    
+    total_steps = 0
+    episodes = 0
+    
+    ROBOT_STATE_DIM = 32 
+    
+    for filepath in hdf5_files:
+        try:
+            with h5py.File(filepath, "r") as f:
+                for demo_key in f["data"].keys():
+                    demo = f["data"][demo_key]
+                    full_states = demo["states"][:] 
+                    
+                    if full_states.shape[1] >= ROBOT_STATE_DIM:
+                        states = full_states[:, :ROBOT_STATE_DIM]
+                    else:
+                        print(f"Warning: State dim {full_states.shape[1]} is smaller than expected {ROBOT_STATE_DIM}!")
+                        continue
+
+                    actions = demo["actions"][:]
+                    rewards = demo["rewards"][:]
+                    dones = demo["dones"][:]
+                    
+                    img_agent = demo["agentview_image"][:]
+                    img_wrist = demo["robot0_eye_in_hand_image"][:]
+                    img_agent = np.transpose(img_agent, (0, 3, 1, 2))
+                    img_wrist = np.transpose(img_wrist, (0, 3, 1, 2))
+                    visual_obs = np.concatenate([img_agent, img_wrist], axis=1)
+                    
+                    num_samples = states.shape[0]
+                    
+                    for t in range(num_samples - 1):
+                        obs = {
+                            "visual": visual_obs[t],
+                            "proprio": states[t]
+                        }
+                        
+                        next_obs = {
+                            "visual": visual_obs[t+1],
+                            "proprio": states[t+1]
+                        }
+                        
+                        action = actions[t]
+                        reward = rewards[t]
+                        done = dones[t]
+                        info = {"success": True if (t == num_samples - 2) else False}
+                        
+                        buffer.add(obs, next_obs, action, reward, done, info)
+                        total_steps += 1
+                    
+                    episodes += 1
+                    
+        except Exception as e:
+            print(f"Error loading {filepath}: {e}")
+            
+    print(f"[Data Loading] Loaded {episodes} episodes, {total_steps} steps into ReplayBuffer.")
+    return total_steps
 
 
 class DictReplayBuffer:

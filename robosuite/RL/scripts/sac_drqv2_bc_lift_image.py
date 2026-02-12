@@ -2,6 +2,8 @@
 import os
 import random
 import time
+import h5py
+import glob
 import datetime
 from dataclasses import dataclass
 from typing import Optional
@@ -19,7 +21,7 @@ import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from gymnasium import spaces
 from gymnasium.vector import AsyncVectorEnv
-from utils import DictReplayBuffer, MultimodalEncoder
+from utils import DictReplayBuffer, MultimodalEncoder, load_demonstrations
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
@@ -81,16 +83,16 @@ class SingleRobosuiteEnv(gym.Env):
         success = False
 
         try:
-            # Robosuite tasks usually have this method
             if self.env._check_success():
                 success = True
-        except Exception:
+        except:
             pass
         
+        # NOTE: we do not ternimate a episode when success
+        terminated = False
+        truncated = (self.step_count >= self.max_episode_steps)
+        
         info["success"] = success
-        terminated = success
-        truncated = (self.step_count >= self.max_episode_steps) or (done and not success)
-
         obs = self._process_obs(obs_dict)
         return obs, reward, terminated, truncated, info
     
@@ -168,8 +170,10 @@ class Args:
     """frequency of episodes to record video"""
     eval_freq: int = 100
     """frequency of steps to eval"""
-    max_episode_steps: int = 250
+    max_episode_steps: int = 300
     """max steps in one episode"""
+    pretraining_steps: int = 20000
+    """using BC and offline SAC to pretrain"""
 
     # Algorithm specific arguments
     env_id: str = "PandaLift"
@@ -178,7 +182,7 @@ class Args:
     """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    buffer_size: int = int(1e5)
+    buffer_size: int = int(5e5)
     """the replay memory buffer size (reduced slightly for image memory safety)"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -186,7 +190,7 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 1024
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5000
+    learning_starts: int = 0
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
@@ -200,14 +204,21 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    ent_scale: float = 0.5
+    """Scales the target entropy. < 1.0 encourages more exploration."""
     
     # Vision specific arguments
     renderer: str = "mjviewer"
     """default renderer in Robosuite"""
     image_size: int = 128
     """Input image size (H, W)"""
+
+    # paths
     pretrained_path: Optional[str] = None
     """Path to the manually downloaded resnet weights (e.g., ./resnet18.pth)"""
+    demo_data_path: str = None
+    """Path to expert successful demonstrations (e.g., ./data | should be a directory)"""
+
 
 
 def make_env(env_id, seed, idx, capture_video, run_name, args: Args, output_path: str):
@@ -420,7 +431,8 @@ if __name__ == "__main__":
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(training_gpu_id)).item()
+        entropy_scale = args.ent_scale
+        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(training_gpu_id)).item() * entropy_scale
         log_alpha = torch.zeros(1, requires_grad=True, device=training_gpu_id)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
@@ -437,6 +449,68 @@ if __name__ == "__main__":
         training_gpu_id,
         n_envs=args.num_envs,
     )
+
+    # load success demos
+    expert_steps = load_demonstrations(rb, data_dir=args.demo_data_path, target_image_size=args.image_size)
+    assert expert_steps > args.batch_size
+    args.learning_starts = 0
+
+    # ADD PRE-TRAINING STEPS
+    print(f"[Pre-Training] Starting {args.pretraining_steps} steps of offline training...")
+    for i in range(args.pretraining_steps):
+        obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = rb.sample(args.batch_size)
+
+        with torch.amp.autocast(device_type=training_gpu_id.type):
+            next_q_value = compute_target_q(
+                actor, qf1_target, qf2_target, next_obs_batch, 
+                alpha, args.gamma, rew_batch, done_batch
+            )
+            qf1_a_values = qf1(obs_batch, act_batch).view(-1)
+            qf2_a_values = qf2(obs_batch, act_batch).view(-1)
+            qf_loss = F.mse_loss(qf1_a_values, next_q_value) + F.mse_loss(qf2_a_values, next_q_value)
+
+        q_optimizer.zero_grad()
+        scaler.scale(qf_loss).backward()
+        scaler.step(q_optimizer)
+        scaler.update()
+
+        # update actor (SAC + BC)
+        if i % args.policy_frequency == 0:
+            with torch.amp.autocast(device_type=training_gpu_id.type):
+                pi, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                qf1_pi = qf1(obs_batch, pi)
+                qf2_pi = qf2(obs_batch, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                
+                sac_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                bc_loss = F.mse_loss(pi, act_batch)
+                actor_loss = sac_loss + (1.0 * bc_loss)
+
+            actor_optimizer.zero_grad()
+            scaler.scale(actor_loss).backward()
+            scaler.step(actor_optimizer)
+            scaler.update()
+            
+            if args.autotune:
+                 with torch.no_grad():
+                    _, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                 alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                 a_optimizer.zero_grad()
+                 alpha_loss.backward()
+                 a_optimizer.step()
+                 alpha = log_alpha.exp().item()
+
+        if i % args.target_network_frequency == 0:
+            for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
+                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+            for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
+                target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+        if i % 100 == 0:
+            print(f"[Pre-Train] Step {i}/{args.pretraining_steps} | Q-Loss: {qf_loss.item():.3f} | Actor-Loss: {actor_loss.item():.3f}")
+
+    print("[Pre-Training] Finished. Starting Online Interaction...\n")
+
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -446,7 +520,6 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            # Dict[numpy.ndarray] -> Dict[torch.Tensor]
             obs_tensor = {k: torch.tensor(v).to(training_gpu_id) for k, v in obs.items()}
             with torch.no_grad():
                 actions, _, _ = actor.get_action(obs_tensor, with_aug=False, detach_encoder=True)
@@ -531,7 +604,11 @@ if __name__ == "__main__":
                         qf1_pi = qf1(obs_batch, pi)
                         qf2_pi = qf2(obs_batch, pi)
                         min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                        actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+
+                        sac_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                        bc_loss = F.mse_loss(pi, act_batch)
+                        bc_weight = max(0, 1.0 - global_step / 200000.0)
+                        actor_loss = sac_loss + (bc_weight * bc_loss)
 
                     actor_optimizer.zero_grad()
                     scaler.scale(actor_loss).backward()
