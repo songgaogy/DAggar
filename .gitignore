@@ -132,3 +132,5 @@ robosuite/armada/outputs
 .vscode/
 outputs/
 data/
+out/
+video/

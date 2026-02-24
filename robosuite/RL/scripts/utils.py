@@ -89,47 +89,54 @@ class DictReplayBuffer:
         self.device = device
         
         self.keys = observation_space.keys()
-        self.obs_shapes = {k: observation_space[k].shape for k in self.keys}
-
-        self.observations = {k: np.zeros((buffer_size, n_envs) + shape, dtype=observation_space[k].dtype) 
-                             for k, shape in self.obs_shapes.items()}
-        self.next_observations = {k: np.zeros((buffer_size, n_envs) + shape, dtype=observation_space[k].dtype) 
-                                  for k, shape in self.obs_shapes.items()}
         
-        self.actions = np.zeros((buffer_size, n_envs) + action_space.shape, dtype=action_space.dtype)
-        self.rewards = np.zeros((buffer_size, n_envs), dtype=np.float32)
-        self.dones = np.zeros((buffer_size, n_envs), dtype=np.float32)
+        self.observations = {k: np.zeros((buffer_size,) + space.shape, dtype=space.dtype) 
+                             for k, space in observation_space.items()}
+        self.next_observations = {k: np.zeros((buffer_size,) + space.shape, dtype=space.dtype) 
+                                  for k, space in observation_space.items()}
+        
+        self.actions = np.zeros((buffer_size,) + action_space.shape, dtype=action_space.dtype)
+        self.rewards = np.zeros((buffer_size,), dtype=np.float32)
+        self.dones = np.zeros((buffer_size,), dtype=np.float32)
         
         self.pos = 0
         self.full = False
 
     def add(self, obs, next_obs, actions, rewards, dones, infos):
-        for k in self.keys:
-            self.observations[k][self.pos] = obs[k]
-            self.next_observations[k][self.pos] = next_obs[k]
-            
-        self.actions[self.pos] = actions
-        self.rewards[self.pos] = rewards
-        self.dones[self.pos] = dones
+        batch_size = self.n_envs
         
-        self.pos += 1
-        if self.pos == self.buffer_size:
+        indices = np.arange(self.pos, self.pos + batch_size) % self.buffer_size
+        
+        for k in self.keys:
+            self.observations[k][indices] = obs[k]
+            self.next_observations[k][indices] = next_obs[k]
+            
+        self.actions[indices] = actions
+        self.rewards[indices] = rewards
+        self.dones[indices] = dones
+        
+        self.pos += batch_size
+        if self.pos >= self.buffer_size:
             self.full = True
-            self.pos = 0
+            self.pos = self.pos % self.buffer_size
 
     def sample(self, batch_size):
-        idx = np.random.randint(0, self.buffer_size if self.full else self.pos, batch_size)
-        env_indices = np.random.randint(0, self.n_envs, batch_size)
+        upper_bound = self.buffer_size if self.full else self.pos
+        batch_inds = np.random.randint(0, upper_bound, size=batch_size)
 
+        return self._get_samples(batch_inds)
+
+    def _get_samples(self, batch_inds):
         obs_batch = {}
         next_obs_batch = {}
+        
         for k in self.keys:
-            obs_batch[k] = torch.tensor(self.observations[k][idx, env_indices], device=self.device)
-            next_obs_batch[k] = torch.tensor(self.next_observations[k][idx, env_indices], device=self.device)
+            obs_batch[k] = torch.as_tensor(self.observations[k][batch_inds], device=self.device)
+            next_obs_batch[k] = torch.as_tensor(self.next_observations[k][batch_inds], device=self.device)
 
-        actions = torch.tensor(self.actions[idx, env_indices], device=self.device)
-        rewards = torch.tensor(self.rewards[idx, env_indices], device=self.device)
-        dones = torch.tensor(self.dones[idx, env_indices], device=self.device)
+        actions = torch.as_tensor(self.actions[batch_inds], device=self.device)
+        rewards = torch.as_tensor(self.rewards[batch_inds], device=self.device)
+        dones = torch.as_tensor(self.dones[batch_inds], device=self.device)
 
         return obs_batch, actions, rewards, next_obs_batch, dones
 
@@ -180,6 +187,12 @@ class MultimodalEncoder(nn.Module):
         global_view, wrist_view = x_vis[:, 0:3], x_vis[:, 3:6]
         combined = torch.cat([global_view, wrist_view], dim=0)
         combined = self.aug(combined)
+
+        if self.mean.device != combined.device:
+            self.mean = self.mean.to(device=combined.device, dtype=combined.dtype)
+        if self.std.device != combined.device:
+            self.std = self.std.to(device=combined.device, dtype=combined.dtype)
+
         combined = (combined - self.mean) / self.std
         
         feat_map = self.features(combined)

@@ -15,13 +15,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from gymnasium import spaces
 from gymnasium.vector import AsyncVectorEnv
 from utils import DictReplayBuffer, MultimodalEncoder, load_demonstrations
+from ddp_utils import init_distributed, unwrap, to_device, is_main_process
+
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
@@ -182,19 +186,31 @@ class Args:
     """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
+    # Performance / scale
+    ddp: bool = True
+    """Enable DistributedDataParallel when launched with torchrun."""
+    torch_compile: bool = True
+    """Use torch.compile() to speed up model forward/backward."""
+    tf32: bool = True
+    """Enable TF32 for matmul/conv on Ampere+ GPUs."""
+    channels_last: bool = True
+    """Use channels_last memory format for CNN speed."""
+    replay_device: str = 'cpu'
+    """Replay storage device: cpu or cuda (cuda uses more VRAM but can be faster)."""
+    
     buffer_size: int = int(5e5)
     """the replay memory buffer size (reduced slightly for image memory safety)"""
     gamma: float = 0.99
     """the discount factor gamma"""
     tau: float = 0.005
     """target smoothing coefficient (default: 0.005)"""
-    batch_size: int = 1024
+    batch_size: int = 512
     """the batch size of sample from the reply memory"""
     learning_starts: int = 0
     """timestep to start learning"""
-    policy_lr: float = 3e-4
+    policy_lr: float = 4e-4
     """the learning rate of the policy network optimizer"""
-    q_lr: float = 3e-4
+    q_lr: float = 4e-4
     """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
@@ -220,14 +236,13 @@ class Args:
     """Path to expert successful demonstrations (e.g., ./data | should be a directory)"""
 
 
-
 def make_env(env_id, seed, idx, capture_video, run_name, args: Args, output_path: str):
     def thunk():
         env = SingleRobosuiteEnv(env_id=env_id, seed=seed+idx, image_size=args.image_size, 
                                  max_episode_steps=args.max_episode_steps)
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        if capture_video and idx == 0:
+        if capture_video and idx == 0 and is_main_process(rank):
             env = gym.wrappers.RecordVideo(
                 env,
                 f"{output_path}/videos", 
@@ -263,23 +278,46 @@ class SoftQNetwork(nn.Module):
 
 def compute_target_q(actor, qf1_target, qf2_target, next_obs_batch, alpha, gamma, rew_batch, done_batch):
     with torch.no_grad():
-        # DrQ style: Average over M augmentations (M=2 is standard)
+        # Determine reference device/dtype from target critics
+        ref_param = next(qf1_target.parameters())
+        device = ref_param.device
+
+        next_obs_batch = to_device(next_obs_batch, device)
+
+        # Ensure reward/done live on the same device
+        rew_batch = to_device(rew_batch, device)
+        done_batch = to_device(done_batch, device)
+
+        # Force numeric dtypes for scalars
+        if torch.is_tensor(rew_batch) and not rew_batch.is_floating_point():
+            rew_batch = rew_batch.float()
+        if torch.is_tensor(done_batch) and done_batch.dtype != torch.float32:
+            done_batch = done_batch.float()
+
+        # DrQ style: Average over M augmentations (M=2)
+        act_mod = unwrap(actor)
+
         # Augmentation 1
-        next_actions_1, next_log_pi_1, _ = actor.get_action(next_obs_batch, with_aug=True, detach_encoder=True)
+        next_actions_1, next_log_pi_1, _ = act_mod.get_action(next_obs_batch, with_aug=True, detach_encoder=True)
         qf1_next_target_1 = qf1_target(next_obs_batch, next_actions_1)
         qf2_next_target_1 = qf2_target(next_obs_batch, next_actions_1)
         min_qf_next_target_1 = torch.min(qf1_next_target_1, qf2_next_target_1) - alpha * next_log_pi_1
-        
+
         # Augmentation 2
-        next_actions_2, next_log_pi_2, _ = actor.get_action(next_obs_batch, with_aug=True, detach_encoder=True)
+        next_actions_2, next_log_pi_2, _ = act_mod.get_action(next_obs_batch, with_aug=True, detach_encoder=True)
         qf1_next_target_2 = qf1_target(next_obs_batch, next_actions_2)
         qf2_next_target_2 = qf2_target(next_obs_batch, next_actions_2)
         min_qf_next_target_2 = torch.min(qf1_next_target_2, qf2_next_target_2) - alpha * next_log_pi_2
-        
-        # Average the targets
+
         min_qf_next_target = 0.5 * (min_qf_next_target_1 + min_qf_next_target_2)
-        
-        next_q_value = rew_batch.flatten() + (1 - done_batch.flatten()) * gamma * (min_qf_next_target).view(-1)
+
+        # Make sure gamma is a tensor on correct device for type promotion safety
+        if not torch.is_tensor(gamma):
+            gamma_t = torch.tensor(float(gamma), device=device, dtype=min_qf_next_target.dtype)
+        else:
+            gamma_t = gamma.to(device=device, dtype=min_qf_next_target.dtype)
+
+        next_q_value = rew_batch.flatten() + (1.0 - done_batch.flatten()) * gamma_t * min_qf_next_target.view(-1)
         return next_q_value
 
 
@@ -352,11 +390,169 @@ class Actor(nn.Module):
         return action
 
 
+class TargetCritic(nn.Module):
+    def __init__(self, env, pretrained_path=None, ebd_size: int = 512, img_nums: int = 2):
+        super().__init__()
+        self.encoder = MultimodalEncoder(env.single_observation_space, pretrained_path=pretrained_path, img_num=img_nums)
+        obs_dim = self.encoder.repr_dim
+        act_dim = int(np.prod(env.single_action_space.shape))
+        self.input_dim = obs_dim + act_dim
+
+        self.q1_fc1 = nn.Linear(self.input_dim, 256)
+        self.q1_fc2 = nn.Linear(256, 256)
+        self.q1_out = nn.Linear(256, 1)
+
+        self.q2_fc1 = nn.Linear(self.input_dim, 256)
+        self.q2_fc2 = nn.Linear(256, 256)
+        self.q2_out = nn.Linear(256, 1)
+
+    def q1(self, obs, act, detach_encoder: bool = False):
+        feat = self.encoder(obs)
+        if detach_encoder:
+            feat = feat.detach()
+        x = torch.cat([feat, act], dim=1)
+        x = F.relu(self.q1_fc1(x))
+        x = F.relu(self.q1_fc2(x))
+        return self.q1_out(x)
+
+    def q2(self, obs, act, detach_encoder: bool = False):
+        feat = self.encoder(obs)
+        if detach_encoder:
+            feat = feat.detach()
+        x = torch.cat([feat, act], dim=1)
+        x = F.relu(self.q2_fc1(x))
+        x = F.relu(self.q2_fc2(x))
+        return self.q2_out(x)
+
+
+class Agent(nn.Module):
+    def __init__(self, env, pretrained_path=None, ebd_size: int = 512, img_nums: int = 2):
+        super().__init__()
+        self.encoder = MultimodalEncoder(env.single_observation_space, pretrained_path=pretrained_path, img_num=img_nums)
+        obs_dim = self.encoder.repr_dim
+        act_dim = int(np.prod(env.single_action_space.shape))
+        self.act_dim = act_dim
+
+        # Actor head
+        self.pi_fc1 = nn.Linear(obs_dim, 256)
+        self.pi_fc2 = nn.Linear(256, 256)
+        self.pi_mean = nn.Linear(256, act_dim)
+        self.pi_logstd = nn.Linear(256, act_dim)
+
+        # Critic heads
+        q_in = obs_dim + act_dim
+        self.q1_fc1 = nn.Linear(q_in, 256)
+        self.q1_fc2 = nn.Linear(256, 256)
+        self.q1_out = nn.Linear(256, 1)
+
+        self.q2_fc1 = nn.Linear(q_in, 256)
+        self.q2_fc2 = nn.Linear(256, 256)
+        self.q2_out = nn.Linear(256, 1)
+
+        # Action rescaling
+        self.register_buffer(
+            "action_scale",
+            torch.tensor((env.single_action_space.high - env.single_action_space.low) / 2.0, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "action_bias",
+            torch.tensor((env.single_action_space.high + env.single_action_space.low) / 2.0, dtype=torch.float32),
+        )
+
+    def _encode(self, obs, with_aug: bool = True):
+        enc_was_training = self.encoder.training
+        if not with_aug:
+            self.encoder.eval()
+        feat = self.encoder(obs)
+        if not with_aug:
+            self.encoder.train(enc_was_training)
+        return feat
+
+    def actor_forward(self, obs, with_aug: bool = True, detach_encoder: bool = False):
+        feat = self._encode(obs, with_aug=with_aug)
+        if detach_encoder:
+            feat = feat.detach()
+        x = F.relu(self.pi_fc1(feat))
+        x = F.relu(self.pi_fc2(x))
+        mean = self.pi_mean(x)
+        log_std = self.pi_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+        return mean, log_std
+
+    def get_action(self, obs, with_aug: bool = True, detach_encoder: bool = False):
+        mean, log_std = self.actor_forward(obs, with_aug=with_aug, detach_encoder=detach_encoder)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_scale + self.action_bias
+        log_prob = normal.log_prob(x_t)
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
+        return action, log_prob, mean_action
+
+    def get_eval_action(self, obs):
+        mean, _ = self.actor_forward(obs, with_aug=False, detach_encoder=True)
+        action = torch.tanh(mean) * self.action_scale + self.action_bias
+        return action
+
+    def q1(self, obs, act, detach_encoder: bool = False):
+        feat = self._encode(obs, with_aug=True)
+        if detach_encoder:
+            feat = feat.detach()
+        x = torch.cat([feat, act], dim=1)
+        x = F.relu(self.q1_fc1(x))
+        x = F.relu(self.q1_fc2(x))
+        return self.q1_out(x)
+
+    def q2(self, obs, act, detach_encoder: bool = False):
+        feat = self._encode(obs, with_aug=True)
+        if detach_encoder:
+            feat = feat.detach()
+        x = torch.cat([feat, act], dim=1)
+        x = F.relu(self.q2_fc1(x))
+        x = F.relu(self.q2_fc2(x))
+        return self.q2_out(x)
+
+    def critic_parameters(self):
+        for p in self.encoder.parameters():
+            yield p
+        for p in self.q1_fc1.parameters():
+            yield p
+        for p in self.q1_fc2.parameters():
+            yield p
+        for p in self.q1_out.parameters():
+            yield p
+        for p in self.q2_fc1.parameters():
+            yield p
+        for p in self.q2_fc2.parameters():
+            yield p
+        for p in self.q2_out.parameters():
+            yield p
+
+
+def soft_update_params(src_params, tgt_params, tau: float):
+    with torch.no_grad():
+        for p, tp in zip(src_params, tgt_params):
+            tp.data.mul_(1.0 - tau)
+            tp.data.add_(tau * p.data)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    ddp, rank, local_rank, world_size = init_distributed()
+    if args.ddp is False:
+        ddp = False
+    if args.cuda and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    # Make per-rank RNG different
+    args.seed = int(args.seed + 10000 * rank)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.env_id}_{args.exp_name}_{args.seed}_{timestamp}"
-    if args.track:
+
+    if args.track and is_main_process(rank):
         import wandb
 
         wandb.init(
@@ -371,11 +567,23 @@ if __name__ == "__main__":
         )
 
     output_path = f"outputs/{run_name}"
-    writer = SummaryWriter(output_path)
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+    class _NullWriter:
+        def add_scalar(self, *args, **kwargs):
+            pass
+        def add_text(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
+
+    if is_main_process(rank):
+        os.makedirs(output_path, exist_ok=True)
+        writer = SummaryWriter(output_path)
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\\n|-|-|\\n%s" % ("\\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        )
+    else:
+        writer = _NullWriter()
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -385,7 +593,13 @@ if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
     # gpu setup
-    training_gpu_id = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    training_gpu_id = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+    if training_gpu_id.type == "cuda":
+        if args.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
     scaler = torch.amp.GradScaler(enabled=(training_gpu_id.type == "cuda"))
 
     # env setup
@@ -410,24 +624,68 @@ if __name__ == "__main__":
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
-    # DrQ-v2 style: share a single encoder across actor and critics; update encoder via critic losses only
-    shared_encoder = qf1.encoder
-    qf2.encoder = shared_encoder
-    actor.encoder = shared_encoder
+    if not ddp:
+        # DrQ-v2 style: share a single encoder across actor and critics; update encoder via critic losses only
+        shared_encoder = qf1.encoder
+        qf2.encoder = shared_encoder
+        actor.encoder = shared_encoder
 
-    def _unique_params(modules):
-        params = []
-        seen = set()
-        for m in modules:
-            for p in m.parameters():
-                if id(p) in seen:
-                    continue
-                params.append(p)
-                seen.add(id(p))
-        return params
+        def _unique_params(modules):
+            params = []
+            seen = set()
+            for m in modules:
+                for p in m.parameters():
+                    if id(p) in seen:
+                        continue
+                    params.append(p)
+                    seen.add(id(p))
+            return params
 
-    q_optimizer = optim.Adam(_unique_params([qf1, qf2]), lr=args.q_lr)
-    actor_optimizer = optim.Adam([p for n, p in actor.named_parameters() if not n.startswith('encoder.')], lr=args.policy_lr)
+        q_params = _unique_params([qf1, qf2])
+        actor_params = [p for n, p in actor.named_parameters() if not n.startswith('encoder.')]
+    else:
+        # DDP: avoid sharing parameters across multiple DDP modules
+        q_params = list(qf1.parameters()) + list(qf2.parameters())
+        actor_params = list(actor.parameters())
+
+    # Wrap with DDP (after any parameter sharing decisions)
+    if ddp:
+        actor = DDP(actor, device_ids=[local_rank], broadcast_buffers=False, static_graph=True)
+        qf1 = DDP(qf1, device_ids=[local_rank], broadcast_buffers=False, static_graph=True)
+        qf2 = DDP(qf2, device_ids=[local_rank], broadcast_buffers=False, static_graph=True)
+
+    # Optimizers (use fused Adam when available)
+    try:
+        q_optimizer = optim.Adam(q_params, lr=args.q_lr, fused=(training_gpu_id.type == 'cuda'))
+        actor_optimizer = optim.Adam(actor_params, lr=args.policy_lr, fused=(training_gpu_id.type == 'cuda'))
+    except TypeError:
+        q_optimizer = optim.Adam(q_params, lr=args.q_lr)
+        actor_optimizer = optim.Adam(actor_params, lr=args.policy_lr)
+
+    if args.torch_compile and training_gpu_id.type == 'cuda':
+        # torch.compile works best after DDP wrapping; compile the underlying modules
+        if ddp:
+            actor.module = torch.compile(actor.module, mode='max-autotune')
+            qf1.module = torch.compile(qf1.module, mode='max-autotune')
+            qf2.module = torch.compile(qf2.module, mode='max-autotune')
+        else:
+            actor = torch.compile(actor, mode='max-autotune')
+            qf1 = torch.compile(qf1, mode='max-autotune')
+            qf2 = torch.compile(qf2, mode='max-autotune')
+
+    if args.channels_last and training_gpu_id.type == 'cuda':
+        # MultimodalEncoder likely uses CNNs; channels_last helps on A100
+        def _to_channels_last(m):
+            if isinstance(m, nn.Conv2d):
+                m.weight.data = m.weight.data.contiguous(memory_format=torch.channels_last)
+        if ddp:
+            actor.module.apply(_to_channels_last)
+            qf1.module.apply(_to_channels_last)
+            qf2.module.apply(_to_channels_last)
+        else:
+            actor.apply(_to_channels_last)
+            qf1.apply(_to_channels_last)
+            qf2.apply(_to_channels_last)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -442,11 +700,12 @@ if __name__ == "__main__":
     envs.single_observation_space.dtype = np.float32
 
     # NOTE(gaoyuan): changed
+    cpu_device = torch.device("cpu")
     rb = DictReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        device=training_gpu_id,
+        device=cpu_device,
         n_envs=args.num_envs,
     )
 
@@ -456,9 +715,18 @@ if __name__ == "__main__":
     args.learning_starts = 0
 
     # ADD PRE-TRAINING STEPS
-    print(f"[Pre-Training] Starting {args.pretraining_steps} steps of offline training...")
+    if is_main_process(rank):
+        print(f"[Pre-Training] Starting {args.pretraining_steps} steps of offline training...")
+
     for i in range(args.pretraining_steps):
         obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = rb.sample(args.batch_size)
+
+        # Move full batch to current device (handles dict/tuple/numpy)
+        obs_batch = to_device(obs_batch, training_gpu_id)
+        next_obs_batch = to_device(next_obs_batch, training_gpu_id)
+        act_batch = to_device(act_batch, training_gpu_id)
+        rew_batch = to_device(rew_batch, training_gpu_id)
+        done_batch = to_device(done_batch, training_gpu_id)
 
         with torch.amp.autocast(device_type=training_gpu_id.type):
             next_q_value = compute_target_q(
@@ -477,7 +745,7 @@ if __name__ == "__main__":
         # update actor (SAC + BC)
         if i % args.policy_frequency == 0:
             with torch.amp.autocast(device_type=training_gpu_id.type):
-                pi, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                pi, log_pi, _ = unwrap(actor).get_action(obs_batch, with_aug=True, detach_encoder=True)
                 qf1_pi = qf1(obs_batch, pi)
                 qf2_pi = qf2(obs_batch, pi)
                 min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -493,7 +761,7 @@ if __name__ == "__main__":
             
             if args.autotune:
                  with torch.no_grad():
-                    _, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                    _, log_pi, _ = unwrap(actor).get_action(obs_batch, with_aug=True, detach_encoder=True)
                  alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
                  a_optimizer.zero_grad()
                  alpha_loss.backward()
@@ -507,22 +775,25 @@ if __name__ == "__main__":
                 target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
         if i % 100 == 0:
-            print(f"[Pre-Train] Step {i}/{args.pretraining_steps} | Q-Loss: {qf_loss.item():.3f} | Actor-Loss: {actor_loss.item():.3f}")
+            if is_main_process(rank):
+                print(f"[Pre-Train] Step {i}/{args.pretraining_steps} | Q-Loss: {qf_loss.item():.3f} | Actor-Loss: {actor_loss.item():.3f}")
 
-    print("[Pre-Training] Finished. Starting Online Interaction...\n")
+    if is_main_process(rank):
+        print("[Pre-Training] Finished. Starting Online Interaction...\n")
 
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    per_rank_timesteps = args.total_timesteps // world_size if ddp else args.total_timesteps
+    for global_step in range(per_rank_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             obs_tensor = {k: torch.tensor(v).to(training_gpu_id) for k, v in obs.items()}
             with torch.no_grad():
-                actions, _, _ = actor.get_action(obs_tensor, with_aug=False, detach_encoder=True)
+                actions, _, _ = unwrap(actor).get_action(obs_tensor, with_aug=False, detach_encoder=True)
             actions = actions.cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -578,6 +849,14 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = rb.sample(args.batch_size)
 
+            # Move full batch to current device (handles dict/tuple/numpy)
+            obs_batch = to_device(obs_batch, training_gpu_id)
+            next_obs_batch = to_device(next_obs_batch, training_gpu_id)
+            act_batch = to_device(act_batch, training_gpu_id)
+            rew_batch = to_device(rew_batch, training_gpu_id)
+            done_batch = to_device(done_batch, training_gpu_id)
+
+
             # NOTE(gaoyuan): changed; use the averaged target calculation
             with torch.amp.autocast(device_type=training_gpu_id.type):
                 next_q_value = compute_target_q(
@@ -600,7 +879,7 @@ if __name__ == "__main__":
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                     with torch.amp.autocast(device_type=training_gpu_id.type):
-                        pi, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                        pi, log_pi, _ = unwrap(actor).get_action(obs_batch, with_aug=True, detach_encoder=True)
                         qf1_pi = qf1(obs_batch, pi)
                         qf2_pi = qf2(obs_batch, pi)
                         min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -617,7 +896,7 @@ if __name__ == "__main__":
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(obs_batch, with_aug=True, detach_encoder=True)
+                            _, log_pi, _ = unwrap(actor).get_action(obs_batch, with_aug=True, detach_encoder=True)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -653,7 +932,7 @@ if __name__ == "__main__":
                       f"Q-Loss: {qf_loss.item():.3f} | Actor-Loss: {actor_loss.item():.3f} | "
                       f"Alpha: {alpha:.3f}")
                 
-            if global_step > 0 and global_step % args.eval_freq == 0:
+            if global_step > 0 and global_step % args.eval_freq == 0 and is_main_process(rank):
                 print(f"\n[EVAL] Starting Evaluation at Step {global_step}")
                 actor.eval()
                 
@@ -668,7 +947,7 @@ if __name__ == "__main__":
                     while not eval_done:
                         with torch.no_grad():
                             eval_obs_tensor = {k: torch.tensor(v).to(training_gpu_id) for k, v in eval_obs.items()}
-                            eval_action = actor.get_eval_action(eval_obs_tensor)
+                            eval_action = unwrap(actor).get_eval_action(eval_obs_tensor)
                             eval_action = eval_action.cpu().numpy()
                         
                         eval_obs, _, eval_terminateds, eval_truncateds, eval_infos = eval_envs.step(eval_action)
@@ -718,7 +997,7 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/eval_return", avg_return, global_step)
                     writer.add_scalar("charts/eval_success_rate", avg_success, global_step)
 
-                torch.save(actor.state_dict(), f"{output_path}/actor_{global_step}.pth")
+                torch.save(unwrap(actor).state_dict(), f"{output_path}/actor_{global_step}.pth")
                 actor.train()
                 
         elif global_step % 500 == 0:
@@ -726,3 +1005,6 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
