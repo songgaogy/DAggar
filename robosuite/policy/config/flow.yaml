@@ -1,0 +1,9 @@
+flow:
+  image_dim: 128
+  propior_dim: 128
+  time_dim: 64
+  token_dim: 128
+  temporal_layers: 2
+  temporal_heads: 4
+  vel_hidden: 256
+  vel_layers: 4

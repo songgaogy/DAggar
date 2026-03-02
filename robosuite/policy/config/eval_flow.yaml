@@ -1,0 +1,24 @@
+defaults:
+  - flow
+  - _self_
+
+# Checkpoint & Paths
+ckpt: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow/BC_warmup/flow_policy_ep0050_20260301_033848.pt"
+video_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow/BC_warmup/video/ep10"
+
+# Eval Settings
+episodes: 5
+max_steps: 300
+device: "cuda"
+n_ode_steps: 20
+
+# Observation & Action
+camera: "agentview"
+image_size: 128
+history_len: 4
+chunk_size: 8
+action_horizon: 4
+
+generate:
+  output_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/unlabled"
+  episodes: 100
