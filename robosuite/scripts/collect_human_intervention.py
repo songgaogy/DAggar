@@ -1,7 +1,5 @@
 """
-A script to collect a batch of human demonstrations.
-
-The demonstrations can be played back using the `playback_demonstrations_from_hdf5.py` script.
+A script to collect a batch of human interventions over a base policy.
 """
 
 import argparse
@@ -19,6 +17,27 @@ import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
 from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper
+
+
+class DummyPolicy:
+    def __init__(self, action_dim):
+        self.action_dim = action_dim
+
+    def get_action(self, obs):
+        return np.random.normal(0, 0.02, size=self.action_dim)
+
+
+def check_intervention(device, input_ac_dict):
+    if input_ac_dict is None:
+        return True 
+    
+    threshold = 0.1
+    total_mag = 0.0
+    for key, value in input_ac_dict.items():
+        if ("delta" in key) and isinstance(value, np.ndarray):
+            total_mag += np.linalg.norm(value)
+
+    return total_mag > threshold
 
 
 def now_readable(ts: datetime.datetime | None = None) -> str:
@@ -41,7 +60,6 @@ def list_ep_dirs(tmp_root: str) -> list[str]:
 
 
 def get_current_ep_dir(env_wrapped, tmp_root: str) -> str | None:
-    # DataCollectionWrapper typically exposes ep_directory; fallback to scanning tmp_root.
     ep_dir = getattr(env_wrapped, "ep_directory", None)
     if isinstance(ep_dir, str) and len(ep_dir) > 0:
         return ep_dir
@@ -50,9 +68,6 @@ def get_current_ep_dir(env_wrapped, tmp_root: str) -> str | None:
 
 
 def read_single_demo_from_ep(ep_dir: str):
-    """
-    Read a single episode worth of DataCollectionWrapper outputs from @ep_dir.
-    """
     state_paths = os.path.join(ep_dir, "state_*.npz")
     states = []
     actions = []
@@ -71,9 +86,7 @@ def read_single_demo_from_ep(ep_dir: str):
     if len(states) == 0:
         return None
 
-    # Delete the last state. This is because when the DataCollector wrapper
-    # recorded the states and actions, the states were recorded AFTER playing that action,
-    # so we end up with an extra state at the end.
+    # Delete the last state to align with action length.
     del states[-1]
 
     states = np.array(states)
@@ -92,24 +105,11 @@ def append_demo_to_hdf5(
     hdf5_path: str,
     demo_id: int,
     demo_payload: dict,
+    step_labels: list[str],
     env_info: str,
     camera_names: list[str],
     images_dict: dict,
 ):
-    """
-    Append one demonstration into a single hdf5 file.
-
-    The strucure of the hdf5 file is as follows.
-
-    demos (group)
-        demo_000001 (group)
-            model_file (attribute) - model xml string for demonstration
-            states (dataset) - flattened mujoco states
-            actions (dataset) - actions applied during demonstration
-            observations (group)
-                <camera_name> (group)
-                    images (dataset) - uint8 images, shape (T, H, W, 3)
-    """
     f = h5py.File(hdf5_path, "a")
 
     if "demos" not in f:
@@ -124,31 +124,70 @@ def append_demo_to_hdf5(
 
     demo_grp = demos_grp.create_group(f"demo_{demo_id:06d}")
 
-    # store model xml as an attribute
+    # Store model xml
     xml_path = os.path.join(demo_payload["ep_dir"], "model.xml")
     if os.path.isfile(xml_path):
         with open(xml_path, "r") as fx:
-            xml_str = fx.read()
-        demo_grp.attrs["model_file"] = xml_str
+            demo_grp.attrs["model_file"] = fx.read()
 
     states = demo_payload["states"]
     actions = demo_payload["actions"]
 
-    # Align lengths across states/actions/images
-    T = min(states.shape[0], actions.shape[0])
+    # Align lengths across states/actions/images/labels
+    T = min(states.shape[0], actions.shape[0], len(step_labels))
     for cam in camera_names:
         imgs = images_dict.get(cam, None)
         if isinstance(imgs, np.ndarray) and imgs.ndim == 4:
             T = min(T, imgs.shape[0])
 
-    states = states[:T]
-    actions = actions[:T]
+    # Resolve fake cooldowns
+    resolved_labels = list(step_labels[:T])
+    n_labels = len(resolved_labels)
+    
+    for i in range(n_labels):
+        if resolved_labels[i] == "COOLDOWN":
+            # Look ahead to see what this cooldown resolves to
+            resolves_to = "END"
+            for j in range(i + 1, n_labels):
+                if resolved_labels[j] != "COOLDOWN":
+                    resolves_to = resolved_labels[j]
+                    break
+            
+            # If it resolves to anything other than POLICY (e.g., back to INTERVENING or hits END), 
+            # it is a fake cooldown. Keep it as INTERVENING.
+            if resolves_to != "POLICY":
+                resolved_labels[i] = "INTERVENING"
 
-    demo_grp.attrs["length"] = int(T)
+    # Filter out true COOLDOWN data that transitioned to POLICY
+    keep_indices = [i for i in range(T) if resolved_labels[i] != "COOLDOWN"]
+    
+    # Generate aligned states, actions, and binary labels (0: policy, 1: intervention)
+    states_filtered = states[keep_indices]
+    actions_filtered = actions[keep_indices]
+    labels_binary = np.array([1 if resolved_labels[i] == "INTERVENING" else 0 for i in keep_indices], dtype=np.uint8)
+
+    # Calculate intervention segment indices [start, end]
+    segments = []
+    in_segment = False
+    start_idx = 0
+    for i, val in enumerate(labels_binary):
+        if val == 1 and not in_segment:
+            start_idx = i
+            in_segment = True
+        elif val == 0 and in_segment:
+            segments.append([start_idx, i - 1])
+            in_segment = False
+    if in_segment:
+        segments.append([start_idx, len(labels_binary) - 1])
+
+    T_final = len(keep_indices)
+    demo_grp.attrs["length"] = int(T_final)
     demo_grp.attrs["successful"] = bool(demo_payload.get("success", False))
+    demo_grp.attrs["intervention_segments"] = json.dumps(segments)
 
-    demo_grp.create_dataset("states", data=states)
-    demo_grp.create_dataset("actions", data=actions)
+    demo_grp.create_dataset("states", data=states_filtered)
+    demo_grp.create_dataset("actions", data=actions_filtered)
+    demo_grp.create_dataset("intervention_labels", data=labels_binary)
 
     obs_grp = demo_grp.create_group("observations")
 
@@ -159,11 +198,11 @@ def append_demo_to_hdf5(
             cam_grp.create_dataset("images", data=np.zeros((0,), dtype=np.uint8))
             continue
 
-        imgs = imgs[:T].astype(np.uint8)
+        imgs_filtered = imgs[keep_indices].astype(np.uint8)
 
         cam_grp.create_dataset(
             "images",
-            data=imgs,
+            data=imgs_filtered,
             dtype=np.uint8,
             compression="gzip",
             compression_opts=4,
@@ -173,33 +212,14 @@ def append_demo_to_hdf5(
     f.close()
 
 
-def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode, camera_names, img_height, img_width):
-    """
-    Use the device (keyboard or SpaceNav 3D mouse) to collect a demonstration.
-    The rollout trajectory is saved to files in npz format.
-    Modify the DataCollectionWrapper wrapper to add new fields or change data formats.
-
-    Args:
-        env (MujocoEnv): environment to control
-        device (Device): to receive controls from the device
-        arms (str): which arm to control (eg bimanual) 'right' or 'left'
-        max_fr (int): if specified, pause the simulation whenever simulation runs faster than max_fr
-    """
-
-    # NOTE:
-    # We do not call env.reset() here. DataCollectionWrapper flushes to disk on reset(),
-    # and deleting ep directories before flush can cause FileNotFoundError.
-    # The caller should manage env.reset() boundaries.
-
+def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_update_mode, camera_names, img_height, img_width, cool_down):
     env.render()
-
-    task_completion_hold_count = -1  # counter to collect 10 timesteps after reaching goal
+    task_completion_hold_count = -1  
     device.start_control()
 
     for robot in env.robots:
         robot.print_action_info_dict()
 
-    # Keep track of prev gripper actions when using since they are position-based and must be maintained when arms switched
     all_prev_gripper_actions = [
         {
             f"{robot_arm}_gripper": np.repeat([0], robot.gripper[robot_arm].dof)
@@ -210,68 +230,101 @@ def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode, camera_
     ]
 
     images = {cam: [] for cam in camera_names}
+    step_labels = []
 
-    # Loop until we get a reset from the input or the task completes
+    # State machine parameters
+    state_mode = "POLICY"
+    prev_state_mode = "POLICY"
+    COOLDOWN_STEPS = int(20 * cool_down)  # assuming 20Hz control frequency
+    cooldown_counter = 0
+
+    obs = env.unwrapped._get_observations()
+    print("\n[INFO] Loop started. Default: Policy. Intervene with Device.")
+
     while True:
         start = time.time()
 
-        # Set active robot
         active_robot = env.robots[device.active_robot]
-
-        # Get the newest action
         input_ac_dict = device.input2action(goal_update_mode=goal_update_mode)
 
-        # If action is none, then this a reset so we should break
         if input_ac_dict is None:
             break
 
-        from copy import deepcopy
+        is_intervening_now = check_intervention(device, input_ac_dict)
 
-        action_dict = deepcopy(input_ac_dict)  # {}
-        # set arm actions
-        for arm_name in active_robot.arms:
-            if isinstance(active_robot.composite_controller, WholeBody):  # input type passed to joint_action_policy
-                controller_input_type = active_robot.composite_controller.joint_action_policy.input_type
-            else:
-                controller_input_type = active_robot.part_controllers[arm_name].input_type
+        # Update state machine
+        if is_intervening_now:
+            state_mode = "INTERVENING"
+            cooldown_counter = 0
+        else:
+            if state_mode == "INTERVENING":
+                state_mode = "COOLDOWN"
+                cooldown_counter = COOLDOWN_STEPS
+            
+            if state_mode == "COOLDOWN":
+                cooldown_counter -= 1
+                if cooldown_counter <= 0:
+                    state_mode = "POLICY"
 
-            if controller_input_type == "delta":
-                action_dict[arm_name] = input_ac_dict[f"{arm_name}_delta"]
-            elif controller_input_type == "absolute":
-                action_dict[arm_name] = input_ac_dict[f"{arm_name}_abs"]
-            else:
-                raise ValueError
+        # Print state transitions to terminal
+        if state_mode != prev_state_mode:
+            if state_mode in ["INTERVENING", "POLICY"]:
+                print(f"[State] {state_mode}")
+            prev_state_mode = state_mode
 
-        # Maintain gripper state for each robot but only update the active robot with action
-        env_action = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
-        env_action[device.active_robot] = active_robot.create_action_vector(action_dict)
-        env_action = np.concatenate(env_action)
-        for gripper_ac in all_prev_gripper_actions[device.active_robot]:
-            all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
+        # Record the current frame's state
+        step_labels.append(state_mode)
 
-        env.step(env_action)
+        if state_mode in ["INTERVENING", "COOLDOWN"]:
+            # Human Control / Brake Buffer
+            from copy import deepcopy
+            action_dict = deepcopy(input_ac_dict)
+            
+            for arm_name in active_robot.arms:
+                if isinstance(active_robot.composite_controller, WholeBody): 
+                    controller_input_type = active_robot.composite_controller.joint_action_policy.input_type
+                else:
+                    controller_input_type = active_robot.part_controllers[arm_name].input_type
 
-        # Capture multiview images after env.step so that images align with post-action states.
+                if controller_input_type == "delta":
+                    action_dict[arm_name] = input_ac_dict[f"{arm_name}_delta"]
+                elif controller_input_type == "absolute":
+                    action_dict[arm_name] = input_ac_dict[f"{arm_name}_abs"]
+                else:
+                    raise ValueError
+
+            env_action_list = [robot.create_action_vector(all_prev_gripper_actions[i]) for i, robot in enumerate(env.robots)]
+            env_action_list[device.active_robot] = active_robot.create_action_vector(action_dict)
+            env_action = np.concatenate(env_action_list)
+            
+            for gripper_ac in all_prev_gripper_actions[device.active_robot]:
+                all_prev_gripper_actions[device.active_robot][gripper_ac] = action_dict[gripper_ac]
+
+        else:
+            # Policy Control
+            env_action = policy.get_action(obs)
+
+        # Step environment
+        obs, reward, done, info = env.step(env_action)
+
+        # Capture multiview images
         for cam in camera_names:
             img = env.sim.render(height=img_height, width=img_width, camera_name=cam)
             images[cam].append(img)
 
         env.render()
 
-        # Also break if we complete the task
         if task_completion_hold_count == 0:
             break
 
-        # state machine to check for having a success for 10 consecutive timesteps
         if env._check_success():
             if task_completion_hold_count > 0:
-                task_completion_hold_count -= 1  # latched state, decrement count
+                task_completion_hold_count -= 1 
             else:
-                task_completion_hold_count = 10  # reset count on first success timestep
+                task_completion_hold_count = 10 
         else:
-            task_completion_hold_count = -1  # null the counter if there's no success
+            task_completion_hold_count = -1 
 
-        # limit frame rate if necessary
         if max_fr is not None:
             elapsed = time.time() - start
             diff = 1 / max_fr - elapsed
@@ -285,7 +338,7 @@ def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode, camera_
         else:
             images_np[cam] = np.stack(images[cam], axis=0).astype(np.uint8)
 
-    return images_np
+    return images_np, step_labels
 
 
 def prompt_user_action() -> str:
@@ -315,11 +368,9 @@ def build_env(env_config: dict, args):
 def build_device(env, args):
     if args.device == "keyboard":
         from robosuite.devices import Keyboard
-
         device = Keyboard(env=env, pos_sensitivity=args.pos_sensitivity, rot_sensitivity=args.rot_sensitivity)
     elif args.device == "spacemouse":
         from robosuite.devices import SpaceMouse
-
         device = SpaceMouse(
             env=env,
             vendor_id=0x256F,
@@ -329,7 +380,6 @@ def build_device(env, args):
         )
     elif args.device == "dualsense":
         from robosuite.devices import DualSense
-
         device = DualSense(
             env=env,
             pos_sensitivity=args.pos_sensitivity,
@@ -339,7 +389,6 @@ def build_device(env, args):
     elif args.device == "mjgui":
         assert args.renderer == "mjviewer", "Mocap is only supported with the mjviewer renderer"
         from robosuite.devices.mjgui import MJGUI
-
         device = MJGUI(env=env)
     else:
         raise Exception(f"Invalid device choice: {args.device}")
@@ -347,160 +396,86 @@ def build_device(env, args):
 
 
 if __name__ == "__main__":
-    # Arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--directory",
-        type=str,
-        default=os.path.join(suite.models.assets_root, "demonstrations_private"),
-    )
+    parser.add_argument("--directory", type=str, default=os.path.join(suite.models.assets_root, "demonstrations_private"))
     parser.add_argument("--environment", type=str, default="Lift")
-    parser.add_argument(
-        "--robots",
-        nargs="+",
-        type=str,
-        default="Panda",
-        help="Which robot(s) to use in the env",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="default",
-        help="Specified environment configuration if necessary",
-    )
-    parser.add_argument(
-        "--arm",
-        type=str,
-        default="right",
-        help="Which arm to control (eg bimanual) 'right' or 'left'",
-    )
-    parser.add_argument(
-        "--camera",
-        nargs="*",
-        type=str,
-        default=["agentview"],
-        help="List of camera names to save. Pass multiple names to enable multiple views. Note: the `mujoco` renderer must be enabled when using multiple views; `mjviewer` is not supported.",
-    )
-    parser.add_argument(
-        "--controller",
-        type=str,
-        default=None,
-        help="Choice of controller. Can be generic (eg. 'BASIC' or 'WHOLE_BODY_MINK_IK') or json file (see robosuite/controllers/config for examples)",
-    )
+    parser.add_argument("--robots", nargs="+", type=str, default="Panda")
+    parser.add_argument("--config", type=str, default="default")
+    parser.add_argument("--arm", type=str, default="right")
+    parser.add_argument("--camera", nargs="*", type=str, default=["agentview"])
+    parser.add_argument("--controller", type=str, default=None)
     parser.add_argument("--device", type=str, default="keyboard")
-    parser.add_argument(
-        "--pos-sensitivity",
-        type=float,
-        default=1.0,
-        help="How much to scale position user inputs",
-    )
-    parser.add_argument(
-        "--rot-sensitivity",
-        type=float,
-        default=1.0,
-        help="How much to scale rotation user inputs",
-    )
-    parser.add_argument(
-        "--renderer",
-        type=str,
-        default="mjviewer",
-        help="Use Mujoco's builtin interactive viewer (mjviewer) or OpenCV viewer (mujoco)",
-    )
-    parser.add_argument(
-        "--max_fr",
-        default=20,
-        type=int,
-        help="Sleep when simluation runs faster than specified frame rate; 20 fps is real time.",
-    )
-    parser.add_argument(
-        "--reverse_xy",
-        type=bool,
-        default=False,
-        help="(DualSense Only)Reverse the effect of the x and y axes of the joystick.It is used to handle the case that the left/right and front/back sides of the view are opposite to the LX and LY of the joystick(Push LX up but the robot move left in your view)",
-    )
-    parser.add_argument(
-        "--goal_update_mode",
-        type=str,
-        default="target",
-        choices=["target", "achieved"],
-        help="Used by the device to get the arm's actions. The mode to update the goal in. Can be 'target' or 'achieved'. If 'target', the goal is updated based on the current target pose. "
-        "If 'achieved', the goal is updated based on the current achieved state. "
-        "We recommend using 'achieved' (and input_ref_frame='base') if collecting demonstrations with a mobile base robot.",
-    )
+    parser.add_argument("--pos-sensitivity", type=float, default=1.0)
+    parser.add_argument("--rot-sensitivity", type=float, default=1.0)
+    parser.add_argument("--renderer", type=str, default="mjviewer")
+    parser.add_argument("--max_fr", default=20, type=int)
+    parser.add_argument("--reverse_xy", type=bool, default=False)
+    parser.add_argument("--goal_update_mode", type=str, default="target", choices=["target", "achieved"])
     parser.add_argument("--img_height", type=int, default=256)
     parser.add_argument("--img_width", type=int, default=256)
+    parser.add_argument("--cool_down_second", type=float, default=1)
     args = parser.parse_args()
 
-    # Get controller config
     controller_config = load_composite_controller_config(
         controller=args.controller,
         robot=args.robots[0],
     )
 
     if controller_config["type"] == "WHOLE_BODY_MINK_IK":
-        # mink-speicific import. requires installing mink
         from robosuite.examples.third_party_controller.mink_controller import WholeBodyMinkIK  # noqa: F401
 
-    # if WHOLE BODY IK; assert only one robot
     if controller_config["type"] == "WHOLE_BODY_IK":
         assert len(args.robots) == 1, "Whole Body IK only supports one robot"
 
-    # Create argument configuration
     env_config = {
         "env_name": args.environment,
         "robots": args.robots,
         "controller_configs": controller_config,
     }
 
-    # Check if we're using a multi-armed environment and use env_configuration argument if so
     if "TwoArm" in args.environment:
         env_config["env_configuration"] = args.config
 
     env_info = json.dumps(env_config)
 
     safe_mkdir(args.directory)
-
     base_time = now_readable()
-
-    tmp_root = os.path.join("/tmp", f"robosuite_collect_{base_time}")
+    tmp_root = os.path.join("/tmp", f"robosuite_intervention_{base_time}")
     safe_mkdir(tmp_root)
 
-    tmp_hdf5_path = os.path.join(args.directory, f"{base_time}_0.hdf5")
+    tmp_hdf5_path = os.path.join(args.directory, f"intervention_{base_time}_0.hdf5")
     print(f"Output HDF5: {tmp_hdf5_path}")
 
     env = build_env(env_config, args)
     device = build_device(env, args)
 
-    # wrap the environment with data collection wrapper
+    # Instantiate the base policy to be intervened
+    action_dim = env.action_spec[0].shape[0]
+    policy = DummyPolicy(action_dim)
+
+    # Wrap the environment with data collection wrapper
     env_wrapped = DataCollectionWrapper(env, tmp_root)
-
     saved_count = 0
-
-    # Start the first episode directory
     env_wrapped.reset()
 
     try:
         while True:
-            # Collect one demo within the current episode directory
-            images_dict = collect_human_trajectory(
+            images_dict, step_labels = collect_intervention_trajectory(
                 env=env_wrapped,
                 device=device,
+                policy=policy,
                 arm=args.arm,
                 max_fr=args.max_fr,
                 goal_update_mode=args.goal_update_mode,
                 camera_names=args.camera,
                 img_height=args.img_height,
                 img_width=args.img_width,
+                cool_down=args.cool_down_second,
             )
 
-            # Identify the episode directory that just finished
             ep_dir = get_current_ep_dir(env_wrapped, tmp_root)
-
-            # Trigger flush-to-disk for the finished episode by starting a new episode.
-            # DataCollectionWrapper writes state_*.npz during _flush() called inside reset().
             env_wrapped.reset()
 
-            # Now ep_dir should contain flushed state_*.npz files and can be safely read/deleted.
             if ep_dir is None or not os.path.isdir(ep_dir):
                 print("Empty demo. Discarded.")
                 continue
@@ -519,6 +494,7 @@ if __name__ == "__main__":
                     hdf5_path=tmp_hdf5_path,
                     demo_id=saved_count,
                     demo_payload=demo_payload,
+                    step_labels=step_labels,
                     env_info=env_info,
                     camera_names=args.camera,
                     images_dict=images_dict,
@@ -543,6 +519,7 @@ if __name__ == "__main__":
                     hdf5_path=tmp_hdf5_path,
                     demo_id=saved_count,
                     demo_payload=demo_payload,
+                    step_labels=step_labels,
                     env_info=env_info,
                     camera_names=args.camera,
                     images_dict=images_dict,
@@ -564,7 +541,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    final_hdf5_path = os.path.join(args.directory, f"{base_time}_{saved_count}.hdf5")
+    final_hdf5_path = os.path.join(args.directory, f"intervention_{base_time}_{saved_count}.hdf5")
     print(f"\nFinal episodes: {saved_count}")
     try:
         if os.path.isfile(tmp_hdf5_path):
