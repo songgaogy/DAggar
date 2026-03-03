@@ -125,6 +125,7 @@ def main(cfg: DictConfig):
     # Set HDF5 output directory and max sequence length
     output_dir = to_absolute_path(cfg.generate.output_dir)
     max_len = cfg.max_steps
+    failure_only = bool(cfg.generate.get("failure_only", False))
     
     os.makedirs(output_dir, exist_ok=True)
     base_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -179,10 +180,19 @@ def main(cfg: DictConfig):
         temporal_heads=cfg.flow.temporal_heads,
         vel_hidden=cfg.flow.vel_hidden,
         vel_layers=cfg.flow.vel_layers,
-        history_len=cfg.history_len
+        history_len=cfg.history_len,
+        action_chunk_size=cfg.chunk_size,
+        action_temporal_layers=cfg.flow.action_temporal_layers,
+        action_temporal_heads=cfg.flow.action_temporal_heads,
     ).to(device)
 
-    model.load_state_dict(state_dict, strict=True)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Checkpoint is incompatible with current FlowPolicy architecture. "
+            "Please retrain with the updated model or switch to a matching code version."
+        ) from e
     model.eval()
 
     img_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -195,9 +205,13 @@ def main(cfg: DictConfig):
 
     env_info = json.dumps({"env_name": "Lift", "robots": ["Panda"]})
 
+    target_saved = int(cfg.generate.episodes)
     saved_count = 0
+    attempt_count = 0
+    pbar = tqdm(total=target_saved, desc="Saved episodes")
 
-    for ep in range(cfg.generate.episodes):
+    while saved_count < target_saved:
+        attempt_count += 1
         obs = env.reset()
         done = False
         step_count = 0
@@ -269,26 +283,32 @@ def main(cfg: DictConfig):
                     done = True
                     break
 
-        print(f"episode={ep} success={success} steps={step_count}")
+        print(f"attempt={attempt_count} success={success} steps={step_count}")
 
-        # Save the episode data
-        saved_count += 1
-        append_demo_to_hdf5(
-            hdf5_path=hdf5_path,
-            demo_id=saved_count,
-            states=ep_states,
-            actions=ep_actions,
-            images_dict=ep_images,
-            success=success,
-            env_name="Lift",
-            env_info=env_info,
-            camera_names=[cfg.camera],
-            xml_str=xml_str
-        )
-        print(f"Saved data_{saved_count:06d} to {hdf5_path}")
+        should_save = (not failure_only) or (not success)
+        if should_save:
+            saved_count += 1
+            append_demo_to_hdf5(
+                hdf5_path=hdf5_path,
+                demo_id=saved_count,
+                states=ep_states,
+                actions=ep_actions,
+                images_dict=ep_images,
+                success=success,
+                env_name="Lift",
+                env_info=env_info,
+                camera_names=[cfg.camera],
+                xml_str=xml_str
+            )
+            print(f"Saved data_{saved_count:06d} to {hdf5_path}")
+            pbar.update(1)
+        else:
+            print("Skipped save: successful episode and failure_only=True")
 
+    pbar.close()
     extractor.close()
-    print(f"\nFinished. All data saved to {hdf5_path}")
+    print(f"\nFinished. Saved {saved_count} episodes in {attempt_count} attempts to {hdf5_path}")
+
 
 if __name__ == "__main__":
     main()

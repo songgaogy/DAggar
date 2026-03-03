@@ -7,3 +7,5 @@ flow:
   temporal_heads: 4
   vel_hidden: 256
   vel_layers: 4
+  action_temporal_layers: 1
+  action_temporal_heads: 4

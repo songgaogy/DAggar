@@ -22,7 +22,8 @@ class ImageEncoder(nn.Module):
                  path: str = "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"):
         super().__init__()
         net = resnet18(weights=None)
-        net.load_state_dict(torch.load(path))
+        if pretrained:
+            net.load_state_dict(torch.load(path, map_location="cpu"))
         net.fc = nn.Identity()
         self.backbone = net
         self.proj = nn.Linear(512, out_dim)
@@ -49,6 +50,10 @@ class AdaLN(nn.Module):
         x = self.ln(x)
         ss = self.to_scale_shift(cond)
         scale, shift = ss.chunk(2, dim=-1)
+        # Broadcast conditioning over token / sequence dimensions when x is [B, N, D].
+        while scale.ndim < x.ndim:
+            scale = scale.unsqueeze(1)
+            shift = shift.unsqueeze(1)
         return x * (1.0 + scale) + shift
 
 
@@ -101,12 +106,23 @@ class FlowPolicy(nn.Module):
         vel_layers: int = 6,
         dropout: float = 0.0,
         history_len: int = 1,
+        action_chunk_size: int = 1,
+        action_temporal_layers: int = 1,
+        action_temporal_heads: int = 4,
         pretrained_resnet: bool = True,
         freeze_resnet: bool = False,
     ):
         super().__init__()
         self.act_dim = int(act_dim)
         self.time_dim = int(time_dim)
+        self.chunk_size = int(action_chunk_size)
+        if self.chunk_size <= 0:
+            raise ValueError(f"action_chunk_size must be > 0, got {self.chunk_size}")
+        if self.act_dim % self.chunk_size != 0:
+            raise ValueError(
+                f"act_dim ({self.act_dim}) must be divisible by action_chunk_size ({self.chunk_size})"
+            )
+        self.step_act_dim = self.act_dim // self.chunk_size
 
         self.img_enc = ImageEncoder(out_dim=img_dim, pretrained=pretrained_resnet, freeze_backbone=freeze_resnet)
         self.prop_enc = nn.Sequential(
@@ -129,11 +145,24 @@ class FlowPolicy(nn.Module):
         )
 
         self.cond_ln = nn.LayerNorm(token_dim)
+        self.token_time_adaln = AdaLN(hidden_dim=token_dim, cond_dim=token_dim)
+        self.time_token = nn.Parameter(torch.zeros(1, 1, token_dim))
 
-        self.in_proj = nn.Linear(self.act_dim, vel_hidden)
+        self.in_proj = nn.Linear(self.step_act_dim, vel_hidden)
         self.cond_proj = nn.Linear(token_dim, vel_hidden)
 
-        self.pos_emb = nn.Parameter(torch.zeros(1, history_len + 2, token_dim))
+        # 1 time token + 1 cls token + history_len image tokens + 1 proprio token
+        self.pos_emb = nn.Parameter(torch.zeros(1, history_len + 3, token_dim))
+        self.action_pos_emb = nn.Parameter(torch.zeros(1, self.chunk_size, vel_hidden))
+        if action_temporal_layers > 0:
+            self.action_temporal = TemporalEncoder(
+                token_dim=vel_hidden,
+                n_layers=action_temporal_layers,
+                n_heads=action_temporal_heads,
+                dropout=dropout,
+            )
+        else:
+            self.action_temporal = nn.Identity()
 
         blocks = []
         for _ in range(vel_layers):
@@ -141,12 +170,12 @@ class FlowPolicy(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
         self.out_ln = nn.LayerNorm(vel_hidden)
-        self.out = nn.Linear(vel_hidden, self.act_dim)
+        self.out = nn.Linear(vel_hidden, self.step_act_dim)
 
         self.gate = nn.Sequential(
             nn.Linear(vel_hidden, vel_hidden),
             nn.GELU(),
-            nn.Linear(vel_hidden, self.act_dim),
+            nn.Linear(vel_hidden, self.step_act_dim),
             nn.Tanh(),
         )
 
@@ -161,26 +190,32 @@ class FlowPolicy(nn.Module):
         img_tok = self.img_to_token(img_feat)
         prop_tok = self.prop_to_token(prop_feat).unsqueeze(1)
         cls_tokens = self.cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls_tokens, img_tok, prop_tok], dim=1) 
-        tokens = tokens + self.pos_emb[:, :tokens.shape[1], :]
+        tokens_base = torch.cat([cls_tokens, img_tok, prop_tok], dim=1)
 
         t_emb = sinusoidal_time_embedding(t, self.time_dim)
-        t_tok = self.time_mlp(t_emb).unsqueeze(1)
-        tokens = tokens + t_tok
+        t_cond = self.time_mlp(t_emb)
+        t_tok = self.time_token + t_cond.unsqueeze(1)
+
+        tokens = torch.cat([t_tok, tokens_base], dim=1)
+        tokens = tokens + self.pos_emb[:, :tokens.shape[1], :]
+        tokens = self.token_time_adaln(tokens, t_cond)
 
         tokens = self.temporal(tokens) 
-        cond = tokens[:, 0]
+        cond = tokens[:, 1]  # cls token follows the time token
         cond = self.cond_ln(cond) 
         cond_h = self.cond_proj(cond) 
 
-        h = self.in_proj(x_t) 
+        x_tokens = x_t.view(B, self.chunk_size, self.step_act_dim)
+        h = self.in_proj(x_tokens)
         for blk in self.blocks:
             h = blk(h, cond_h)
 
+        h = h + self.action_pos_emb
+        h = self.action_temporal(h)
         h = self.out_ln(h)
         v = self.out(h) 
         v = v * (1.0 + 0.5 * self.gate(h))
-        return v
+        return v.reshape(B, self.act_dim)
 
     def get_cond_features(self, images, proprio):
         B, K = images.shape[0], images.shape[1]
@@ -193,24 +228,30 @@ class FlowPolicy(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         
         tokens_base = torch.cat([cls_tokens, img_tok, prop_tok], dim=1)
-        tokens_base = tokens_base + self.pos_emb[:, :tokens_base.shape[1], :]
         return tokens_base
 
     def forward_with_features(self, x_t, t, tokens_base):
+        B = x_t.shape[0]
         t_emb = sinusoidal_time_embedding(t, self.time_dim)
-        t_tok = self.time_mlp(t_emb).unsqueeze(1)
-        tokens = tokens_base + t_tok
+        t_cond = self.time_mlp(t_emb)
+        t_tok = self.time_token + t_cond.unsqueeze(1)
+        tokens = torch.cat([t_tok, tokens_base], dim=1)
+        tokens = tokens + self.pos_emb[:, :tokens.shape[1], :]
+        tokens = self.token_time_adaln(tokens, t_cond)
         
         tokens = self.temporal(tokens)
-        cond = tokens[:, 0]
+        cond = tokens[:, 1]
         cond = self.cond_ln(cond)
         cond_h = self.cond_proj(cond)
 
-        h = self.in_proj(x_t)
+        x_tokens = x_t.view(B, self.chunk_size, self.step_act_dim)
+        h = self.in_proj(x_tokens)
         for blk in self.blocks:
             h = blk(h, cond_h)
 
+        h = h + self.action_pos_emb
+        h = self.action_temporal(h)
         h = self.out_ln(h)
         v = self.out(h)
         v = v * (1.0 + 0.5 * self.gate(h))
-        return v
+        return v.reshape(B, self.act_dim)

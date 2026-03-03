@@ -1,0 +1,36 @@
+seed: 42
+
+policy_ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
+save_dir: "./checkpoints/PandaLift/discriminator/bce"
+
+camera: "agentview"
+image_size: 128
+history_len: -1  # <=0 means auto from policy checkpoint
+
+# D+ and D- directories
+data:
+  expert_dir: "./data/expoert"
+  unlabeled_dir: "./data/unlabeled"
+  unlabled_size: -1
+  normalize_with_policy_stats: true
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+
+train:
+  device: "cuda"
+  batch_size: 256
+  num_workers: 16
+  lr: 1e-4
+  weight_decay: 4e-6
+  epochs: 50
+  grad_clip_norm: 1.0
+  freeze_policy_backbone: true
+
+eval:
+  eval_ratio: 0.1
+  eval_every: 5
+  batch_size: 256
+
+save_freq: 10

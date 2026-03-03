@@ -17,16 +17,19 @@ stride: 1
 train:
   batch_size: 256
   num_workers: 16
+  prefetch_factor: 8
   lr: 2e-4
   weight_decay: 1e-6
-  epochs: 200
+  epochs: 100
   seed: 0
   device: "cuda"
   dropout: 0.1
+  unfreeze_backbone: false
+  unfreeze_epoch_ratio: 0.2
+  lambda_endpoint: 0.0
+  lambda_smooth: 0.0
 
 # logging & checkpointing
 log_every: 50
 save_freq: 10
-uf_low: 0.2
-uf_high: 0.4
 ema_decay: 0.999

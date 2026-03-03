@@ -9,22 +9,207 @@ import os
 import shutil
 import time
 from glob import glob
-
 import h5py
 import numpy as np
+import torch
+from torchvision.transforms import Normalize
+from collections import deque
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from hydra.utils import to_absolute_path
 
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
 from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper
 
+from utils.env_util import PandaLiftProprioExtractor
+from flow import FlowPolicy
+from eval_flow import center_crop_resize, sample_action_fast
 
-class DummyPolicy:
+
+class BasePolicy:
+    def reset(self, initial_obs, env):
+        pass
+        
+    def update_history(self, obs, env):
+        pass
+        
+    def notify_intervention(self):
+        """Called when human takes over. Invalidate current action chunks."""
+        pass
+        
+    def get_action(self):
+        raise NotImplementedError
+
+
+class DummyPolicy(BasePolicy):
     def __init__(self, action_dim):
         self.action_dim = action_dim
 
-    def get_action(self, obs):
+    def get_action(self):
         return np.random.normal(0, 0.02, size=self.action_dim)
+
+
+class FlowMatchWrapper(BasePolicy):
+    def __init__(self, cfg: DictConfig, env):
+        self.cfg = cfg
+        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+        if isinstance(cfg.camera, str):
+            self.camera_names_list = [cfg.camera]
+        else:
+            self.camera_names_list = list(cfg.camera)
+        
+        # Extractor for proprio
+        self.extractor = PandaLiftProprioExtractor(
+            robots="Panda",
+            env_name="Lift",
+            has_renderer=False,
+            has_offscreen_renderer=True,
+            use_camera_obs=True,
+            camera_names=self.camera_names_list,
+            reward_shaping=False,
+        )
+        # Bind extractor to environment's sim
+        self.extractor.env = env
+        
+        # Load Checkpoint
+        ckpt_path = to_absolute_path(cfg.ckpt)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        
+        def _to_numpy(x):
+            if x is None: return None
+            if torch.is_tensor(x): return x.detach().cpu().numpy()
+            return x
+
+        self.act_mean = _to_numpy(ckpt.get("act_mean"))
+        self.act_std = _to_numpy(ckpt.get("act_std"))
+        self.prop_mean = _to_numpy(ckpt.get("prop_mean"))
+        self.prop_std = _to_numpy(ckpt.get("prop_std"))
+        
+        state_dict = ckpt.get("ema_model", ckpt["model"])
+        
+        if self.act_mean is not None:
+            act_dim = int(np.prod(self.act_mean.shape))
+        else:
+            out_w = next((state_dict[k] for k in ["out.weight", "head.weight", "vel_head.weight"] if k in state_dict), None)
+            act_dim = int(out_w.shape[0])
+
+        if self.prop_mean is not None:
+            prop_dim = int(np.prod(self.prop_mean.shape))
+        else:
+            prop_w = next((state_dict[k] for k in ["prop_enc.0.weight", "proprio_enc.0.weight", "prop_encoder.0.weight"] if k in state_dict), None)
+            prop_dim = int(prop_w.shape[1])
+
+        self.base_act_dim = act_dim // cfg.chunk_size
+
+        self.model = FlowPolicy(
+            act_dim=act_dim,
+            proprio_in_dim=prop_dim,
+            img_dim=cfg.flow.image_dim,
+            prop_dim=cfg.flow.propior_dim,
+            time_dim=cfg.flow.time_dim,
+            token_dim=cfg.flow.token_dim,
+            pretrained_resnet=True,
+            freeze_resnet=True,
+            temporal_layers=cfg.flow.temporal_layers,
+            temporal_heads=cfg.flow.temporal_heads,
+            vel_hidden=cfg.flow.vel_hidden,
+            vel_layers=cfg.flow.vel_layers,
+            history_len=cfg.history_len,
+            action_chunk_size=cfg.chunk_size,
+            action_temporal_layers=cfg.flow.action_temporal_layers,
+            action_temporal_heads=cfg.flow.action_temporal_heads,
+        ).to(self.device)
+
+        try:
+            if "ema_model" in ckpt:
+                self.model.load_state_dict(ckpt["ema_model"], strict=True)
+                print("Successfully loaded EMA model weights for Flow Policy.")
+            else:
+                self.model.load_state_dict(ckpt["model"], strict=True)
+                print("Loaded standard model weights for Flow Policy.")
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Checkpoint is incompatible with current FlowPolicy architecture. "
+                "Please retrain with the updated model or switch to a matching code version."
+            ) from e
+            
+        self.model.eval()
+        self.img_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
+        self.img_history = deque(maxlen=cfg.history_len)
+        self.prop_history = deque(maxlen=cfg.history_len)
+        
+        self.current_chunk = None
+        self.step_in_chunk = 0
+
+    def reset(self, initial_obs, initial_images, env):
+        self.img_history.clear()
+        self.prop_history.clear()
+        
+        prop = self.extractor.extract(env.sim.get_state().flatten()).reshape(-1)
+        
+        cam_name = self.camera_names_list[0]
+        raw_img = initial_images[cam_name]
+        
+        img = center_crop_resize(raw_img, self.cfg.image_size)
+        img_processed = np.transpose(img.astype(np.float32) / 255.0, (2, 0, 1))
+
+        for _ in range(self.cfg.history_len):
+            self.prop_history.append(prop)
+            self.img_history.append(img_processed)
+            
+        self.current_chunk = None
+        self.step_in_chunk = 0
+
+    def update_history(self, obs, step_images, env):
+        prop = self.extractor.extract(env.sim.get_state().flatten()).reshape(-1)
+        self.prop_history.append(prop)
+        
+        cam_name = self.camera_names_list[0]
+        raw_img = step_images[cam_name]
+        
+        img = center_crop_resize(raw_img, self.cfg.image_size)
+        img_processed = np.transpose(img.astype(np.float32) / 255.0, (2, 0, 1))
+        self.img_history.append(img_processed)
+
+    def notify_intervention(self):
+        """Invalidate the current chunk so it replans upon return to policy mode."""
+        self.current_chunk = None
+        self.step_in_chunk = 0
+
+    def get_action(self):
+        execute_steps = min(self.cfg.action_horizon, self.cfg.chunk_size)
+        
+        if self.current_chunk is None or self.step_in_chunk >= execute_steps:
+            # Need to sample a new action chunk
+            imgs_stacked = np.stack(self.img_history, axis=0)
+            images = torch.from_numpy(imgs_stacked).unsqueeze(0).to(self.device)
+            B, K, C, H, W = images.shape
+            images_flat = images.view(B * K, C, H, W)
+            images_norm = self.img_normalize(images_flat).view(B, K, C, H, W)
+            
+            prop_stacked = np.concatenate(self.prop_history, axis=0).astype(np.float32)
+            if self.prop_mean is not None:
+                prop_stacked = (prop_stacked - self.prop_mean) / self.prop_std
+            proprio = torch.from_numpy(prop_stacked).unsqueeze(0).to(self.device)
+
+            a_norm = sample_action_fast(self.model, images_norm, proprio, n_steps=self.cfg.n_ode_steps).cpu().numpy().reshape(-1)
+            
+            if self.act_mean is not None:
+                a_flat = a_norm * self.act_std + self.act_mean
+            else:
+                a_flat = a_norm
+
+            self.current_chunk = a_flat.reshape(self.cfg.chunk_size, self.base_act_dim)
+            self.step_in_chunk = 0
+
+        action_step = self.current_chunk[self.step_in_chunk]
+        self.step_in_chunk += 1
+        return action_step
 
 
 def check_intervention(device, input_ac_dict):
@@ -118,7 +303,7 @@ def append_demo_to_hdf5(
         f.attrs["repository_version"] = suite.__version__
         f.attrs["env"] = demo_payload.get("env_name", "")
         f.attrs["env_info"] = env_info
-        f.attrs["camera_names"] = json.dumps(camera_names)
+        f.attrs["camera_names"] = json.dumps(list(camera_names))
     else:
         demos_grp = f["demos"]
 
@@ -212,7 +397,8 @@ def append_demo_to_hdf5(
     f.close()
 
 
-def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_update_mode, camera_names, img_height, img_width, cool_down):
+def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_update_mode, 
+                                    camera_names, img_height, img_width, cool_down):
     env.render()
     task_completion_hold_count = -1  
     device.start_control()
@@ -229,6 +415,9 @@ def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_updat
         for robot in env.robots
     ]
 
+    if isinstance(camera_names, str):
+        camera_names = [camera_names]
+
     images = {cam: [] for cam in camera_names}
     step_labels = []
 
@@ -239,6 +428,13 @@ def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_updat
     cooldown_counter = 0
 
     obs = env.unwrapped._get_observations()
+    initial_images = {}
+    for cam in camera_names:
+        img = env.sim.render(height=img_height, width=img_width, camera_name=cam)
+        initial_images[cam] = img
+        images[cam].append(img)
+        
+    policy.reset(obs, initial_images, env.unwrapped)
     print("\n[INFO] Loop started. Default: Policy. Intervene with Device.")
 
     while True:
@@ -302,15 +498,19 @@ def collect_intervention_trajectory(env, device, policy, arm, max_fr, goal_updat
 
         else:
             # Policy Control
-            env_action = policy.get_action(obs)
+            env_action = policy.get_action()
 
         # Step environment
         obs, reward, done, info = env.step(env_action)
 
-        # Capture multiview images
+        step_images = {}
         for cam in camera_names:
             img = env.sim.render(height=img_height, width=img_width, camera_name=cam)
+            step_images[cam] = img
             images[cam].append(img)
+            
+        # Update policy history with the new observations and images
+        policy.update_history(obs, step_images, env.unwrapped)
 
         env.render()
 
@@ -349,13 +549,17 @@ def prompt_user_action() -> str:
         print("Invalid input. Please enter s, d, f or q.")
 
 
-def build_env(env_config: dict, args):
+def build_env(env_config: dict, cfg):
+    camera_names = cfg.camera if len(cfg.camera) > 0 else ["agentview"]
     env = suite.make(
         **env_config,
         has_renderer=True,
-        renderer=args.renderer,
+        renderer=cfg.renderer,
         has_offscreen_renderer=True,
-        render_camera=args.camera[0] if len(args.camera) > 0 else "agentview",
+        # `render_camera` is the interactive viewer camera only.
+        render_camera=camera_names[0],
+        # Configure all requested cameras for multi-view image capture.
+        camera_names=camera_names,
         ignore_done=True,
         use_camera_obs=False,
         reward_shaping=True,
@@ -365,93 +569,95 @@ def build_env(env_config: dict, args):
     return env
 
 
-def build_device(env, args):
-    if args.device == "keyboard":
+def build_device(env, cfg):
+    if cfg.device == "keyboard":
         from robosuite.devices import Keyboard
-        device = Keyboard(env=env, pos_sensitivity=args.pos_sensitivity, rot_sensitivity=args.rot_sensitivity)
-    elif args.device == "spacemouse":
+        device = Keyboard(env=env, pos_sensitivity=cfg.pos_sensitivity, rot_sensitivity=cfg.rot_sensitivity)
+    elif cfg.device == "spacemouse":
         from robosuite.devices import SpaceMouse
         device = SpaceMouse(
             env=env,
             vendor_id=0x256F,
             product_id=0xC635,
-            pos_sensitivity=args.pos_sensitivity,
-            rot_sensitivity=args.rot_sensitivity,
+            pos_sensitivity=cfg.pos_sensitivity,
+            rot_sensitivity=cfg.rot_sensitivity,
         )
-    elif args.device == "dualsense":
+    elif cfg.device == "dualsense":
         from robosuite.devices import DualSense
         device = DualSense(
             env=env,
-            pos_sensitivity=args.pos_sensitivity,
-            rot_sensitivity=args.rot_sensitivity,
-            reverse_xy=args.reverse_xy,
+            pos_sensitivity=cfg.pos_sensitivity,
+            rot_sensitivity=cfg.rot_sensitivity,
+            reverse_xy=cfg.reverse_xy,
         )
-    elif args.device == "mjgui":
-        assert args.renderer == "mjviewer", "Mocap is only supported with the mjviewer renderer"
+    elif cfg.device == "mjgui":
+        assert cfg.renderer == "mjviewer", "Mocap is only supported with the mjviewer renderer"
         from robosuite.devices.mjgui import MJGUI
         device = MJGUI(env=env)
     else:
-        raise Exception(f"Invalid device choice: {args.device}")
+        raise Exception(f"Invalid device choice: {cfg.device}")
     return device
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--directory", type=str, default=os.path.join(suite.models.assets_root, "demonstrations_private"))
-    parser.add_argument("--environment", type=str, default="Lift")
-    parser.add_argument("--robots", nargs="+", type=str, default="Panda")
-    parser.add_argument("--config", type=str, default="default")
-    parser.add_argument("--arm", type=str, default="right")
-    parser.add_argument("--camera", nargs="*", type=str, default=["agentview"])
-    parser.add_argument("--controller", type=str, default=None)
-    parser.add_argument("--device", type=str, default="keyboard")
-    parser.add_argument("--pos-sensitivity", type=float, default=1.0)
-    parser.add_argument("--rot-sensitivity", type=float, default=1.0)
-    parser.add_argument("--renderer", type=str, default="mjviewer")
-    parser.add_argument("--max_fr", default=20, type=int)
-    parser.add_argument("--reverse_xy", type=bool, default=False)
-    parser.add_argument("--goal_update_mode", type=str, default="target", choices=["target", "achieved"])
-    parser.add_argument("--img_height", type=int, default=256)
-    parser.add_argument("--img_width", type=int, default=256)
-    parser.add_argument("--cool_down_second", type=float, default=1)
-    args = parser.parse_args()
+@hydra.main(version_base="1.2", config_path="./config", config_name="collect_intervention")
+def main(cfg: DictConfig):
+    if isinstance(cfg.camera, str):
+        cfg.camera = [cfg.camera]
+    else:
+        cfg.camera = list(cfg.camera)
+    if len(cfg.camera) == 0:
+        cfg.camera = ["agentview"]
+
+    icfg = cfg.intervention
 
     controller_config = load_composite_controller_config(
-        controller=args.controller,
-        robot=args.robots[0],
+        controller=icfg.controller,
+        robot=icfg.robots[0],
     )
 
     if controller_config["type"] == "WHOLE_BODY_MINK_IK":
         from robosuite.examples.third_party_controller.mink_controller import WholeBodyMinkIK  # noqa: F401
 
     if controller_config["type"] == "WHOLE_BODY_IK":
-        assert len(args.robots) == 1, "Whole Body IK only supports one robot"
+        assert len(icfg.robots) == 1, "Whole Body IK only supports one robot"
 
     env_config = {
-        "env_name": args.environment,
-        "robots": args.robots,
+        "env_name": icfg.environment,
+        "robots": list(icfg.robots),
         "controller_configs": controller_config,
     }
 
-    if "TwoArm" in args.environment:
-        env_config["env_configuration"] = args.config
+    if "TwoArm" in icfg.environment:
+        env_config["env_configuration"] = icfg.config
 
     env_info = json.dumps(env_config)
 
-    safe_mkdir(args.directory)
+    safe_mkdir(icfg.directory)
     base_time = now_readable()
     tmp_root = os.path.join("/tmp", f"robosuite_intervention_{base_time}")
     safe_mkdir(tmp_root)
 
-    tmp_hdf5_path = os.path.join(args.directory, f"intervention_{base_time}_0.hdf5")
+    tmp_hdf5_path = os.path.join(icfg.directory, f"intervention_{base_time}_0.hdf5")
     print(f"Output HDF5: {tmp_hdf5_path}")
 
+    # Create dummy args mapping for compatibility with build_env / build_device
+    class DummyArgs: pass
+    args = DummyArgs()
+    for k, v in icfg.items(): setattr(args, k, v)
+    
     env = build_env(env_config, args)
     device = build_device(env, args)
 
-    # Instantiate the base policy to be intervened
-    action_dim = env.action_spec[0].shape[0]
-    policy = DummyPolicy(action_dim)
+    # policy
+    if cfg.policy_type == "flow":
+        print("Using FlowMatching as the base policy.")
+        policy = FlowMatchWrapper(cfg, env.unwrapped)
+    elif cfg.policy_type == "dummy":
+        print("Using Dummy Policy (Random Noise).")
+        action_dim = env.action_spec[0].shape[0]
+        policy = DummyPolicy(action_dim)
+    else:
+        raise ValueError(f"Unknown policy_type: {cfg.policy_type}")
 
     # Wrap the environment with data collection wrapper
     env_wrapped = DataCollectionWrapper(env, tmp_root)
@@ -464,13 +670,13 @@ if __name__ == "__main__":
                 env=env_wrapped,
                 device=device,
                 policy=policy,
-                arm=args.arm,
-                max_fr=args.max_fr,
-                goal_update_mode=args.goal_update_mode,
-                camera_names=args.camera,
-                img_height=args.img_height,
-                img_width=args.img_width,
-                cool_down=args.cool_down_second,
+                arm=icfg.arm,
+                max_fr=icfg.max_fr,
+                goal_update_mode=icfg.goal_update_mode,
+                camera_names=cfg.camera,
+                img_height=icfg.img_height,
+                img_width=icfg.img_width,
+                cool_down=icfg.cool_down_second,
             )
 
             ep_dir = get_current_ep_dir(env_wrapped, tmp_root)
@@ -496,7 +702,7 @@ if __name__ == "__main__":
                     demo_payload=demo_payload,
                     step_labels=step_labels,
                     env_info=env_info,
-                    camera_names=args.camera,
+                    camera_names=cfg.camera,
                     images_dict=images_dict,
                 )
                 print(f"Saved demo_{saved_count:06d}.")
@@ -521,7 +727,7 @@ if __name__ == "__main__":
                     demo_payload=demo_payload,
                     step_labels=step_labels,
                     env_info=env_info,
-                    camera_names=args.camera,
+                    camera_names=cfg.camera,
                     images_dict=images_dict,
                 )
                 print(f"Saved demo_{saved_count:06d}.")
@@ -541,7 +747,7 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    final_hdf5_path = os.path.join(args.directory, f"intervention_{base_time}_{saved_count}.hdf5")
+    final_hdf5_path = os.path.join(icfg.directory, f"intervention_{base_time}_{saved_count}.hdf5")
     print(f"\nFinal episodes: {saved_count}")
     try:
         if os.path.isfile(tmp_hdf5_path):
@@ -552,3 +758,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Failed to rename HDF5: {e}")
         print(f"Kept temporary file: {tmp_hdf5_path}")
+
+
+if __name__ == "__main__":
+    main()

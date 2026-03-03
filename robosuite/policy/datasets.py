@@ -44,6 +44,7 @@ class PandaLiftFlowDataset(Dataset):
         self._demo_meta = []
         self._handles = {}
         self._proprio_cache = {}
+        self._resize_index_cache = {}
 
         self._build_index()
         print("finish building index!")
@@ -83,27 +84,49 @@ class PandaLiftFlowDataset(Dataset):
             self._handles[pid][fp] = h5py.File(fp, "r", libver="latest", swmr=True)
         return self._handles[pid][fp]
 
-    def _load_demo_arrays(self, meta_id):
+    def _get_demo(self, meta_id: int):
         fp, dk, T = self._demo_meta[meta_id]
+        return fp, dk, T
+
+    def _load_states(self, meta_id: int, start: int, end: int):
+        fp, dk, _ = self._get_demo(meta_id)
         f = self._get_handle(fp)
         demo = f["demos"][dk]
-        states = demo["states"][:T]
-        actions = demo["actions"][:T]
-        images = demo["observations"][self.camera_name]["images"][:T]
-        return states, actions, images
+        return demo["states"][start:end]
 
-    def _get_proprio_seq(self, meta_id: int, states: np.ndarray):
-        if not self.cache_proprio:
-            proprio = np.stack([self.proprio_extractor.extract(s) for s in states], axis=0)
-            return proprio
+    def _load_actions(self, meta_id: int, start: int, end: int):
+        fp, dk, _ = self._get_demo(meta_id)
+        f = self._get_handle(fp)
+        demo = f["demos"][dk]
+        return demo["actions"][start:end]
 
-        key = (self._demo_meta[meta_id][0], self._demo_meta[meta_id][1])
+    def _load_images(self, meta_id: int, start: int, end: int):
+        fp, dk, _ = self._get_demo(meta_id)
+        f = self._get_handle(fp)
+        demo = f["demos"][dk]
+        return demo["observations"][self.camera_name]["images"][start:end]
+
+    def _compute_proprio_from_states(self, states: np.ndarray):
+        return np.stack([self.proprio_extractor.extract(s) for s in states], axis=0)
+
+    def _get_proprio_seq(self, meta_id: int):
+        fp, dk, T = self._get_demo(meta_id)
+        key = (fp, dk)
         if key in self._proprio_cache:
             return self._proprio_cache[key]
 
-        proprio = np.stack([self.proprio_extractor.extract(s) for s in states], axis=0)
+        states = self._load_states(meta_id, 0, T)
+        proprio = self._compute_proprio_from_states(states)
         self._proprio_cache[key] = proprio
         return proprio
+
+    def _get_proprio_window(self, meta_id: int, t0: int):
+        if self.cache_proprio:
+            prop_all = self._get_proprio_seq(meta_id)
+            return prop_all[t0 : t0 + self.history_len]
+
+        states = self._load_states(meta_id, t0, t0 + self.history_len)
+        return self._compute_proprio_from_states(states)
 
     def _resize_center_crop(self, img: np.ndarray):
         # img: HWC uint8
@@ -115,8 +138,12 @@ class PandaLiftFlowDataset(Dataset):
         if s == self.image_size:
             return crop
         # simple nearest resize to avoid extra deps
-        ys = np.linspace(0, s - 1, self.image_size).astype(np.int32)
-        xs = np.linspace(0, s - 1, self.image_size).astype(np.int32)
+        if s not in self._resize_index_cache:
+            ys = np.linspace(0, s - 1, self.image_size).astype(np.int32)
+            xs = np.linspace(0, s - 1, self.image_size).astype(np.int32)
+            self._resize_index_cache[s] = (ys, xs)
+        else:
+            ys, xs = self._resize_index_cache[s]
         out = crop[ys][:, xs]
         return out
 
@@ -131,20 +158,17 @@ class PandaLiftFlowDataset(Dataset):
         act_list = []
         prop_list = []
 
-        n_samples = min(len(self.index), 500)
+        n_samples = min(len(self.index), 5000)
         sel = np.random.choice(len(self.index), size=n_samples, replace=False)
 
         for idx in tqdm(sel, desc="fit normalizers..."):
             meta_id, t0 = self.index[int(idx)]
-            states, actions, images = self._load_demo_arrays(meta_id)
-            try:
-                prop = self._get_proprio_seq(meta_id, states)
-                a = actions[t0 : t0 + self.horizon].reshape(-1).astype(np.float32)
-                p = prop[t0 : t0 + self.history_len].reshape(-1).astype(np.float32)
-                act_list.append(a)
-                prop_list.append(p)
-            except:
-                raise Exception
+            actions = self._load_actions(meta_id, t0, t0 + self.horizon)
+            prop = self._get_proprio_window(meta_id, t0)
+            a = actions.reshape(-1).astype(np.float32)
+            p = prop.reshape(-1).astype(np.float32)
+            act_list.append(a)
+            prop_list.append(p)
 
         act_arr = np.stack(act_list, axis=0)
         prop_arr = np.stack(prop_list, axis=0)
@@ -159,34 +183,28 @@ class PandaLiftFlowDataset(Dataset):
 
     def __getitem__(self, i: int):
         meta_id, t0 = self.index[i]
-        states, actions, images = self._load_demo_arrays(meta_id)
-        try:
-            prop = self._get_proprio_seq(meta_id, states)
+        img_seq = self._load_images(meta_id, t0, t0 + self.history_len)
+        prop_seq = self._get_proprio_window(meta_id, t0)
+        actions = self._load_actions(meta_id, t0, t0 + self.horizon)
+        act_seq = actions.reshape(-1).astype(np.float32)
 
-            img_seq = images[t0 : t0 + self.history_len]
-            prop_seq = prop[t0 : t0 + self.history_len]
-            act_seq = actions[t0 : t0 + self.horizon].reshape(-1).astype(np.float32)
+        img_list = []
+        for k in range(self.history_len):
+            img = self._resize_center_crop(img_seq[k])
+            img = img.astype(np.float32) / 255.0
+            img = np.transpose(img, (2, 0, 1))  # CHW
+            img_list.append(img)
+        img_stack = np.stack(img_list, axis=0)  # K, C, H, W
 
-            img_list = []
-            for k in range(self.history_len):
-                img = self._resize_center_crop(img_seq[k])
-                img = img.astype(np.float32) / 255.0
+        prop_flat = prop_seq.reshape(-1).astype(np.float32)
 
-                img = np.transpose(img, (2, 0, 1))  # CHW
-                img_list.append(img)
-            img_stack = np.stack(img_list, axis=0)  # K, C, H, W
+        if self.normalize:
+            act_seq = (act_seq - self.act_mean) / self.act_std
+            prop_flat = (prop_flat - self.prop_mean) / self.prop_std
 
-            prop_flat = prop_seq.reshape(-1).astype(np.float32)
-
-            if self.normalize:
-                act_seq = (act_seq - self.act_mean) / self.act_std
-                prop_flat = (prop_flat - self.prop_mean) / self.prop_std
-
-            sample = dict(
-                images=torch.from_numpy(img_stack),
-                proprio=torch.from_numpy(prop_flat),
-                actions=torch.from_numpy(act_seq),
-            )
-            return sample
-        except:
-            raise Exception
+        sample = dict(
+            images=torch.from_numpy(img_stack),
+            proprio=torch.from_numpy(prop_flat),
+            actions=torch.from_numpy(act_seq),
+        )
+        return sample

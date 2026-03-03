@@ -1,109 +1,177 @@
-import os
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn as nn
 
-try:
-    from torchvision.models import resnet18
-except Exception:
-    resnet18 = None
-
-
-def _build_resnet18_backbone(pretrained: bool = True, local_weights_path: str = "") -> nn.Module:
-    m = resnet18(weights=None)
-    if pretrained and local_weights_path and os.path.exists(local_weights_path):
-        state_dict = torch.load(local_weights_path, map_location="cpu")
-        m.load_state_dict(state_dict)
-    m.fc = nn.Identity()
-    return m
-
-
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, out_dim: int, depth: int, dropout: float) -> None:
-        super().__init__()
-        layers = []
-        d = in_dim
-        for _ in range(depth - 1):
-            layers += [nn.Linear(d, hidden), nn.ReLU(inplace=True), nn.Dropout(dropout)]
-            d = hidden
-        layers += [nn.Linear(d, out_dim)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+from robosuite.policy.flow import FlowPolicy, sinusoidal_time_embedding
 
 
 @dataclass
-class DetectorConfig:
-    use_images: bool = True
-    img_embed_dim: int = 128
-    proprio_dim: int = 32
-    action_dim: int = 7
-    temporal_hidden: int = 256
-    fusion_hidden: int = 256
-    resnet_path: str = "/home/gy/Documents/DAgger/robosuite/RL/models/resnet18-f37072fd.pth"
+class BackboneBuildResult:
+    backbone: FlowPolicy
+    history_len: int
+    token_dim: int
+    proprio_in_dim: int
+    loaded_params: int
 
 
-class SequenceFailureDetector(nn.Module):
-    def __init__(self, cfg: DetectorConfig) -> None:
+def _infer_num_transformer_layers(state_dict: dict[str, torch.Tensor], prefix: str) -> int:
+    layer_ids = set()
+    needle = prefix + ".enc.layers."
+    for key in state_dict.keys():
+        if key.startswith(needle):
+            rest = key[len(needle) :]
+            layer_ids.add(int(rest.split(".")[0]))
+    return (max(layer_ids) + 1) if layer_ids else 1
+
+
+def _choose_heads(token_dim: int) -> int:
+    for h in (8, 4, 2, 1):
+        if token_dim % h == 0:
+            return h
+    return 1
+
+
+def infer_backbone_shapes(state_dict: dict[str, torch.Tensor]) -> dict[str, int]:
+    img_dim = int(state_dict["img_enc.proj.weight"].shape[0])
+    token_dim = int(state_dict["img_to_token.weight"].shape[0])
+    prop_dim = int(state_dict["prop_enc.0.weight"].shape[0])
+    proprio_in_dim = int(state_dict["prop_enc.0.weight"].shape[1])
+    time_dim = int(state_dict["time_mlp.0.weight"].shape[1])
+    history_len = int(state_dict["pos_emb"].shape[1]) - 3
+
+    return {
+        "img_dim": img_dim,
+        "token_dim": token_dim,
+        "prop_dim": prop_dim,
+        "proprio_in_dim": proprio_in_dim,
+        "time_dim": time_dim,
+        "history_len": history_len,
+    }
+
+
+def build_policy_backbone_from_ckpt(
+    ckpt_path: str,
+    history_len: int = -1,
+    freeze_backbone: bool = True,
+    device: str = "cpu",
+) -> BackboneBuildResult:
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("ema_model", ckpt["model"])
+
+    shapes = infer_backbone_shapes(state_dict)
+    resolved_history = shapes["history_len"] if int(history_len) <= 0 else int(history_len)
+
+    temporal_layers = _infer_num_transformer_layers(state_dict, "temporal")
+    temporal_heads = _choose_heads(shapes["token_dim"])
+
+    backbone = FlowPolicy(
+        act_dim=1,
+        proprio_in_dim=shapes["proprio_in_dim"],
+        img_dim=shapes["img_dim"],
+        prop_dim=shapes["prop_dim"],
+        time_dim=shapes["time_dim"],
+        token_dim=shapes["token_dim"],
+        temporal_layers=temporal_layers,
+        temporal_heads=temporal_heads,
+        vel_hidden=64,
+        vel_layers=1,
+        history_len=resolved_history,
+        action_chunk_size=1,
+        action_temporal_layers=0,
+        action_temporal_heads=1,
+        pretrained_resnet=False,
+        freeze_resnet=freeze_backbone,
+    )
+
+    load_prefixes = (
+        "img_enc.",
+        "prop_enc.",
+        "img_to_token.",
+        "prop_to_token.",
+        "cls_token",
+        "temporal.",
+        "time_mlp.",
+        "token_time_adaln.",
+        "time_token",
+        "cond_ln.",
+        "pos_emb",
+    )
+
+    own = backbone.state_dict()
+    filtered: dict[str, torch.Tensor] = {}
+    for key, val in state_dict.items():
+        if not key.startswith(load_prefixes):
+            continue
+        if key not in own:
+            continue
+        if own[key].shape != val.shape:
+            continue
+        filtered[key] = val
+
+    own.update(filtered)
+    backbone.load_state_dict(own, strict=False)
+
+    if freeze_backbone:
+        for p in backbone.parameters():
+            p.requires_grad = False
+
+    backbone.to(device)
+    return BackboneBuildResult(
+        backbone=backbone,
+        history_len=resolved_history,
+        token_dim=shapes["token_dim"],
+        proprio_in_dim=shapes["proprio_in_dim"],
+        loaded_params=len(filtered),
+    )
+
+
+class PolicyConditionEncoder(nn.Module):
+    def __init__(self, backbone: FlowPolicy):
         super().__init__()
-        self.cfg = cfg
+        self.backbone = backbone
 
-        # Spatial Encoders
-        if cfg.use_images:
-            self.img_backbone = _build_resnet18_backbone(True, cfg.resnet_path)
-            self.img_proj = nn.Linear(512, cfg.img_embed_dim)
-            step_feat_dim = cfg.img_embed_dim + cfg.proprio_dim
-        else:
-            step_feat_dim = cfg.proprio_dim
+    @property
+    def output_dim(self) -> int:
+        return int(self.backbone.cond_ln.normalized_shape[0])
 
-        # Temporal Encoder for History + Current State
-        self.temporal_encoder = nn.GRU(
-            input_size=step_feat_dim, 
-            hidden_size=cfg.temporal_hidden, 
-            batch_first=True
+    def forward(self, images: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
+        tokens_base = self.backbone.get_cond_features(images=images, proprio=proprio)
+        batch_size = int(tokens_base.shape[0])
+
+        t = torch.zeros(batch_size, device=images.device, dtype=images.dtype)
+        t_emb = sinusoidal_time_embedding(t, self.backbone.time_dim)
+        t_cond = self.backbone.time_mlp(t_emb)
+        t_tok = self.backbone.time_token + t_cond.unsqueeze(1)
+
+        tokens = torch.cat([t_tok, tokens_base], dim=1)
+        tokens = tokens + self.backbone.pos_emb[:, : tokens.shape[1], :]
+        tokens = self.backbone.token_time_adaln(tokens, t_cond)
+        tokens = self.backbone.temporal(tokens)
+
+        cond = tokens[:, 1]
+        cond = self.backbone.cond_ln(cond)
+        return cond
+
+
+class BCEVisitationDiscriminator(nn.Module):
+    def __init__(self, encoder: PolicyConditionEncoder, action_dim: int, hidden_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.encoder = encoder
+        feat_dim = int(encoder.output_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim + int(action_dim), hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
         )
 
-        # Fusion network: Temporal Context + Current Action -> Logit
-        self.fusion = MLP(
-            in_dim=cfg.temporal_hidden + cfg.action_dim,
-            hidden=cfg.fusion_hidden,
-            out_dim=1,
-            depth=3,
-            dropout=0.1
-        )
-
-    def forward(
-        self, 
-        img_agent_seq: Optional[torch.Tensor] = None, # Shape: [B, T, C, H, W]
-        proprio_seq: torch.Tensor = None,             # Shape: [B, T, D_p]
-        current_action: torch.Tensor = None           # Shape: [B, D_a]
-    ) -> torch.Tensor:
-        
-        B, T = proprio_seq.shape[:2]
-        step_features = []
-
-        if self.cfg.use_images:
-            # Flatten B and T to process all images in a single forward pass
-            ia_flat = img_agent_seq.view(B * T, *img_agent_seq.shape[2:]).float() / 255.0
-            fa = self.img_proj(self.img_backbone(ia_flat))
-
-            fa = fa.view(B, T, -1)
-            step_features.extend([fa])
-
-        step_features.append(proprio_seq)
-        
-        # Concat spatial features for each timestep
-        x_seq = torch.cat(step_features, dim=-1) # Shape: [B, T, step_feat_dim]
-
-        # Temporal encoding
-        _, h_n = self.temporal_encoder(x_seq)
-        context = h_n.squeeze(0) # Shape: [B, temporal_hidden]
-
-        # Fuse with current action
-        fusion_in = torch.cat([context, current_action], dim=-1)
-        logit = self.fusion(fusion_in).squeeze(-1) # Shape: [B]
-        
-        return logit
+    def forward(self, images: torch.Tensor, proprio: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        feat = self.encoder(images=images, proprio=proprio)
+        x = torch.cat([feat, actions], dim=-1)
+        logits = self.head(x).squeeze(-1)
+        return logits

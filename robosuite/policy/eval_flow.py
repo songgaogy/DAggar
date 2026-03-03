@@ -5,6 +5,7 @@ import robosuite as suite
 import imageio
 from collections import deque
 from torchvision.transforms import Normalize
+from tqdm import tqdm
 
 import hydra
 from omegaconf import DictConfig
@@ -128,15 +129,24 @@ def main(cfg: DictConfig):
         temporal_heads=cfg.flow.temporal_heads,
         vel_hidden=cfg.flow.vel_hidden,
         vel_layers=cfg.flow.vel_layers,
-        history_len=cfg.history_len
+        history_len=cfg.history_len,
+        action_chunk_size=cfg.chunk_size,
+        action_temporal_layers=cfg.flow.action_temporal_layers,
+        action_temporal_heads=cfg.flow.action_temporal_heads,
     ).to(device)
 
-    if "ema_model" in ckpt:
-        model.load_state_dict(ckpt["ema_model"], strict=True)
-        print("Successfully loaded EMA model weights.")
-    else:
-        model.load_state_dict(ckpt["model"], strict=True)
-        print("Loaded standard model weights (EMA not found).")
+    try:
+        if "ema_model" in ckpt:
+            model.load_state_dict(ckpt["ema_model"], strict=True)
+            print("Successfully loaded EMA model weights.")
+        else:
+            model.load_state_dict(ckpt["model"], strict=True)
+            print("Loaded standard model weights (EMA not found).")
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Checkpoint is incompatible with current FlowPolicy architecture. "
+            "Please retrain with the updated model or switch to a matching code version."
+        ) from e
         
     model.eval()
 
@@ -146,12 +156,13 @@ def main(cfg: DictConfig):
     # torchvision Normalize is not a nn.Module; do not call .to(device)
     img_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-    for ep in range(cfg.episodes):
+    def rollout_episode(record_video: bool = False):
         obs = env.reset()
         done = False
         total_r = 0.0
         frames = []
         step_count = 0
+        is_success = False
         
         img_history = deque(maxlen=cfg.history_len)
         prop_history = deque(maxlen=cfg.history_len)
@@ -194,13 +205,19 @@ def main(cfg: DictConfig):
 
             execute_steps = min(cfg.action_horizon, cfg.chunk_size)
             for i in range(execute_steps):
-                if cfg.video_dir is not None:
+                if record_video:
                     frames.append(np.flipud(obs[cfg.camera + "_image"]))
 
                 action_step = a_chunk[i]
                 obs, r, done, info = env.step(action_step)
                 total_r += float(r)
                 step_count += 1
+                is_success = (
+                    is_success
+                    or bool(info.get("success", False))
+                    or bool(info.get("is_success", False))
+                    or bool(env._check_success())
+                )
 
                 new_prop = extractor.extract(env.sim.get_state().flatten()).reshape(-1)
                 prop_history.append(new_prop)
@@ -213,12 +230,30 @@ def main(cfg: DictConfig):
                 if done or step_count >= cfg.max_steps:
                     break
 
+        return total_r, step_count, frames, is_success
+
+    for ep in range(cfg.episodes):
+        record_video = video_dir is not None
+        total_r, step_count, frames, is_success = rollout_episode(record_video=record_video)
         print(f"episode={ep} return={total_r:.4f} steps={step_count}")
+        print(f"episode={ep} success={int(is_success)}")
 
         if video_dir is not None and len(frames) > 0:
             video_path = os.path.join(cfg.video_dir, f"episode_{ep}_return_{total_r:.2f}.mp4")
             imageio.mimsave(video_path, frames, fps=20)
             print(f"Saved video to {video_path}")
+
+    if cfg.succ_rate:
+        num_eval_episodes = 100
+        success_count = 0
+        for _ in tqdm(range(num_eval_episodes), desc="Success-rate eval"):
+            _, _, _, is_success = rollout_episode(record_video=False)
+            success_count += int(is_success)
+        success_rate = success_count / float(num_eval_episodes)
+        print(
+            f"checkpoint={ckpt_path} success_rate={success_rate:.4f} "
+            f"({success_count}/{num_eval_episodes})"
+        )
 
     extractor.close()
 

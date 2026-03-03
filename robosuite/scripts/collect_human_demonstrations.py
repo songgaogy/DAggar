@@ -297,12 +297,16 @@ def prompt_user_action() -> str:
 
 
 def build_env(env_config: dict, args):
+    camera_names = args.camera if len(args.camera) > 0 else ["agentview"]
     env = suite.make(
         **env_config,
         has_renderer=True,
         renderer=args.renderer,
         has_offscreen_renderer=True,
-        render_camera=args.camera[0] if len(args.camera) > 0 else "agentview",
+        # `render_camera` controls only the on-screen viewer camera.
+        render_camera=camera_names[0],
+        # Configure all requested cameras in the env so multiview capture can use all of them.
+        camera_names=camera_names,
         ignore_done=True,
         use_camera_obs=False,
         reward_shaping=True,
@@ -430,6 +434,8 @@ if __name__ == "__main__":
     parser.add_argument("--img_height", type=int, default=256)
     parser.add_argument("--img_width", type=int, default=256)
     args = parser.parse_args()
+    if len(args.camera) == 0:
+        args.camera = ["agentview"]
 
     # Get controller config
     controller_config = load_composite_controller_config(

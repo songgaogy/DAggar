@@ -1,0 +1,24 @@
+seed: 42
+
+disc_ckpt: "./checkpoints/PandaLift/discriminator/bce/bce_discriminator_best.pt"
+policy_ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
+data_dir: "./data/PandaLift.intervention"
+
+camera: "agentview"
+image_size: 128
+history_len: -1  # <=0 means auto from policy checkpoint
+
+device: "cuda"
+
+model:
+  hidden_dim: 256
+  dropout: 0.1
+
+eval:
+  batch_size: 256
+  num_workers: 16
+  max_demos: -1
+  threshold: 0.5
+  window_before: 2
+  window_after: 2
+  normalize_with_policy_stats: true
