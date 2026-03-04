@@ -7,8 +7,15 @@ import numpy as np
 import torch
 from torchvision.transforms import Normalize
 
-from robosuite.policy.flow import FlowPolicy, sinusoidal_time_embedding
-from robosuite.policy.utils.env_util import PandaLiftProprioExtractor
+try:
+    from robosuite.policy.flow import FlowPolicy, sinusoidal_time_embedding
+    from robosuite.policy.utils.env_util import PandaLiftProprioExtractor
+except ModuleNotFoundError as exc:  # pragma: no cover
+    if exc.name not in {"mujoco", "robosuite"}:
+        raise
+    # Fallback import path for environments without robosuite top-level package deps.
+    from policy.flow import FlowPolicy, sinusoidal_time_embedding
+    from policy.utils.env_util import PandaLiftProprioExtractor
 
 from .float_data import PolicyTrajectory
 
@@ -240,7 +247,7 @@ class FlowPolicyLatentExtractor:
         return cond
 
     @torch.no_grad()
-    def encode_trajectory(self, traj: PolicyTrajectory) -> np.ndarray:
+    def encode_trajectory_with_indices(self, traj: PolicyTrajectory) -> tuple[np.ndarray, np.ndarray]:
         states = np.asarray(traj.states, dtype=np.float32)
         images_raw = np.asarray(traj.images, dtype=np.uint8)
 
@@ -288,4 +295,9 @@ class FlowPolicyLatentExtractor:
             emb = self._policy_cond_embedding(images=img_norm, proprio=prop_batch)
             outputs.append(emb.detach().cpu().numpy().astype(np.float32))
 
-        return np.concatenate(outputs, axis=0)
+        return np.concatenate(outputs, axis=0), sampled_indices.astype(np.int64)
+
+    @torch.no_grad()
+    def encode_trajectory(self, traj: PolicyTrajectory) -> np.ndarray:
+        emb, _ = self.encode_trajectory_with_indices(traj)
+        return emb

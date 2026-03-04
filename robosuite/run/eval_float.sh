@@ -18,4 +18,4 @@ python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/eval_discri
   float.to=2 \
   float.num_expert_candidates=20 \
   online.adaptive_delta=false \
-  output.save_json_path="/home/dodo/Documents/DAggar/robosuite/outputs/float_eval/summary_quick.json"
+  output.save_json_path="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/discriminator/float/eval/summary_quick.json"
