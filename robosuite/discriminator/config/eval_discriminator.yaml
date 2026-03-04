@@ -1,24 +1,53 @@
 seed: 42
 
-disc_ckpt: "./checkpoints/PandaLift/discriminator/bce/bce_discriminator_best.pt"
-policy_ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
-data_dir: "./data/PandaLift.intervention"
+data:
+  expert_dir: "./data/PandaLift/expert"
+  fail_rollout_dir: "./data/PandaLift/fail_rollout"
+  success_rollout_dir: ""
+  obs_key: "states"   # official-like evaluator currently supports states
+  camera_name: "agentview"
+  max_expert_trajectories: -1
+  max_fail_trajectories: -1
+  max_success_trajectories: -1
 
-camera: "agentview"
-image_size: 128
-history_len: -1  # <=0 means auto from policy checkpoint
+split:
+  val_ratio: 0.2
 
-device: "cuda"
+labels:
+  fail_tail_ratio: 0.2
 
-model:
-  hidden_dim: 256
-  dropout: 0.1
+float:
+  sinkhorn_reg: 0.05
+  max_iter: 300
+  tol: 1e-5
+  ta: 8
+  to: 2
+  num_expert_candidates: 50
+  max_steps: -1
+  use_similarity_cost: false
 
-eval:
-  batch_size: 256
-  num_workers: 16
-  max_demos: -1
-  threshold: 0.5
-  window_before: 2
-  window_after: 2
-  normalize_with_policy_stats: true
+policy:
+  ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
+  device: "cuda"
+  image_size: 128
+  history_len: -1
+  latent_batch_size: 128
+  robots: "Panda"
+  env_name: "Lift"
+
+calibration:
+  delta: 10.0
+  delta_step: 1.0
+
+online:
+  adaptive_delta: false
+
+random_truncation_eval:
+  enabled: true
+  fail_start_ratio: 0.8
+  expert_start_ratio: 0.8
+  samples_per_trajectory: 3
+  seed: 42
+
+output:
+  save_json_path: "./outputs/float_eval/summary.json"

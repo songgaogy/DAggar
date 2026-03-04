@@ -1,15 +1,18 @@
 export CUDA_VISIBLE_DEVICES=0
 
 python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/train_discriminator_intervention.py \
-  policy_ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
-  data.intervention_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/intervention" \
   data.expert_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert" \
-  save_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/discriminator/bce/intervention_train" \
-  train_eps=-1 \
-  labels.window_before=5 \
-  labels.window_after=2 \
-  train.epochs=50 \
-  train.lr=5e-5 \
-  train.label_smoothing=0.08 \
-  train.early_stop_patience=10 \
-  eval.threshold=0.5
+  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout" \
+  data.success_rollout_dir="" \
+  data.obs_key="states" \
+  data.camera_name="agentview" \
+  policy.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
+  policy.device="cuda" \
+  policy.image_size=128 \
+  save_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/discriminator/float" \
+  split.val_ratio=0.2 \
+  labels.fail_tail_ratio=0.2 \
+  float.sinkhorn_reg=0.05 \
+  calibration.delta=10.0 \
+  calibration.delta_step=1.0 \
+  online.adaptive_delta=true

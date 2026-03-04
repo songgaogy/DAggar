@@ -1,6 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
-
-python -m robosuite.discriminator.eval_discriminator \
+python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/eval_discriminator.py \
   data.expert_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert" \
   data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout" \
   data.success_rollout_dir="" \
@@ -9,12 +7,15 @@ python -m robosuite.discriminator.eval_discriminator \
   policy.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
   policy.device="cuda" \
   policy.image_size=128 \
-  split.val_ratio=0.2 \
+  data.max_expert_trajectories=100 \
+  data.max_fail_trajectories=100 \
+  split.val_ratio=0.1 \
   labels.fail_tail_ratio=0.2 \
   float.sinkhorn_reg=0.05 \
-  float.max_iter=300 \
+  float.max_iter=200 \
+  float.tol=1e-5 \
   float.ta=8 \
   float.to=2 \
-  float.num_expert_candidates=50 \
-  calibration.delta=10.0 \
-  online.adaptive_delta=false
+  float.num_expert_candidates=20 \
+  online.adaptive_delta=false \
+  output.save_json_path="/home/dodo/Documents/DAggar/robosuite/outputs/float_eval/summary_quick.json"

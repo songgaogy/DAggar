@@ -1,44 +1,45 @@
 seed: 42
 
-policy_ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
-save_dir: "./checkpoints/PandaLift/discriminator/intervention_train"
-
-train_eps: -1
-
-camera: "agentview"
-image_size: 128
-history_len: -1  # <=0 means auto from policy checkpoint
+save_dir: "./checkpoints/PandaLift/discriminator/float"
 
 data:
-  intervention_dir: "./data/PandaLift/intervention"
   expert_dir: "./data/PandaLift/expert"
-  normalize_with_policy_stats: true
+  fail_rollout_dir: "./data/PandaLift/fail_rollout"
+  success_rollout_dir: ""
+  obs_key: "states"
+  camera_name: "agentview"
+  max_expert_trajectories: -1
+  max_fail_trajectories: -1
+  max_success_trajectories: -1
+
+split:
+  val_ratio: 0.2
 
 labels:
-  window_before: 2
-  window_after: 2
+  fail_tail_ratio: 0.2
 
-model:
-  hidden_dim: 256
-  dropout: 0.1
+float:
+  sinkhorn_reg: 0.05
+  max_iter: 300
+  tol: 1e-5
+  ta: 8
+  to: 2
+  num_expert_candidates: 50
+  max_steps: -1
+  use_similarity_cost: false
 
-train:
+policy:
+  ckpt: "./checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt"
   device: "cuda"
-  batch_size: 128
-  num_workers: 16
-  lr: 1e-4
-  weight_decay: 1e-6
-  epochs: 50
-  grad_clip_norm: 1.0
-  freeze_policy_backbone: true
-  augment_pad: 4
-  label_smoothing: 0.05
-  bce_aux_weight: 0.2
-  early_stop_patience: 12
+  image_size: 128
+  history_len: -1
+  latent_batch_size: 128
+  robots: "Panda"
+  env_name: "Lift"
 
-eval:
-  eval_ratio: 0.2
-  batch_size: 256
-  threshold: 0.5
+calibration:
+  delta: 10.0
+  delta_step: 1.0
 
-save_freq: 5
+online:
+  adaptive_delta: false
