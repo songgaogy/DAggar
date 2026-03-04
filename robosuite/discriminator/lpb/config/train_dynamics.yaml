@@ -1,0 +1,48 @@
+hydra:
+  run:
+    dir: outputs/lpb_dynamics/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 42
+
+save_dir: "./checkpoints/PandaLift/discriminator/lpb_dynamics"
+save_name: "dynamics_model.pt"
+
+data:
+  expert_paths:
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
+  rollout_paths:
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/unlabled"
+  camera_name: "agentview"
+  horizon: 1
+  image_size: 224
+  proprio_indices: []
+  max_trajectories: -1
+
+split:
+  val_ratio: 0.1
+
+encoder:
+  ckpt_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"
+  pretrained: false
+  trainable: false
+  normalize_input: true
+
+model:
+  d_model: 512
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+  max_action_horizon: 32
+
+training:
+  device: "cuda"
+  batch_size: 256
+  num_workers: 16
+  epochs: 50
+  save_freq: 10
+  lr: 1e-4
+  weight_decay: 1e-4
+  expert_ratio: 0.5
+  proprio_loss_weight: 0.0
+  grad_clip_norm: 1.0
+  log_every: 50
