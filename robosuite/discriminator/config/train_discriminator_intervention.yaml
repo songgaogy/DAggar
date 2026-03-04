@@ -31,10 +31,14 @@ train:
   epochs: 50
   grad_clip_norm: 1.0
   freeze_policy_backbone: true
+  augment_pad: 4
+  label_smoothing: 0.05
+  bce_aux_weight: 0.2
+  early_stop_patience: 12
 
 eval:
   eval_ratio: 0.2
   batch_size: 256
-  threshold: 0.7
+  threshold: 0.5
 
 save_freq: 5

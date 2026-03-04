@@ -260,6 +260,30 @@ def _normalize_images(images: torch.Tensor, normalizer: Normalize) -> torch.Tens
     return normalizer(flat).view(b, k, c, h, w)
 
 
+def augment_images(images: torch.Tensor, pad: int = 4) -> torch.Tensor:
+    """
+    Random shift / crop with strict temporal consistency per sample.
+    Expects [B, K, C, H, W].
+    """
+    if pad <= 0:
+        return images
+
+    b, k, c, h, w = images.shape
+    flat = images.view(b * k, c, h, w)
+    flat_pad = F.pad(flat, (pad, pad, pad, pad), mode="replicate")
+    pad_imgs = flat_pad.view(b, k, c, h + 2 * pad, w + 2 * pad)
+
+    w_start = torch.randint(0, 2 * pad + 1, (b,), device=images.device)
+    h_start = torch.randint(0, 2 * pad + 1, (b,), device=images.device)
+
+    out = torch.empty((b, k, c, h, w), device=images.device, dtype=images.dtype)
+    for i in range(b):
+        hs = int(h_start[i].item())
+        ws = int(w_start[i].item())
+        out[i] = pad_imgs[i, :, :, hs : hs + h, ws : ws + w]
+    return out
+
+
 def _make_loader(ds, batch_size: int, workers: int, shuffle: bool):
     kwargs = dict(
         dataset=ds,
@@ -330,12 +354,29 @@ def evaluate(model, pos_loader, neg_loader, device, img_normalize, threshold):
     acc_neg = tn / max(1, tn + fp)
     acc = 0.5 * (acc_pos + acc_neg)
 
+    # threshold sweep for better operational point under class imbalance
+    best_thr = float(threshold)
+    best_bal_acc = float(acc)
+    for thr in np.linspace(0.05, 0.95, 19):
+        tp_t = int((pos_probs >= thr).sum().item())
+        fn_t = int((pos_probs < thr).sum().item())
+        tn_t = int((neg_probs < thr).sum().item())
+        fp_t = int((neg_probs >= thr).sum().item())
+        acc_pos_t = tp_t / max(1, tp_t + fn_t)
+        acc_neg_t = tn_t / max(1, tn_t + fp_t)
+        bal_acc_t = 0.5 * (acc_pos_t + acc_neg_t)
+        if bal_acc_t > best_bal_acc:
+            best_bal_acc = float(bal_acc_t)
+            best_thr = float(thr)
+
     return {
         "loss": float(loss.item()),
         "objective": float(objective.item()),
         "acc": float(acc),
         "acc_pos": float(acc_pos),
         "acc_neg": float(acc_neg),
+        "best_bal_acc": best_bal_acc,
+        "best_thr": best_thr,
         "tp": tp,
         "tn": tn,
         "fp": fp,
@@ -484,6 +525,10 @@ def main(cfg: DictConfig):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps), eta_min=1e-6)
 
     img_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).to(device)
+    aug_pad = int(getattr(cfg.train, "augment_pad", 4))
+    label_smoothing = float(getattr(cfg.train, "label_smoothing", 0.05))
+    label_smoothing = min(max(label_smoothing, 0.0), 0.49)
+    early_stop_patience = int(getattr(cfg.train, "early_stop_patience", 12))
 
     pos_iter = _cycle_loader(pos_train_loader)
     neg_iter = _cycle_loader(neg_train_loader)
@@ -497,7 +542,8 @@ def main(cfg: DictConfig):
         f"samples neg train/eval={len(neg_train_ds)}/{len(neg_eval_ds)}"
     )
 
-    best_eval_loss = float("inf")
+    best_bal_acc = -1.0
+    no_improve_epochs = 0
     global_step = 0
 
     for ep in range(1, int(cfg.train.epochs) + 1):
@@ -510,13 +556,16 @@ def main(cfg: DictConfig):
             pos_batch = next(pos_iter)
             neg_batch = next(neg_iter)
 
-            pos_images = _normalize_images(pos_batch["images"].to(device, non_blocking=True), img_normalize)
+            pos_images = pos_batch["images"].to(device, non_blocking=True)
             pos_proprio = pos_batch["proprio"].to(device, non_blocking=True)
             pos_actions = pos_batch["actions"].to(device, non_blocking=True)
 
-            neg_images = _normalize_images(neg_batch["images"].to(device, non_blocking=True), img_normalize)
+            neg_images = neg_batch["images"].to(device, non_blocking=True)
             neg_proprio = neg_batch["proprio"].to(device, non_blocking=True)
             neg_actions = neg_batch["actions"].to(device, non_blocking=True)
+
+            pos_images = _normalize_images(augment_images(pos_images, pad=aug_pad), img_normalize)
+            neg_images = _normalize_images(augment_images(neg_images, pad=aug_pad), img_normalize)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -524,7 +573,12 @@ def main(cfg: DictConfig):
             neg_logits = model(images=neg_images, proprio=neg_proprio, actions=neg_actions)
 
             objective = F.logsigmoid(pos_logits).mean() + F.logsigmoid(-neg_logits).mean()
-            loss = -objective
+            pos_target = torch.full_like(pos_logits, 1.0 - label_smoothing)
+            neg_target = torch.full_like(neg_logits, label_smoothing)
+            pos_bce = F.binary_cross_entropy_with_logits(pos_logits, pos_target)
+            neg_bce = F.binary_cross_entropy_with_logits(neg_logits, neg_target)
+            bce_loss = 0.5 * (pos_bce + neg_bce)
+            loss = -objective + float(getattr(cfg.train, "bce_aux_weight", 0.2)) * bce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=float(cfg.train.grad_clip_norm))
@@ -550,7 +604,8 @@ def main(cfg: DictConfig):
         print(
             f"epoch={ep:04d} step={global_step:07d} train_loss={train_loss:.6f} train_obj={train_obj:.6f} "
             f"eval_loss={eval_metrics['loss']:.6f} eval_obj={eval_metrics['objective']:.6f} "
-            f"eval_acc={eval_metrics['acc']:.4f} eval_acc_pos={eval_metrics['acc_pos']:.4f} eval_acc_neg={eval_metrics['acc_neg']:.4f}"
+            f"eval_acc={eval_metrics['acc']:.4f} eval_acc_pos={eval_metrics['acc_pos']:.4f} eval_acc_neg={eval_metrics['acc_neg']:.4f} "
+            f"best_thr={eval_metrics['best_thr']:.2f} best_bal_acc={eval_metrics['best_bal_acc']:.4f}"
         )
 
         if ep % int(cfg.save_freq) == 0 or ep == int(cfg.train.epochs):
@@ -570,8 +625,9 @@ def main(cfg: DictConfig):
             )
             print(f"saved checkpoint: {out}")
 
-        if eval_metrics["loss"] < best_eval_loss:
-            best_eval_loss = eval_metrics["loss"]
+        if eval_metrics["best_bal_acc"] > best_bal_acc:
+            best_bal_acc = eval_metrics["best_bal_acc"]
+            no_improve_epochs = 0
             best_path = os.path.join(save_dir, "train_intervention_discriminator_best.pt")
             torch.save(
                 {
@@ -586,6 +642,11 @@ def main(cfg: DictConfig):
                 best_path,
             )
             print(f"updated best checkpoint: {best_path}")
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= early_stop_patience:
+                print(f"early stop at epoch={ep}, no improvement for {no_improve_epochs} epochs")
+                break
 
     extractor.close()
 

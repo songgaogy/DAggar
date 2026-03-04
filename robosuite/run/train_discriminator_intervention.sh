@@ -9,4 +9,7 @@ python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/train_discr
   labels.window_before=5 \
   labels.window_after=2 \
   train.epochs=50 \
-  eval.threshold=0.7
+  train.lr=5e-5 \
+  train.label_smoothing=0.08 \
+  train.early_stop_patience=10 \
+  eval.threshold=0.5
