@@ -1,0 +1,5 @@
+- policy_checkpoint=/home/dodo/Documents/DAggar/robosuite/lpb_robosuite/data/outputs/2026.03.06/13.42.42_train_diffusion_unet_hybrid_pandalift_image/checkpoints
+- dynamics_model_checkpoint=/home/dodo/Documents/DAggar/robosuite/lpb_robosuite/data/outputs/2026.03.06/15.28.37_pandalift/checkpoints
+- demo_dataset_path=/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert
+- dataset_path=/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert
+- output_dir=/home/dodo/Documents/DAggar/robosuite/lpb_robosuite/data/release_pandalift_test

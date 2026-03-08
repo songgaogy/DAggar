@@ -50,18 +50,31 @@ def load_model(model_ckpt, train_cfg, device):
         for param in language_encoder.parameters():
             param.requires_grad = False
 
-    action_dim = 10 if train_cfg.abs_action else 7
-    prior_in_chans = 9
-    if 'transport' in train_cfg.train_data_path:
-        action_dim = 20
-        prior_in_chans = 18
-    elif 'pusht' in train_cfg.train_data_path:
-        action_dim = 2
-        prior_in_chans = 2
-    elif 'libero' in train_cfg.train_data_path:
-        action_dim = 10
-        prior_in_chans = 14
-    total_action_dim = action_dim * train_cfg.frameskip
+    # Prefer dimensions encoded in checkpoint weights to avoid config heuristic mismatch.
+    total_action_dim = None
+    prior_in_chans = None
+    if "action_encoder" in result:
+        action_sd = result["action_encoder"]
+        if "patch_embed.weight" in action_sd:
+            total_action_dim = int(action_sd["patch_embed.weight"].shape[1])
+    if "proprio_encoder" in result:
+        proprio_sd = result["proprio_encoder"]
+        if "patch_embed.weight" in proprio_sd:
+            prior_in_chans = int(proprio_sd["patch_embed.weight"].shape[1])
+
+    if total_action_dim is None or prior_in_chans is None:
+        action_dim = 10 if train_cfg.abs_action else 7
+        prior_in_chans = 9
+        if 'transport' in train_cfg.train_data_path:
+            action_dim = 20
+            prior_in_chans = 18
+        elif 'pusht' in train_cfg.train_data_path:
+            action_dim = 2
+            prior_in_chans = 2
+        elif 'libero' in train_cfg.train_data_path:
+            action_dim = 10
+            prior_in_chans = 14
+        total_action_dim = action_dim * train_cfg.frameskip
 
     language_emb_dim = 0
     if 'libero' in train_cfg.train_data_path:

@@ -1,0 +1,41 @@
+# config.yaml
+hydra:
+  run:
+    dir: .
+
+# Accepts either a checkpoint file or a checkpoint directory.
+policy_checkpoint: 'data/outputs/2026.03.06/13.42.42_train_diffusion_unet_hybrid_pandalift_image/checkpoints'
+dynamics_model_checkpoint: 'data/outputs/2026.03.06/15.28.37_pandalift/checkpoints'
+
+guidance_start_timestep: 10
+guidance_scale: 0.1
+threshold: 2.0
+
+n_test: 50
+n_test_vis: 10
+test_start_seed: 100000
+n_action_steps: 8
+max_steps: 400
+
+output_dir: 'data/release_pandalift_test'
+device: "cuda"
+
+# PandaLift environment settings
+env_name: "Lift"
+robots: "Panda"
+camera_name: "agentview"
+render_obs_key: "agentview_image"
+fps: 20
+reward_shaping: false
+
+# Environment runner configuration
+env_runner_target: 'diffusion_policy.env_runner.robosuite_pandalift_image_sequential_runner.SequentialRobosuitePandaLiftImageRunner'
+
+# Planner configuration
+planner_target: 'dyn_model.planner.Planner'
+
+# Demo dataset path for nearest-neighbor latent reward
+demo_dataset_path: '../data/PandaLift/expert'
+
+# Optional dataset path override for env runner / payload configs that need it.
+dataset_path: '../data/PandaLift/expert'

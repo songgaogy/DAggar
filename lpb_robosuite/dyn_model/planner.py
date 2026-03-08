@@ -1,27 +1,23 @@
 import os
+import glob
+import json
+import copy
 from pathlib import Path 
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.dataset.robomimic_replay_image_dataset import _convert_actions, undo_transform_action
-from diffusion_policy.env_runner.robomimic_image_runner import create_env
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
-from dyn_model.datasets.robomimic_dset import RobomimicImageDynamicsModelDataset
-import robomimic.utils.file_utils as FileUtils
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer
-from dyn_model.datasets.img_transforms import default_transform, get_eval_crop_transform, get_eval_crop_transform_resnet
+from dyn_model.datasets.img_transforms import default_transform, get_eval_crop_transform_resnet
 from dyn_model.plan import load_model
-import torch.optim as optim
 import torch
-from torch import nn
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 
 import hydra
 from omegaconf import OmegaConf, open_dict
-from hydra.utils import instantiate
-import copy
 import numpy as np
 from einops import rearrange
+import h5py
 
 
 class Planner:
@@ -42,10 +38,17 @@ class Planner:
         dynamics_model_dir = os.path.dirname(os.path.dirname(dynamics_model_ckpt))
         with open(os.path.join(dynamics_model_dir, "hydra.yaml"), "r") as f:
             model_cfg = OmegaConf.load(f)
-            assert model_cfg.abs_action == self.demo_dataset_config.abs_action
+            if model_cfg.abs_action != self.demo_dataset_config.abs_action:
+                print(
+                    "[Planner] abs_action mismatch between dynamics ckpt and policy payload: "
+                    f"dynamics={model_cfg.abs_action}, policy={self.demo_dataset_config.abs_action}. "
+                    "Using dynamics setting for planner."
+                )
+                with open_dict(self.demo_dataset_config):
+                    self.demo_dataset_config.abs_action = bool(model_cfg.abs_action)
         self.dyn_model = load_model(Path(dynamics_model_ckpt), model_cfg, device=self.device)
         if not model_cfg.model.train_encoder and model_cfg.encoder_ckpt_path is not None:
-            encoder_ckpt = torch.load(model_cfg.encoder_ckpt_path, map_location='cuda')
+            encoder_ckpt = torch.load(model_cfg.encoder_ckpt_path, map_location=self.device)
             self.dyn_model.encoder.load_state_dict(encoder_ckpt['encoder'])
             print('loaded encoder from ', model_cfg.encoder_ckpt_path)
 
@@ -66,18 +69,27 @@ class Planner:
 
         # eval_env
         self.abs_action = self.demo_dataset_config.abs_action
-        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=demo_dataset_config.dataset_path)
-            
+        env_name = None
+        env_meta_dataset_path = self.demo_dataset_path
+        if env_meta_dataset_path is None:
+            env_meta_dataset_path = demo_dataset_config.dataset_path
+        env_name = self._infer_env_name_from_dataset(env_meta_dataset_path)
+        print(f"[Planner] Inferred env_name from dataset `{env_meta_dataset_path}`: {env_name}")
+
         self.use_crop = model_cfg.use_crop
         self.original_img_size = model_cfg.original_img_size
         self.cropped_img_size = model_cfg.cropped_img_size
         if self.use_crop:
             self.img_transform = get_eval_crop_transform_resnet(original_img_size=self.original_img_size, 
                                                         cropped_img_size=self.cropped_img_size)
+        else:
+            self.img_transform = default_transform(self.original_img_size)
 
         self.view_names = model_cfg.view_names
 
-        self.env_name = env_meta["env_name"]
+        if env_name is None:
+            env_name = "Lift"
+        self.env_name = env_name
         print('env_name ', self.env_name)
 
         self.frameskip = model_cfg.frameskip
@@ -92,6 +104,64 @@ class Planner:
         self.output_dir = output_dir
         self.idx = 0
 
+    @staticmethod
+    def _to_path_list(dataset_path):
+        if OmegaConf.is_config(dataset_path):
+            dataset_path = OmegaConf.to_container(dataset_path, resolve=True)
+        if isinstance(dataset_path, str):
+            return [os.path.expanduser(dataset_path)]
+        if isinstance(dataset_path, (list, tuple)):
+            return [os.path.expanduser(str(p)) for p in dataset_path]
+        return [str(dataset_path)]
+
+    def _find_dataset_files(self, dataset_path):
+        files = []
+        for path in self._to_path_list(dataset_path):
+            if os.path.isfile(path):
+                files.append(path)
+            elif os.path.isdir(path):
+                files.extend(sorted(glob.glob(os.path.join(path, "**", "*.hdf5"), recursive=True)))
+            else:
+                files.extend(sorted(glob.glob(path)))
+        return files
+
+    @staticmethod
+    def _parse_env_name_from_obj(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, bytes):
+            obj = obj.decode("utf-8")
+        if isinstance(obj, str):
+            try:
+                obj = json.loads(obj)
+            except Exception:
+                return obj if len(obj) > 0 else None
+        if isinstance(obj, dict):
+            for key in ["env_name", "env", "name"]:
+                value = obj.get(key, None)
+                if isinstance(value, str) and len(value) > 0:
+                    return value
+        return None
+
+    def _infer_env_name_from_dataset(self, dataset_path):
+        files = self._find_dataset_files(dataset_path)
+        for file_path in files:
+            try:
+                with h5py.File(file_path, "r") as f:
+                    candidates = []
+                    for attr_key in ["env_name", "env", "env_info"]:
+                        candidates.append(f.attrs.get(attr_key, None))
+                    if "data" in f:
+                        for attr_key in ["env_name", "env", "env_info"]:
+                            candidates.append(f["data"].attrs.get(attr_key, None))
+                    for candidate in candidates:
+                        env_name = self._parse_env_name_from_obj(candidate)
+                        if env_name is not None:
+                            return env_name
+            except Exception:
+                continue
+        return "Lift"
+
     def set_policy_action_normalizer(self, policy_action_normalizer):
         self.policy_action_normalizer = policy_action_normalizer
 
@@ -99,18 +169,26 @@ class Planner:
         demo_dataset: BaseImageDataset
         
         # Use demo_dataset_path from config if provided, otherwise fall back to hardcoded paths
+        demo_dataset_config = copy.deepcopy(self.demo_dataset_config)
         if self.demo_dataset_path:
-            self.demo_dataset_config.dataset_path = self.demo_dataset_path
+            with open_dict(demo_dataset_config):
+                demo_dataset_config.dataset_path = self.demo_dataset_path
 
-        self.demo_dataset_config.val_ratio = 0
-        self.demo_dataset_config.horizon = 1
-        self.demo_dataset_config.n_obs_steps = 1
-        self.demo_dataset_config.pad_before = 0
-        self.demo_dataset_config.pad_after = 0
+        # We only need observations for demo latents (horizon=1), so disable abs_action
+        # requirement to support robosuite datasets without `abs_actions`.
+        with open_dict(demo_dataset_config):
+            demo_dataset_config.abs_action = False
+            demo_dataset_config.val_ratio = 0
+            demo_dataset_config.horizon = 1
+            demo_dataset_config.n_obs_steps = 1
+            demo_dataset_config.pad_before = 0
+            demo_dataset_config.pad_after = 0
 
-        demo_dataset = hydra.utils.instantiate(self.demo_dataset_config)
+        demo_dataset = hydra.utils.instantiate(demo_dataset_config)
         print('len(demo_dataset) ', len(demo_dataset))
-        demo_loader = DataLoader(demo_dataset, batch_size=64, shuffle=False, num_workers=4)
+        # Use single-process loading for evaluation stability (h5py + multiprocessing
+        # can trigger intermittent segfaults on some systems).
+        demo_loader = DataLoader(demo_dataset, batch_size=64, shuffle=False, num_workers=0)
 
         demo_visual_latents = []
         demo_proprio_latents = []
@@ -247,12 +325,12 @@ class Planner:
             if key in current_obs:
                 proprio_arrays.append(current_obs[key])
 
-        proprio = torch.cat(proprio_arrays, dim=-1).to('cuda') if proprio_arrays else torch.zeros((1, 0)).to('cuda')
+        proprio = torch.cat(proprio_arrays, dim=-1).to(self.device) if proprio_arrays else torch.zeros((1, 0)).to(self.device)
 
         visual = {}
         for view_name in self.view_names:
-            visual[view_name] = current_obs[view_name].to('cuda')
-            visual[view_name] = self.dyn_model_normalizer[view_name].normalize(visual[view_name].to('cuda'))
+            visual[view_name] = current_obs[view_name].to(self.device)
+            visual[view_name] = self.dyn_model_normalizer[view_name].normalize(visual[view_name].to(self.device))
             visual[view_name] = self.img_transform(visual[view_name].view(-1, 3, self.original_img_size, self.original_img_size))
             visual[view_name] = visual[view_name].view(-1, 1, 3, self.cropped_img_size, self.cropped_img_size)
 

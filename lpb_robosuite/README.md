@@ -128,6 +128,24 @@ will run the task with ID
 (lpb)[lpb]$ python eval_test_time_optimization.py --config-name=eval_libero
 ```
 
+For **PandaLift (robosuite simulation)** using your own trained checkpoints, set paths in
+`dyn_model/conf/planner/eval_pandalift.yaml` and run:
+
+```console
+(lpb)[lpb]$ python eval_test_time_optimization.py --config-name=eval_pandalift
+```
+
+This runner evaluates directly in robosuite `Lift` with `Panda`, logs per-seed reward / success, and stores videos under `output_dir/media`.
+
+For **base diffusion policy** (without LPB) on PandaLift, run:
+
+```console
+(lpb)[lpb]$ bash eval_base_policy.sh
+```
+
+The script reports success rate and saves per-episode results to:
+`data/release_pandalift_base_policy/base_policy_eval_results.json`.
+
 ## Code
 
  - [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/): The base diffusion policy was built on top of the Diffusion Policy codebase.
