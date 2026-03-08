@@ -3,7 +3,9 @@ defaults:
   - _self_
 
 # Dataset & Paths
-data_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaLift"
+data_dirs:
+  - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
+  - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/intervention"
 save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow/BC_warmup"
 
 seed: 42
@@ -28,6 +30,10 @@ train:
   unfreeze_epoch_ratio: 0.2
   lambda_endpoint: 0.0
   lambda_smooth: 0.0
+  use_weighted_sampler: true
+  labeled_intervention_only: true
+  intervention_sample_weight: 2.0
+  non_intervention_sample_weight: 1.0
 
 # logging & checkpointing
 log_every: 50

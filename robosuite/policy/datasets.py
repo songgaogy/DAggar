@@ -7,17 +7,32 @@ import torch
 from torch.utils.data import Dataset
 
 
-def _list_hdf5_files(data_dir: str):
-    files = sorted(glob.glob(os.path.join(data_dir, "*.hdf5")))
+def _as_dir_list(data_dirs):
+    if isinstance(data_dirs, str):
+        return [data_dirs]
+    if isinstance(data_dirs, (list, tuple)):
+        out = [str(d) for d in data_dirs]
+        if len(out) == 0:
+            raise ValueError("data_dirs cannot be empty")
+        return out
+    raise TypeError(f"data_dirs must be str or list/tuple of str, got: {type(data_dirs)}")
+
+
+def _list_hdf5_files(data_dirs):
+    roots = _as_dir_list(data_dirs)
+    files = []
+    for root in roots:
+        files.extend(glob.glob(os.path.join(root, "**", "*.hdf5"), recursive=True))
+    files = sorted(set(files))
     if len(files) == 0:
-        raise FileNotFoundError(f"No .hdf5 files found in {data_dir}")
+        raise FileNotFoundError(f"No .hdf5 files found under: {roots}")
     return files
 
 
 class PandaLiftFlowDataset(Dataset):
     def __init__(
         self,
-        data_dir: str,
+        data_dirs,
         proprio_extractor,
         camera_name: str = "agentview",
         history_len: int = 1,
@@ -27,9 +42,12 @@ class PandaLiftFlowDataset(Dataset):
         normalize: bool = True,
         max_demos_per_file: int | None = None,
         cache_proprio: bool = True,
+        intervention_weight: float = 1.0,
+        non_intervention_weight: float = 1.0,
+        labeled_intervention_only: bool = False,
     ):
-        self.data_dir = data_dir
-        self.files = _list_hdf5_files(data_dir)
+        self.data_dirs = _as_dir_list(data_dirs)
+        self.files = _list_hdf5_files(self.data_dirs)
         self.camera_name = camera_name
         self.history_len = int(history_len)
         self.horizon = int(horizon)
@@ -39,12 +57,20 @@ class PandaLiftFlowDataset(Dataset):
         self.proprio_extractor = proprio_extractor
         self.max_demos_per_file = max_demos_per_file
         self.cache_proprio = cache_proprio
+        self.intervention_weight = float(intervention_weight)
+        self.non_intervention_weight = float(non_intervention_weight)
+        self.labeled_intervention_only = bool(labeled_intervention_only)
 
         self.index = []
         self._demo_meta = []
         self._handles = {}
         self._proprio_cache = {}
         self._resize_index_cache = {}
+        self.sample_weights = []
+        self.sample_is_intervention = []
+        self.n_intervention_samples = 0
+        self.n_non_intervention_samples = 0
+        self.n_filtered_labeled_non_intervention = 0
 
         self._build_index()
         print("finish building index!")
@@ -64,8 +90,11 @@ class PandaLiftFlowDataset(Dataset):
                     states = demo["states"]
                     actions = demo["actions"]
                     images = demo["observations"][self.camera_name]["images"]
+                    labels = demo.get("intervention_labels", None)
 
                     T = min(states.shape[0], actions.shape[0], images.shape[0])
+                    if labels is not None:
+                        T = min(T, labels.shape[0])
                     if T < (self.history_len + self.horizon):
                         continue
 
@@ -74,7 +103,23 @@ class PandaLiftFlowDataset(Dataset):
 
                     max_t = T - (self.history_len + self.horizon) + 1
                     for t0 in range(0, max_t, self.stride):
+                        is_intervention = False
+                        if labels is not None:
+                            lbl_window = labels[t0 : t0 + self.horizon]
+                            is_intervention = bool(np.any(lbl_window > 0))
+                            if self.labeled_intervention_only and (not is_intervention):
+                                self.n_filtered_labeled_non_intervention += 1
+                                continue
+
                         self.index.append((meta_id, t0))
+                        if is_intervention:
+                            self.sample_is_intervention.append(1)
+                            self.sample_weights.append(self.intervention_weight)
+                            self.n_intervention_samples += 1
+                        else:
+                            self.sample_is_intervention.append(0)
+                            self.sample_weights.append(self.non_intervention_weight)
+                            self.n_non_intervention_samples += 1
 
     def _get_handle(self, fp):
         pid = os.getpid()

@@ -57,7 +57,10 @@ def main(cfg: DictConfig):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    data_dir = to_absolute_path(cfg.data_dir)
+    if "data_dirs" in cfg and cfg.data_dirs is not None:
+        data_dirs = [to_absolute_path(p) for p in cfg.data_dirs]
+    else:
+        data_dirs = [to_absolute_path(cfg.data_dir)]
     save_dir = to_absolute_path(cfg.save_dir)
     os.makedirs(save_dir, exist_ok=True)
 
@@ -74,7 +77,7 @@ def main(cfg: DictConfig):
     )
 
     ds = PandaLiftFlowDataset(
-        data_dir=data_dir,
+        data_dirs=data_dirs,
         proprio_extractor=extractor,
         camera_name=cfg.camera,
         history_len=cfg.history_len,
@@ -83,17 +86,34 @@ def main(cfg: DictConfig):
         image_size=cfg.image_size,
         normalize=True,
         cache_proprio=True,
+        intervention_weight=float(getattr(cfg.train, "intervention_sample_weight", 1.0)),
+        non_intervention_weight=float(getattr(cfg.train, "non_intervention_sample_weight", 1.0)),
+        labeled_intervention_only=bool(getattr(cfg.train, "labeled_intervention_only", False)),
+    )
+
+    print(
+        "dataset stats: "
+        f"total={len(ds)} intervention={ds.n_intervention_samples} "
+        f"non_intervention={ds.n_non_intervention_samples} "
+        f"filtered_labeled_non_intervention={ds.n_filtered_labeled_non_intervention}"
     )
 
     dl_kwargs = dict(
         dataset=ds,
         batch_size=cfg.train.batch_size,
-        shuffle=True,
+        shuffle=not bool(getattr(cfg.train, "use_weighted_sampler", False)),
         num_workers=cfg.train.num_workers,
         persistent_workers=bool(cfg.train.num_workers > 0),
         pin_memory=True,
         drop_last=True,
     )
+    if bool(getattr(cfg.train, "use_weighted_sampler", False)):
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.as_tensor(ds.sample_weights, dtype=torch.double),
+            num_samples=len(ds.sample_weights),
+            replacement=True,
+        )
+        dl_kwargs["sampler"] = sampler
     if cfg.train.num_workers > 0:
         dl_kwargs["prefetch_factor"] = int(getattr(cfg.train, "prefetch_factor", 4))
     dl = DataLoader(**dl_kwargs)

@@ -49,7 +49,7 @@ has_predictor: True
 use_pretrained_encoder: True
 encoder_ckpt_path: null
 # predictor_ckpt_path: '/store/real/zhanyis/diffusion_policy/outputs/2025-06-12/05-15-35/checkpoints/model_50.pth'
-predictor_ckpt_path: '/store/real/zhanyis/diffusion_policy/outputs/2025-04-15/07-30-10/checkpoints/model_60.pth'
+predictor_ckpt_path: null
 model:
   _target_: dyn_model.models.visual_dyn_model.VisualDynamicsModel
   image_size: ${img_size}
