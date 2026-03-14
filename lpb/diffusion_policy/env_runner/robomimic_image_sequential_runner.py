@@ -1,5 +1,6 @@
 import json
 import os
+import copy
 import wandb
 import numpy as np
 import torch
@@ -16,18 +17,31 @@ from diffusion_policy.model.common.rotation_transformer import RotationTransform
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
+from diffusion_policy.common.mujoco_py_compat import install_mujoco_py_stub
+
+install_mujoco_py_stub()
 from diffusion_policy.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.tensor_utils as TensorUtils
+from diffusion_policy.env_runner.robomimic_image_runner import (
+    _configure_worker_render_gpu,
+    _parse_render_gpu_ids,
+)
 
 def create_env(env_meta, shape_meta, enable_render=True, render_obs_key='agentview_image',
-               fps=10, crf=22, n_obs_steps=2, n_action_steps=8, max_steps=400):
+               fps=10, crf=22, n_obs_steps=2, n_action_steps=8, max_steps=400,
+               render_gpu_device_id=None):
     modality_mapping = collections.defaultdict(list)
     for key, attr in shape_meta['obs'].items():
         modality_mapping[attr.get('type', 'low_dim')].append(key)
     ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
+
+    env_meta = copy.deepcopy(env_meta)
+    if render_gpu_device_id is not None:
+        env_meta.setdefault('env_kwargs', {})['render_gpu_device_id'] = int(render_gpu_device_id)
+        _configure_worker_render_gpu(int(render_gpu_device_id))
 
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -165,6 +179,7 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
         self.abs_action = abs_action
         self.rotation_transformer = rotation_transformer
         self.tqdm_interval_sec = tqdm_interval_sec
+        self.render_gpu_ids = _parse_render_gpu_ids()
 
         self.output_path = None
 
@@ -191,6 +206,7 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
                 n_obs_steps=self.n_obs_steps,
                 n_action_steps=self.n_action_steps,
                 max_steps=self.max_steps,
+                render_gpu_device_id=self.render_gpu_ids[i % len(self.render_gpu_ids)],
             )
             
             self._initialize_env(env, prefix, init_state, seed, enable_render, i)

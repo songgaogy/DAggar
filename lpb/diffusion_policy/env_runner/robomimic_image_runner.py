@@ -1,4 +1,6 @@
 import os
+import copy
+import logging
 import wandb
 import numpy as np
 import torch
@@ -18,17 +20,58 @@ from diffusion_policy.model.common.rotation_transformer import RotationTransform
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
+from diffusion_policy.common.mujoco_py_compat import install_mujoco_py_stub
+
+install_mujoco_py_stub()
 from diffusion_policy.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
 
 
-def create_env(env_meta, shape_meta, enable_render=True):
+logger = logging.getLogger(__name__)
+
+
+def _parse_render_gpu_ids():
+    raw = os.environ.get("LPB_RENDER_GPU_IDS", os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    ids = []
+    for token in raw.split(","):
+        token = token.strip()
+        if token.isdigit():
+            ids.append(int(token))
+    if not ids:
+        return [0]
+    return ids
+
+
+def _configure_worker_render_gpu(render_gpu_id: int):
+    # Ensure robosuite EGL context selection is deterministic per worker.
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(render_gpu_id)
+    if os.environ.get("LPB_DEBUG_RENDER_INIT", "0").strip().lower() in {"1", "true", "yes"}:
+        print(
+            f"[LPB][pid={os.getpid()}] configure render gpu={render_gpu_id} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')} "
+            f"MUJOCO_EGL_DEVICE_ID={os.environ.get('MUJOCO_EGL_DEVICE_ID')}"
+        )
+    try:
+        import egl_probe
+    except Exception:
+        return
+
+    # robomimic calls egl_probe.get_available_devices() and takes the first one.
+    # Return a single configured device to avoid probing unrelated GPUs.
+    egl_probe.get_available_devices = lambda: [render_gpu_id]
+
+
+def create_env(env_meta, shape_meta, enable_render=True, render_gpu_device_id=None):
     modality_mapping = collections.defaultdict(list)
     for key, attr in shape_meta['obs'].items():
         modality_mapping[attr.get('type', 'low_dim')].append(key)
     ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
+
+    env_meta = copy.deepcopy(env_meta)
+    if render_gpu_device_id is not None:
+        env_meta.setdefault('env_kwargs', {})['render_gpu_device_id'] = int(render_gpu_device_id)
 
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -86,49 +129,60 @@ class RobomimicImageRunner(BaseImageRunner):
             env_meta['env_kwargs']['controller_configs']['control_delta'] = False
             rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
 
-        def env_fn():
-            robomimic_env = create_env(
-                env_meta=env_meta, 
-                shape_meta=shape_meta
-            )
-            # Robosuite's hard reset causes excessive memory consumption.
-            # Disabled to run more envs.
-            # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
-            robomimic_env.env.hard_reset = False
-            return MultiStepWrapper(
-                VideoRecordingWrapper(
-                    RobomimicImageWrapper(
-                        env=robomimic_env,
+        render_gpu_ids = _parse_render_gpu_ids()
+        logger.info("Rollout render GPUs: %s", render_gpu_ids)
+        vector_env_mode = os.environ.get("LPB_VECTOR_ENV_MODE", "auto").strip().lower()
+        vector_env_context = os.environ.get("LPB_VECTOR_ENV_CONTEXT", "spawn").strip()
+        if vector_env_mode not in {"auto", "async", "sync"}:
+            raise ValueError(f"Invalid LPB_VECTOR_ENV_MODE={vector_env_mode}")
+
+        def make_env_fn(render_gpu_id):
+            def env_fn():
+                _configure_worker_render_gpu(render_gpu_id)
+                try:
+                    robomimic_env = create_env(
+                        env_meta=env_meta, 
                         shape_meta=shape_meta,
-                        init_state=None,
-                        render_obs_key=render_obs_key
+                        render_gpu_device_id=render_gpu_id
+                    )
+                except Exception:
+                    print(f"[LPB][pid={os.getpid()}] failed creating env on render gpu={render_gpu_id}")
+                    raise
+                # Robosuite's hard reset causes excessive memory consumption.
+                # Disabled to run more envs.
+                # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
+                robomimic_env.env.hard_reset = False
+                return MultiStepWrapper(
+                    VideoRecordingWrapper(
+                        RobomimicImageWrapper(
+                            env=robomimic_env,
+                            shape_meta=shape_meta,
+                            init_state=None,
+                            render_obs_key=render_obs_key
+                        ),
+                        video_recoder=VideoRecorder.create_h264(
+                            fps=fps,
+                            codec='h264',
+                            input_pix_fmt='rgb24',
+                            crf=crf,
+                            thread_type='FRAME',
+                            thread_count=1
+                        ),
+                        file_path=None,
+                        steps_per_render=steps_per_render
                     ),
-                    video_recoder=VideoRecorder.create_h264(
-                        fps=fps,
-                        codec='h264',
-                        input_pix_fmt='rgb24',
-                        crf=crf,
-                        thread_type='FRAME',
-                        thread_count=1
-                    ),
-                    file_path=None,
-                    steps_per_render=steps_per_render
-                ),
-                n_obs_steps=n_obs_steps,
-                n_action_steps=n_action_steps,
-                max_episode_steps=max_steps
-            )
-        
-        # For each process the OpenGL context can only be initialized once
-        # Since AsyncVectorEnv uses fork to create worker process,
-        # a separate env_fn that does not create OpenGL context (enable_render=False)
-        # is needed to initialize spaces.
+                    n_obs_steps=n_obs_steps,
+                    n_action_steps=n_action_steps,
+                    max_episode_steps=max_steps
+                )
+            return env_fn
+
         def dummy_env_fn():
             robomimic_env = create_env(
-                    env_meta=env_meta, 
-                    shape_meta=shape_meta,
-                    enable_render=False
-                )
+                env_meta=env_meta, 
+                shape_meta=shape_meta,
+                enable_render=False
+            )
             return MultiStepWrapper(
                 VideoRecordingWrapper(
                     RobomimicImageWrapper(
@@ -153,7 +207,8 @@ class RobomimicImageRunner(BaseImageRunner):
                 max_episode_steps=max_steps
             )
 
-        env_fns = [env_fn] * n_envs
+        env_render_gpu_ids = [render_gpu_ids[i % len(render_gpu_ids)] for i in range(n_envs)]
+        env_fns = [make_env_fn(render_gpu_id) for render_gpu_id in env_render_gpu_ids]
         env_seeds = list()
         env_prefixs = list()
         env_init_fn_dills = list()
@@ -215,13 +270,46 @@ class RobomimicImageRunner(BaseImageRunner):
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
 
-        env = AsyncVectorEnv(env_fns, dummy_env_fn=dummy_env_fn)
-        # env = SyncVectorEnv(env_fns)
+        def make_vector_env(current_env_fns):
+            if vector_env_mode == "sync":
+                return SyncVectorEnv(current_env_fns)
+            if vector_env_mode == "async":
+                return AsyncVectorEnv(
+                    current_env_fns,
+                    dummy_env_fn=dummy_env_fn,
+                    context=vector_env_context
+                )
+            # auto
+            try:
+                return AsyncVectorEnv(
+                    current_env_fns,
+                    dummy_env_fn=dummy_env_fn,
+                    context=vector_env_context
+                )
+            except Exception:
+                logger.exception(
+                    "AsyncVectorEnv init failed (context=%s).",
+                    vector_env_context
+                )
+                if len(current_env_fns) == 1:
+                    raise
+                logger.warning(
+                    "Falling back to single-env SyncVectorEnv for rollout. "
+                    "Set LPB_VECTOR_ENV_MODE=async to force async and fail fast."
+                )
+                return None
+
+        env = make_vector_env(env_fns)
+        if env is None:
+            env_render_gpu_ids = [render_gpu_ids[0]]
+            env_fns = [make_env_fn(render_gpu_ids[0])]
+            env = SyncVectorEnv(env_fns)
 
 
         self.env_meta = env_meta
         self.env = env
         self.env_fns = env_fns
+        self.env_render_gpu_ids = env_render_gpu_ids
         self.env_seeds = env_seeds
         self.env_prefixs = env_prefixs
         self.env_init_fn_dills = env_init_fn_dills

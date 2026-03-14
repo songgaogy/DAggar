@@ -31,7 +31,12 @@ class Planner:
         dynamics_model_ckpt,
         action_step=8,
         output_dir='debug/',
-        demo_dataset_path=None
+        demo_dataset_path=None,
+        demo_batch_size=64,
+        demo_loader_workers=0,
+        demo_subsample_stride=1,
+        demo_max_samples=None,
+        nn_chunk_size=2048,
     ):
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
@@ -39,6 +44,17 @@ class Planner:
         # demo dataset
         self.demo_dataset_config = demo_dataset_config
         self.demo_dataset_path = demo_dataset_path
+        self.demo_batch_size = int(demo_batch_size)
+        self.demo_loader_workers = int(demo_loader_workers)
+        self.demo_subsample_stride = max(1, int(demo_subsample_stride))
+        if demo_max_samples is None or str(demo_max_samples).strip().lower() in {"", "none", "null"}:
+            self.demo_max_samples = None
+        else:
+            self.demo_max_samples = int(demo_max_samples)
+        self.nn_chunk_size = max(1, int(nn_chunk_size))
+        # Always honor runtime override before reading env metadata.
+        if self.demo_dataset_path:
+            self.demo_dataset_config.dataset_path = self.demo_dataset_path
         dynamics_model_dir = os.path.dirname(os.path.dirname(dynamics_model_ckpt))
         with open(os.path.join(dynamics_model_dir, "hydra.yaml"), "r") as f:
             model_cfg = OmegaConf.load(f)
@@ -66,7 +82,10 @@ class Planner:
 
         # eval_env
         self.abs_action = self.demo_dataset_config.abs_action
-        env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=demo_dataset_config.dataset_path)
+        print('planner dataset_path ', self.demo_dataset_config.dataset_path)
+        env_meta = FileUtils.get_env_metadata_from_dataset(
+            dataset_path=self.demo_dataset_config.dataset_path
+        )
             
         self.use_crop = model_cfg.use_crop
         self.original_img_size = model_cfg.original_img_size
@@ -98,10 +117,6 @@ class Planner:
     def get_demo_latents(self,):
         demo_dataset: BaseImageDataset
         
-        # Use demo_dataset_path from config if provided, otherwise fall back to hardcoded paths
-        if self.demo_dataset_path:
-            self.demo_dataset_config.dataset_path = self.demo_dataset_path
-
         self.demo_dataset_config.val_ratio = 0
         self.demo_dataset_config.horizon = 1
         self.demo_dataset_config.n_obs_steps = 1
@@ -110,11 +125,14 @@ class Planner:
 
         demo_dataset = hydra.utils.instantiate(self.demo_dataset_config)
         print('len(demo_dataset) ', len(demo_dataset))
-        demo_loader = DataLoader(demo_dataset, batch_size=64, shuffle=False, num_workers=4)
+        demo_loader = DataLoader(
+            demo_dataset,
+            batch_size=self.demo_batch_size,
+            shuffle=False,
+            num_workers=self.demo_loader_workers,
+        )
 
         demo_visual_latents = []
-        demo_proprio_latents = []
-        demo_images = []
         with torch.no_grad():
             for batch_idx, batch in enumerate(demo_loader):
                 obs = batch['obs']
@@ -135,19 +153,14 @@ class Planner:
                     visual[view_name] = self.dyn_model_normalizer[view_name].normalize(visual[view_name])
                     visual[view_name] = self.img_transform(visual[view_name].view(-1, 3, self.original_img_size, self.original_img_size))
                     visual[view_name] = visual[view_name].view(-1, 1, 3, self.cropped_img_size, self.cropped_img_size)
-                visual_cpu = {k: v.cpu() for k, v in visual.items()}
-                demo_images.append(visual_cpu)
 
                 obs_wm = {'visual': visual, 'proprio': proprio}
                 obs_wm['proprio'] = self.dyn_model_normalizer['state'].normalize(obs_wm['proprio'])
 
                 encode_obs = self.dyn_model.encode_obs(obs_wm)
                 demo_visual_latents.append(encode_obs['visual'].cpu())
-                demo_proprio_latents.append(encode_obs['proprio'].cpu())
-                torch.cuda.empty_cache()
 
         self.demo_visual_latents = torch.cat(demo_visual_latents, dim=0)
-        self.demo_proprio_latents = torch.cat(demo_proprio_latents, dim=0)
 
         if len(self.demo_visual_latents.shape) > 2:
             self.demo_visual_latents = self.demo_visual_latents.reshape(self.demo_visual_latents.size(0), -1)
@@ -156,14 +169,12 @@ class Planner:
             elif 'Transport' in self.env_name:
                 self.demo_visual_latents = self.demo_visual_latents[...,:1024]
 
+        if self.demo_subsample_stride > 1:
+            self.demo_visual_latents = self.demo_visual_latents[::self.demo_subsample_stride]
+        if self.demo_max_samples is not None and self.demo_max_samples > 0:
+            self.demo_visual_latents = self.demo_visual_latents[:self.demo_max_samples]
+
         print('demo_visual_latents shape ', self.demo_visual_latents.shape)
-        print('demo_proprio_latents shape ', self.demo_proprio_latents.shape)
-        self.demo_images = {
-            key: torch.cat([d[key] for d in demo_images], dim=0)
-            for key in demo_images[0].keys()
-        }
-        for key in self.demo_images.keys():
-            print(key, self.demo_images[key].shape)
 
         del demo_dataset
  
@@ -184,7 +195,7 @@ class Planner:
                 current_visual_latent = current_visual_latent[...,:1024]
 
         device = current_visual_latent.device
-        chunk_size = 2048 
+        chunk_size = self.nn_chunk_size
         
         global_min_cost = None
         global_min_idx = None

@@ -93,6 +93,10 @@ class AsyncVectorEnv(VectorEnv):
         self.env_fns = env_fns
         self.shared_memory = shared_memory
         self.copy = copy
+        self._state = AsyncState.DEFAULT
+        self.parent_pipes = []
+        self.processes = []
+        self.error_queue = None
 
         # Added dummy_env_fn to fix OpenGL error in Mujoco
         # disable any OpenGL rendering in dummy_env_fn, since it
@@ -136,7 +140,6 @@ class AsyncVectorEnv(VectorEnv):
                 self.single_observation_space, n=self.num_envs, fn=np.zeros
             )
 
-        self.parent_pipes, self.processes = [], []
         self.error_queue = ctx.Queue()
         target = _worker_shared_memory if self.shared_memory else _worker
         target = worker or target

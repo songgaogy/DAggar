@@ -200,9 +200,25 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                            guidance_start_timestep,
                            guidance_scale,
                            threshold,
-                           demo_dataset_path=None):
+                           demo_dataset_path=None,
+                           demo_batch_size=64,
+                           demo_loader_workers=0,
+                           demo_subsample_stride=1,
+                           demo_max_samples=None,
+                           nn_chunk_size=2048):
         planner_cls = hydra.utils.get_class(planner_target)
-        self.planner = planner_cls(demo_dataset_config, dynamics_model_ckpt, action_step, output_dir, demo_dataset_path)
+        self.planner = planner_cls(
+            demo_dataset_config,
+            dynamics_model_ckpt,
+            action_step,
+            output_dir,
+            demo_dataset_path,
+            demo_batch_size,
+            demo_loader_workers,
+            demo_subsample_stride,
+            demo_max_samples,
+            nn_chunk_size,
+        )
         self.guidance_start_timestep = guidance_start_timestep
         self.guidance_scale = guidance_scale
         self.planner.set_policy_action_normalizer(self.normalizer['action'])

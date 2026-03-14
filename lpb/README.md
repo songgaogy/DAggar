@@ -35,6 +35,18 @@ For example, to train a base Diffusion Policy on the **Transport** task: first d
 ```
 This will create an output directory with format `data/outputs/YYYY.MM.DD/HH.MM.SS_${name}_${task_name}`.
 
+To evaluate a trained **base diffusion policy** checkpoint (without LPB test-time optimization) and report success rate:
+```console
+(lpb)[lpb]$ python eval_base_diffusion_policy.py \
+  --policy-checkpoint data/outputs/YYYY.MM.DD/HH.MM.SS_train_diffusion_unet_hybrid_transport_image/checkpoints/20.ckpt \
+  --output-dir data/eval/base_transport \
+  --device cuda:0 \
+  --n-test 50 \
+  --test-start-seed 100000 \
+  --success-reward-threshold 0.5
+```
+The script writes `eval_base_results.json` under the provided output directory, including `summary.success_rate`.
+
 To train a multi-task base diffusion policy for **Libero10** tasks, download data from [link](https://drive.google.com/drive/folders/11AweLP_N5OL3Df9CDktYrwMfx_fikYSu?usp=sharing), extract it and place it under `data/libero10/data/expert_demonstration/` subdirectory, then run
 ```console
 (lpb)[lpb]$ python train.py --config-dir=. --config-name=image_transport_diffusion_policy_cnn.yaml training.seed=42 training.device=cuda:0 hydra.run.dir='data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}'

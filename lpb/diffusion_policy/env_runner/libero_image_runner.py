@@ -21,7 +21,9 @@ from diffusion_policy.gym_util.video_recording_wrapper import (
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
+from diffusion_policy.common.mujoco_py_compat import install_mujoco_py_stub
 
+install_mujoco_py_stub()
 ## here we just use the same env wrapper as robomimic
 from diffusion_policy.env.robomimic.robomimic_image_wrapper import (
     RobomimicImageWrapper,

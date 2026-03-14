@@ -104,22 +104,21 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        if "libero" not in cfg.task.name:
-            env_runner: BaseImageRunner
-            env_runner = hydra.utils.instantiate(
-                cfg.task.env_runner,
-                output_dir=self.output_dir)
-            assert isinstance(env_runner, BaseImageRunner)
-        else:
-            env_runner = load_env_runner(cfg, self.output_dir)
+        # lazily initialize env runners only when a rollout is actually needed
+        env_runner = None
 
         # configure logging
-        wandb_run = wandb.init(
+        wandb_init_kwargs = dict(
             dir=str(self.output_dir),
             config=OmegaConf.to_container(cfg, resolve=True),
             **cfg.logging
         )
+        try:
+            wandb_run = wandb.init(**wandb_init_kwargs)
+        except Exception as e:
+            print(f"W&B init failed, falling back to disabled mode. Error: {e}")
+            wandb_init_kwargs["mode"] = "disabled"
+            wandb_run = wandb.init(**wandb_init_kwargs)
         wandb.config.update(
             {
                 "output_dir": self.output_dir,
@@ -219,7 +218,15 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                if cfg.training.rollout_every > 0 and (self.epoch % cfg.training.rollout_every) == 0:
+                    if env_runner is None:
+                        if 'libero' not in cfg.task.name:
+                            env_runner = hydra.utils.instantiate(
+                                cfg.task.env_runner,
+                                output_dir=self.output_dir)
+                            assert isinstance(env_runner, BaseImageRunner)
+                        else:
+                            env_runner = load_env_runner(cfg, self.output_dir)
                     if 'libero' not in cfg.task.name:
                         runner_log = env_runner.run(policy)
                     else:

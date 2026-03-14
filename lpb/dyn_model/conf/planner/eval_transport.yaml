@@ -10,8 +10,16 @@ guidance_scale: 0.2
 
 threshold: 2.8
 n_test: 50
+n_test_vis: 0
 test_start_seed: 100000
 n_action_steps: 15
+
+# Memory controls for planner latent cache
+demo_batch_size: 32
+demo_loader_workers: 0
+demo_subsample_stride: 1
+demo_max_samples: null
+nn_chunk_size: 1024
 
 output_dir: 'data/release_transport_test'
 
@@ -26,3 +34,6 @@ planner_target: 'dyn_model.planner.Planner'
 # Demo dataset path
 demo_dataset_path: 'data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'
 
+# Optional explicit override for policy payload dataset path.
+# Keep this consistent with transport evaluation dataset.
+dataset_path: 'data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'

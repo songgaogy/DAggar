@@ -1,3 +1,11 @@
+if __name__ == "__main__":
+    import sys
+    import pathlib
+
+    ROOT_DIR = str(pathlib.Path(__file__).resolve().parent.parent)
+    if ROOT_DIR not in sys.path:
+        sys.path.append(ROOT_DIR)
+
 import os
 from diffusion_policy.common.language_models import extract_text_features
 from dyn_model.models.language_encoder import LanguageEncoder

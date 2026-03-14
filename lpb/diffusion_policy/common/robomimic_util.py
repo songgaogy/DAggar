@@ -3,6 +3,9 @@ import copy
 import os
 
 import h5py
+from diffusion_policy.common.mujoco_py_compat import install_mujoco_py_stub
+
+install_mujoco_py_stub()
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils

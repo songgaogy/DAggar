@@ -14,6 +14,7 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="eval_transport")
 def main(cfg: DictConfig):
     output_dir = cfg.output_dir
@@ -39,13 +40,19 @@ def main(cfg: DictConfig):
     cfg_task_env_runner.policy.n_action_steps = cfg.n_action_steps
 
     cfg_task_env_runner.task.env_runner.n_test = cfg.n_test
-    cfg_task_env_runner.task.env_runner.n_test_vis = cfg.n_test
+    cfg_task_env_runner.task.env_runner.n_test_vis = cfg.get('n_test_vis', cfg.n_test)
     cfg_task_env_runner.task.env_runner.n_train = 0
     cfg_task_env_runner.task.env_runner.n_train_vis = 0
     cfg_task_env_runner.task.env_runner.test_start_seed = cfg.test_start_seed
 
-    if 'libero' in cfg.policy_checkpoint:
-        cfg_task_env_runner.task.env_runner.dataset_path = cfg.dataset_path
+    dataset_override = cfg.get('dataset_path', None)
+    if dataset_override is not None:
+        if 'dataset_path' in cfg_task_env_runner.task:
+            cfg_task_env_runner.task.dataset_path = dataset_override
+        if 'dataset' in cfg_task_env_runner.task and 'dataset_path' in cfg_task_env_runner.task.dataset:
+            cfg_task_env_runner.task.dataset.dataset_path = dataset_override
+        if 'dataset_path' in cfg_task_env_runner.task.env_runner:
+            cfg_task_env_runner.task.env_runner.dataset_path = dataset_override
         
     # Initialize workspace
     cls = hydra.utils.get_class(cfg_task_env_runner._target_)
@@ -69,21 +76,26 @@ def main(cfg: DictConfig):
 
     policy.initialize_planner(
         planner_target=cfg.planner_target,
-        demo_dataset_config=payload['cfg'].task.dataset,
+        demo_dataset_config=cfg_task_env_runner.task.dataset,
         dynamics_model_ckpt=cfg.dynamics_model_checkpoint,
         action_step=cfg_task_env_runner.n_action_steps,
         output_dir=cfg.output_dir,
         guidance_start_timestep=cfg.guidance_start_timestep,
         guidance_scale=cfg.guidance_scale,
         threshold=cfg.threshold,
-        demo_dataset_path=cfg.get('demo_dataset_path', None)
+        demo_dataset_path=cfg.get('demo_dataset_path', None),
+        demo_batch_size=cfg.get('demo_batch_size', 64),
+        demo_loader_workers=cfg.get('demo_loader_workers', 0),
+        demo_subsample_stride=cfg.get('demo_subsample_stride', 1),
+        demo_max_samples=cfg.get('demo_max_samples', None),
+        nn_chunk_size=cfg.get('nn_chunk_size', 2048),
     )
 
     # Run evaluation - use env_runner_target from the planner config
     cfg_task_env_runner.task.env_runner._target_ = cfg.env_runner_target
 
     # Check if it's a libero task by examining the dataset target
-    dataset_target = payload['cfg'].task.dataset._target_
+    dataset_target = cfg_task_env_runner.task.dataset._target_
     if 'libero' in dataset_target:
         env_runner = hydra.utils.instantiate(
             cfg_task_env_runner.task.env_runner,
@@ -111,6 +123,7 @@ def main(cfg: DictConfig):
         json.dump(results, f, indent=2, sort_keys=True)
 
     print(f"Evaluation results saved to {results_path}")
+
 
 if __name__ == '__main__':
     main()
