@@ -21,7 +21,8 @@ training:
 img_size: 140 # should be a multiple of 224
 frameskip: 15
 
-# Dataset configuration - imported from env-specific configs
+# Dataset configuration - imported from env-specific configs.
+# `train_data_path` can also be overridden from CLI with a Hydra list of HDF5 files.
 train_data_path: ${env.train_data_path}
 val_data_path: ${env.val_data_path}
 view_names: ${env.view_names}

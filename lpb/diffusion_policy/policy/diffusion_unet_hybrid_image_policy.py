@@ -11,7 +11,7 @@ import numpy as np
 import torch.nn.functional as F
 import torch.optim as optim
 
-from einops import reduce
+from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
@@ -32,7 +32,8 @@ def boundary_penalty(action, lower_bound=-1.0, upper_bound=1.0):
 
 
 class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
-    def __init__(self, 
+    def __init__(
+            self, 
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             horizon, 
@@ -190,6 +191,8 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             self.text_model, self.tokenizer, self.max_length = get_text_model(
                 'libero_10', 'clip'
             )
+        self._pending_guidance_target_info = None
+        self._last_guidance_metrics = None
 
     def initialize_planner(self,
                            planner_target,
@@ -207,9 +210,11 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
                            demo_max_samples=None,
                            nn_chunk_size=2048):
         planner_cls = hydra.utils.get_class(planner_target)
+
+        # (gaoyuan) initialize the planner; see @./lpb/dyn_model/planner.py for detail
         self.planner = planner_cls(
             demo_dataset_config,
-            dynamics_model_ckpt,
+            dynamics_model_ckpt,    # planner takes pretraind dynamic model
             action_step,
             output_dir,
             demo_dataset_path,
@@ -223,36 +228,145 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self.guidance_scale = guidance_scale
         self.planner.set_policy_action_normalizer(self.normalizer['action'])
         self.threshold = threshold
+
+    def reset(self):
+        self._pending_guidance_target_info = None
+        self._last_guidance_metrics = None
+
+    def _predict_next_visual_latent_from_sample(
+            self,
+            sample: torch.Tensor,
+            current_obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        action_sample = sample[..., :self.action_dim]
+        expected_steps = self.planner.horizon * self.planner.frameskip
+        init_actions_normalized = action_sample[:, 1:1 + expected_steps]
+        if init_actions_normalized.shape[1] != expected_steps:
+            raise RuntimeError(
+                f"Expected {expected_steps} normalized action steps for dynamics rollout, "
+                f"got {init_actions_normalized.shape[1]}"
+            )
+
+        with torch.no_grad():
+            init_actions_unnormalized = self.normalizer['action'].unnormalize(init_actions_normalized)
+            init_actions = self.planner.dyn_model_normalizer['act'].normalize(init_actions_unnormalized)
+            action_batch = rearrange(
+                init_actions,
+                'b (h f) a -> b h (f a)',
+                f=self.planner.frameskip,
+                h=self.planner.horizon,
+            )
+            batch_size = action_batch.shape[0]
+            current_obs_wm = self.planner.prepare_obs(current_obs, batch_size)
+            act_0 = action_batch[:, :1, :]
+            z = self.planner.dyn_model.encode(current_obs_wm, act_0)
+            z_pred = self.planner.dyn_model.predict(z)
+            z_new = z_pred[:, -1:, ...]
+            z_obs, _ = self.planner.dyn_model.separate_emb(z_new)
+            next_visual_latent = self.planner._flatten_visual_latent(z_obs['visual'].squeeze(1))
+        return next_visual_latent
+
+    def _compute_steering_comparison_metrics(
+            self,
+            guided_sample: torch.Tensor,
+            base_sample: torch.Tensor,
+            current_obs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        guided_next_visual_latent = self._predict_next_visual_latent_from_sample(guided_sample, current_obs)
+        base_next_visual_latent = self._predict_next_visual_latent_from_sample(base_sample, current_obs)
+
+        with torch.no_grad():
+            guided_reward, _ = self.planner.compute_nn_reward(guided_next_visual_latent)
+            base_reward, _ = self.planner.compute_nn_reward(base_next_visual_latent)
+
+            start = self.n_obs_steps - 1
+            end = start + self.n_action_steps
+            guided_action = self.normalizer['action'].unnormalize(guided_sample[..., :self.action_dim])[:, start:end]
+            base_action = self.normalizer['action'].unnormalize(base_sample[..., :self.action_dim])[:, start:end]
+            action_delta = guided_action - base_action
+
+            metrics = {
+                "guided_predicted_next_demo_distance": (-guided_reward).detach().cpu(),
+                "base_predicted_next_demo_distance": (-base_reward).detach().cpu(),
+                "predicted_next_demo_distance_improvement": ((-base_reward) - (-guided_reward)).detach().cpu(),
+                "guided_base_predicted_next_latent_distance": torch.norm(
+                    guided_next_visual_latent - base_next_visual_latent, dim=-1
+                ).detach().cpu(),
+                "guided_base_action_distance": reduce(
+                    action_delta ** 2, 'b t a -> b', 'sum'
+                ).sqrt().detach().cpu(),
+                "guided_base_action_max_abs_distance": action_delta.abs().amax(
+                    dim=tuple(range(1, action_delta.ndim))
+                ).detach().cpu(),
+            }
+        return metrics
         
     # ========= inference  ============
-    def guided_conditional_sample(self, 
+    def guided_conditional_sample(
+            self, 
             condition_data, condition_mask,
             local_cond=None, global_cond=None,
             generator=None,
             classifier_guidance=False,
             current_obs=None,
             text_latents=None,
+            initial_trajectory=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
-        # print('variant2')
+        """
+        Run reverse diffusion to produce an action trajectory, optionally with LPB steering.
+
+        The reverse process always follows the same backbone:
+
+        1. Start from a noisy action trajectory.
+        2. Re-apply observation conditioning at every diffusion step.
+        3. Predict the denoising residual with the diffusion model.
+        4. Step the diffusion scheduler toward a cleaner trajectory.
+
+        When `classifier_guidance=True`, an extra LPB update is inserted before
+        the scheduler step whenever the current observation is farther than the
+        configured threshold from the demo latent manifold:
+
+        1. Convert the current noisy sample into `pred_original_sample`, which is
+           the current clean-action estimate for this denoising step. (sample is still noise
+           but we directly compute clean output of this)
+        2. Feed the first action chunk of that estimate into the dynamics model
+           together with the current real observation.
+        3. Predict the one-step-ahead latent and compute its nearest-demo
+           distance in latent space.
+        4. Backpropagate that scalar cost to the noisy trajectory and shift the
+           denoising direction (current step!) before continuing reverse diffusion.
+
+        Notes:
+        - The steering target used in this loss is recomputed from the predicted
+          next latent at each guided diffusion step. It is not the same as the
+          fixed target used later for post-hoc evaluation metrics.
+        - `initial_trajectory` allows guided and unguided sampling to start from
+          identical noise, which makes their final action difference a direct
+          measure of steering strength rather than diffusion randomness.
+        """
         if text_latents is not None:
             current_obs['language'] = text_latents
 
         model = self.model
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
-            generator=generator)
+        if initial_trajectory is None:
+            trajectory = torch.randn(
+                size=condition_data.shape, 
+                dtype=condition_data.dtype,
+                device=condition_data.device,
+                generator=generator)
+        else:
+            trajectory = initial_trajectory.to(
+                device=condition_data.device,
+                dtype=condition_data.dtype,
+            ).clone()
     
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
         if classifier_guidance:
-            current_cost = -1 * self.planner.compute_current_reward(current_obs)
+            current_cost = -1 * self.planner.compute_current_reward(current_obs)    # cost = min_distance
             current_cost = current_cost.item()
             if current_cost >= self.threshold:
                 self.correct_num += 1
@@ -263,9 +377,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             trajectory = trajectory.detach().requires_grad_()
 
             # 2. predict model output
-            model_output = model(trajectory, t, 
-                local_cond=local_cond, global_cond=global_cond)
+            model_output = model(trajectory, t, local_cond=local_cond, global_cond=global_cond)     # base diffusion policy
 
+            # (gaoyuan) only too far did LPB start denoising loop
             if classifier_guidance and t < self.guidance_start_timestep and current_cost > self.threshold:
                 trajectory0 = scheduler.step(model_output, t, trajectory).pred_original_sample
                 loss = self.planner.compute_loss(trajectory0, current_obs)
@@ -426,6 +540,28 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
+        current_obs = dict_apply(obs_dict, lambda x: x[:, -1:, ...])
+        guidance_target_info = self.planner.get_guidance_target_info(current_obs)
+        initial_trajectory = torch.randn(
+            size=cond_data.shape,
+            dtype=dtype,
+            device=device,
+        )
+        base_nsample = self.guided_conditional_sample(
+            cond_data,
+            cond_mask,
+            local_cond=local_cond,
+            global_cond=global_cond,
+            classifier_guidance=False,
+            current_obs=current_obs,
+            text_latents=text_latents,
+            initial_trajectory=initial_trajectory,
+            **self.kwargs)
+        self._pending_guidance_target_info = {
+            "target_demo_idx": guidance_target_info["target_demo_idx"].detach().clone(),
+            "current_target_distance": guidance_target_info["current_target_distance"].detach().clone(),
+            "num_inference_steps": int(self.num_inference_steps),
+        }
 
         nsample = self.guided_conditional_sample(
             cond_data, 
@@ -433,9 +569,16 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             local_cond=local_cond,
             global_cond=global_cond,
             classifier_guidance=True,
-            current_obs=dict_apply(obs_dict, lambda x: x[:, -1:, ...]),
+            current_obs=current_obs,
             text_latents=text_latents,
+            initial_trajectory=initial_trajectory,
             **self.kwargs)
+        comparison_metrics = self._compute_steering_comparison_metrics(
+            guided_sample=nsample,
+            base_sample=base_nsample,
+            current_obs=current_obs,
+        )
+        self._pending_guidance_target_info["steering_comparison_metrics"] = comparison_metrics
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
@@ -450,6 +593,28 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             'action_pred': action_pred
         }
         return result
+
+    def compute_actual_next_state_guidance_metrics(self, obs_dict: Dict[str, torch.Tensor]):
+        if self._pending_guidance_target_info is None:
+            return None
+
+        next_obs = dict_apply(obs_dict, lambda x: x[:, -1:, ...])
+        target_demo_idx = self._pending_guidance_target_info["target_demo_idx"]
+        actual_next_distance = self.planner.compute_distance_to_demo_target(
+            next_obs,
+            target_demo_idx,
+        )
+        metrics = {
+            "actual_next_target_distance": actual_next_distance.detach().cpu(),
+            "current_target_distance": self._pending_guidance_target_info["current_target_distance"].detach().cpu(),
+            "target_demo_idx": target_demo_idx.detach().cpu(),
+            "num_inference_steps": self._pending_guidance_target_info["num_inference_steps"],
+        }
+        if "steering_comparison_metrics" in self._pending_guidance_target_info:
+            metrics.update(self._pending_guidance_target_info["steering_comparison_metrics"])
+        self._last_guidance_metrics = metrics
+        self._pending_guidance_target_info = None
+        return metrics
     
     # ========= training  ============
     def set_normalizer(self, normalizer: LinearNormalizer):

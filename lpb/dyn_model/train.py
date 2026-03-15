@@ -18,7 +18,7 @@ import warnings
 import itertools
 import numpy as np
 from tqdm import tqdm
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf, open_dict, ListConfig
 from einops import rearrange
 from accelerate import Accelerator
 from pathlib import Path
@@ -42,9 +42,23 @@ def seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def ensure_path_list(path_or_paths):
+    if isinstance(path_or_paths, ListConfig):
+        path_or_paths = list(path_or_paths)
+    if isinstance(path_or_paths, (list, tuple)):
+        return [str(path) for path in path_or_paths]
+    return [str(path_or_paths)]
+
+
+def path_list_contains(path_or_paths, keyword):
+    return any(keyword in path for path in ensure_path_list(path_or_paths))
+
 class Trainer:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.train_data_paths = ensure_path_list(self.cfg.env.train_data_path)
+        self.val_data_paths = ensure_path_list(self.cfg.env.val_data_path)
         with open_dict(cfg):
             cfg["saved_folder"] = os.getcwd()
             log.info(f"Model saved dir: {cfg['saved_folder']}")
@@ -91,16 +105,18 @@ class Trainer:
                     resume="allow",
                 )
             else:
-                if 'tool_hang' in self.cfg.env.train_data_path:
+                if path_list_contains(self.cfg.env.train_data_path, 'tool_hang'):
                     project_name = "tool_hang_ph_demo_v141_dyn_model"
-                elif 'square' in self.cfg.env.train_data_path:
+                elif path_list_contains(self.cfg.env.train_data_path, 'square'):
                     project_name = "square_ph_demo_v141_dyn_model"
-                elif 'transport' in self.cfg.env.train_data_path:
+                elif path_list_contains(self.cfg.env.train_data_path, 'transport'):
                     project_name = "transport_ph_demo_v141_dyn_model"
-                elif 'pusht' in self.cfg.env.train_data_path:
+                elif path_list_contains(self.cfg.env.train_data_path, 'pusht'):
                     project_name = "pusht_dyn_model"
-                elif 'libero' in self.cfg.env.train_data_path:
+                elif path_list_contains(self.cfg.env.train_data_path, 'libero'):
                     project_name = "libero_dyn_model"
+                else:
+                    project_name = "dyn_model"
                 self.wandb_run = wandb.init(
                     project=project_name,
                     config=wandb_dict,
@@ -206,7 +222,7 @@ class Trainer:
             if self.train_predictor
             else []
         )
-        if 'libero' in self.cfg.env.train_data_path:
+        if path_list_contains(self.cfg.env.train_data_path, 'libero'):
             self._keys_to_save += ["language_encoder"]
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
 
@@ -298,7 +314,7 @@ class Trainer:
                     for param in self.encoder.base_model.blocks[block_idx].parameters():
                         param.requires_grad = True
         language_emb_dim = 0
-        if 'libero' in self.cfg.env.train_data_path:
+        if path_list_contains(self.cfg.env.train_data_path, 'libero'):
             self.language_encoder = LanguageEncoder(policy_ckpt_path=self.cfg.env.policy_ckpt_path)
             for param in self.language_encoder.parameters():
                 param.requires_grad = False

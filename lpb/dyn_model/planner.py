@@ -52,6 +52,7 @@ class Planner:
         else:
             self.demo_max_samples = int(demo_max_samples)
         self.nn_chunk_size = max(1, int(nn_chunk_size))
+
         # Always honor runtime override before reading env metadata.
         if self.demo_dataset_path:
             self.demo_dataset_config.dataset_path = self.demo_dataset_path
@@ -115,6 +116,10 @@ class Planner:
         self.policy_action_normalizer = policy_action_normalizer
 
     def get_demo_latents(self,):
+        """(gaoyuan) 
+        precompute all the image latent; store them in large torch.Tensor;
+        also store metadata like: episode_end(List[int])
+        """
         demo_dataset: BaseImageDataset
         
         self.demo_dataset_config.val_ratio = 0
@@ -179,20 +184,58 @@ class Planner:
         del demo_dataset
  
     def compute_current_reward(self, current_obs):
+        """(gaoyuan)  
+        encodes the current observation into latent space(get z) --> nearest neighbour and min distance --> reward = - distance
+        """
         with torch.no_grad():
-            current_obs_wm = self.prepare_obs(current_obs, 1)
-            encode_obs = self.dyn_model.encode_obs(current_obs_wm)
-            current_visual_latent = encode_obs['visual'] # (1, 1, 196, 382*2)
-            reward, _ = self.compute_nn_reward(current_visual_latent.squeeze(1))
+            current_visual_latent = self.encode_current_visual_latent(current_obs)
+            reward, _ = self.compute_nn_reward(current_visual_latent.squeeze(1))    # nn = nearest neighbour
         return reward
 
-    def compute_nn_reward(self, current_visual_latent):
+    def _flatten_visual_latent(self, current_visual_latent):
         if len(current_visual_latent.shape) > 2:
             current_visual_latent = current_visual_latent.reshape(current_visual_latent.size(0), -1)
             if 'ToolHang' in self.env_name or 'Square' in self.env_name:
                 current_visual_latent = current_visual_latent[..., 512:]
             elif 'Transport' in self.env_name:
                 current_visual_latent = current_visual_latent[...,:1024]
+        return current_visual_latent
+
+    def encode_current_visual_latent(self, current_obs):
+        with torch.no_grad():
+            current_obs_wm = self.prepare_obs(current_obs, 1)
+            encode_obs = self.dyn_model.encode_obs(current_obs_wm)
+            current_visual_latent = encode_obs['visual']
+        return current_visual_latent
+
+    def get_guidance_target_info(self, current_obs):
+        with torch.no_grad():
+            current_visual_latent = self.encode_current_visual_latent(current_obs)
+            flat_visual_latent = self._flatten_visual_latent(current_visual_latent.squeeze(1))
+            reward, target_demo_idx = self.compute_nn_reward(flat_visual_latent)
+        return {
+            "reward": reward.detach(),
+            "target_demo_idx": target_demo_idx.detach(),
+            "current_target_distance": (-reward).detach(),
+        }
+
+    def compute_distance_to_demo_target(self, current_obs, target_demo_idx):
+        with torch.no_grad():
+            current_visual_latent = self.encode_current_visual_latent(current_obs)
+            flat_visual_latent = self._flatten_visual_latent(current_visual_latent.squeeze(1))
+            if not torch.is_tensor(target_demo_idx):
+                target_demo_idx = torch.as_tensor(target_demo_idx, device=flat_visual_latent.device, dtype=torch.long)
+            else:
+                target_demo_idx = target_demo_idx.to(device=flat_visual_latent.device, dtype=torch.long)
+            target_demo_latent = self.demo_visual_latents[target_demo_idx.detach().cpu()].to(
+                flat_visual_latent.device, non_blocking=True
+            )
+            distance = torch.norm(flat_visual_latent - target_demo_latent, dim=-1)
+        return distance
+
+    def compute_nn_reward(self, current_visual_latent):
+        """(gaoyuan) get nearest sample"""
+        current_visual_latent = self._flatten_visual_latent(current_visual_latent)
 
         device = current_visual_latent.device
         chunk_size = self.nn_chunk_size
@@ -242,6 +285,7 @@ class Planner:
             rew, idx = self.compute_nn_reward(z_obs['visual'])
             total_rew += rew
             t += inc
+            
         cost = -1 * total_rew
         loss = cost.mean()
         self.idx += 1

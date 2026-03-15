@@ -87,6 +87,39 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             # keyword arguments to scheduler.step
             **kwargs
             ):
+        """
+        Run the standard diffusion-policy denoising loop without LPB steering.
+
+        The sampler starts from Gaussian noise in trajectory space and iterates
+        over `scheduler.timesteps` until it produces a clean action trajectory.
+        At each diffusion step:
+
+        1. The observation-conditioned entries are re-imposed through
+           `condition_mask`.
+        2. The diffusion model predicts the residual for the current noisy
+           trajectory.
+        3. The scheduler applies one reverse-diffusion update.
+
+        The hybrid LPB policy keeps exactly this backbone loop, but inserts an
+        extra guidance update before the scheduler step:
+
+        1. Decode the current noisy sample into a cleaner action proposal.
+        2. Roll that proposal one step forward with the dynamics model from the
+           current real observation.
+        3. Measure how close the predicted next latent is to the demo latent
+           manifold.
+        4. Backpropagate that scalar cost to the noisy trajectory and nudge the
+           denoising direction before continuing the reverse process.
+
+        Important time axes:
+        - Diffusion timestep: the internal reverse-denoising iteration index.
+        - Environment timestep: the real control step in the simulator.
+        - Dynamics rollout step: the one-step latent prediction used only for
+          guidance inside one denoising pass.
+
+        This base class does not apply the guidance term itself; the LPB logic
+        is implemented in `DiffusionUnetHybridImagePolicy.guided_conditional_sample`.
+        """
         model = self.model
         scheduler = self.noise_scheduler
 
@@ -118,6 +151,28 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         trajectory[condition_mask] = condition_data[condition_mask]        
 
         return trajectory
+
+    def guided_conditional_sample(self,
+            condition_data, condition_mask,
+            local_cond=None, global_cond=None,
+            generator=None,
+            **kwargs):
+        """
+        Documentation-only entry for the LPB-guided sampler interface.
+
+        The base image policy has no dynamics-model steering term, so this
+        method simply forwards to `conditional_sample`. The full LPB behavior is
+        described in `conditional_sample` above and executed by the hybrid image
+        policy subclass.
+        """
+        return self.conditional_sample(
+            condition_data=condition_data,
+            condition_mask=condition_mask,
+            local_cond=local_cond,
+            global_cond=global_cond,
+            generator=generator,
+            **kwargs,
+        )
 
 
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

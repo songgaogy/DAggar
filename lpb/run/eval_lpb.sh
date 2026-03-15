@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 export CUDA_VISIBLE_DEVICES=1
 export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM="${MUJOCO_GL}"
+export PYOPENGL_PLATFORM=egl
 export LPB_RENDER_GPU_IDS="${LPB_RENDER_GPU_IDS:-$CUDA_VISIBLE_DEVICES}"
 export LPB_VECTOR_ENV_MODE="${LPB_VECTOR_ENV_MODE:-auto}"
 export LPB_VECTOR_ENV_CONTEXT="${LPB_VECTOR_ENV_CONTEXT:-spawn}"
@@ -26,10 +26,10 @@ DEFAULT_DYN_CKPT="/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03
 CONFIG_NAME="eval_transport"
 POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-$DEFAULT_POLICY_CKPT}"
 DYNAMICS_MODEL_CHECKPOINT="${DYNAMICS_MODEL_CHECKPOINT:-$DEFAULT_DYN_CKPT}"
-DEMO_DATASET_PATH="${DEMO_DATASET_PATH:-$REPO_ROOT/data/lpb/transport/transport_rollout_and_demo.hdf5}"
+DEMO_DATASET_PATH="/home/dodo/Documents/DAggar/robosuite/data/lpb/transport/transport_rollout_and_demo.hdf5"
 DATASET_PATH="${DATASET_PATH:-$DEMO_DATASET_PATH}"
 
-N_TEST=50
+N_TEST=50  
 N_TEST_VIS=1
 TEST_START_SEED=100000
 N_ACTION_STEPS=15
@@ -44,8 +44,9 @@ DEMO_LOADER_WORKERS=8
 DEMO_SUBSAMPLE_STRIDE=1
 DEMO_MAX_SAMPLES=null
 NN_CHUNK_SIZE=1024
+NUM_INFERENCE_STEPS_LIST='[20,50,100]'
 
-OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/data/eval/lpb_transport/$(date +%Y.%m.%d_%H.%M.%S)}"
+OUTPUT_DIR="/home/dodo/Documents/DAggar/robosuite/lpb/data/eval/lpb_transport/$(date +%Y.%m.%d_%H.%M.%S)"
 FORCE_OVERWRITE="${FORCE_OVERWRITE:-0}"
 BASE_RESULTS_PATH="${BASE_RESULTS_PATH:-}"
 
@@ -116,28 +117,64 @@ echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "N_TEST=$N_TEST N_TEST_VIS=$N_TEST_VIS TEST_START_SEED=$TEST_START_SEED"
 echo "GUIDANCE_SCALE=$GUIDANCE_SCALE THRESHOLD=$THRESHOLD"
 echo "DEMO_BATCH_SIZE=$DEMO_BATCH_SIZE DEMO_SUBSAMPLE_STRIDE=$DEMO_SUBSAMPLE_STRIDE DEMO_MAX_SAMPLES=$DEMO_MAX_SAMPLES"
+if [ -n "$NUM_INFERENCE_STEPS_LIST" ]; then
+  echo "NUM_INFERENCE_STEPS_LIST=$NUM_INFERENCE_STEPS_LIST"
+fi
+
+EVAL_CMD=(
+  python -X faulthandler /home/dodo/Documents/DAggar/robosuite/lpb/eval_test_time_optimization.py
+  --config-name="$CONFIG_NAME"
+  policy_checkpoint="$POLICY_CHECKPOINT"
+  dynamics_model_checkpoint="$DYNAMICS_MODEL_CHECKPOINT"
+  demo_dataset_path="$DEMO_DATASET_PATH"
+  ++dataset_path="$DATASET_PATH"
+  n_test="$N_TEST"
+  n_test_vis="$N_TEST_VIS"
+  test_start_seed="$TEST_START_SEED"
+  n_action_steps="$N_ACTION_STEPS"
+  guidance_start_timestep="$GUIDANCE_START_TIMESTEP"
+  guidance_scale="$GUIDANCE_SCALE"
+  threshold="$THRESHOLD"
+  demo_batch_size="$DEMO_BATCH_SIZE"
+  demo_loader_workers="$DEMO_LOADER_WORKERS"
+  demo_subsample_stride="$DEMO_SUBSAMPLE_STRIDE"
+  demo_max_samples="$DEMO_MAX_SAMPLES"
+  nn_chunk_size="$NN_CHUNK_SIZE"
+  output_dir="$OUTPUT_DIR"
+  device="$DEVICE"
+)
+
+if [ -n "$NUM_INFERENCE_STEPS_LIST" ]; then
+  EVAL_CMD+=("num_inference_steps_list=$NUM_INFERENCE_STEPS_LIST")
+fi
 
 cd "$SCRIPT_DIR"
-python -X faulthandler eval_test_time_optimization.py \
-  --config-name="$CONFIG_NAME" \
-  policy_checkpoint="$POLICY_CHECKPOINT" \
-  dynamics_model_checkpoint="$DYNAMICS_MODEL_CHECKPOINT" \
-  demo_dataset_path="$DEMO_DATASET_PATH" \
-  ++dataset_path="$DATASET_PATH" \
-  n_test="$N_TEST" \
-  n_test_vis="$N_TEST_VIS" \
-  test_start_seed="$TEST_START_SEED" \
-  n_action_steps="$N_ACTION_STEPS" \
-  guidance_start_timestep="$GUIDANCE_START_TIMESTEP" \
-  guidance_scale="$GUIDANCE_SCALE" \
-  threshold="$THRESHOLD" \
-  demo_batch_size="$DEMO_BATCH_SIZE" \
-  demo_loader_workers="$DEMO_LOADER_WORKERS" \
-  demo_subsample_stride="$DEMO_SUBSAMPLE_STRIDE" \
-  demo_max_samples="$DEMO_MAX_SAMPLES" \
-  nn_chunk_size="$NN_CHUNK_SIZE" \
-  output_dir="$OUTPUT_DIR" \
-  device="$DEVICE"
+("${EVAL_CMD[@]}")
+
+if [ -n "$NUM_INFERENCE_STEPS_LIST" ]; then
+  steps_list="${NUM_INFERENCE_STEPS_LIST#[}"
+  steps_list="${steps_list%]}"
+  IFS=',' read -r -a STEP_VALUES <<< "$steps_list"
+  for raw_step in "${STEP_VALUES[@]}"; do
+    step="$(echo "$raw_step" | xargs)"
+    step_output_dir="$OUTPUT_DIR/denoise_steps_${step}"
+    if [ ! -f "$step_output_dir/eval_results.json" ]; then
+      echo "missing eval results for denoise_steps_${step}: $step_output_dir/eval_results.json"
+      continue
+    fi
+    SUMMARY_ARGS=(
+      --eval-results "$step_output_dir/eval_results.json"
+      --output "$step_output_dir/eval_lpb_summary.json"
+      --success-reward-threshold "$SUCCESS_REWARD_THRESHOLD"
+    )
+    if [ -n "$BASE_RESULTS_PATH" ]; then
+      SUMMARY_ARGS+=(--base-results "$BASE_RESULTS_PATH")
+    fi
+    python summarize_lpb_eval.py "${SUMMARY_ARGS[@]}"
+    echo "Saved final LPB summary to: $step_output_dir/eval_lpb_summary.json"
+  done
+  exit 0
+fi
 
 SUMMARY_ARGS=(
   --eval-results "$OUTPUT_DIR/eval_results.json"

@@ -189,6 +189,7 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
         n_inits = len(self.env_configs)  # total number of train + test inits
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        all_guidance_metrics = [None] * n_inits
 
         for i, env_cfg in enumerate(self.env_configs):
             prefix = env_cfg['prefix']
@@ -216,6 +217,7 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
             policy.reset()
             past_action = None
             rewards = []
+            guidance_metrics = []
 
             # Build a progress bar for steps
             # Use environment name from self.env_meta
@@ -257,6 +259,14 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
 
                 obs, reward, done, info = env.step(env_action)
                 success = env.env.get_success_label()
+                if hasattr(policy, "compute_actual_next_state_guidance_metrics"):
+                    next_obs_dict = dict_apply(
+                        dict(obs),
+                        lambda x: torch.from_numpy(np.expand_dims(x, axis=0)).to(device=device)
+                    )
+                    next_metrics = policy.compute_actual_next_state_guidance_metrics(next_obs_dict)
+                    if next_metrics is not None:
+                        guidance_metrics.append(next_metrics)
 
                 done = np.all(done)
                 past_action = action
@@ -274,12 +284,23 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
                 video_path = video_path[0]
             all_video_paths[i] = video_path
             all_rewards[i] = rewards
+            all_guidance_metrics[i] = guidance_metrics
             env.close()
             del env
 
         # Log results
         max_rewards = collections.defaultdict(list)
         log_data = dict()
+        metric_aliases = {
+            "actual_next_target_distance": "next_target_latent_distance",
+            "current_target_distance": "current_target_latent_distance",
+            "guided_predicted_next_demo_distance": "guided_predicted_next_demo_distance",
+            "base_predicted_next_demo_distance": "base_predicted_next_demo_distance",
+            "predicted_next_demo_distance_improvement": "predicted_next_demo_distance_improvement",
+            "guided_base_predicted_next_latent_distance": "guided_base_predicted_next_latent_distance",
+            "guided_base_action_distance": "guided_base_action_distance",
+            "guided_base_action_max_abs_distance": "guided_base_action_max_abs_distance",
+        }
 
         for i, env_cfg in enumerate(self.env_configs):
             prefix = env_cfg['prefix']
@@ -307,10 +328,48 @@ class SequentialRobomimicImageRunner(BaseImageRunner):
                 else:
                     log_data[prefix + f'sim_video_{env_cfg["seed"]}'] = sim_video
 
+            guidance_metrics = all_guidance_metrics[i]
+            if len(guidance_metrics) > 0:
+                per_metric_values = dict()
+                for metric_key, metric_alias in metric_aliases.items():
+                    values = [
+                        float(metric[metric_key].mean().item())
+                        for metric in guidance_metrics
+                        if metric_key in metric
+                    ]
+                    if len(values) > 0:
+                        per_metric_values[metric_alias] = np.array(values)
+                if prefix.startswith('train'):
+                    metric_suffix = str(i)
+                else:
+                    metric_suffix = str(env_cfg["seed"])
+                for metric_alias, values in per_metric_values.items():
+                    log_data[prefix + f'avg_{metric_alias}_{metric_suffix}'] = float(values.mean())
+                if (
+                    "next_target_latent_distance" in per_metric_values
+                    and "current_target_latent_distance" in per_metric_values
+                ):
+                    log_data[prefix + f'avg_target_latent_distance_delta_{metric_suffix}'] = float(
+                        (
+                            per_metric_values["next_target_latent_distance"]
+                            - per_metric_values["current_target_latent_distance"]
+                        ).mean()
+                    )
+
         # log aggregate metrics
         for prefix, value in max_rewards.items():
             name = prefix + 'mean_score'
             log_data[name] = np.mean(value)
+
+        for prefix in ['train/', 'test/']:
+            for metric_alias in list(metric_aliases.values()) + ['target_latent_distance_delta']:
+                prefix_metric_values = [
+                    float(log_data[key])
+                    for key in log_data
+                    if key.startswith(prefix + f'avg_{metric_alias}_')
+                ]
+                if len(prefix_metric_values) > 0:
+                    log_data[prefix + f'mean_{metric_alias}'] = float(np.mean(prefix_metric_values))
 
         return log_data
 

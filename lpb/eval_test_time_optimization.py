@@ -4,7 +4,7 @@ import pathlib
 
 import numpy as np
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, ListConfig
 import torch
 import dill
 import wandb
@@ -15,10 +15,45 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 
+def _to_int_list(value):
+    if value is None:
+        return None
+    if isinstance(value, ListConfig):
+        value = list(value)
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    return [int(value)]
+
+
+def _instantiate_env_runner(cfg_task_env_runner, output_dir):
+    dataset_target = cfg_task_env_runner.task.dataset._target_
+    if 'libero' in dataset_target:
+        return hydra.utils.instantiate(
+            cfg_task_env_runner.task.env_runner,
+            output_dir=output_dir,
+            task_dir=cfg_task_env_runner.task.env_runner.dataset_path
+        )
+    return hydra.utils.instantiate(
+        cfg_task_env_runner.task.env_runner,
+        output_dir=output_dir
+    )
+
+
+def _convert_runner_log(runner_log):
+    results = {}
+    for key, value in runner_log.items():
+        if isinstance(value, wandb.sdk.data_types.video.Video):
+            results[key] = value._path
+        else:
+            results[key] = value
+    return results
+
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="eval_transport")
 def main(cfg: DictConfig):
     output_dir = cfg.output_dir
 
+    # save for outputs
     if os.path.exists(output_dir):
         confirm = input(f"Output path {output_dir} already exists! Overwrite? (y/N): ")
         if confirm.lower() != 'y':
@@ -77,7 +112,7 @@ def main(cfg: DictConfig):
     policy.initialize_planner(
         planner_target=cfg.planner_target,
         demo_dataset_config=cfg_task_env_runner.task.dataset,
-        dynamics_model_ckpt=cfg.dynamics_model_checkpoint,
+        dynamics_model_ckpt=cfg.dynamics_model_checkpoint,      # load dynamic model
         action_step=cfg_task_env_runner.n_action_steps,
         output_dir=cfg.output_dir,
         guidance_start_timestep=cfg.guidance_start_timestep,
@@ -94,35 +129,48 @@ def main(cfg: DictConfig):
     # Run evaluation - use env_runner_target from the planner config
     cfg_task_env_runner.task.env_runner._target_ = cfg.env_runner_target
 
-    # Check if it's a libero task by examining the dataset target
-    dataset_target = cfg_task_env_runner.task.dataset._target_
-    if 'libero' in dataset_target:
-        env_runner = hydra.utils.instantiate(
-            cfg_task_env_runner.task.env_runner,
-            output_dir=output_dir,
-            task_dir=cfg_task_env_runner.task.env_runner.dataset_path
-        )
-    else:
-        env_runner = hydra.utils.instantiate(
-            cfg_task_env_runner.task.env_runner,
-            output_dir=output_dir
-        )
+    inference_steps_list = _to_int_list(cfg.get('num_inference_steps_list', None))
+    if inference_steps_list is None:
+        inference_steps_list = [int(policy.num_inference_steps)]
 
-    runner_log = env_runner.run(policy)
-    
-    # Save evaluation results separately
-    results = {}
-    for key, value in runner_log.items():
-        if isinstance(value, wandb.sdk.data_types.video.Video):
-            results[key] = value._path
-        else:
-            results[key] = value
-    
-    results_path = os.path.join(output_dir, 'eval_results.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2, sort_keys=True)
+    if len(inference_steps_list) == 1:
+        policy.num_inference_steps = int(inference_steps_list[0])
+        env_runner = _instantiate_env_runner(cfg_task_env_runner, output_dir)
+        runner_log = env_runner.run(policy)
+        results = _convert_runner_log(runner_log)
+        results_path = os.path.join(output_dir, 'eval_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+        print(f"Evaluation results saved to {results_path}")
+        return
 
-    print(f"Evaluation results saved to {results_path}")
+    sweep_results = {}
+    for num_inference_steps in inference_steps_list:
+        run_output_dir = os.path.join(output_dir, f"denoise_steps_{num_inference_steps}")
+        pathlib.Path(run_output_dir).mkdir(parents=True, exist_ok=True)
+        policy.num_inference_steps = int(num_inference_steps)
+        env_runner = _instantiate_env_runner(cfg_task_env_runner, run_output_dir)
+        runner_log = env_runner.run(policy)
+        results = _convert_runner_log(runner_log)
+        results['num_inference_steps'] = int(num_inference_steps)
+
+        results_path = os.path.join(run_output_dir, 'eval_results.json')
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+        sweep_results[str(num_inference_steps)] = {
+            'output_dir': run_output_dir,
+            'results_path': results_path,
+            'metrics': {
+                key: value for key, value in results.items()
+                if isinstance(value, (int, float, bool))
+            }
+        }
+        print(f"Evaluation results saved to {results_path}")
+
+    sweep_path = os.path.join(output_dir, 'eval_results_sweep.json')
+    with open(sweep_path, 'w') as f:
+        json.dump(sweep_results, f, indent=2, sort_keys=True)
+    print(f"Evaluation sweep summary saved to {sweep_path}")
 
 
 if __name__ == '__main__':

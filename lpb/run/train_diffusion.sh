@@ -35,7 +35,7 @@ TRAIN_DEVICE="cuda:0"
 ROLLOUT_EVERY=10
 
 
-python -X faulthandler train.py \
+python -X faulthandler /home/dodo/Documents/DAggar/robosuite/lpb/train.py \
     --config-dir=. \
     --config-name=image_transport_diffusion_policy_cnn.yaml \
     training.seed=42 \

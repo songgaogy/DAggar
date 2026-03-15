@@ -22,9 +22,10 @@ conda activate lpb
 DEFAULT_POLICY_CKPT="/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.09/11.53.10_train_diffusion_unet_hybrid_transport_image/checkpoints/20.ckpt"
 
 ENV_NAME="transport"
-TRAIN_DATA_PATH="/home/dodo/Documents/DAggar/robosuite/data/lpb/transport/transport_rollout_and_demo.hdf5"
+EXPERT_DATA_PATH="/home/dodo/Documents/DAggar/robosuite/data/lpb/transport/transport_rollout_and_demo.hdf5"
+ROLLOUT_DATA_DIR="/home/dodo/Documents/DAggar/robosuite/data/lpb/transport/rollouts"
 VAL_DATA_PATH="/home/dodo/Documents/DAggar/robosuite/data/lpb/transport/transport_val.hdf5"
-POLICY_CKPT_PATH="${DEFAULT_POLICY_CKPT}"
+POLICY_CKPT_PATH="${POLICY_CKPT_PATH:-$DEFAULT_POLICY_CKPT}"
 
 SEED="42"
 DEVICE="cuda:0"
@@ -34,14 +35,14 @@ SAVE_EVERY="10"
 ENCODER_LR=1e-7
 PREDICTOR_LR=5e-4
 ACTION_ENCODER_LR=5e-4
-HYDRA_RUN_DIR='./data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${env.name}'
+HYDRA_RUN_DIR='/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${env.name}'
 
 if [ -z "$POLICY_CKPT_PATH" ]; then
   echo "policy checkpoint is required. Set POLICY_CKPT_PATH=/path/to/base_policy.ckpt"
   exit 1
 fi
-if [ ! -f "$TRAIN_DATA_PATH" ]; then
-  echo "train dataset file not found: $TRAIN_DATA_PATH"
+if [ ! -f "$EXPERT_DATA_PATH" ]; then
+  echo "expert dataset file not found: $EXPERT_DATA_PATH"
   exit 1
 fi
 if [ ! -f "$VAL_DATA_PATH" ]; then
@@ -53,18 +54,35 @@ if [ ! -f "$POLICY_CKPT_PATH" ]; then
   exit 1
 fi
 
-echo "TRAIN_DATA_PATH=$TRAIN_DATA_PATH"
+TRAIN_DATA_FILES=("$EXPERT_DATA_PATH")
+if [ -d "$ROLLOUT_DATA_DIR" ]; then
+  while IFS= read -r rollout_file; do
+    TRAIN_DATA_FILES+=("$rollout_file")
+  done < <(find "$ROLLOUT_DATA_DIR" -maxdepth 1 -type f -name '*.hdf5' | sort)
+fi
+
+TRAIN_DATA_PATHS='['
+for train_data_file in "${TRAIN_DATA_FILES[@]}"; do
+  escaped_path="${train_data_file//\\/\\\\}"
+  escaped_path="${escaped_path//\"/\\\"}"
+  TRAIN_DATA_PATHS+="\"$escaped_path\","
+done
+TRAIN_DATA_PATHS="${TRAIN_DATA_PATHS%,}]"
+
+echo "EXPERT_DATA_PATH=$EXPERT_DATA_PATH"
+echo "ROLLOUT_DATA_DIR=$ROLLOUT_DATA_DIR"
+echo "NUM_TRAIN_DATA_FILES=${#TRAIN_DATA_FILES[@]}"
 echo "VAL_DATA_PATH=$VAL_DATA_PATH"
 echo "POLICY_CKPT_PATH=$POLICY_CKPT_PATH"
 echo "DEVICE=$DEVICE"
 echo "SEED=$SEED"
 echo "EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE"
 
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR"/..
 python -X faulthandler -m dyn_model.train \
   --config-name=train \
   env="$ENV_NAME" \
-  env.train_data_path="$TRAIN_DATA_PATH" \
+  env.train_data_path="$TRAIN_DATA_PATHS" \
   env.val_data_path="$VAL_DATA_PATH" \
   env.policy_ckpt_path="$POLICY_CKPT_PATH" \
   training.seed="$SEED" \

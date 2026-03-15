@@ -11,11 +11,66 @@ from torch.utils.data import Dataset
 import numpy as np
 import copy
 import shutil
+from omegaconf import ListConfig
 
 import zarr
 from einops import rearrange
 import random
 from torch.utils.data import DataLoader
+
+
+def _normalize_dataset_paths(dataset_path):
+    if isinstance(dataset_path, ListConfig):
+        dataset_path = list(dataset_path)
+    if isinstance(dataset_path, (list, tuple)):
+        return [os.path.expanduser(str(path)) for path in dataset_path]
+    return [os.path.expanduser(str(dataset_path))]
+
+
+def _load_replay_buffer_from_path(dataset_path, shape_meta, abs_action, rotation_transformer):
+    cache_zarr_path = dataset_path + '.zarr.zip'
+    cache_lock_path = cache_zarr_path + '.lock'
+    print(f'Acquiring lock on cache: {dataset_path}')
+    with FileLock(cache_lock_path):
+        if not os.path.exists(cache_zarr_path):
+            try:
+                print(f'Cache does not exist. Creating: {dataset_path}')
+                replay_buffer = _convert_robomimic_to_replay(
+                    store=zarr.MemoryStore(),
+                    shape_meta=shape_meta,
+                    dataset_path=dataset_path,
+                    abs_action=abs_action,
+                    rotation_transformer=rotation_transformer)
+                print(f'Saving cache to disk: {cache_zarr_path}')
+                with zarr.ZipStore(cache_zarr_path) as zip_store:
+                    replay_buffer.save_to_store(store=zip_store)
+            except Exception as e:
+                if os.path.exists(cache_zarr_path):
+                    os.remove(cache_zarr_path)
+                raise e
+        else:
+            print(f'Loading cached ReplayBuffer from Disk: {dataset_path}')
+            with zarr.ZipStore(cache_zarr_path, mode='r') as zip_store:
+                replay_buffer = ReplayBuffer.copy_from_store(
+                    src_store=zip_store, store=zarr.MemoryStore())
+            print('Loaded!')
+    return replay_buffer
+
+
+def _load_replay_buffer(dataset_paths, shape_meta, abs_action, rotation_transformer):
+    replay_buffers = [
+        _load_replay_buffer_from_path(path, shape_meta, abs_action, rotation_transformer)
+        for path in dataset_paths
+    ]
+    if len(replay_buffers) == 1:
+        return replay_buffers[0]
+
+    combined_buffer = ReplayBuffer.create_empty_numpy()
+    for replay_buffer in replay_buffers:
+        for episode_idx in range(replay_buffer.n_episodes):
+            combined_buffer.add_episode(replay_buffer.get_episode(episode_idx, copy=True))
+    return combined_buffer
+
 
 class RobomimicImageDynamicsModelDataset(Dataset):
     def __init__(self, 
@@ -54,34 +109,14 @@ class RobomimicImageDynamicsModelDataset(Dataset):
         }
         rotation_transformer = RotationTransformer(
             from_rep='axis_angle', to_rep='rotation_6d')
-        
-        cache_zarr_path = zarr_path + '.zarr.zip'
-        cache_lock_path = cache_zarr_path + '.lock'
-        print('Acquiring lock on cache.')
-        with FileLock(cache_lock_path):
-            if not os.path.exists(cache_zarr_path):
-                try:
-                    print('Cache does not exist. Creating!')
-                    replay_buffer = _convert_robomimic_to_replay(
-                        store=zarr.MemoryStore(), 
-                        shape_meta=shape_meta, 
-                        dataset_path=zarr_path, 
-                        abs_action=abs_action, 
-                        rotation_transformer=rotation_transformer)
-                    print('Saving cache to disk.')
-                    with zarr.ZipStore(cache_zarr_path) as zip_store:
-                        replay_buffer.save_to_store(
-                            store=zip_store
-                        )
-                except Exception as e:
-                    shutil.rmtree(cache_zarr_path)
-                    raise e
-            else:
-                print('Loading cached ReplayBuffer from Disk.')
-                with zarr.ZipStore(cache_zarr_path, mode='r') as zip_store:
-                    replay_buffer = ReplayBuffer.copy_from_store(
-                        src_store=zip_store, store=zarr.MemoryStore())
-                print('Loaded!')
+
+        self.dataset_paths = _normalize_dataset_paths(zarr_path)
+        replay_buffer = _load_replay_buffer(
+            dataset_paths=self.dataset_paths,
+            shape_meta=shape_meta,
+            abs_action=abs_action,
+            rotation_transformer=rotation_transformer,
+        )
                 
         # Extract episode ends (1-indexed)
         self.episode_ends = replay_buffer.episode_ends[:]
@@ -185,4 +220,3 @@ class RobomimicImageDynamicsModelDataset(Dataset):
         for view_name in self.view_names:
             normalizer[view_name] = get_image_range_normalizer()
         return normalizer
-

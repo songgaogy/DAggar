@@ -13,6 +13,7 @@ n_test: 50
 n_test_vis: 0
 test_start_seed: 100000
 n_action_steps: 15
+num_inference_steps_list: null
 
 # Memory controls for planner latent cache
 demo_batch_size: 32
