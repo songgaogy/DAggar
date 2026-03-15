@@ -152,6 +152,8 @@ class LPBFeatureExtractor:
         num_heads = int(_cfg_get(cfg, "model.num_heads", 8))
         dropout = float(_cfg_get(cfg, "model.dropout", 0.1))
         max_action_horizon = int(_cfg_get(cfg, "model.max_action_horizon", action_horizon))
+        fusion_hidden_dim = int(_cfg_get(cfg, "model.fusion_hidden_dim", d_model))
+        projection_dim = int(_cfg_get(cfg, "model.projection_dim", 128))
         normalize_input = bool(_cfg_get(cfg, "encoder.normalize_input", True))
 
         encoder = Encoder(
@@ -169,8 +171,13 @@ class LPBFeatureExtractor:
             nhead=num_heads,
             dropout=dropout,
             max_action_horizon=max(max_action_horizon, action_horizon),
+            fusion_hidden_dim=fusion_hidden_dim,
         )
-        model = DynamicsModel(encoder=encoder, predictor=predictor)
+        model = DynamicsModel(
+            encoder=encoder,
+            predictor=predictor,
+            projection_dim=projection_dim,
+        )
         model.load_state_dict(payload["model"], strict=True)
         model.to(self.device)
         model.eval()

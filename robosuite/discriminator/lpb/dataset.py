@@ -22,6 +22,7 @@ class _TransitionRef:
     t: int
     horizon: int
     is_expert: bool
+    traj_length: int
 
 
 def _expand_hdf5_inputs(paths: Optional[Sequence[str]]) -> List[str]:
@@ -55,12 +56,34 @@ class LatentDynamicsDataset(Dataset):
         proprio_indices: Optional[Sequence[int]] = None,
         image_size: Optional[Tuple[int, int]] = None,
         max_trajectories: Optional[int] = None,
+        failure_tail_ratio: float = 0.3,
+        failure_soft_start_ratio: float = 0.55,
+        failure_soft_power: float = 2.0,
     ) -> None:
         super().__init__()
         self.camera_name = str(camera_name)
         self.horizon = int(horizon)
         if self.horizon <= 0:
             raise ValueError(f"horizon must be >= 1, got {horizon}")
+        self.failure_tail_ratio = float(failure_tail_ratio)
+        self.failure_soft_start_ratio = float(failure_soft_start_ratio)
+        self.failure_soft_power = float(failure_soft_power)
+        if not (0.0 < self.failure_tail_ratio < 1.0):
+            raise ValueError(
+                f"failure_tail_ratio must be in (0, 1), got {self.failure_tail_ratio}"
+            )
+        if not (0.0 <= self.failure_soft_start_ratio < 1.0):
+            raise ValueError(
+                "failure_soft_start_ratio must be in [0, 1), "
+                f"got {self.failure_soft_start_ratio}"
+            )
+        if self.failure_soft_start_ratio > (1.0 - self.failure_tail_ratio):
+            raise ValueError(
+                "failure_soft_start_ratio should not exceed the nominal fail boundary "
+                f"{1.0 - self.failure_tail_ratio:.3f}"
+            )
+        if self.failure_soft_power <= 0.0:
+            raise ValueError(f"failure_soft_power must be > 0, got {self.failure_soft_power}")
 
         self.proprio_indices = None if proprio_indices is None else np.asarray(proprio_indices, dtype=np.int64)
         if self.proprio_indices is not None and self.proprio_indices.size == 0:
@@ -154,6 +177,7 @@ class LatentDynamicsDataset(Dataset):
                                 t=t,
                                 horizon=self.horizon,
                                 is_expert=is_expert,
+                                traj_length=length,
                             )
                         )
                         self._sample_is_expert.append(is_expert)
@@ -210,6 +234,24 @@ class LatentDynamicsDataset(Dataset):
         chw = np.transpose(img, (2, 0, 1))
         return torch.from_numpy(chw)
 
+    def _failure_confidence(self, ref: _TransitionRef) -> float:
+        if ref.is_expert:
+            return 0.0
+
+        denom = max(ref.traj_length - 1, 1)
+        progress = float(ref.t + ref.horizon) / float(denom)
+        progress = float(np.clip(progress, 0.0, 1.0))
+        soft_start = self.failure_soft_start_ratio
+        hard_start = 1.0 - self.failure_tail_ratio
+        if progress <= soft_start:
+            return 0.0
+        if progress >= hard_start:
+            return 1.0
+
+        scaled = (progress - soft_start) / max(hard_start - soft_start, 1e-6)
+        scaled = float(np.clip(scaled, 0.0, 1.0))
+        return float(scaled ** self.failure_soft_power)
+
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         ref = self._refs[index]
         with h5py.File(ref.file_path, "r") as f:
@@ -247,4 +289,12 @@ class LatentDynamicsDataset(Dataset):
             "target_image": tgt_img,
             "target_proprio": torch.from_numpy(tgt_prop),
             "is_expert": torch.tensor(1 if ref.is_expert else 0, dtype=torch.int64),
+            "sample_progress": torch.tensor(
+                float(ref.t + ref.horizon) / float(max(ref.traj_length - 1, 1)),
+                dtype=torch.float32,
+            ),
+            "failure_confidence": torch.tensor(
+                self._failure_confidence(ref),
+                dtype=torch.float32,
+            ),
         }

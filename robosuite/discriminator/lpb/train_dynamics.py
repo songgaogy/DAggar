@@ -71,6 +71,9 @@ def main(cfg: DictConfig) -> None:
         max_trajectories=(
             None if int(cfg.data.max_trajectories) <= 0 else int(cfg.data.max_trajectories)
         ),
+        failure_tail_ratio=float(cfg.data.failure_tail_ratio),
+        failure_soft_start_ratio=float(cfg.data.failure_soft_start_ratio),
+        failure_soft_power=float(cfg.data.failure_soft_power),
     )
     print(
         f"dataset size={len(dataset)} expert_samples={dataset.num_expert_samples} "
@@ -101,8 +104,13 @@ def main(cfg: DictConfig) -> None:
         nhead=int(cfg.model.num_heads),
         dropout=float(cfg.model.dropout),
         max_action_horizon=max(int(cfg.model.max_action_horizon), int(cfg.data.horizon)),
+        fusion_hidden_dim=int(cfg.model.fusion_hidden_dim),
     )
-    model = DynamicsModel(encoder=encoder, predictor=predictor)
+    model = DynamicsModel(
+        encoder=encoder,
+        predictor=predictor,
+        projection_dim=int(cfg.model.projection_dim),
+    )
 
     trainer_cfg = TrainerConfig(
         batch_size=int(cfg.training.batch_size),
@@ -112,6 +120,11 @@ def main(cfg: DictConfig) -> None:
         epochs=int(cfg.training.epochs),
         expert_sampling_ratio=float(cfg.training.expert_ratio),
         proprio_loss_weight=float(cfg.training.proprio_loss_weight),
+        contrastive_loss_weight=float(cfg.training.contrastive_loss_weight),
+        contrastive_temperature=float(cfg.training.contrastive_temperature),
+        contrastive_negative_confidence_threshold=float(
+            cfg.training.contrastive_negative_confidence_threshold
+        ),
         grad_clip_norm=float(cfg.training.grad_clip_norm),
         log_every=int(cfg.training.log_every),
     )

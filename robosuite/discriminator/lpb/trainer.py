@@ -19,6 +19,9 @@ class TrainerConfig:
     epochs: int = 50
     expert_sampling_ratio: float = 0.5
     proprio_loss_weight: float = 0.0
+    contrastive_loss_weight: float = 0.0
+    contrastive_temperature: float = 0.1
+    contrastive_negative_confidence_threshold: float = 0.0
     grad_clip_norm: float = 1.0
     log_every: int = 50
 
@@ -132,6 +135,11 @@ class Trainer:
                 target_image=b["target_image"],
                 target_proprio=b["target_proprio"],
                 proprio_loss_weight=self.cfg.proprio_loss_weight,
+                is_expert=b.get("is_expert"),
+                failure_confidence=b.get("failure_confidence"),
+                contrastive_loss_weight=self.cfg.contrastive_loss_weight,
+                contrastive_temperature=self.cfg.contrastive_temperature,
+                negative_confidence_threshold=self.cfg.contrastive_negative_confidence_threshold,
             )
             loss = stats["loss"]
             if train:
@@ -143,6 +151,7 @@ class Trainer:
         out = {
             "loss": float(stats["loss"].detach().item()),
             "latent_mse": float(stats["latent_mse"].detach().item()),
+            "contrastive_loss": float(stats["contrastive_loss"].detach().item()),
         }
         if "proprio_mse" in stats:
             out["proprio_mse"] = float(stats["proprio_mse"].detach().item())
@@ -164,7 +173,8 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f}"
+                    f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f} "
+                    f"contrastive={out['contrastive_loss']:.6f}"
                 )
         return self._mean_metrics(logs)
 
@@ -180,7 +190,8 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f}"
+                    f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f} "
+                    f"contrastive={out['contrastive_loss']:.6f}"
                 )
         return self._mean_metrics(logs)
 

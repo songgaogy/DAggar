@@ -35,7 +35,7 @@ detector:
   transition_aux_weight: 0.5
 
 labels:
-  fail_tail_ratio: 0.2
+  fail_tail_ratio: 0.3
 
 online:
   adaptive_delta: true

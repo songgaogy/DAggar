@@ -185,8 +185,8 @@ class DecoderBlock(nn.Module):
 class DynamicsPredictor(nn.Module):
     """
     Decoder-only transformer transition model f_phi.
-    Input tokens: [z_t, s_t, a_t, ..., a_{t+h-1}, <pred_z>, <pred_s>]
-    Output heads read from the final two tokens.
+    Input tokens: [z_t, s_t, a_t, ..., a_{t+h-1}, <act_summary>, <pred_z>, <pred_s>]
+    Output heads fuse query states with summary/context tokens.
     """
 
     def __init__(
@@ -200,22 +200,30 @@ class DynamicsPredictor(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         max_action_horizon: int = 32,
+        fusion_hidden_dim: int = 512,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.proprio_dim = int(proprio_dim)
         self.action_dim = int(action_dim)
         self.max_action_horizon = int(max_action_horizon)
+        self.fusion_hidden_dim = int(fusion_hidden_dim)
 
         self.obs_proj = nn.Linear(self.latent_dim, d_model)
         self.proprio_proj = nn.Linear(self.proprio_dim, d_model)
         self.action_proj = nn.Linear(self.action_dim, d_model)
+        self.action_summary_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
 
         # Query tokens used to decode predicted future latent/proprio.
+        self.action_summary_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pred_latent_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pred_proprio_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
-        max_seq_len = 2 + self.max_action_horizon + 2
+        max_seq_len = 2 + self.max_action_horizon + 3
         self.pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
@@ -230,8 +238,30 @@ class DynamicsPredictor(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(d_model)
-        self.latent_head = nn.Linear(d_model, self.latent_dim)
-        self.proprio_head = nn.Linear(d_model, self.proprio_dim)
+        self.latent_fusion = nn.Sequential(
+            nn.Linear(d_model * 3, self.fusion_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.fusion_hidden_dim),
+            nn.Linear(self.fusion_hidden_dim, d_model),
+            nn.GELU(),
+        )
+        self.proprio_fusion = nn.Sequential(
+            nn.Linear(d_model * 3, self.fusion_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.LayerNorm(self.fusion_hidden_dim),
+            nn.Linear(self.fusion_hidden_dim, d_model),
+            nn.GELU(),
+        )
+        self.latent_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, self.latent_dim),
+        )
+        self.proprio_head = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, self.proprio_dim),
+        )
 
     def _causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         mask = torch.full((seq_len, seq_len), float("-inf"), device=device)
@@ -267,11 +297,13 @@ class DynamicsPredictor(nn.Module):
         obs = self.obs_proj(obs_token).unsqueeze(1)  # (B,1,D)
         prop = self.proprio_proj(proprio_token).unsqueeze(1)  # (B,1,D)
         act = self.action_proj(action_tokens)  # (B,H,D)
+        act_summary = self.action_summary_proj(act.mean(dim=1, keepdim=True))
 
+        summary_tok = self.action_summary_token.expand(bsz, -1, -1) + act_summary
         pred_z_tok = self.pred_latent_token.expand(bsz, -1, -1)
         pred_s_tok = self.pred_proprio_token.expand(bsz, -1, -1)
 
-        x = torch.cat([obs, prop, act, pred_z_tok, pred_s_tok], dim=1)
+        x = torch.cat([obs, prop, act, summary_tok, pred_z_tok, pred_s_tok], dim=1)
         seq_len = x.size(1)
         x = x + self.pos_embedding[:, :seq_len, :]
         x = self.drop(x)
@@ -281,8 +313,16 @@ class DynamicsPredictor(nn.Module):
             x = blk(x, attn_mask=mask)
         x = self.norm(x)
 
-        pred_latent = self.latent_head(x[:, -2, :])
-        pred_proprio = self.proprio_head(x[:, -1, :])
+        summary_state = x[:, -(2 + 1), :]
+        latent_state = self.latent_fusion(
+            torch.cat([x[:, -2, :], summary_state, x[:, 0, :]], dim=-1)
+        )
+        proprio_state = self.proprio_fusion(
+            torch.cat([x[:, -1, :], summary_state, x[:, 1, :]], dim=-1)
+        )
+
+        pred_latent = self.latent_head(latent_state)
+        pred_proprio = self.proprio_head(proprio_state)
         return {"pred_latent": pred_latent, "pred_proprio": pred_proprio}
 
 
@@ -295,10 +335,17 @@ class DynamicsModel(nn.Module):
         self,
         encoder: Encoder,
         predictor: DynamicsPredictor,
+        projection_dim: int = 128,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.predictor = predictor
+        self.projection_dim = int(projection_dim)
+        self.contrastive_head = nn.Sequential(
+            nn.Linear(self.encoder.latent_dim, self.encoder.latent_dim),
+            nn.GELU(),
+            nn.Linear(self.encoder.latent_dim, self.projection_dim),
+        )
 
     def _encoder_is_trainable(self) -> bool:
         return any(p.requires_grad for p in self.encoder.parameters())
@@ -322,6 +369,55 @@ class DynamicsModel(nn.Module):
             action_tokens=action_sequence,
         )
 
+    def project_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.contrastive_head(latent), p=2.0, dim=-1)
+
+    def _pu_contrastive_loss(
+        self,
+        pred_latent: torch.Tensor,
+        target_latent: torch.Tensor,
+        is_expert: Optional[torch.Tensor],
+        failure_confidence: Optional[torch.Tensor],
+        temperature: float,
+        negative_confidence_threshold: float,
+    ) -> torch.Tensor:
+        if is_expert is None or failure_confidence is None:
+            return pred_latent.new_zeros(())
+
+        expert_mask = is_expert.reshape(-1).to(dtype=torch.bool, device=pred_latent.device)
+        if int(expert_mask.sum().item()) == 0:
+            return pred_latent.new_zeros(())
+
+        anchors = self.project_latent(pred_latent[expert_mask])
+        targets = self.project_latent(target_latent)
+        logits = anchors @ targets.transpose(0, 1)
+        logits = logits / max(float(temperature), 1e-6)
+
+        target_is_expert = is_expert.reshape(-1, 1).to(dtype=logits.dtype, device=logits.device)
+        rollout_weight = failure_confidence.reshape(-1, 1).to(dtype=logits.dtype, device=logits.device)
+        rollout_weight = torch.where(
+            rollout_weight >= float(negative_confidence_threshold),
+            rollout_weight,
+            torch.zeros_like(rollout_weight),
+        )
+
+        pos_mask = target_is_expert.transpose(0, 1).expand_as(logits)
+        sample_weight = pos_mask + rollout_weight.transpose(0, 1).expand_as(logits)
+        sample_weight = torch.clamp(sample_weight, min=0.0)
+        if not torch.any(sample_weight > 0):
+            return pred_latent.new_zeros(())
+
+        exp_logits = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
+        pos_mass = (exp_logits * pos_mask).sum(dim=1)
+        denom_mass = (exp_logits * sample_weight).sum(dim=1)
+
+        valid = (pos_mass > 0) & (denom_mass > 0)
+        if not torch.any(valid):
+            return pred_latent.new_zeros(())
+
+        loss = -torch.log((pos_mass[valid] + 1e-8) / (denom_mass[valid] + 1e-8))
+        return loss.mean()
+
     def compute_dynamics_loss(
         self,
         current_image: torch.Tensor,
@@ -330,6 +426,11 @@ class DynamicsModel(nn.Module):
         target_image: torch.Tensor,
         target_proprio: Optional[torch.Tensor] = None,
         proprio_loss_weight: float = 0.0,
+        is_expert: Optional[torch.Tensor] = None,
+        failure_confidence: Optional[torch.Tensor] = None,
+        contrastive_loss_weight: float = 0.0,
+        contrastive_temperature: float = 0.1,
+        negative_confidence_threshold: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         pred = self.forward(current_image, current_proprio, action_sequence)
         z_target = self.encode_observation(target_image).detach()
@@ -342,9 +443,20 @@ class DynamicsModel(nn.Module):
             proprio_mse = F.mse_loss(pred["pred_proprio"], target_proprio)
             total = total + float(proprio_loss_weight) * proprio_mse
 
+        contrastive_loss = self._pu_contrastive_loss(
+            pred_latent=pred["pred_latent"],
+            target_latent=z_target,
+            is_expert=is_expert,
+            failure_confidence=failure_confidence,
+            temperature=contrastive_temperature,
+            negative_confidence_threshold=negative_confidence_threshold,
+        )
+        total = total + float(contrastive_loss_weight) * contrastive_loss
+
         out: Dict[str, Any] = {
             "loss": total,
             "latent_mse": latent_mse,
+            "contrastive_loss": contrastive_loss,
             "pred_latent": pred["pred_latent"],
             "target_latent": z_target,
             "pred_proprio": pred["pred_proprio"],
