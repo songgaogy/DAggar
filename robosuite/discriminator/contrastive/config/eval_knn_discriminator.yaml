@@ -1,0 +1,46 @@
+seed: 42
+
+save_dir: "./checkpoints/PandaLift/discriminator/pure_contrastive_knn"
+
+data:
+  expert_dir: "./data/PandaLift/expert"
+  fail_rollout_dir: "./data/PandaLift/fail_rollout"
+  camera_name: "agentview"
+  max_expert_trajectories: -1
+  max_fail_trajectories: -1
+
+split:
+  holdout_ratio: 0.3
+  calib_ratio_within_holdout: 0.5
+
+model:
+  checkpoint_path: "./checkpoints/PandaLift/discriminator/pure_contrastive"
+
+feature:
+  device: "cuda"
+  batch_size: 256
+  action_horizon: -1
+  proprio_indices: []
+  normalize_feature: true
+
+detector:
+  device: "cuda"
+  delta: 10.0
+  delta_step: 0.5
+  knn_chunk_size: 8192
+  lambda_mode: "mean"
+  lambda_window_size: -1
+
+labels:
+  fail_tail_ratio: 0.3
+
+online:
+  adaptive_delta: true
+  delta_min: 2.0
+  delta_max: 40.0
+  warmup_steps: 20
+  update_interval: 5
+
+hydra:
+  run:
+    dir: outputs/pure_contrastive_knn_eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
