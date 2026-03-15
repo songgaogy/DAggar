@@ -9,6 +9,7 @@ import datetime
 import json
 import os
 import shutil
+import sys
 import time
 from glob import glob
 
@@ -19,6 +20,13 @@ import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.controllers.composite.composite_controller import WholeBody
 from robosuite.wrappers import DataCollectionWrapper, VisualizationWrapper
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 
 
 def now_readable(ts: datetime.datetime | None = None) -> str:
@@ -290,30 +298,52 @@ def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode, camera_
 
 def prompt_user_action() -> str:
     while True:
-        ans = input("Action for this demo: [s]ave / [d]elete / [q]uit / [f]inish ? ").strip().lower()
+        prompt = "Action for this demo: [s]ave / [d]elete / [q]uit / [f]inish ? "
+        if termios is not None and tty is not None and sys.stdin.isatty():
+            print(prompt, end="", flush=True)
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            ans = ch.strip().lower()
+            print(ans)
+        else:
+            ans = input(prompt).strip().lower()
         if ans in ("s", "d", "q", "f"):
             return ans
-        print("Invalid input. Please enter s, d, f or q.")
+        print("Invalid input. Please press s, d, f or q.")
 
 
 def build_env(env_config: dict, args):
-    camera_names = args.camera if len(args.camera) > 0 else ["agentview"]
+    requested_camera_names = args.camera if args.camera else ["agentview"]
     env = suite.make(
         **env_config,
         has_renderer=True,
         renderer=args.renderer,
         has_offscreen_renderer=True,
         # `render_camera` controls only the on-screen viewer camera.
-        render_camera=camera_names[0],
+        render_camera=requested_camera_names[0],
         # Configure all requested cameras in the env so multiview capture can use all of them.
-        camera_names=camera_names,
+        camera_names=requested_camera_names,
         ignore_done=True,
         use_camera_obs=False,
         reward_shaping=True,
         control_freq=20,
     )
     env = VisualizationWrapper(env)
-    return env
+    if args.camera:
+        camera_names = list(args.camera)
+    else:
+        camera_names = [str(cam_name) for cam_name in env.sim.model.camera_names]
+        if len(camera_names) == 0:
+            camera_names = ["agentview"]
+        print(f"No --camera provided. Saving all cameras by default: {camera_names}")
+    return env, camera_names
 
 
 def build_device(env, args):
@@ -382,7 +412,7 @@ if __name__ == "__main__":
         "--camera",
         nargs="*",
         type=str,
-        default=["agentview"],
+        default=[],
         help="List of camera names to save. Pass multiple names to enable multiple views. Note: the `mujoco` renderer must be enabled when using multiple views; `mjviewer` is not supported.",
     )
     parser.add_argument(
@@ -434,8 +464,6 @@ if __name__ == "__main__":
     parser.add_argument("--img_height", type=int, default=256)
     parser.add_argument("--img_width", type=int, default=256)
     args = parser.parse_args()
-    if len(args.camera) == 0:
-        args.camera = ["agentview"]
 
     # Get controller config
     controller_config = load_composite_controller_config(
@@ -474,7 +502,7 @@ if __name__ == "__main__":
     tmp_hdf5_path = os.path.join(args.directory, f"{base_time}_0.hdf5")
     print(f"Output HDF5: {tmp_hdf5_path}")
 
-    env = build_env(env_config, args)
+    env, camera_names = build_env(env_config, args)
     device = build_device(env, args)
 
     # wrap the environment with data collection wrapper
@@ -494,7 +522,7 @@ if __name__ == "__main__":
                 arm=args.arm,
                 max_fr=args.max_fr,
                 goal_update_mode=args.goal_update_mode,
-                camera_names=args.camera,
+                camera_names=camera_names,
                 img_height=args.img_height,
                 img_width=args.img_width,
             )
@@ -526,7 +554,7 @@ if __name__ == "__main__":
                     demo_id=saved_count,
                     demo_payload=demo_payload,
                     env_info=env_info,
-                    camera_names=args.camera,
+                    camera_names=camera_names,
                     images_dict=images_dict,
                 )
                 print(f"Saved demo_{saved_count:06d}.")
@@ -550,7 +578,7 @@ if __name__ == "__main__":
                     demo_id=saved_count,
                     demo_payload=demo_payload,
                     env_info=env_info,
-                    camera_names=args.camera,
+                    camera_names=camera_names,
                     images_dict=images_dict,
                 )
                 print(f"Saved demo_{saved_count:06d}.")

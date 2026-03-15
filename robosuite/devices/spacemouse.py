@@ -130,6 +130,7 @@ class SpaceMouse(Device):
         ROBOSUITE_DEFAULT_LOGGER.info("Opening SpaceMouse device")
         self.vendor_id = vendor_id
         self.product_id = product_id
+        self.device_path = device_path
         self.device = hid.device()
 
         if device_path:
@@ -190,6 +191,25 @@ class SpaceMouse(Device):
         self.vendor_id = selected["vendor_id"]
         self.product_id = selected["product_id"]
         ROBOSUITE_DEFAULT_LOGGER.info(f"Auto-detected: {selected['product_string']} with path {selected['path']}")
+
+    def _reconnect_device(self):
+        """Reconnect to SpaceMouse after a transient HID read / USB error."""
+        # Replace the handle first; stale handles often keep throwing read errors.
+        self.device = hid.device()
+        if self.device_path:
+            try:
+                self.device.open_path(self.device_path)
+                ROBOSUITE_DEFAULT_LOGGER.info(f"SpaceMouse reconnected using path: {self.device_path}")
+                return
+            except OSError:
+                ROBOSUITE_DEFAULT_LOGGER.warning(f"Reconnect failed on path: {self.device_path}, trying auto-detect")
+        try:
+            self.device.open(self.vendor_id, self.product_id)
+            ROBOSUITE_DEFAULT_LOGGER.info(
+                f"SpaceMouse reconnected using IDs: {self.vendor_id:04x}:{self.product_id:04x}"
+            )
+        except OSError:
+            self._auto_detect_device()
 
     @staticmethod
     def _display_controls():
@@ -272,7 +292,22 @@ class SpaceMouse(Device):
         t_last_click = -1
 
         while True:
-            d = self.device.read(13)
+            try:
+                d = self.device.read(13)
+            except OSError as exc:
+                # Common when the USB receiver disconnects / resumes. Keep thread alive and retry.
+                ROBOSUITE_DEFAULT_LOGGER.warning(f"SpaceMouse read error: {exc}. Attempting reconnect...")
+                was_enabled = self._enabled
+                self._enabled = False
+                self._control = np.zeros(6)
+                try:
+                    self._reconnect_device()
+                except OSError as reconnect_exc:
+                    ROBOSUITE_DEFAULT_LOGGER.warning(f"SpaceMouse reconnect failed: {reconnect_exc}")
+                    time.sleep(0.2)
+                    continue
+                self._enabled = was_enabled
+                continue
             if d is not None and self._enabled:
 
                 if self.product_id == 50741:
