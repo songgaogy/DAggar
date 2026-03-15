@@ -11,6 +11,7 @@ export WANDB_MODE="offline"
 
 cd "${ROOT_DIR}"
 
+# contrastive learning objective
 exec "${PYTHON_BIN}" -m robosuite.discriminator.lpb.train_dynamics \
   data.expert_paths='["/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"]' \
   data.rollout_paths='["/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout"]' \
@@ -23,24 +24,25 @@ exec "${PYTHON_BIN}" -m robosuite.discriminator.lpb.train_dynamics \
   encoder.ckpt_path=/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth \
   model.d_model=512 \
   model.num_layers=6 \
-  model.num_heads=4 \
+  model.num_heads=8 \
   model.dropout=0.1 \
   model.max_action_horizon=32 \
   model.fusion_hidden_dim=768 \
-  model.projection_dim=128 \
+  model.projection_dim=0 \
   training.device=cuda \
   training.batch_size=256 \
-  training.num_workers=16 \
-  training.epochs=200 \
+  training.num_workers=24 \
+  training.epochs=100 \
   training.lr=1e-4 \
   training.weight_decay=1e-4 \
   training.expert_ratio=0.5 \
   training.proprio_loss_weight=0.0 \
-  training.contrastive_loss_weight=0.2 \
-  training.contrastive_temperature=0.1 \
-  training.contrastive_negative_confidence_threshold=0.1 \
+  training.contrastive_loss_weight=0.8 \
+  training.contrastive_temperature=0.2 \
+  training.contrastive_negative_confidence_threshold=0.2 \
+  training.contrastive_queue_size=4096 \
   training.grad_clip_norm=1.0 \
   training.log_every=50 \
-  save_dir=./checkpoints/PandaLift/discriminator/lpb_dynamics/contrastive \
-  save_name=dynamics_model_pu_contrastive.pt \
+  save_dir=./checkpoints/PandaLift/discriminator/lpb_dynamics/contrastive-v2 \
+  save_name=dynamics_model_pu_contrastive_aligned.pt \
   "$@"

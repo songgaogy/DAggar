@@ -14,7 +14,7 @@ split:
   calib_ratio_within_holdout: 0.5
 
 model:
-  lpb_ckpt: "./checkpoints/PandaLift/discriminator/lpb_dynamics/dynamics_model_ep0015.pt"
+  lpb_ckpt: "./checkpoints/PandaLift/discriminator/lpb_dynamics/contrastive"
 
 feature:
   device: "cuda"

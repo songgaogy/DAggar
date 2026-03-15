@@ -8,6 +8,7 @@ import hydra
 import numpy as np
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
+from tqdm import tqdm
 
 from robosuite.discriminator.float.float_data import (
     fail_prefix_labels,
@@ -22,6 +23,25 @@ def _now_tag() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def _resolve_lpb_ckpt(path: str) -> str:
+    abs_path = to_absolute_path(str(path))
+    if os.path.isfile(abs_path):
+        return abs_path
+    if not os.path.isdir(abs_path):
+        raise FileNotFoundError(f"LPB checkpoint path does not exist: {abs_path}")
+
+    ckpts = sorted(
+        [
+            os.path.join(abs_path, name)
+            for name in os.listdir(abs_path)
+            if name.endswith(".pt")
+        ]
+    )
+    if not ckpts:
+        raise FileNotFoundError(f"No .pt checkpoint found under directory: {abs_path}")
+    return ckpts[-1]
+
+
 @hydra.main(version_base="1.2", config_path="./config", config_name="eval_knn_discriminator")
 def main(cfg: DictConfig) -> None:
     np.random.seed(int(cfg.seed))
@@ -29,19 +49,21 @@ def main(cfg: DictConfig) -> None:
     expert_dir = to_absolute_path(str(cfg.data.expert_dir))
     fail_dir = to_absolute_path(str(cfg.data.fail_rollout_dir))
     camera_name = str(cfg.data.camera_name)
-    lpb_ckpt = to_absolute_path(str(cfg.model.lpb_ckpt))
+    lpb_ckpt = _resolve_lpb_ckpt(str(cfg.model.lpb_ckpt))
+    print(f"Using LPB checkpoint: {lpb_ckpt}")
 
+    print("start loading expert trajectories")
     experts = load_policy_trajectories(
         data_dir=expert_dir,
         camera_name=camera_name,
         max_trajectories=(None if int(cfg.data.max_expert_trajectories) <= 0 else int(cfg.data.max_expert_trajectories)),
     )
+    print("start loading fail_rollout trajectories")
     fails = load_policy_trajectories(
         data_dir=fail_dir,
         camera_name=camera_name,
         max_trajectories=(None if int(cfg.data.max_fail_trajectories) <= 0 else int(cfg.data.max_fail_trajectories)),
     )
-    print("finish loading data")
 
     if len(experts) == 0:
         raise RuntimeError("No expert trajectories found.")
@@ -139,7 +161,7 @@ def main(cfg: DictConfig) -> None:
     fail_lambda_values: list[float] = []
     pre_fail_lambda_values: list[float] = []
 
-    for traj in fails:
+    for traj in tqdm(fails, desc="running evaluation"):
         if use_transition_score:
             feat, aux = extractor.encode_trajectory_with_transition_error(
                 traj,

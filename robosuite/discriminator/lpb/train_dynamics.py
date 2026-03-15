@@ -125,6 +125,7 @@ def main(cfg: DictConfig) -> None:
         contrastive_negative_confidence_threshold=float(
             cfg.training.contrastive_negative_confidence_threshold
         ),
+        contrastive_queue_size=int(cfg.training.contrastive_queue_size),
         grad_clip_norm=float(cfg.training.grad_clip_norm),
         log_every=int(cfg.training.log_every),
     )

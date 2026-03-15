@@ -22,6 +22,7 @@ class TrainerConfig:
     contrastive_loss_weight: float = 0.0
     contrastive_temperature: float = 0.1
     contrastive_negative_confidence_threshold: float = 0.0
+    contrastive_queue_size: int = 0
     grad_clip_norm: float = 1.0
     log_every: int = 50
 
@@ -140,6 +141,7 @@ class Trainer:
                 contrastive_loss_weight=self.cfg.contrastive_loss_weight,
                 contrastive_temperature=self.cfg.contrastive_temperature,
                 negative_confidence_threshold=self.cfg.contrastive_negative_confidence_threshold,
+                contrastive_queue_size=self.cfg.contrastive_queue_size,
             )
             loss = stats["loss"]
             if train:
@@ -152,6 +154,12 @@ class Trainer:
             "loss": float(stats["loss"].detach().item()),
             "latent_mse": float(stats["latent_mse"].detach().item()),
             "contrastive_loss": float(stats["contrastive_loss"].detach().item()),
+            "contrastive_positive_count": float(stats["contrastive_positive_count"].detach().item()),
+            "contrastive_negative_count": float(stats["contrastive_negative_count"].detach().item()),
+            "contrastive_negative_weight_mean": float(
+                stats["contrastive_negative_weight_mean"].detach().item()
+            ),
+            "shared_feature_norm": float(stats["shared_feature_norm"].detach().item()),
         }
         if "proprio_mse" in stats:
             out["proprio_mse"] = float(stats["proprio_mse"].detach().item())
@@ -166,6 +174,7 @@ class Trainer:
 
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
+        self.model.reset_contrastive_queue()
         logs: list[Dict[str, float]] = []
         for step, batch in enumerate(self.train_loader):
             out = self._run_step(batch, train=True)
@@ -174,7 +183,9 @@ class Trainer:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f} "
-                    f"contrastive={out['contrastive_loss']:.6f}"
+                    f"contrastive={out['contrastive_loss']:.6f} "
+                    f"pos={out['contrastive_positive_count']:.1f} "
+                    f"neg={out['contrastive_negative_count']:.1f}"
                 )
         return self._mean_metrics(logs)
 
@@ -183,6 +194,7 @@ class Trainer:
         if self.val_loader is None:
             return {}
         self.model.eval()
+        self.model.reset_contrastive_queue()
         logs: list[Dict[str, float]] = []
         for step, batch in enumerate(self.val_loader):
             out = self._run_step(batch, train=False)
@@ -191,7 +203,9 @@ class Trainer:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} latent_mse={out['latent_mse']:.6f} "
-                    f"contrastive={out['contrastive_loss']:.6f}"
+                    f"contrastive={out['contrastive_loss']:.6f} "
+                    f"pos={out['contrastive_positive_count']:.1f} "
+                    f"neg={out['contrastive_negative_count']:.1f}"
                 )
         return self._mean_metrics(logs)
 

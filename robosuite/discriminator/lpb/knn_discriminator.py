@@ -110,7 +110,8 @@ class LPBFeatureExtractor:
     Build (o, a) latent feature from LPB dynamics checkpoint.
 
     Feature definition (per timestep):
-      feat_t = [obs_proj(h(o_t)), proprio_proj(s_t), mean(action_proj(a_{t:t+h-1}))].
+      feat_t = predictor shared feature built from transformer states of
+      [obs, proprio, action summary].
     """
 
     def __init__(
@@ -178,7 +179,21 @@ class LPBFeatureExtractor:
             predictor=predictor,
             projection_dim=projection_dim,
         )
-        model.load_state_dict(payload["model"], strict=True)
+        incompatible = model.load_state_dict(payload["model"], strict=False)
+        unexpected = list(incompatible.unexpected_keys)
+        missing = [
+            k
+            for k in incompatible.missing_keys
+            if not k.startswith("predictor.shared_feature_norm.")
+        ]
+        if unexpected or missing:
+            print(
+                "LPB checkpoint load warning:",
+                {
+                    "missing_keys": missing,
+                    "unexpected_keys": unexpected,
+                },
+            )
         model.to(self.device)
         model.eval()
         return model, action_horizon, action_dim, proprio_dim
@@ -247,11 +262,12 @@ class LPBFeatureExtractor:
             prop_b = prop_t[start:end].to(self.device)
             act_b = act_t[start:end].to(self.device)
 
-            z = self.model.encode_observation(img_b)
-            obs_tok = self.model.predictor.obs_proj(z)
-            prop_tok = self.model.predictor.proprio_proj(prop_b)
-            act_tok = self.model.predictor.action_proj(act_b).mean(dim=1)
-            f = torch.cat([obs_tok, prop_tok, act_tok], dim=-1)
+            pred = self.model(
+                current_image=img_b,
+                current_proprio=prop_b,
+                action_sequence=act_b,
+            )
+            f = pred["shared_feature"]
             if self.normalize_feature:
                 f = F.normalize(f, p=2.0, dim=-1)
             feats.append(f.detach().cpu())
@@ -291,29 +307,19 @@ class LPBFeatureExtractor:
         act_t = torch.from_numpy(act_chunks)
 
         z_all = []
-        feat_all = []
         for start in range(0, t_len, self.batch_size):
             end = min(start + self.batch_size, t_len)
             img_b = imgs[start:end].to(self.device)
-            prop_b = prop_t[start:end].to(self.device)
-            act_b = act_t[start:end].to(self.device)
 
             z = self.model.encode_observation(img_b)
-            obs_tok = self.model.predictor.obs_proj(z)
-            prop_tok = self.model.predictor.proprio_proj(prop_b)
-            act_tok = self.model.predictor.action_proj(act_b).mean(dim=1)
-            f = torch.cat([obs_tok, prop_tok, act_tok], dim=-1)
-            if self.normalize_feature:
-                f = F.normalize(f, p=2.0, dim=-1)
 
             z_all.append(z.detach().cpu())
-            feat_all.append(f.detach().cpu())
 
         z_all_t = torch.cat(z_all, dim=0).to(self.device)
-        feat_all_t = torch.cat(feat_all, dim=0)
         prop_all_t = prop_t.to(self.device)
         act_all_t = act_t.to(self.device)
 
+        feats = []
         errs = []
         w_prop = float(proprio_error_weight)
         for start in range(0, valid_len, self.batch_size):
@@ -323,6 +329,10 @@ class LPBFeatureExtractor:
                 proprio_token=prop_all_t[start:end],
                 action_tokens=act_all_t[start:end],
             )
+            f = pred["shared_feature"]
+            if self.normalize_feature:
+                f = F.normalize(f, p=2.0, dim=-1)
+            feats.append(f.detach().cpu())
             tgt_z = z_all_t[start + h : end + h]
             tgt_p = prop_all_t[start + h : end + h]
 
@@ -332,7 +342,8 @@ class LPBFeatureExtractor:
             errs.append(e.detach().cpu())
 
         err_t = torch.cat(errs, dim=0)
-        return feat_all_t[:valid_len], err_t
+        feat_t = torch.cat(feats, dim=0)
+        return feat_t, err_t
 
 
 class AdaptiveKNNDiscriminator:
