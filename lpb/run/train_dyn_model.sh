@@ -4,13 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export WANDB_MODE="offline"
 export WANDB_ENTITY="songgao-personal"
 
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export ZARR_V3_EXPERIMENTAL_API="${ZARR_V3_EXPERIMENTAL_API:-0}"
 
 if ! command -v conda >/dev/null 2>&1; then
   echo "conda not found in PATH"
@@ -30,8 +31,12 @@ POLICY_CKPT_PATH="${POLICY_CKPT_PATH:-$DEFAULT_POLICY_CKPT}"
 SEED="42"
 DEVICE="cuda:0"
 EPOCHS="200"
-BATCH_SIZE="128"
+BATCH_SIZE="64"
 SAVE_EVERY="10"
+NUM_WORKERS=24
+PREFETCH_FACTOR=16
+PIN_MEMORY="${PIN_MEMORY:-true}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 ENCODER_LR=1e-7
 PREDICTOR_LR=5e-4
 ACTION_ENCODER_LR=5e-4
@@ -77,6 +82,8 @@ echo "POLICY_CKPT_PATH=$POLICY_CKPT_PATH"
 echo "DEVICE=$DEVICE"
 echo "SEED=$SEED"
 echo "EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE"
+echo "NUM_WORKERS=$NUM_WORKERS PREFETCH_FACTOR=$PREFETCH_FACTOR"
+echo "PIN_MEMORY=$PIN_MEMORY PERSISTENT_WORKERS=$PERSISTENT_WORKERS"
 
 cd "$SCRIPT_DIR"/..
 python -X faulthandler -m dyn_model.train \
@@ -89,6 +96,10 @@ python -X faulthandler -m dyn_model.train \
   training.epochs="$EPOCHS" \
   training.batch_size="$BATCH_SIZE" \
   training.save_every_x_epoch="$SAVE_EVERY" \
+  training.num_workers="$NUM_WORKERS" \
+  training.prefetch_factor="$PREFETCH_FACTOR" \
+  training.pin_memory="$PIN_MEMORY" \
+  training.persistent_workers="$PERSISTENT_WORKERS" \
   training.encoder_lr="$ENCODER_LR" \
   training.predictor_lr="$PREDICTOR_LR" \
   training.action_encoder_lr="$ACTION_ENCODER_LR" \

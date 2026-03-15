@@ -186,9 +186,19 @@ class Trainer:
                 self.datasets[x],
                 batch_size=self.cfg.gpu_batch_size,
                 shuffle=True,
-                num_workers=16,
+                num_workers=self.cfg.training.num_workers,
                 collate_fn=None,
-                prefetch_factor=8
+                pin_memory=self.cfg.training.pin_memory,
+                persistent_workers=(
+                    self.cfg.training.persistent_workers
+                    if self.cfg.training.num_workers > 0
+                    else False
+                ),
+                prefetch_factor=(
+                    self.cfg.training.prefetch_factor
+                    if self.cfg.training.num_workers > 0
+                    else None
+                )
             )
             for x in ["train", "valid"]
         }
@@ -230,6 +240,49 @@ class Trainer:
         self.init_optimizers()
 
         self.epoch_log = OrderedDict()
+
+    def _apply_image_transform(self, images, train=True):
+        crop_size = self.cropped_image_size
+        if images.shape[-1] == crop_size and images.shape[-2] == crop_size:
+            return images
+
+        batch_size, num_frames, channels, height, width = images.shape
+        merged = images.reshape(batch_size, num_frames * channels, height, width)
+        max_top = height - crop_size
+        max_left = width - crop_size
+
+        if train:
+            top = torch.randint(0, max_top + 1, (batch_size,), device=images.device)
+            left = torch.randint(0, max_left + 1, (batch_size,), device=images.device)
+        else:
+            top_value = max(max_top // 2, 0)
+            left_value = max(max_left // 2, 0)
+            top = torch.full((batch_size,), top_value, device=images.device, dtype=torch.long)
+            left = torch.full((batch_size,), left_value, device=images.device, dtype=torch.long)
+
+        unfolded = merged.unfold(2, crop_size, 1).unfold(3, crop_size, 1)
+        batch_idx = torch.arange(batch_size, device=images.device)
+        cropped = unfolded[batch_idx, :, top, left]
+        return cropped.reshape(batch_size, num_frames, channels, crop_size, crop_size)
+
+    def _prepare_visual_obs(self, obs, train=True):
+        for view_name in self.cfg.env.view_names:
+            visual = self.normalizer[view_name].normalize(obs['visual'][view_name])
+            if self.cfg.use_crop:
+                visual = self._apply_image_transform(visual, train=train)
+            else:
+                visual = visual.view(-1, 3, self.original_img_size, self.original_img_size)
+                transform = self.train_img_transform if train else self.valid_img_transform
+                visual = transform(visual)
+                visual = visual.view(
+                    -1,
+                    self.cfg.num_hist + self.cfg.num_pred,
+                    3,
+                    visual.shape[-2],
+                    visual.shape[-1],
+                )
+            obs['visual'][view_name] = visual
+        return obs
 
     def save_ckpt(self):
         self.accelerator.wait_for_everyone()
@@ -457,12 +510,7 @@ class Trainer:
         ):
             # if i == 1: break
             obs, act, state = data
-            for view_name in self.cfg.env.view_names:
-                obs['visual'][view_name] = self.normalizer[view_name].normalize(obs['visual'][view_name])
-                obs['visual'][view_name] = torch.stack([self.train_img_transform(img) for img in obs['visual'][view_name]])
-                obs['visual'][view_name] = obs['visual'][view_name].view(-1, self.cfg.num_hist+self.cfg.num_pred, 3, self.cropped_image_size, self.cropped_image_size)
-
-
+            obs = self._prepare_visual_obs(obs, train=True)
             obs['proprio'] = self.normalizer['state'].normalize(obs['proprio'])
 
             if 'language' in obs and obs['language'] is not None:
@@ -518,11 +566,7 @@ class Trainer:
         ):
             # if i == 1: break
             obs, act, state = data
-            for view_name in self.cfg.env.view_names:
-                obs['visual'][view_name] = self.normalizer[view_name].normalize(obs['visual'][view_name])
-                obs['visual'][view_name] = self.valid_img_transform(obs['visual'][view_name].view(-1, 3, self.original_img_size, self.original_img_size))
-                obs['visual'][view_name] = obs['visual'][view_name].view(-1, self.cfg.num_hist+self.cfg.num_pred, 3, self.cropped_image_size, self.cropped_image_size)
-
+            obs = self._prepare_visual_obs(obs, train=False)
             obs['proprio'] = self.normalizer['state'].normalize(obs['proprio'])
 
             if 'language' in obs and obs['language'] is not None:
