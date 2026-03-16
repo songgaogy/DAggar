@@ -4,6 +4,7 @@ import glob
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+from tqdm import tqdm
 
 import numpy as np
 
@@ -203,7 +204,7 @@ def load_policy_trajectories(
 ) -> list[PolicyTrajectory]:
     refs = scan_hdf5_trajectories(data_dir=data_dir, max_trajectories=max_trajectories)
     trajectories: list[PolicyTrajectory] = []
-    for ref in refs:
+    for ref in tqdm(refs, desc="loading trajectories"):
         try:
             trajectories.append(load_policy_trajectory_from_ref(ref=ref, camera_name=camera_name))
         except Exception:
