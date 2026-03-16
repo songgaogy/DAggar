@@ -19,6 +19,12 @@ ALL_MODEL_KEYS = [
     "action_encoder",
 ]
 
+
+def _path_list_contains(path_or_paths, keyword):
+    if isinstance(path_or_paths, (list, tuple)):
+        return any(keyword in str(path) for path in path_or_paths)
+    return keyword in str(path_or_paths)
+
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
         ckpt = torch.load(f, map_location=device)
@@ -45,26 +51,26 @@ def load_model(model_ckpt, train_cfg, device):
         raise ValueError("Encoder not found in model checkpoint")
     
     language_encoder = None
-    if 'libero' in train_cfg.train_data_path:
+    if _path_list_contains(train_cfg.train_data_path, 'libero'):
         language_encoder = LanguageEncoder(policy_ckpt_path=train_cfg.policy_ckpt_path)
         for param in language_encoder.parameters():
             param.requires_grad = False
 
     action_dim = 10 if train_cfg.abs_action else 7
     prior_in_chans = 9
-    if 'transport' in train_cfg.train_data_path:
+    if _path_list_contains(train_cfg.train_data_path, 'transport'):
         action_dim = 20
         prior_in_chans = 18
-    elif 'pusht' in train_cfg.train_data_path:
+    elif _path_list_contains(train_cfg.train_data_path, 'pusht'):
         action_dim = 2
         prior_in_chans = 2
-    elif 'libero' in train_cfg.train_data_path:
+    elif _path_list_contains(train_cfg.train_data_path, 'libero'):
         action_dim = 10
         prior_in_chans = 14
     total_action_dim = action_dim * train_cfg.frameskip
 
     language_emb_dim = 0
-    if 'libero' in train_cfg.train_data_path:
+    if _path_list_contains(train_cfg.train_data_path, 'libero'):
         language_emb_dim = 32
 
     action_encoder = hydra.utils.instantiate(

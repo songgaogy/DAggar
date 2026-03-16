@@ -1,4 +1,4 @@
-dynamics_model_checkpoint: /home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.12/11.02.54_transport/checkpoints/model_200.pth
+dynamics_model_checkpoint: /home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.15/17.27.43_transport/checkpoints/model_20.pth
 policy_checkpoint: /home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.09/11.53.10_train_diffusion_unet_hybrid_transport_image/checkpoints/20.ckpt
 guidance_start_timestep: 10
 guidance_scale: 0.2
@@ -9,14 +9,12 @@ test_start_seed: 100000
 n_action_steps: 15
 num_inference_steps_list:
 - 20
-- 50
-- 100
 demo_batch_size: 32
 demo_loader_workers: 8
 demo_subsample_stride: 1
 demo_max_samples: null
 nn_chunk_size: 1024
-output_dir: /home/dodo/Documents/DAggar/robosuite/lpb/data/eval/lpb_transport/2026.03.15_13.10.10
+output_dir: /home/dodo/Documents/DAggar/robosuite/lpb/data/eval/lpb_transport/2026.03.16_10.46.52
 device: cuda:0
 env_runner_target: diffusion_policy.env_runner.robomimic_image_sequential_runner.SequentialRobomimicImageRunner
 planner_target: dyn_model.planner.Planner

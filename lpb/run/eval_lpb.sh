@@ -21,7 +21,7 @@ eval "$(conda shell.bash hook)"
 conda activate lpb
 
 DEFAULT_POLICY_CKPT="/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.09/11.53.10_train_diffusion_unet_hybrid_transport_image/checkpoints/20.ckpt"
-DEFAULT_DYN_CKPT="/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.12/11.02.54_transport/checkpoints/model_200.pth"
+DEFAULT_DYN_CKPT="/home/dodo/Documents/DAggar/robosuite/lpb/data/outputs/2026.03.15/17.27.43_transport/checkpoints/model_20.pth"
 
 CONFIG_NAME="eval_transport"
 POLICY_CHECKPOINT="${POLICY_CHECKPOINT:-$DEFAULT_POLICY_CKPT}"
@@ -44,7 +44,7 @@ DEMO_LOADER_WORKERS=8
 DEMO_SUBSAMPLE_STRIDE=1
 DEMO_MAX_SAMPLES=null
 NN_CHUNK_SIZE=1024
-NUM_INFERENCE_STEPS_LIST='[20,50,100]'
+NUM_INFERENCE_STEPS_LIST='[20]'
 
 OUTPUT_DIR="/home/dodo/Documents/DAggar/robosuite/lpb/data/eval/lpb_transport/$(date +%Y.%m.%d_%H.%M.%S)"
 FORCE_OVERWRITE="${FORCE_OVERWRITE:-0}"
