@@ -37,12 +37,12 @@ exec "${PYTHON_BIN}" -m robosuite.discriminator.lpb.train_dynamics \
   training.weight_decay=1e-4 \
   training.expert_ratio=0.5 \
   training.proprio_loss_weight=0.0 \
-  training.contrastive_loss_weight=0.8 \
+  training.contrastive_loss_weight=0.3 \
   training.contrastive_temperature=0.2 \
   training.contrastive_negative_confidence_threshold=0.2 \
   training.contrastive_queue_size=4096 \
   training.grad_clip_norm=1.0 \
   training.log_every=50 \
-  save_dir=./checkpoints/PandaLift/discriminator/lpb_dynamics/contrastive-v2 \
+  save_dir=./checkpoints/PandaLift/discriminator/lpb_dynamics/contrastive-v3 \
   save_name=dynamics_model_pu_contrastive_aligned.pt \
   "$@"
