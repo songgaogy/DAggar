@@ -30,7 +30,7 @@ exec "${PYTHON_BIN}" -m robosuite.discriminator.contrastive.train_contrastive \
   model.projection_dim=128 \
   training.device=cuda \
   training.batch_size=256 \
-  training.num_workers=24 \
+  training.num_workers=16 \
   training.epochs=100 \
   training.lr=1e-4 \
   training.weight_decay=1e-4 \
@@ -40,6 +40,6 @@ exec "${PYTHON_BIN}" -m robosuite.discriminator.contrastive.train_contrastive \
   training.contrastive_queue_size=4096 \
   training.grad_clip_norm=1.0 \
   training.log_every=50 \
-  save_dir=./checkpoints/PandaLift/discriminator/pure_contrastive/contrastive-v1 \
+  save_dir=./checkpoints/PandaLift/discriminator/pure_contrastive \
   save_name=pure_contrastive_model.pt \
   "$@"
