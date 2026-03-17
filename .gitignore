@@ -137,3 +137,4 @@ video/
 checkpoints/
 error.txt
 ./lpb/
+wandb/

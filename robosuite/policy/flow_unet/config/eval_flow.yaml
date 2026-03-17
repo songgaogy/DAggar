@@ -1,0 +1,19 @@
+defaults:
+  - flow
+  - _self_
+
+data:
+  image_size: 128
+
+eval:
+  ckpt: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_unet/pickplace_can/flow_unet_ep0010.pt"
+  device: "cuda"
+  episodes: 5
+  succ_rate: false
+  succ_rate_episodes: 100
+  max_steps: 300
+  n_ode_steps: 20
+  action_horizon: 4
+  video_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_unet/pickplace_can/videos"
+  video_camera: "agentview"
+  video_fps: 20
