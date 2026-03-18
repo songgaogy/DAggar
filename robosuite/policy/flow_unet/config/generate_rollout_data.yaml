@@ -1,0 +1,18 @@
+defaults:
+  - flow
+  - _self_
+
+data:
+  image_size: 128
+
+generate:
+  ckpt: "/home/dodo/Documents/DAggar/robosuite/checkpoints/PickPlaceCan/flow_unet-10/flow_unet_ep0400_20260318_020356.pt"
+  output_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan"
+  device: "cuda"
+  episodes: 20
+  keep_mode: "all"
+  max_steps: 400
+  n_ode_steps: 20
+  action_horizon: 4
+  render_height: 256
+  render_width: 256

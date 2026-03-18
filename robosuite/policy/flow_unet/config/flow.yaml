@@ -13,13 +13,13 @@ flow:
     type: "transformer"
     feature_dim: 256
     depth: 3
-    num_heads: 8
+    num_heads: 4
     dropout: 0.1
 
   head:
     type: "unet_1d"
-    hidden_dim: 256
-    time_dim: 256
-    cond_dim: 512
+    hidden_dim: 128
+    time_dim: 128
+    cond_dim: 256
     channel_mults: [1, 2, 2, 2]
     dropout: 0.0
