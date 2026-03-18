@@ -4,7 +4,6 @@ data:
   expert_dir: "./data/PandaPickPlaceCan/expert_recover"
   fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
   success_rollout_dir: ""
-  obs_key: "states"   # official-like evaluator currently supports states
   camera_name: "agentview"
   max_expert_trajectories: -1
   max_fail_trajectories: -1
@@ -20,28 +19,24 @@ float:
   sinkhorn_reg: 0.05
   max_iter: 300
   tol: 1e-5
-  ta: 8
-  to: 2
   num_expert_candidates: 50
   max_steps: -1
   use_similarity_cost: false
-  ot_device: "cuda"
 
 policy:
-  type: "flow_unet"
-  ckpt: "./checkpoints/PickPlaceCan/flow_unet-10/flow_unet_ep0400_20260318_020356.pt"
+  type: "dino_v2"
+  pretrained_path: ""
+  model_name: "vit_base"
   device: "cuda"
-  image_size: -1
-  history_len: -1
-  latent_batch_size: 128
-  robots: "Panda"
-  env_name: "PickPlaceCan"
-  use_ema: true
+  image_size: 518
+  patch_size: 14
+  num_register_tokens: 4
+  latent_batch_size: 32
+  normalize_embedding: true
 
 calibration:
   delta: 10.0
   delta_step: 1.0
-  max_expert_trajectories: 100
 
 online:
   adaptive_delta: false
@@ -54,4 +49,4 @@ random_truncation_eval:
   seed: 42
 
 output:
-  save_json_path: "./outputs/float_eval_pickplacecan/summary.json"
+  save_json_path: "./outputs/float_dino_eval_pickplacecan/summary.json"

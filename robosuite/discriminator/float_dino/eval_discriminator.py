@@ -3,24 +3,17 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from typing import Any
-from tqdm import tqdm
 
 import hydra
 import numpy as np
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
+from tqdm import tqdm
 
-from robosuite.discriminator.float.float_data import (
-    fail_prefix_labels,
-    load_multiview_policy_trajectories,
-    load_policy_trajectories,
-    preload_flow_unet_demo_cache_into_memory,
-    split_train_val,
-)
-from robosuite.discriminator.float.float_eval import classification_metrics
-from robosuite.discriminator.float.float_official import OfficialFloatOfflineEvaluator
-from robosuite.discriminator.float.float_policy_latent import FlowPolicyLatentExtractor, FlowUNetPolicyLatentExtractor
+from robosuite.discriminator.float_dino.dino_v2_latent import DinoV2ImageLatentExtractor
+from robosuite.discriminator.float_dino.float_data import fail_prefix_labels, load_policy_trajectories, split_train_val
+from robosuite.discriminator.float_dino.float_eval import classification_metrics
+from robosuite.discriminator.float_dino.float_official import OfficialFloatOfflineEvaluator
 
 
 @dataclass
@@ -59,25 +52,13 @@ def _evaluate_random_truncation_success_rate(
     expert_start_ratio: float,
     samples_per_trajectory: int,
     seed: int,
-    show_progress: bool = True,
 ) -> dict[str, float]:
-    """
-    Build a random truncation validation set:
-    - fail class: prefixes sampled from the last 20% (or configured tail) of fail trajectories
-    - success class: prefixes sampled from expert trajectories
-    """
     rng = np.random.default_rng(int(seed))
 
     y_true: list[int] = []
     y_pred: list[int] = []
 
-    # Fail samples (label=1): sample 80%+n% prefixes
-    for emb in tqdm(
-        fail_embeddings,
-        desc="Random truncation on fail rollouts",
-        total=len(fail_embeddings),
-        disable=not bool(show_progress),
-    ):
+    for emb in fail_embeddings:
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
         sampled_idx = _sample_tail_indices(
             length=int(out.step_failure_flags.shape[0]),
@@ -89,13 +70,7 @@ def _evaluate_random_truncation_success_rate(
             y_true.append(1)
             y_pred.append(int(out.step_failure_flags[int(idx)]))
 
-    # Expert samples (label=0): sample late prefixes to match truncation regime
-    for emb in tqdm(
-        expert_embeddings,
-        desc="Random truncation on expert rollouts",
-        total=len(expert_embeddings),
-        disable=not bool(show_progress),
-    ):
+    for emb in expert_embeddings:
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
         sampled_idx = _sample_tail_indices(
             length=int(out.step_failure_flags.shape[0]),
@@ -129,86 +104,8 @@ def _compute_threshold(scores: list[float], delta: float) -> float:
     return float(np.percentile(np.asarray(scores, dtype=np.float64), q=q))
 
 
-def _trajectory_eval_steps(embeddings: np.ndarray, max_steps: int) -> int:
-    arr = np.asarray(embeddings)
-    if arr.ndim != 2:
-        raise ValueError(f"embeddings must be (T, E), got {arr.shape}")
-    return max(1, min(int(arr.shape[0]), int(max_steps)))
-
-
-def _select_calibration_subset(embeddings: list[np.ndarray], max_items: int, seed: int) -> list[np.ndarray]:
-    if max_items <= 0 or len(embeddings) <= max_items:
-        return embeddings
-    rng = np.random.default_rng(int(seed))
-    indices = np.sort(rng.choice(len(embeddings), size=int(max_items), replace=False))
-    return [embeddings[int(i)] for i in indices.tolist()]
-
-
-def _encode_rollouts(extractor: Any, trajectories: list, desc: str) -> list[np.ndarray]:
-    embeddings: list[np.ndarray] = []
-    for traj in tqdm(trajectories, desc=desc, total=len(trajectories)):
-        embeddings.append(extractor.encode_trajectory(traj))
-    return embeddings
-
-
-def _policy_type(cfg: DictConfig) -> str:
-    policy_type = str(getattr(cfg.policy, "type", "flow")).lower()
-    aliases = {
-        "flow_v0": "flow",
-        "flow_policy": "flow",
-        "flow_unet_policy": "flow_unet",
-    }
-    return aliases.get(policy_type, policy_type)
-
-
-def _build_policy_extractor(cfg: DictConfig, policy_ckpt: str, policy_device: str):
-    policy_type = _policy_type(cfg)
-    if policy_type == "flow_unet":
-        return FlowUNetPolicyLatentExtractor(
-            ckpt_path=policy_ckpt,
-            image_size=int(cfg.policy.image_size),
-            device=policy_device,
-            batch_size=int(cfg.policy.latent_batch_size),
-            use_ema=bool(getattr(cfg.policy, "use_ema", True)),
-        )
-
-    if policy_type == "flow":
-        if cfg.data.camera_name in (None, ""):
-            raise ValueError("data.camera_name is required for flow policy latent extraction")
-        return FlowPolicyLatentExtractor(
-            ckpt_path=policy_ckpt,
-            camera_name=str(cfg.data.camera_name),
-            image_size=int(cfg.policy.image_size),
-            ta=int(cfg.float.ta),
-            to=int(cfg.float.to),
-            device=policy_device,
-            batch_size=int(cfg.policy.latent_batch_size),
-            history_len=int(cfg.policy.history_len),
-            robots=str(cfg.policy.robots),
-            env_name=str(cfg.policy.env_name),
-        )
-
-    raise ValueError(f"Unsupported policy.type='{policy_type}'. Supported: flow, flow_unet")
-
-
-def _load_rollouts_by_policy(
-    data_dir: str,
-    extractor: Any,
-    cfg: DictConfig,
-    max_trajectories: int,
-):
-    max_value = None if int(max_trajectories) <= 0 else int(max_trajectories)
-    if _policy_type(cfg) == "flow_unet":
-        return load_multiview_policy_trajectories(
-            data_dir=data_dir,
-            camera_names=list(extractor.camera_names),
-            max_trajectories=max_value,
-        )
-    return load_policy_trajectories(
-        data_dir=data_dir,
-        camera_name=str(cfg.data.camera_name),
-        max_trajectories=max_value,
-    )
+def _encode_rollouts(extractor: DinoV2ImageLatentExtractor, trajectories: list) -> list[np.ndarray]:
+    return [extractor.encode_trajectory(t) for t in trajectories]
 
 
 def _resolve_torch_device(preferred: str) -> str:
@@ -228,81 +125,56 @@ def _resolve_torch_device(preferred: str) -> str:
     return preferred
 
 
-def _resolve_ot_device(preferred: str, fallback: str) -> str:
-    requested = str(preferred).strip()
-    if requested in {"", "auto"}:
-        requested = str(fallback)
-    return _resolve_torch_device(requested)
-
-
 @hydra.main(version_base="1.2", config_path="./config", config_name="eval_discriminator")
 def main(cfg: DictConfig) -> None:
     np.random.seed(int(cfg.seed))
 
-    if str(cfg.data.obs_key) != "states":
-        raise ValueError("Official-like evaluator requires states for proprio extraction")
-    if cfg.policy.ckpt in (None, ""):
-        raise ValueError("policy.ckpt is required for policy latent extraction")
+    if cfg.data.camera_name in (None, ""):
+        raise ValueError("data.camera_name is required for DINOv2 image embedding")
 
     expert_dir = to_absolute_path(cfg.data.expert_dir)
     fail_dir = to_absolute_path(cfg.data.fail_rollout_dir)
     success_dir = to_absolute_path(cfg.data.success_rollout_dir) if cfg.data.success_rollout_dir else ""
-    policy_ckpt = to_absolute_path(cfg.policy.ckpt)
     policy_device = _resolve_torch_device(str(cfg.policy.device))
-    ot_device = _resolve_ot_device(str(getattr(cfg.float, "ot_device", "auto")), fallback=policy_device)
+    pretrained_path = str(cfg.policy.pretrained_path)
+    pretrained_path = to_absolute_path(pretrained_path) if pretrained_path else ""
 
-    extractor = _build_policy_extractor(cfg=cfg, policy_ckpt=policy_ckpt, policy_device=policy_device)
+    extractor = DinoV2ImageLatentExtractor(
+        camera_name=str(cfg.data.camera_name),
+        image_size=int(cfg.policy.image_size),
+        device=policy_device,
+        pretrained_path=pretrained_path,
+        model_name=str(cfg.policy.model_name),
+        batch_size=int(cfg.policy.latent_batch_size),
+        patch_size=int(cfg.policy.patch_size),
+        num_register_tokens=int(cfg.policy.num_register_tokens),
+        normalize_embedding=bool(cfg.policy.normalize_embedding),
+    )
+
     try:
-        expert_rollouts = _load_rollouts_by_policy(
+        expert_rollouts = load_policy_trajectories(
             data_dir=expert_dir,
-            extractor=extractor,
-            cfg=cfg,
-            max_trajectories=int(cfg.data.max_expert_trajectories),
+            camera_name=str(cfg.data.camera_name),
+            max_trajectories=(None if int(cfg.data.max_expert_trajectories) <= 0 else int(cfg.data.max_expert_trajectories)),
         )
-        print("finish loading expert rollouts")
-        
-        fail_rollouts = _load_rollouts_by_policy(
+        fail_rollouts = load_policy_trajectories(
             data_dir=fail_dir,
-            extractor=extractor,
-            cfg=cfg,
-            max_trajectories=int(cfg.data.max_fail_trajectories),
+            camera_name=str(cfg.data.camera_name),
+            max_trajectories=(None if int(cfg.data.max_fail_trajectories) <= 0 else int(cfg.data.max_fail_trajectories)),
         )
-        print("finish loading failure rollouts")
 
         success_rollouts = []
         if success_dir and os.path.isdir(success_dir):
-            success_rollouts = _load_rollouts_by_policy(
+            success_rollouts = load_policy_trajectories(
                 data_dir=success_dir,
-                extractor=extractor,
-                cfg=cfg,
-                max_trajectories=int(cfg.data.max_success_trajectories),
+                camera_name=str(cfg.data.camera_name),
+                max_trajectories=(
+                    None if int(cfg.data.max_success_trajectories) <= 0 else int(cfg.data.max_success_trajectories)
+                ),
             )
-
-        if _policy_type(cfg) == "flow_unet":
-            expert_cache_stats = preload_flow_unet_demo_cache_into_memory(
-                expert_rollouts,
-                camera_names=list(extractor.camera_names),
-                image_size=int(extractor.image_size),
-                progress_desc="Preloading expert flow_unet cache",
-            )
-            if success_rollouts:
-                preload_flow_unet_demo_cache_into_memory(
-                    success_rollouts,
-                    camera_names=list(extractor.camera_names),
-                    image_size=int(extractor.image_size),
-                    progress_desc="Preloading success flow_unet cache",
-                )
-            preload_flow_unet_demo_cache_into_memory(
-                fail_rollouts,
-                camera_names=list(extractor.camera_names),
-                image_size=int(extractor.image_size),
-                progress_desc="Preloading fail flow_unet cache",
-            )
-        else:
-            expert_cache_stats = {"loaded": 0, "missing": len(expert_rollouts), "bytes_loaded": 0}
 
         expert_train, expert_val = split_train_val(expert_rollouts, val_ratio=float(cfg.split.val_ratio), seed=int(cfg.seed))
-        fail_eval = fail_rollouts
+        fail_train, fail_val = split_train_val(fail_rollouts, val_ratio=float(cfg.split.val_ratio), seed=int(cfg.seed) + 1)
 
         if success_rollouts:
             success_train, success_val = split_train_val(success_rollouts, val_ratio=float(cfg.split.val_ratio), seed=int(cfg.seed) + 2)
@@ -311,22 +183,18 @@ def main(cfg: DictConfig) -> None:
 
         if not expert_train:
             raise RuntimeError("No expert training trajectories available after split")
-        if not fail_eval:
-            raise RuntimeError("No fail trajectories available for evaluation")
+        if not fail_val:
+            raise RuntimeError("No fail validation trajectories available after split")
 
         calibration_rollouts = success_train if success_train else expert_train
         if not success_train:
             print("No rollout success data provided. Calibrating threshold with expert trajectories only (surrogate).")
 
-        expert_train_emb = _encode_rollouts(extractor, expert_train, desc="Encoding expert reference pool")
-        expert_val_emb = _encode_rollouts(extractor, expert_val, desc="Encoding expert holdout set")
-        fail_eval_emb = _encode_rollouts(extractor, fail_eval, desc="Encoding fail evaluation set")
-        calibration_emb_full = _encode_rollouts(extractor, calibration_rollouts, desc="Encoding calibration set")
-        success_eval_emb = _encode_rollouts(
-            extractor,
-            success_val if success_val else expert_val,
-            desc="Encoding success evaluation set",
-        )
+        expert_train_emb = _encode_rollouts(extractor, expert_train)
+        expert_val_emb = _encode_rollouts(extractor, expert_val)
+        fail_val_emb = _encode_rollouts(extractor, fail_val)
+        calibration_emb = _encode_rollouts(extractor, calibration_rollouts)
+        success_eval_emb = _encode_rollouts(extractor, success_val if success_val else expert_val)
     finally:
         extractor.close()
 
@@ -341,37 +209,15 @@ def main(cfg: DictConfig) -> None:
         num_expert_candidates=int(cfg.float.num_expert_candidates),
         max_steps=max_steps,
         use_similarity_cost=bool(cfg.float.use_similarity_cost),
-        ot_device=ot_device,
     )
 
-    calibration_emb = _select_calibration_subset(
-        calibration_emb_full,
-        max_items=int(getattr(cfg.calibration, "max_expert_trajectories", 100)),
-        seed=int(cfg.seed),
-    )
-    calibration_total_steps = sum(_trajectory_eval_steps(x, max_steps) for x in calibration_emb)
-    calibration_scores: list[float] = []
-    calibration_pbar = tqdm(total=calibration_total_steps, desc="Calibrating threshold")
-    try:
-        for traj_idx, emb in enumerate(calibration_emb):
-            traj_steps = _trajectory_eval_steps(emb, max_steps)
-            calibration_pbar.set_postfix_str(f"traj={traj_idx + 1}/{len(calibration_emb)} steps={traj_steps}")
-            score = evaluator.episode_score_with_callback(
-                emb,
-                step_callback=lambda _step, _total: calibration_pbar.update(1),
-            )
-            calibration_scores.append(score)
-    finally:
-        calibration_pbar.close()
+    calibration_scores = [evaluator.episode_score(x) for x in calibration_emb]
     delta = float(cfg.calibration.delta)
     delta_step = float(cfg.calibration.delta_step)
     threshold = _compute_threshold(calibration_scores, delta)
 
     fail_records: list[PrefixRecord] = []
-
-    for traj_id, emb in enumerate(
-        tqdm(fail_eval_emb, desc="Evaluating fail rollouts", total=len(fail_eval_emb))
-    ):
+    for traj_id, emb in enumerate(tqdm(fail_val_emb, desc="evaluating fail rollouts")):
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
         n_steps = int(out.step_failure_flags.shape[0])
         labels = fail_prefix_labels(length=n_steps, fail_tail_ratio=float(cfg.labels.fail_tail_ratio))
@@ -413,12 +259,11 @@ def main(cfg: DictConfig) -> None:
         ),
     }
 
-    # success validation (all labels=0)
     success_total = 0
     success_false_alarm = 0
     success_costs: list[float] = []
 
-    for emb in tqdm(success_eval_emb, desc="Evaluating success rollouts", total=len(success_eval_emb)):
+    for emb in success_eval_emb:
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
         success_total += int(out.step_failure_flags.shape[0])
         success_false_alarm += int(np.sum(out.step_failure_flags))
@@ -436,13 +281,12 @@ def main(cfg: DictConfig) -> None:
         random_truncation_metrics = _evaluate_random_truncation_success_rate(
             evaluator=evaluator,
             threshold=threshold,
-            fail_embeddings=fail_eval_emb,
+            fail_embeddings=fail_val_emb,
             expert_embeddings=expert_val_emb,
             fail_start_ratio=float(cfg.random_truncation_eval.fail_start_ratio),
             expert_start_ratio=float(cfg.random_truncation_eval.expert_start_ratio),
             samples_per_trajectory=int(cfg.random_truncation_eval.samples_per_trajectory),
             seed=int(cfg.random_truncation_eval.seed),
-            show_progress=True,
         )
 
     result = {
@@ -454,33 +298,26 @@ def main(cfg: DictConfig) -> None:
             "expert_train": len(expert_train),
             "expert_val": len(expert_val),
             "fail_total": len(fail_rollouts),
-            "fail_eval": len(fail_eval),
+            "fail_train": len(fail_train),
+            "fail_val": len(fail_val),
             "success_total": len(success_rollouts),
             "success_train": len(success_train),
             "success_val": len(success_val),
         },
         "float_runtime": {
-            "ta": int(cfg.float.ta),
-            "to": int(cfg.float.to),
             "num_expert_candidates": int(cfg.float.num_expert_candidates),
             "max_steps": int(max_steps),
-            "policy_ckpt": policy_ckpt,
+            "policy_type": "dino_v2",
+            "policy_latent_source": "dino_v2_cls_token",
+            "pretrained_path": pretrained_path,
             "policy_device": policy_device,
-            "ot_device": ot_device,
-            "policy_type": _policy_type(cfg),
-            "policy_latent_source": (
-                "flow_unet.encode_context"
-                if _policy_type(cfg) == "flow_unet"
-                else "flow_cond_token"
-            ),
-            "expert_cache_loaded": int(expert_cache_stats["loaded"]),
-            "expert_cache_missing": int(expert_cache_stats["missing"]),
-            "expert_cache_bytes_loaded": int(expert_cache_stats["bytes_loaded"]),
+            "camera_name": str(cfg.data.camera_name),
+            "image_size": int(cfg.policy.image_size),
+            "model_name": str(cfg.policy.model_name),
+            "loaded_params": int(extractor.loaded_params),
         },
         "calibration_scores": {
             "num_scores": len(calibration_scores),
-            "num_rollouts_used": len(calibration_emb),
-            "num_rollouts_available": len(calibration_emb_full),
             "mean": float(np.mean(calibration_scores)) if calibration_scores else float("nan"),
             "std": float(np.std(calibration_scores)) if calibration_scores else float("nan"),
         },

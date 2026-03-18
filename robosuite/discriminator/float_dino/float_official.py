@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
 import numpy as np
 
-from .float_core import (
-    cosine_cost_matrix,
-    sinkhorn,
-    torch_batched_cosine_cost_matrix,
-    torch_cosine_cost_matrix,
-    torch_sinkhorn,
-    torch_sinkhorn_batched,
-)
+from .float_core import cosine_cost_matrix, sinkhorn
 
 
 @dataclass
@@ -120,7 +113,6 @@ class OfficialFloatOfflineEvaluator:
         num_expert_candidates: int,
         max_steps: Optional[int] = None,
         use_similarity_cost: bool = False,
-        ot_device: str = "cpu",
     ) -> None:
         if not expert_embeddings:
             raise ValueError("OfficialFloatOfflineEvaluator requires non-empty expert embeddings")
@@ -130,9 +122,6 @@ class OfficialFloatOfflineEvaluator:
         self.tol = float(tol)
         self.num_expert_candidates = int(num_expert_candidates)
         self.use_similarity_cost = bool(use_similarity_cost)
-        self.ot_device = str(ot_device)
-        self._use_torch_ot = False
-        self._torch = None
 
         if self.num_expert_candidates <= 0:
             raise ValueError(f"num_expert_candidates must be >= 1, got {num_expert_candidates}")
@@ -143,74 +132,16 @@ class OfficialFloatOfflineEvaluator:
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be >=1, got {self.max_steps}")
 
-        padded_experts = [_pad_last(np.asarray(e, dtype=np.float32), self.max_steps) for e in expert_embeddings]
-
-        if self.ot_device != "cpu":
-            try:
-                import torch
-
-                self._torch = torch
-                self._torch_device = torch.device(self.ot_device)
-                self.expert_embeddings = [
-                    torch.as_tensor(e, device=self._torch_device, dtype=torch.float32) for e in padded_experts
-                ]
-                self._expert_embeddings_stacked = torch.stack(self.expert_embeddings, dim=0)
-                self._use_torch_ot = True
-            except Exception:
-                self.expert_embeddings = padded_experts
-                self._use_torch_ot = False
-        else:
-            self.expert_embeddings = padded_experts
-
-    def _to_rollout_backend(self, rollout_embeddings: np.ndarray):
-        rollout = np.asarray(rollout_embeddings, dtype=np.float32)
-        if not self._use_torch_ot:
-            return rollout
-        return self._torch.as_tensor(rollout, device=self._torch_device, dtype=self._torch.float32)
+        self.expert_embeddings = [_pad_last(np.asarray(e, dtype=np.float32), self.max_steps) for e in expert_embeddings]
 
     def _ot_cost(self, x: np.ndarray, y: np.ndarray) -> float:
-        if self._use_torch_ot:
-            c = torch_cosine_cost_matrix(x, y, use_similarity_cost=self.use_similarity_cost)
-            a = self._torch.full((x.shape[0],), 1.0 / float(x.shape[0]), device=x.device, dtype=c.dtype)
-            b = self._torch.full((y.shape[0],), 1.0 / float(y.shape[0]), device=y.device, dtype=c.dtype)
-            p = torch_sinkhorn(a=a, b=b, c=c, reg=self.sinkhorn_reg, max_iter=self.max_iter, tol=self.tol)
-            return float((p * c).sum().item())
-
         c = cosine_cost_matrix(x, y, use_similarity_cost=self.use_similarity_cost)
         a = np.full(x.shape[0], 1.0 / float(x.shape[0]), dtype=np.float64)
         b = np.full(y.shape[0], 1.0 / float(y.shape[0]), dtype=np.float64)
         p = sinkhorn(a=a, b=b, c=c, reg=self.sinkhorn_reg, max_iter=self.max_iter, tol=self.tol)
         return float(np.sum(p * c))
 
-    def _batched_ot_costs(self, experts, rollout_prefix) -> np.ndarray:
-        if not self._use_torch_ot:
-            raise RuntimeError("_batched_ot_costs is only available for torch OT backend")
-        c = torch_batched_cosine_cost_matrix(experts, rollout_prefix, use_similarity_cost=self.use_similarity_cost)
-        p = torch_sinkhorn_batched(c=c, reg=self.sinkhorn_reg, max_iter=self.max_iter, tol=self.tol)
-        return (p * c).sum(dim=(1, 2)).detach().cpu().numpy().astype(np.float64)
-
     def _partial_ot_cost_vector(self, expert: np.ndarray, rollout_prefix: np.ndarray) -> np.ndarray:
-        if self._use_torch_ot:
-            idx = int(rollout_prefix.shape[0] - 1)
-            le = int(expert.shape[0])
-            partial_dist = self._torch.cat(
-                [
-                    torch_cosine_cost_matrix(expert, rollout_prefix, use_similarity_cost=self.use_similarity_cost),
-                    self._torch.zeros(
-                        (le, self.max_steps - idx - 1),
-                        device=expert.device,
-                        dtype=self._torch.float32,
-                    ),
-                ],
-                dim=1,
-            )
-            a = self._torch.full((le,), 1.0 / float(le), device=expert.device, dtype=partial_dist.dtype)
-            b = self._torch.full((self.max_steps,), 1.0 / float(self.max_steps), device=expert.device, dtype=partial_dist.dtype)
-            p = torch_sinkhorn(a=a, b=b, c=partial_dist, reg=self.sinkhorn_reg, max_iter=self.max_iter, tol=self.tol)
-            observed_col_cost = self._torch.sum(p[:, : idx + 1] * partial_dist[:, : idx + 1], dim=0)
-            tail = self._torch.zeros(self.max_steps - idx - 1, device=expert.device, dtype=partial_dist.dtype)
-            return self._torch.cat([observed_col_cost, tail], dim=0).detach().cpu().numpy()
-
         idx = rollout_prefix.shape[0] - 1
         le = expert.shape[0]
 
@@ -238,12 +169,6 @@ class OfficialFloatOfflineEvaluator:
         return np.concatenate([observed_col_cost, np.zeros(self.max_steps - idx - 1, dtype=np.float64)], axis=0)
 
     def find_matching_expert_demo(self, rollout_init: np.ndarray) -> np.ndarray:
-        if self._use_torch_ot:
-            costs = self._batched_ot_costs(self._expert_embeddings_stacked, rollout_init)
-            order = np.argsort(costs)
-            k = min(self.num_expert_candidates, len(order))
-            return order[:k]
-
         costs = []
         for expert in self.expert_embeddings:
             costs.append(self._ot_cost(expert, rollout_init))
@@ -252,14 +177,6 @@ class OfficialFloatOfflineEvaluator:
         return order[:k]
 
     def rematch_expert_episode(self, candidate_indices: np.ndarray, rollout_prefix: np.ndarray) -> np.ndarray:
-        if self._use_torch_ot:
-            candidate_tensor = self._expert_embeddings_stacked[
-                self._torch.as_tensor(candidate_indices, device=self._torch_device, dtype=self._torch.long)
-            ]
-            costs = self._batched_ot_costs(candidate_tensor, rollout_prefix)
-            order = np.argsort(costs)
-            return candidate_indices[order]
-
         costs = []
         for idx in candidate_indices:
             expert = self.expert_embeddings[int(idx)]
@@ -268,35 +185,21 @@ class OfficialFloatOfflineEvaluator:
         return candidate_indices[order]
 
     def run_episode(self, rollout_embeddings: np.ndarray, threshold: Optional[float]) -> EpisodeFloatResult:
-        return self.run_episode_with_callback(
-            rollout_embeddings=rollout_embeddings,
-            threshold=threshold,
-            step_callback=None,
-        )
-
-    def run_episode_with_callback(
-        self,
-        rollout_embeddings: np.ndarray,
-        threshold: Optional[float],
-        step_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> EpisodeFloatResult:
-        rollout = self._to_rollout_backend(rollout_embeddings)
-        rollout_shape = tuple(rollout.shape)
-        if len(rollout_shape) != 2:
-            raise ValueError(f"rollout_embeddings must be (T,E), got {rollout_shape}")
-        if rollout_shape[0] == 0:
+        rollout = np.asarray(rollout_embeddings, dtype=np.float32)
+        if rollout.ndim != 2:
+            raise ValueError(f"rollout_embeddings must be (T,E), got {rollout.shape}")
+        if rollout.shape[0] == 0:
             raise ValueError("rollout_embeddings cannot be empty")
 
-        if rollout_shape[0] > self.max_steps:
+        if rollout.shape[0] > self.max_steps:
             rollout = rollout[: self.max_steps]
 
         candidates = self.find_matching_expert_demo(rollout_init=rollout[:1])
-        rollout_len = int(rollout.shape[0])
-        cumulative = np.zeros(rollout_len, dtype=np.float64)
-        flags = np.zeros(rollout_len, dtype=np.int64)
-        matched = np.zeros(rollout_len, dtype=np.int64)
+        cumulative = np.zeros(rollout.shape[0], dtype=np.float64)
+        flags = np.zeros(rollout.shape[0], dtype=np.int64)
+        matched = np.zeros(rollout.shape[0], dtype=np.int64)
 
-        for idx in range(rollout_len):
+        for idx in range(rollout.shape[0]):
             prefix = rollout[: idx + 1]
             candidates = self.rematch_expert_episode(candidates, prefix)
             best_idx = int(candidates[0])
@@ -307,8 +210,6 @@ class OfficialFloatOfflineEvaluator:
             cumulative[idx] = float(np.sum(greedy_cost[: idx + 1]))
             if threshold is not None:
                 flags[idx] = int(cumulative[idx] > float(threshold))
-            if step_callback is not None:
-                step_callback(idx + 1, rollout_len)
 
         return EpisodeFloatResult(
             cumulative_costs=cumulative,
@@ -317,23 +218,7 @@ class OfficialFloatOfflineEvaluator:
         )
 
     def episode_score(self, rollout_embeddings: np.ndarray) -> float:
-        result = self.run_episode_with_callback(
-            rollout_embeddings=rollout_embeddings,
-            threshold=None,
-            step_callback=None,
-        )
-        return float(result.cumulative_costs[-1])
-
-    def episode_score_with_callback(
-        self,
-        rollout_embeddings: np.ndarray,
-        step_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> float:
-        result = self.run_episode_with_callback(
-            rollout_embeddings=rollout_embeddings,
-            threshold=None,
-            step_callback=step_callback,
-        )
+        result = self.run_episode(rollout_embeddings=rollout_embeddings, threshold=None)
         return float(result.cumulative_costs[-1])
 
     def calibrate_threshold(self, success_embeddings: list[np.ndarray], delta: float) -> float:

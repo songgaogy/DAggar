@@ -17,20 +17,30 @@ except Exception:  # pragma: no cover
         return iterable
 
 try:
-    from robosuite.discriminator.float_data import fail_prefix_labels, load_policy_trajectories
-    from robosuite.discriminator.float_official import OfficialFloatOfflineEvaluator
+    from robosuite.discriminator.float.float_data import (
+        fail_prefix_labels,
+        load_multiview_policy_trajectories,
+        load_policy_trajectories,
+        preload_flow_unet_demo_cache_into_memory,
+    )
+    from robosuite.discriminator.float.float_official import OfficialFloatOfflineEvaluator
 except ModuleNotFoundError as exc:  # pragma: no cover
     # Allow running this script without importing robosuite package top-level (mujoco dependency).
     if exc.name not in {"mujoco", "robosuite"}:
         raise
     import sys
 
-    pkg_root = Path(__file__).resolve().parents[2]
+    pkg_root = Path(__file__).resolve().parents[3]
     if str(pkg_root) not in sys.path:
         sys.path.insert(0, str(pkg_root))
 
-    from discriminator.float_data import fail_prefix_labels, load_policy_trajectories
-    from discriminator.float_official import OfficialFloatOfflineEvaluator
+    from discriminator.float.float_data import (
+        fail_prefix_labels,
+        load_multiview_policy_trajectories,
+        load_policy_trajectories,
+        preload_flow_unet_demo_cache_into_memory,
+    )
+    from discriminator.float.float_official import OfficialFloatOfflineEvaluator
 
 try:
     import cv2
@@ -43,20 +53,29 @@ def _import_flow_latent_extractor():
     Import FlowPolicyLatentExtractor lazily so --help works without torch installed.
     """
     try:
-        from robosuite.discriminator.float_policy_latent import FlowPolicyLatentExtractor
+        from robosuite.discriminator.float.float_policy_latent import (
+            FlowPolicyLatentExtractor,
+            FlowUNetPolicyLatentExtractor,
+        )
 
-        return FlowPolicyLatentExtractor
+        return {
+            "flow": FlowPolicyLatentExtractor,
+            "flow_unet": FlowUNetPolicyLatentExtractor,
+        }
     except ModuleNotFoundError as exc:  # pragma: no cover
         if exc.name not in {"mujoco", "robosuite"}:
             raise
         import sys
 
-        pkg_root = Path(__file__).resolve().parents[2]
+        pkg_root = Path(__file__).resolve().parents[3]
         if str(pkg_root) not in sys.path:
             sys.path.insert(0, str(pkg_root))
-        from discriminator.float_policy_latent import FlowPolicyLatentExtractor
+        from discriminator.float.float_policy_latent import FlowPolicyLatentExtractor, FlowUNetPolicyLatentExtractor
 
-        return FlowPolicyLatentExtractor
+        return {
+            "flow": FlowPolicyLatentExtractor,
+            "flow_unet": FlowUNetPolicyLatentExtractor,
+        }
 
 
 @dataclass
@@ -87,6 +106,13 @@ def _resolve_torch_device(preferred: str) -> str:
     return preferred
 
 
+def _resolve_ot_device(preferred: str, fallback: str) -> str:
+    requested = str(preferred).strip()
+    if requested in {"", "auto"}:
+        requested = str(fallback)
+    return _resolve_torch_device(requested)
+
+
 def _compute_threshold(scores: list[float], delta: float) -> float:
     if not scores:
         raise ValueError("Cannot compute threshold from empty calibration scores")
@@ -96,18 +122,33 @@ def _compute_threshold(scores: list[float], delta: float) -> float:
     return float(np.percentile(np.asarray(scores, dtype=np.float64), q=q))
 
 
-def _split_fail_train_eval(
+def _trajectory_eval_steps(embeddings: np.ndarray, max_steps: int) -> int:
+    arr = np.asarray(embeddings)
+    if arr.ndim != 2:
+        raise ValueError(f"embeddings must be (T, E), got {arr.shape}")
+    return max(1, min(int(arr.shape[0]), int(max_steps)))
+
+
+def _select_calibration_subset(embeddings: list[np.ndarray], max_items: int, seed: int) -> list[np.ndarray]:
+    if max_items <= 0 or len(embeddings) <= max_items:
+        return embeddings
+    rng = np.random.default_rng(int(seed))
+    indices = np.sort(rng.choice(len(embeddings), size=int(max_items), replace=False))
+    return [embeddings[int(i)] for i in indices.tolist()]
+
+
+def _split_fail_reference_eval(
     fail_rollouts: list,
-    num_eval_fail: int,
+    num_vis: int,
     seed: int,
 ) -> tuple[list, list]:
     if not fail_rollouts:
         raise ValueError("No fail rollouts provided")
-    if num_eval_fail <= 0:
-        raise ValueError(f"num_eval_fail must be >=1, got {num_eval_fail}")
+    if num_vis <= 0:
+        raise ValueError(f"num_vis must be >=1, got {num_vis}")
     if len(fail_rollouts) < 2:
         raise ValueError(
-            "Need at least 2 fail trajectories for train/eval split "
+            "Need at least 2 fail trajectories for reference/eval split "
             f"(got {len(fail_rollouts)})."
         )
 
@@ -115,11 +156,44 @@ def _split_fail_train_eval(
     indices = np.arange(len(fail_rollouts))
     rng.shuffle(indices)
 
-    k = min(int(num_eval_fail), len(fail_rollouts) - 1)
+    k = min(int(num_vis), len(fail_rollouts) - 1)
     eval_ids = set(indices[:k].tolist())
     fail_eval = [x for i, x in enumerate(fail_rollouts) if i in eval_ids]
-    fail_train = [x for i, x in enumerate(fail_rollouts) if i not in eval_ids]
-    return fail_train, fail_eval
+    fail_reference = [x for i, x in enumerate(fail_rollouts) if i not in eval_ids]
+    return fail_reference, fail_eval
+
+
+def _policy_type(value: str) -> str:
+    policy_type = str(value).lower()
+    aliases = {
+        "flow_v0": "flow",
+        "flow_policy": "flow",
+        "flow_unet_policy": "flow_unet",
+    }
+    return aliases.get(policy_type, policy_type)
+
+
+def _trajectory_num_frames(traj) -> int:
+    return int(traj.images.shape[0])
+
+
+def _extract_visual_frame(traj, frame_id: int, vis_camera_name: Optional[str]) -> np.ndarray:
+    images = np.asarray(traj.images)
+    if images.ndim == 4:
+        return images[frame_id]
+    if images.ndim != 5:
+        raise ValueError(f"Unsupported trajectory image shape for visualization: {images.shape}")
+
+    camera_names = traj.meta.get("camera_names", None)
+    if camera_names is None:
+        view_idx = 0
+    else:
+        names = [str(name) for name in camera_names]
+        if vis_camera_name and vis_camera_name in names:
+            view_idx = names.index(vis_camera_name)
+        else:
+            view_idx = 0
+    return images[frame_id, view_idx]
 
 
 def _map_step_values_to_frames(
@@ -221,9 +295,9 @@ def _fix_robosuite_frame_orientation(frame_rgb: np.ndarray, flip_vertical: bool)
     return np.flipud(frame_rgb)
 
 
-def _adapt_delta_on_fail_train(
+def _adapt_delta_on_fail_reference(
     evaluator: OfficialFloatOfflineEvaluator,
-    fail_train_embeddings: list[np.ndarray],
+    fail_reference_embeddings: list[np.ndarray],
     calibration_scores: list[float],
     delta: float,
     delta_step: float,
@@ -232,18 +306,18 @@ def _adapt_delta_on_fail_train(
     show_progress: bool = True,
 ) -> tuple[float, float]:
     threshold = _compute_threshold(calibration_scores, delta)
-    if not fail_train_embeddings:
+    if not fail_reference_embeddings:
         return delta, threshold
 
     traj_iter = tqdm(
-        fail_train_embeddings,
-        desc="Adaptive delta on fail-train",
+        fail_reference_embeddings,
+        desc="Adaptive delta on fail-reference",
         leave=False,
         disable=not show_progress,
     )
     for emb in traj_iter:
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
-        labels = fail_prefix_labels(length=emb.shape[0], fail_tail_ratio=fail_tail_ratio)
+        labels = fail_prefix_labels(length=int(out.step_failure_flags.shape[0]), fail_tail_ratio=fail_tail_ratio)
         preds = out.step_failure_flags.astype(np.int64)
 
         for i in range(labels.shape[0]):
@@ -270,9 +344,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--expert-dir", type=str, default="data/PandaLift/expert")
     parser.add_argument("--fail-dir", type=str, default="data/PandaLift/fail_rollout")
+    parser.add_argument("--policy-type", type=str, default="flow")
     parser.add_argument("--camera-name", type=str, default="agentview")
+    parser.add_argument("--vis-camera-name", type=str, default="")
     parser.add_argument("--policy-ckpt", type=str, required=True)
     parser.add_argument("--policy-device", type=str, default="cuda")
+    parser.add_argument("--ot-device", type=str, default="auto")
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--latent-batch-size", type=int, default=128)
     parser.add_argument("--history-len", type=int, default=-1)
@@ -287,9 +364,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-similarity-cost", action="store_true")
     parser.add_argument("--delta", type=float, default=10.0)
     parser.add_argument("--delta-step", type=float, default=1.0)
+    parser.add_argument("--max-calibration-experts", type=int, default=100)
     parser.add_argument("--adaptive-delta-on-fail-train", action="store_true")
     parser.add_argument("--fail-tail-ratio", type=float, default=0.2)
-    parser.add_argument("--num-eval-fail", type=int, default=2)
+    parser.add_argument("--num-vis", type=int, default=2)
     parser.add_argument("--max-expert-trajectories", type=int, default=0)
     parser.add_argument("--max-fail-trajectories", type=int, default=0)
     parser.add_argument("--fps", type=int, default=20)
@@ -323,36 +401,78 @@ def main() -> None:
     if not os.path.isfile(policy_ckpt):
         raise FileNotFoundError(f"policy checkpoint not found: {policy_ckpt}")
 
-    expert_rollouts = load_policy_trajectories(
-        data_dir=expert_dir,
-        camera_name=args.camera_name,
-        max_trajectories=(None if int(args.max_expert_trajectories) <= 0 else int(args.max_expert_trajectories)),
-    )
-    fail_rollouts = load_policy_trajectories(
-        data_dir=fail_dir,
-        camera_name=args.camera_name,
-        max_trajectories=(None if int(args.max_fail_trajectories) <= 0 else int(args.max_fail_trajectories)),
-    )
-    fail_train, fail_eval = _split_fail_train_eval(
+    policy_type = _policy_type(args.policy_type)
+    policy_device = _resolve_torch_device(args.policy_device)
+    ot_device = _resolve_ot_device(args.ot_device, fallback=policy_device)
+    extractor_map = _import_flow_latent_extractor()
+    if policy_type == "flow_unet":
+        extractor = extractor_map["flow_unet"](
+            ckpt_path=policy_ckpt,
+            image_size=int(args.image_size),
+            device=policy_device,
+            batch_size=int(args.latent_batch_size),
+            use_ema=True,
+        )
+        expert_rollouts = load_multiview_policy_trajectories(
+            data_dir=expert_dir,
+            camera_names=list(extractor.camera_names),
+            max_trajectories=(None if int(args.max_expert_trajectories) <= 0 else int(args.max_expert_trajectories)),
+        )
+        print("expert data loaded!")
+        fail_rollouts = load_multiview_policy_trajectories(
+            data_dir=fail_dir,
+            camera_names=list(extractor.camera_names),
+            max_trajectories=(None if int(args.max_fail_trajectories) <= 0 else int(args.max_fail_trajectories)),
+        )
+        print("failure data loaded!")
+    elif policy_type == "flow":
+        extractor = extractor_map["flow"](
+            ckpt_path=policy_ckpt,
+            camera_name=args.camera_name,
+            image_size=int(args.image_size),
+            ta=int(args.ta),
+            to=int(args.to),
+            device=policy_device,
+            batch_size=int(args.latent_batch_size),
+            history_len=int(args.history_len),
+            robots=str(args.robots),
+            env_name=str(args.env_name),
+        )
+        expert_rollouts = load_policy_trajectories(
+            data_dir=expert_dir,
+            camera_name=args.camera_name,
+            max_trajectories=(None if int(args.max_expert_trajectories) <= 0 else int(args.max_expert_trajectories)),
+        )
+        fail_rollouts = load_policy_trajectories(
+            data_dir=fail_dir,
+            camera_name=args.camera_name,
+            max_trajectories=(None if int(args.max_fail_trajectories) <= 0 else int(args.max_fail_trajectories)),
+        )
+    else:
+        raise ValueError(f"Unsupported --policy-type {args.policy_type}")
+
+    fail_reference, fail_eval = _split_fail_reference_eval(
         fail_rollouts=fail_rollouts,
-        num_eval_fail=int(args.num_eval_fail),
+        num_vis=int(args.num_vis),
         seed=int(args.seed),
     )
 
-    policy_device = _resolve_torch_device(args.policy_device)
-    FlowPolicyLatentExtractor = _import_flow_latent_extractor()
-    extractor = FlowPolicyLatentExtractor(
-        ckpt_path=policy_ckpt,
-        camera_name=args.camera_name,
-        image_size=int(args.image_size),
-        ta=int(args.ta),
-        to=int(args.to),
-        device=policy_device,
-        batch_size=int(args.latent_batch_size),
-        history_len=int(args.history_len),
-        robots=str(args.robots),
-        env_name=str(args.env_name),
-    )
+    if policy_type == "flow_unet":
+        expert_cache_stats = preload_flow_unet_demo_cache_into_memory(
+            expert_rollouts,
+            camera_names=list(extractor.camera_names),
+            image_size=int(extractor.image_size),
+            progress_desc="Preloading expert flow_unet cache",
+        )
+        fail_cache_stats = preload_flow_unet_demo_cache_into_memory(
+            fail_rollouts,
+            camera_names=list(extractor.camera_names),
+            image_size=int(extractor.image_size),
+            progress_desc="Preloading fail flow_unet cache",
+        )
+    else:
+        expert_cache_stats = {"loaded": 0, "missing": len(expert_rollouts), "bytes_loaded": 0}
+        fail_cache_stats = {"loaded": 0, "missing": len(fail_rollouts), "bytes_loaded": 0}
 
     eval_assets: list[tuple] = []
     try:
@@ -360,9 +480,13 @@ def main() -> None:
         for t in tqdm(expert_rollouts, desc="Encoding expert trajectories", disable=not bool(args.progress)):
             expert_embeddings.append(extractor.encode_trajectory(t))
 
-        fail_train_embeddings = []
-        for t in tqdm(fail_train, desc="Encoding fail-train trajectories", disable=not bool(args.progress)):
-            fail_train_embeddings.append(extractor.encode_trajectory(t))
+        fail_reference_embeddings = []
+        for t in tqdm(
+            fail_reference,
+            desc="Encoding fail-reference trajectories",
+            disable=not bool(args.progress),
+        ):
+            fail_reference_embeddings.append(extractor.encode_trajectory(t))
 
         for traj in tqdm(fail_eval, desc="Encoding fail-eval trajectories", disable=not bool(args.progress)):
             emb, sampled_idx = extractor.encode_trajectory_with_indices(traj)
@@ -382,20 +506,40 @@ def main() -> None:
         num_expert_candidates=int(args.num_expert_candidates),
         max_steps=max_steps,
         use_similarity_cost=bool(args.use_similarity_cost),
+        ot_device=ot_device,
     )
 
-    calibration_scores = [
-        evaluator.episode_score(x)
-        for x in tqdm(expert_embeddings, desc="Calibrating threshold", disable=not bool(args.progress))
-    ]
+    calibration_embeddings = _select_calibration_subset(
+        expert_embeddings,
+        max_items=int(args.max_calibration_experts),
+        seed=int(args.seed),
+    )
+    calibration_total_steps = sum(_trajectory_eval_steps(x, max_steps) for x in calibration_embeddings)
+    calibration_scores: list[float] = []
+    calibration_pbar = tqdm(
+        total=calibration_total_steps,
+        desc="Calibrating threshold",
+        disable=not bool(args.progress),
+    )
+    try:
+        for traj_idx, emb in enumerate(calibration_embeddings):
+            traj_steps = _trajectory_eval_steps(emb, max_steps)
+            calibration_pbar.set_postfix_str(f"traj={traj_idx + 1}/{len(calibration_embeddings)} steps={traj_steps}")
+            score = evaluator.episode_score_with_callback(
+                emb,
+                step_callback=lambda _step, _total: calibration_pbar.update(1),
+            )
+            calibration_scores.append(score)
+    finally:
+        calibration_pbar.close()
     delta_before = float(args.delta)
     threshold = _compute_threshold(scores=calibration_scores, delta=delta_before)
 
     delta_after = delta_before
     if bool(args.adaptive_delta_on_fail_train):
-        delta_after, threshold = _adapt_delta_on_fail_train(
+        delta_after, threshold = _adapt_delta_on_fail_reference(
             evaluator=evaluator,
-            fail_train_embeddings=fail_train_embeddings,
+            fail_reference_embeddings=fail_reference_embeddings,
             calibration_scores=calibration_scores,
             delta=delta_before,
             delta_step=float(args.delta_step),
@@ -413,24 +557,26 @@ def main() -> None:
         tqdm(eval_assets, desc="Evaluating / rendering videos", disable=not bool(args.progress))
     ):
         out = evaluator.run_episode(rollout_embeddings=emb, threshold=threshold)
-        labels = fail_prefix_labels(length=emb.shape[0], fail_tail_ratio=float(args.fail_tail_ratio))
+        n_steps = int(out.step_failure_flags.shape[0])
+        labels = fail_prefix_labels(length=n_steps, fail_tail_ratio=float(args.fail_tail_ratio))
+        sampled_idx = np.asarray(sampled_idx[:n_steps], dtype=np.int64)
 
         frame_flags = _map_step_values_to_frames(
             step_values=out.step_failure_flags,
             sampled_indices=sampled_idx,
-            num_frames=traj.images.shape[0],
+            num_frames=_trajectory_num_frames(traj),
             default_value=0.0,
         ).astype(np.int64)
         frame_costs = _map_step_values_to_frames(
             step_values=out.cumulative_costs,
             sampled_indices=sampled_idx,
-            num_frames=traj.images.shape[0],
+            num_frames=_trajectory_num_frames(traj),
             default_value=0.0,
         )
         frame_labels = _map_step_values_to_frames(
             step_values=labels,
             sampled_indices=sampled_idx,
-            num_frames=traj.images.shape[0],
+            num_frames=_trajectory_num_frames(traj),
             default_value=0.0,
         ).astype(np.int64)
 
@@ -442,7 +588,7 @@ def main() -> None:
         writer = imageio.get_writer(video_path, fps=int(args.fps))
         try:
             frame_iter = tqdm(
-                range(traj.images.shape[0]),
+                range(_trajectory_num_frames(traj)),
                 desc=f"Writing video traj={traj_idx}",
                 leave=False,
                 disable=not bool(args.progress),
@@ -451,7 +597,11 @@ def main() -> None:
                 pred_fail_flag = bool(frame_flags[frame_id])
                 gt_fail_flag = bool(frame_labels[frame_id])
                 frame_rgb = _fix_robosuite_frame_orientation(
-                    frame_rgb=traj.images[frame_id],
+                    frame_rgb=_extract_visual_frame(
+                        traj=traj,
+                        frame_id=frame_id,
+                        vis_camera_name=(args.vis_camera_name if args.vis_camera_name else args.camera_name),
+                    ),
                     flip_vertical=bool(args.flip_vertical),
                 )
                 frame = _draw_overlay(
@@ -472,8 +622,8 @@ def main() -> None:
             trajectory_id=traj_idx,
             source_file=str(traj.meta.get("file_path", "")),
             demo_key=demo_key,
-            num_frames=int(traj.images.shape[0]),
-            num_latent_steps=int(emb.shape[0]),
+            num_frames=int(_trajectory_num_frames(traj)),
+            num_latent_steps=int(n_steps),
             first_pred_failure_frame=(int(first_pred_failure[0] + 1) if first_pred_failure.size > 0 else None),
             pred_failure_frame_count=int(np.sum(frame_flags)),
             gt_failure_frame_count=int(np.sum(frame_labels)),
@@ -487,13 +637,15 @@ def main() -> None:
             "expert_dir": expert_dir,
             "fail_dir": fail_dir,
             "policy_ckpt": policy_ckpt,
+            "policy_type": policy_type,
             "camera_name": args.camera_name,
+            "vis_camera_name": (args.vis_camera_name if args.vis_camera_name else args.camera_name),
         },
         "split": {
             "fail_total": len(fail_rollouts),
-            "fail_train": len(fail_train),
-            "fail_eval": len(fail_eval),
-            "num_eval_fail": int(args.num_eval_fail),
+            "fail_reference": len(fail_reference),
+            "fail_visualized": len(fail_eval),
+            "num_vis": int(args.num_vis),
             "seed": int(args.seed),
         },
         "float_runtime": {
@@ -505,11 +657,20 @@ def main() -> None:
             "num_expert_candidates": int(args.num_expert_candidates),
             "use_similarity_cost": bool(args.use_similarity_cost),
             "policy_device": policy_device,
+            "ot_device": ot_device,
             "flip_vertical": bool(args.flip_vertical),
+            "expert_cache_loaded": int(expert_cache_stats["loaded"]),
+            "expert_cache_missing": int(expert_cache_stats["missing"]),
+            "expert_cache_bytes_loaded": int(expert_cache_stats["bytes_loaded"]),
+            "fail_cache_loaded": int(fail_cache_stats["loaded"]),
+            "fail_cache_missing": int(fail_cache_stats["missing"]),
+            "fail_cache_bytes_loaded": int(fail_cache_stats["bytes_loaded"]),
         },
         "calibration": {
             "mode": "expert_only",
             "num_scores": len(calibration_scores),
+            "num_rollouts_used": len(calibration_embeddings),
+            "num_rollouts_available": len(expert_embeddings),
             "score_mean": float(np.mean(calibration_scores)),
             "score_std": float(np.std(calibration_scores)),
             "delta_before": float(delta_before),

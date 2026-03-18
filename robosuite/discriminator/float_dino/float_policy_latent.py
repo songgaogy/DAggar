@@ -410,10 +410,6 @@ class FlowUNetPolicyLatentExtractor:
 
     def _compute_proprio(self, states: np.ndarray) -> np.ndarray:
         props = np.stack([self.proprio_extractor.extract(s) for s in states], axis=0).astype(np.float32)
-        return self._normalize_proprio(props)
-
-    def _normalize_proprio(self, proprio: np.ndarray) -> np.ndarray:
-        props = np.asarray(proprio, dtype=np.float32)
         if self.prop_mean is not None and self.prop_std is not None:
             if props.shape[1] == self.prop_mean.size:
                 props = (props - self.prop_mean.reshape(1, -1)) / (self.prop_std.reshape(1, -1) + 1e-6)
@@ -438,47 +434,19 @@ class FlowUNetPolicyLatentExtractor:
     @torch.no_grad()
     def encode_trajectory_with_indices(self, traj: MultiViewPolicyTrajectory) -> tuple[np.ndarray, np.ndarray]:
         states = np.asarray(traj.states, dtype=np.float32)
-        cached_images = traj.meta.get("flow_unet_cached_images_chw")
-        cached_proprio = traj.meta.get("flow_unet_cached_proprio")
+        images_raw = np.asarray(traj.images, dtype=np.uint8)
 
+        if states.shape[0] != images_raw.shape[0]:
+            raise ValueError(
+                "state and image length mismatch in multiview policy trajectory: "
+                f"states={states.shape[0]} images={images_raw.shape[0]}"
+            )
         if states.shape[0] == 0:
             raise ValueError("trajectory is empty")
 
-        if cached_images is not None and cached_proprio is not None:
-            images = np.asarray(cached_images, dtype=np.float32)
-            proprio = np.asarray(cached_proprio, dtype=np.float32)
-
-            if images.ndim != 5:
-                raise ValueError(f"Cached flow_unet images must be (T,V,C,H,W), got {images.shape}")
-            if proprio.ndim != 2:
-                raise ValueError(f"Cached flow_unet proprio must be (T,P), got {proprio.shape}")
-
-            t = min(int(states.shape[0]), int(images.shape[0]), int(proprio.shape[0]))
-            if t <= 0:
-                raise ValueError("cached trajectory is empty after length alignment")
-            if images.shape[1] != len(self.camera_names):
-                raise ValueError(
-                    f"Cached image view mismatch: expected {len(self.camera_names)} views, got {images.shape[1]}"
-                )
-            if images.shape[-1] != self.image_size or images.shape[-2] != self.image_size:
-                raise ValueError(
-                    "Cached image size does not match checkpoint image size: "
-                    f"cache={(images.shape[-2], images.shape[-1])} expected={(self.image_size, self.image_size)}"
-                )
-
-            images = images[:t].astype(np.float32) / 255.0
-            proprio = self._normalize_proprio(proprio[:t])
-            sampled_indices = np.arange(t, dtype=np.int64)
-        else:
-            images_raw = np.asarray(traj.images, dtype=np.uint8)
-            if states.shape[0] != images_raw.shape[0]:
-                raise ValueError(
-                    "state and image length mismatch in multiview policy trajectory: "
-                    f"states={states.shape[0]} images={images_raw.shape[0]}"
-                )
-            images = self._prepare_images(images_raw)
-            proprio = self._compute_proprio(states)
-            sampled_indices = np.arange(states.shape[0], dtype=np.int64)
+        images = self._prepare_images(images_raw)
+        proprio = self._compute_proprio(states)
+        sampled_indices = np.arange(states.shape[0], dtype=np.int64)
 
         outputs: list[np.ndarray] = []
         for start in range(0, images.shape[0], self.batch_size):
