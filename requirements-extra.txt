@@ -7,6 +7,9 @@ hidapi
 # required for demonstration utils
 h5py
 
+# required for pretrained language encoder in flow_multi
+transformers
+
 # for extra robosuite_models
 robosuite-models==1.0.0
 

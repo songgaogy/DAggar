@@ -1,21 +1,23 @@
-python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/eval_discriminator.py \
-  data.expert_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert" \
-  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout" \
-  data.success_rollout_dir="" \
-  data.obs_key="states" \
-  data.camera_name="agentview" \
-  policy.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export CUDA_VISIBLE_DEVICES=0
+ADAPTIVE_DELTA=true
+
+python -m robosuite.discriminator.float.eval_discriminator \
+  data.expert_dir="${ROOT_DIR}/data/PandaPickPlaceCan/expert_recover" \
+  data.fail_rollout_dir="${ROOT_DIR}/data/PandaPickPlaceCan/fail_rollout" \
+  policy.ckpt="${ROOT_DIR}/checkpoints/PickPlaceCan/flow_unet-10/flow_unet_ep0400_20260318_020356.pt" \
+  policy.type="flow_unet" \
   policy.device="cuda" \
-  policy.image_size=128 \
-  data.max_expert_trajectories=100 \
-  data.max_fail_trajectories=100 \
-  split.val_ratio=0.1 \
-  labels.fail_tail_ratio=0.2 \
-  float.sinkhorn_reg=0.05 \
-  float.max_iter=200 \
-  float.tol=1e-5 \
-  float.ta=8 \
-  float.to=2 \
-  float.num_expert_candidates=20 \
-  online.adaptive_delta=false \
-  output.save_json_path="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/discriminator/float/eval/summary_quick.json"
+  policy.image_size=-1 \
+  float.ot_device="cuda" \
+  float.num_expert_candidates=100 \
+  calibration.delta=10.0 \
+  calibration.delta_step=1.0 \
+  calibration.max_expert_trajectories=100 \
+  labels.fail_tail_ratio=0.5 \
+  online.adaptive_delta="${ADAPTIVE_DELTA}" \
+  output.save_json_path="${ROOT_DIR}/checkpoints/PickPlaceCan/discriminator/float_unet/summary.json" \
+  "$@"

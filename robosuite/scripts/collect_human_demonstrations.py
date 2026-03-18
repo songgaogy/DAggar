@@ -4,6 +4,7 @@ A script to collect a batch of human demonstrations.
 The demonstrations can be played back using the `playback_demonstrations_from_hdf5.py` script.
 """
 
+import sys
 import argparse
 import datetime
 import json
@@ -288,11 +289,37 @@ def collect_human_trajectory(env, device, arm, max_fr, goal_update_mode, camera_
     return images_np
 
 
+def getch():
+    try:
+        # Windows
+        import msvcrt
+        return msvcrt.getch().decode("utf-8").lower()
+    except ImportError:
+        # Unix / macOS / Linux
+        import tty
+        import termios
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        return ch.lower()
+
+
 def prompt_user_action() -> str:
+    print("Action for this demo: [s]ave / [d]elete / [q]uit / [f]inish ? ", end="", flush=True)
     while True:
-        ans = input("Action for this demo: [s]ave / [d]elete / [q]uit / [f]inish ? ").strip().lower()
+        ans = getch()
+        print(ans)
+
         if ans in ("s", "d", "q", "f"):
             return ans
+
         print("Invalid input. Please enter s, d, f or q.")
 
 

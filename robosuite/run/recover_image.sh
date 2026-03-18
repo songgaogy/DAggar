@@ -4,8 +4,8 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 ROOT_DIR="/home/dodo/Documents/DAggar/robosuite"
-INPUT_DIR="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
-OUTPUT_DIR="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert_recover"
+INPUT_DIR="/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert_original"
+OUTPUT_DIR="/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert"
 PYTHON_BIN="python"
 JOBS=8
 

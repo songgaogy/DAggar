@@ -2,7 +2,7 @@ export CUDA_VISIBLE_DEVICES=0
 export WANDB_MODE="offline"
 export WANDB_ENTITY="songgao-personal"
 
-# --- for 350 trajectroies ---
+# --- for 350, 200, 100 trajectroies ---
 # python /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_unet/train_flow.py \
 #   data.data_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert_recover" \
 #   data.camera_names='["agentview","robot0_robotview","robot0_eye_in_hand"]' \
@@ -13,6 +13,10 @@ export WANDB_ENTITY="songgao-personal"
 #   train.batch_size=512 \
 #   train.num_workers=16 \
 #   train.prefetch_factor=8 \
+#   flow.head.hidden_dim=256 \
+#   flow.head.time_dim=256 \
+#   flow.fusion.num_heads=8 \
+#   flow.head.cond_dim=512 \
 #   train.device="cuda"
 
 
