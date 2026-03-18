@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -24,7 +25,7 @@ class CLIPLanguageEncoder(nn.Module):
     ):
         super().__init__()
         try:
-            from transformers import AutoTokenizer, CLIPTextModel
+            from transformers import AutoConfig, AutoTokenizer, CLIPTextModel
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "transformers is required for flow_multi language encoding. "
@@ -39,7 +40,14 @@ class CLIPLanguageEncoder(nn.Module):
         }
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(pretrained_name, **load_kwargs)
-            self.backbone = CLIPTextModel.from_pretrained(pretrained_name, **load_kwargs)
+            config = AutoConfig.from_pretrained(pretrained_name, **load_kwargs)
+            if self._is_full_clip_config(config):
+                self.backbone = self._load_text_backbone_from_full_clip_checkpoint(
+                    pretrained_name=pretrained_name,
+                    config=config,
+                )
+            else:
+                self.backbone = CLIPTextModel.from_pretrained(pretrained_name, **load_kwargs)
         except OSError as exc:  # pragma: no cover
             raise OSError(
                 f"Failed to load language encoder '{pretrained_name}'. "
@@ -61,6 +69,42 @@ class CLIPLanguageEncoder(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
             self.backbone.eval()
+
+    def _is_full_clip_config(self, config: Any) -> bool:
+        architectures = getattr(config, "architectures", None) or []
+        if "CLIPModel" in architectures:
+            return True
+        return hasattr(config, "vision_config")
+
+    def _load_text_backbone_from_full_clip_checkpoint(self, pretrained_name: str, config: Any) -> nn.Module:
+        from transformers import CLIPTextModel
+
+        text_model = CLIPTextModel(config.text_config)
+        weights_path = os.path.join(pretrained_name, "pytorch_model.bin")
+        if not os.path.exists(weights_path):
+            raise OSError(
+                f"Expected CLIP checkpoint weights at '{weights_path}', but the file was not found."
+            )
+
+        full_state_dict = torch.load(weights_path, map_location="cpu")
+        text_state_dict = {}
+        prefix = "text_model."
+        for key, value in full_state_dict.items():
+            if not key.startswith(prefix):
+                continue
+            if key.endswith("position_ids"):
+                continue
+            text_state_dict[key] = value
+
+        incompatible = text_model.load_state_dict(text_state_dict, strict=False)
+        unexpected_keys = [key for key in incompatible.unexpected_keys if not key.endswith("position_ids")]
+        missing_keys = [key for key in incompatible.missing_keys if not key.endswith("position_ids")]
+        if len(unexpected_keys) > 0 or len(missing_keys) > 0:
+            raise OSError(
+                "Failed to load CLIP text weights cleanly. "
+                f"Missing keys: {missing_keys}. Unexpected keys: {unexpected_keys}."
+            )
+        return text_model
 
     def train(self, mode: bool = True):
         super().train(mode)

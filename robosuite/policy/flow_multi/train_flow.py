@@ -282,10 +282,6 @@ def main(cfg: DictConfig):
         camera_names=list(cfg.data.camera_names),
     ).to(device)
 
-    if bool(cfg.flow.image_encoder.freeze_backbone):
-        for param in model.image_encoder.backbone.parameters():
-            param.requires_grad = False
-
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(float(cfg.train.ema_decay)))
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(

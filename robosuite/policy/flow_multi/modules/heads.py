@@ -26,6 +26,23 @@ def sinusoidal_time_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor
     return embedding
 
 
+def sinusoidal_step_embedding(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    positions = torch.arange(length, device=device, dtype=torch.float32)
+    if length > 1:
+        positions = positions / float(length - 1)
+    half_dim = dim // 2
+    freq = torch.exp(
+        -math.log(10000.0)
+        * torch.arange(half_dim, device=device, dtype=torch.float32)
+        / max(half_dim, 1)
+    )
+    args = positions.unsqueeze(-1) * freq.unsqueeze(0)
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2 == 1:
+        embedding = F.pad(embedding, (0, 1))
+    return embedding.to(dtype=dtype)
+
+
 def _film(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
     return x * (1.0 + scale.unsqueeze(-1)) + shift.unsqueeze(-1)
 
@@ -171,6 +188,18 @@ class GatedCrossAttention1D(nn.Module):
         return query_tokens.transpose(1, 2)
 
 
+class ActionStepConditioner(nn.Module):
+    def __init__(self, embedding_dim: int, out_channels: int):
+        super().__init__()
+        self.embedding_dim = int(embedding_dim)
+        self.proj = nn.Linear(self.embedding_dim, out_channels)
+
+    def forward(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        step_embedding = sinusoidal_step_embedding(length, self.embedding_dim, device=device, dtype=dtype)
+        step_embedding = self.proj(step_embedding)
+        return step_embedding.transpose(0, 1).unsqueeze(0)
+
+
 class UNet1DFlowHead(nn.Module):
     def __init__(
         self,
@@ -183,12 +212,15 @@ class UNet1DFlowHead(nn.Module):
         channel_mults: list[int],
         dropout: float = 0.0,
         cross_attention_cfg: Any = None,
+        action_step_embedding_cfg: Any = None,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.conditioner = TimeConditioner(time_dim=time_dim, task_scene_dim=context_dim, cond_dim=cond_dim)
         cross_attention_cfg = {} if cross_attention_cfg is None else cross_attention_cfg
+        action_step_embedding_cfg = {} if action_step_embedding_cfg is None else action_step_embedding_cfg
         self.cross_attention_enabled = bool(_cfg_get(cross_attention_cfg, "enabled", False))
+        self.action_step_embedding = None
         down_layers = {int(idx) for idx in _cfg_get(cross_attention_cfg, "down_layers", [])}
         up_layers = {int(idx) for idx in _cfg_get(cross_attention_cfg, "up_layers", [0, 1])}
         attn_dim = int(_cfg_get(cross_attention_cfg, "attn_dim", cond_dim))
@@ -197,6 +229,11 @@ class UNet1DFlowHead(nn.Module):
 
         channels = [hidden_dim * mult for mult in channel_mults]
         self.input_proj = nn.Conv1d(action_dim, channels[0], kernel_size=3, padding=1)
+        if bool(_cfg_get(action_step_embedding_cfg, "enabled", True)):
+            self.action_step_embedding = ActionStepConditioner(
+                embedding_dim=int(_cfg_get(action_step_embedding_cfg, "embedding_dim", 64)),
+                out_channels=channels[0],
+            )
 
         self.down_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
@@ -294,6 +331,8 @@ class UNet1DFlowHead(nn.Module):
 
         cond = self.conditioner(timesteps, task_scene_cond)
         h = self.input_proj(x_t)
+        if self.action_step_embedding is not None:
+            h = h + self.action_step_embedding(length=h.shape[-1], device=h.device, dtype=h.dtype)
 
         skips = []
         for idx, blocks in enumerate(self.down_blocks):
@@ -346,4 +385,5 @@ def build_flow_head(cfg: Any, action_dim: int, context_dim: int, token_context_d
         channel_mults=channel_mults,
         dropout=float(_cfg_get(cfg, "dropout", 0.0)),
         cross_attention_cfg=_cfg_get(cfg, "cross_attention", None),
+        action_step_embedding_cfg=_cfg_get(cfg, "action_step_embedding", None),
     )

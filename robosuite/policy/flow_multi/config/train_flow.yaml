@@ -51,7 +51,7 @@ logging:
   project: "robosuite-flow-multi"
   entity: "songgao-personal"
   mode: "offline"
-  log_every: 20
+  log_every: 100
 
 checkpoint:
   save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask_6tasks"

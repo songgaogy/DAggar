@@ -38,6 +38,8 @@ class SharedResNetSpatialSoftmaxEncoder(nn.Module):
         feature_dim: int,
         pretrained_path: str,
         freeze_backbone: bool = False,
+        trainable_stages: list[str] | None = None,
+        train_token_projections: bool = True,
         include_spatial_softmax: bool = True,
         layer3_pool_size: int = 2,
         layer4_pool_size: int = 2,
@@ -50,6 +52,8 @@ class SharedResNetSpatialSoftmaxEncoder(nn.Module):
         self.include_spatial_softmax = bool(include_spatial_softmax)
         self.layer3_pool_size = int(layer3_pool_size)
         self.layer4_pool_size = int(layer4_pool_size)
+        self.trainable_stages = None if trainable_stages is None else [str(stage) for stage in trainable_stages]
+        self.train_token_projections = bool(train_token_projections)
         self.backbone = nn.ModuleDict(
             {
                 "stem": nn.Sequential(
@@ -104,9 +108,64 @@ class SharedResNetSpatialSoftmaxEncoder(nn.Module):
         if self.num_tokens <= 0:
             raise ValueError("Image encoder must output at least one token per image")
 
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
+        self.frozen_backbone_stages = self._configure_backbone_trainability(freeze_backbone=bool(freeze_backbone))
+        if not self.train_token_projections:
+            self._set_projection_trainability(requires_grad=False)
+
+    def _set_module_trainability(self, module: nn.Module, requires_grad: bool):
+        for param in module.parameters():
+            param.requires_grad = requires_grad
+
+    def _set_projection_trainability(self, requires_grad: bool):
+        projection_modules = []
+        projection_parameters = []
+
+        if hasattr(self, "spatial_proj"):
+            projection_modules.append(self.spatial_proj)
+            projection_parameters.append(self.spatial_token_embedding)
+        if hasattr(self, "layer3_proj"):
+            projection_modules.append(self.layer3_proj)
+            projection_parameters.append(self.layer3_token_embedding)
+        if hasattr(self, "layer4_proj"):
+            projection_modules.append(self.layer4_proj)
+            projection_parameters.append(self.layer4_token_embedding)
+
+        for module in projection_modules:
+            self._set_module_trainability(module, requires_grad=requires_grad)
+        for param in projection_parameters:
+            param.requires_grad = requires_grad
+
+    def _configure_backbone_trainability(self, freeze_backbone: bool) -> set[str]:
+        backbone_stage_names = set(self.backbone.keys())
+        trainable_stage_names = None
+        if self.trainable_stages is not None:
+            trainable_stage_names = set(self.trainable_stages)
+            invalid_stage_names = sorted(trainable_stage_names - backbone_stage_names)
+            if len(invalid_stage_names) > 0:
+                raise ValueError(
+                    f"Unsupported trainable_stages={invalid_stage_names}. "
+                    f"Available stages are {sorted(backbone_stage_names)}."
+                )
+
+        if freeze_backbone or trainable_stage_names is not None:
+            for stage_name, stage_module in self.backbone.items():
+                self._set_module_trainability(stage_module, requires_grad=False)
+        if not freeze_backbone and trainable_stage_names is None:
+            return set()
+
+        if trainable_stage_names is None:
+            return backbone_stage_names
+
+        for stage_name in trainable_stage_names:
+            self._set_module_trainability(self.backbone[stage_name], requires_grad=True)
+        return backbone_stage_names - trainable_stage_names
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode:
+            for stage_name in self.frozen_backbone_stages:
+                self.backbone[stage_name].eval()
+        return self
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         stem = self.backbone["stem"](images)
@@ -159,6 +218,8 @@ def build_image_encoder(cfg: Any) -> nn.Module:
         feature_dim=int(_cfg_get(cfg, "feature_dim")),
         pretrained_path=str(_cfg_get(cfg, "pretrained_path")),
         freeze_backbone=bool(_cfg_get(cfg, "freeze_backbone", False)),
+        trainable_stages=_cfg_get(cfg, "trainable_stages", None),
+        train_token_projections=bool(_cfg_get(cfg, "train_token_projections", True)),
         include_spatial_softmax=bool(_cfg_get(cfg, "include_spatial_softmax", True)),
         layer3_pool_size=int(_cfg_get(cfg, "layer3_pool_size", 2)),
         layer4_pool_size=int(_cfg_get(cfg, "layer4_pool_size", 2)),

@@ -19,7 +19,7 @@ python "$ROOT/robosuite/policy/flow_multi/train_flow.py" \
   data.use_disk_cache=true \
   checkpoint.save_dir="$SAVE_DIR" \
   train.epochs=300 \
-  train.batch_size=256 \
+  train.batch_size=512 \
   train.num_workers=16 \
   train.prefetch_factor=8 \
   train.lr=1e-4 \
