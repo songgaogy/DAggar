@@ -28,10 +28,20 @@ class LanguageGuidedTokenModulator(nn.Module):
 
 
 class LanguageGuidedModulation(nn.Module):
-    def __init__(self, feature_dim: int, hidden_dim: int):
+    def __init__(self, feature_dim: int, hidden_dim: int, modulate_visual: bool = True, modulate_proprio: bool = True):
         super().__init__()
-        self.visual_modulator = LanguageGuidedTokenModulator(feature_dim=feature_dim, hidden_dim=hidden_dim)
-        self.proprio_modulator = LanguageGuidedTokenModulator(feature_dim=feature_dim, hidden_dim=hidden_dim)
+        self.modulate_visual = bool(modulate_visual)
+        self.modulate_proprio = bool(modulate_proprio)
+        self.visual_modulator = (
+            LanguageGuidedTokenModulator(feature_dim=feature_dim, hidden_dim=hidden_dim)
+            if self.modulate_visual
+            else None
+        )
+        self.proprio_modulator = (
+            LanguageGuidedTokenModulator(feature_dim=feature_dim, hidden_dim=hidden_dim)
+            if self.modulate_proprio
+            else None
+        )
 
     def forward(
         self,
@@ -39,10 +49,11 @@ class LanguageGuidedModulation(nn.Module):
         proprio_tokens: torch.Tensor,
         language_global: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self.visual_modulator(visual_tokens, language_global),
-            self.proprio_modulator(proprio_tokens, language_global),
-        )
+        if self.visual_modulator is not None:
+            visual_tokens = self.visual_modulator(visual_tokens, language_global)
+        if self.proprio_modulator is not None:
+            proprio_tokens = self.proprio_modulator(proprio_tokens, language_global)
+        return visual_tokens, proprio_tokens
 
 
 def build_language_guided_modulation(cfg: Any, feature_dim: int) -> nn.Module:
@@ -52,4 +63,6 @@ def build_language_guided_modulation(cfg: Any, feature_dim: int) -> nn.Module:
     return LanguageGuidedModulation(
         feature_dim=feature_dim,
         hidden_dim=int(_cfg_get(cfg, "hidden_dim", feature_dim * 2)),
+        modulate_visual=bool(_cfg_get(cfg, "modulate_visual", True)),
+        modulate_proprio=bool(_cfg_get(cfg, "modulate_proprio", True)),
     )

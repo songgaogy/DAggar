@@ -138,3 +138,4 @@ checkpoints/
 error.txt
 ./lpb/
 wandb/
+logs/

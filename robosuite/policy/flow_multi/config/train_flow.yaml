@@ -55,4 +55,4 @@ logging:
 
 checkpoint:
   save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask_6tasks"
-  save_freq: 10
+  save_freq: 50

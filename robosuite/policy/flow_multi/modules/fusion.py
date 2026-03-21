@@ -202,6 +202,7 @@ def build_fusion_module(cfg: Any, num_image_tokens: int, num_proprio_tokens: int
     fusion_type = _cfg_get(cfg, "type", "transformer")
     if fusion_type != "transformer":
         raise ValueError(f"Unsupported fusion type: {fusion_type}")
+    
     return MultiModalTransformerFusion(
         feature_dim=int(_cfg_get(cfg, "feature_dim")),
         num_image_tokens=int(num_image_tokens),
@@ -218,6 +219,7 @@ def build_condition_aggregator(cfg: Any, feature_dim: int) -> nn.Module:
     aggregator_type = _cfg_get(cfg, "type", "attention_pool")
     if aggregator_type != "attention_pool":
         raise ValueError(f"Unsupported condition aggregator type: {aggregator_type}")
+    
     return AttentionConditionAggregator(
         feature_dim=int(feature_dim),
         hidden_dim=int(_cfg_get(cfg, "hidden_dim", feature_dim * 2)),

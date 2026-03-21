@@ -8,7 +8,8 @@ data:
 generate:
   ckpt: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask/flow_multi_ep0010.pt"
   task_name: "PickPlaceCan"
-  output_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan"
+  output_dir: null
+  num_trajs: null
   device: "cuda"
   episodes: 20
   keep_mode: "all"

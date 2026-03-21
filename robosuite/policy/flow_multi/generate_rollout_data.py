@@ -11,17 +11,23 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
 from robosuite.policy.flow_multi.eval_flow import (
-    center_crop_resize,
     preprocess_observation_images,
     resolve_checkpoint_task_name,
     resolve_language_instruction,
     sample_action_sequence,
 )
 from robosuite.policy.flow_multi.model import build_flow_policy
-from robosuite.policy.flow_multi.utils.env_util import (
-    RobosuiteProprioExtractor,
-    camera_obs_key,
-)
+from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor
+
+
+DEFAULT_TASK_OUTPUT_ROOTS = {
+    "PickPlaceBread": "PickPlaceBread",
+    "PickPlaceCereal": "PickPlaceCereal",
+    "PickPlaceMilk": "PickPlaceMilk",
+    "PickPlaceCan": "PandaPickPlaceCan",
+    "Stack": "PandaStack",
+    "Lift": "PandaLift",
+}
 
 
 def now_readable(ts: datetime.datetime | None = None) -> str:
@@ -37,6 +43,16 @@ def normalize_keep_mode(keep_mode: str) -> str:
     return keep_mode
 
 
+def resolve_num_trajs(cfg_generate: DictConfig) -> int:
+    num_trajs = getattr(cfg_generate, "num_trajs", None)
+    if num_trajs is None:
+        num_trajs = cfg_generate.episodes
+    num_trajs = int(num_trajs)
+    if num_trajs <= 0:
+        raise ValueError("generate.num_trajs must be >= 1")
+    return num_trajs
+
+
 def should_keep_episode(keep_mode: str, success: bool) -> bool:
     if keep_mode == "all":
         return True
@@ -49,16 +65,17 @@ def discover_all_cameras(env) -> list[str]:
     return sorted(str(name) for name in env.sim.model.camera_names)
 
 
-def collect_non_image_observations(obs: dict) -> dict[str, np.ndarray]:
-    outputs = {}
-    for key, value in obs.items():
-        if key.endswith("_image"):
-            continue
-        value_np = np.asarray(value)
-        if value_np.dtype.kind in {"U", "S", "O"}:
-            continue
-        outputs[key] = value_np.copy()
-    return outputs
+def resolve_output_dir(task_name: str, keep_mode: str, output_dir: str | None) -> str:
+    if output_dir is not None and str(output_dir).strip().lower() not in {"", "none", "null"}:
+        return to_absolute_path(str(output_dir))
+
+    task_root = DEFAULT_TASK_OUTPUT_ROOTS.get(task_name, task_name)
+    rollout_dir_name = {
+        "all": "rollout",
+        "success": "success_rollout",
+        "fail": "fail_rollout",
+    }[keep_mode]
+    return to_absolute_path(os.path.join("data", task_root, rollout_dir_name))
 
 
 def append_demo_to_hdf5(
@@ -66,64 +83,49 @@ def append_demo_to_hdf5(
     demo_id: int,
     env_name: str,
     env_info: str,
-    task_name: str,
-    language_instruction: str,
     all_camera_names: list[str],
     states: list[np.ndarray],
     actions: list[np.ndarray],
     images_dict: dict[str, list[np.ndarray]],
-    obs_dict: dict[str, list[np.ndarray]],
+    render_height: int,
+    render_width: int,
     success: bool,
     xml_str: str,
 ):
-    file_handle = h5py.File(hdf5_path, "a")
+    with h5py.File(hdf5_path, "a") as file_handle:
+        if "demos" not in file_handle:
+            demos_grp = file_handle.create_group("demos")
+            file_handle.attrs["created_at"] = now_readable()
+            file_handle.attrs["repository_version"] = suite.__version__
+            file_handle.attrs["env"] = env_name
+            file_handle.attrs["env_info"] = env_info
+            file_handle.attrs["camera_names"] = json.dumps(list(all_camera_names))
+        else:
+            demos_grp = file_handle["demos"]
 
-    if "demos" not in file_handle:
-        demos_grp = file_handle.create_group("demos")
-        file_handle.attrs["created_at"] = now_readable()
-        file_handle.attrs["repository_version"] = suite.__version__
-        file_handle.attrs["env"] = env_name
-        file_handle.attrs["env_info"] = env_info
-        file_handle.attrs["task_name"] = task_name
-        file_handle.attrs["language_instruction"] = language_instruction
-        file_handle.attrs["camera_names"] = json.dumps(list(all_camera_names))
-    else:
-        demos_grp = file_handle["demos"]
+        demo_grp = demos_grp.create_group(f"demo_{demo_id:06d}")
+        demo_grp.attrs["length"] = int(len(actions))
+        demo_grp.attrs["successful"] = bool(success)
+        if len(xml_str) > 0:
+            demo_grp.attrs["model_file"] = xml_str
 
-    demo_grp = demos_grp.create_group(f"demo_{demo_id:06d}")
-    demo_grp.attrs["length"] = int(len(actions))
-    demo_grp.attrs["successful"] = bool(success)
-    if len(xml_str) > 0:
-        demo_grp.attrs["model_file"] = xml_str
+        demo_grp.create_dataset("states", data=np.asarray(states))
+        demo_grp.create_dataset("actions", data=np.asarray(actions))
 
-    states_np = np.asarray(states)
-    actions_np = np.asarray(actions)
-    demo_grp.create_dataset("states", data=states_np)
-    demo_grp.create_dataset("actions", data=actions_np)
-
-    obs_grp = demo_grp.create_group("observations")
-
-    for obs_key, obs_values in sorted(obs_dict.items()):
-        obs_np = np.asarray(obs_values)
-        obs_grp.create_dataset(obs_key, data=obs_np)
-
-    for camera_name in all_camera_names:
-        cam_grp = obs_grp.create_group(camera_name)
-        cam_images = images_dict.get(camera_name, [])
-        if len(cam_images) == 0:
-            cam_grp.create_dataset("images", data=np.zeros((0,), dtype=np.uint8))
-            continue
-        cam_np = np.stack(cam_images, axis=0).astype(np.uint8)
-        cam_grp.create_dataset(
-            "images",
-            data=cam_np,
-            dtype=np.uint8,
-            compression="gzip",
-            compression_opts=4,
-            chunks=True,
-        )
-
-    file_handle.close()
+        obs_grp = demo_grp.create_group("observations")
+        empty_images = np.zeros((0, render_height, render_width, 3), dtype=np.uint8)
+        for camera_name in all_camera_names:
+            cam_grp = obs_grp.create_group(camera_name)
+            cam_images = images_dict.get(camera_name, [])
+            cam_np = empty_images if len(cam_images) == 0 else np.stack(cam_images, axis=0).astype(np.uint8)
+            cam_grp.create_dataset(
+                "images",
+                data=cam_np,
+                dtype=np.uint8,
+                compression="gzip",
+                compression_opts=4,
+                chunks=True,
+            )
 
 
 def save_rollout_summary(
@@ -142,6 +144,7 @@ def save_rollout_summary(
 @hydra.main(version_base="1.2", config_path="./config", config_name="generate_rollout_data")
 def main(cfg: DictConfig):
     keep_mode = normalize_keep_mode(cfg.generate.keep_mode)
+    num_trajs = resolve_num_trajs(cfg.generate)
     device = torch.device(cfg.generate.device if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(to_absolute_path(cfg.generate.ckpt), map_location="cpu", weights_only=False)
     task_name = resolve_checkpoint_task_name(getattr(cfg.generate, "task_name", None), checkpoint)
@@ -187,33 +190,38 @@ def main(cfg: DictConfig):
     env = extractor.env
     all_camera_names = discover_all_cameras(env)
 
-    output_dir = to_absolute_path(cfg.generate.output_dir)
+    output_dir = resolve_output_dir(
+        task_name=task_name,
+        keep_mode=keep_mode,
+        output_dir=getattr(cfg.generate, "output_dir", None),
+    )
     os.makedirs(output_dir, exist_ok=True)
     base_time = now_readable()
     output_path = os.path.join(
         output_dir,
-        f"flow_multi_rollout_{task_name}_{keep_mode}_{base_time}_{int(cfg.generate.episodes)}.hdf5",
+        f"flow_multi_rollout_{task_name}_{keep_mode}_{base_time}_{num_trajs}.hdf5",
     )
 
-    try:
-        xml_str = env.sim.model.get_xml()
-    except Exception:
-        xml_str = ""
     env_info = json.dumps(env_metadata)
+    render_height = int(cfg.generate.render_height)
+    render_width = int(cfg.generate.render_width)
 
     saved_count = 0
     attempt_idx = 0
-    while saved_count < int(cfg.generate.episodes):
+    while saved_count < num_trajs:
         attempt_idx += 1
         obs = env.reset()
         done = False
         success = False
         step_count = 0
+        try:
+            xml_str = env.sim.model.get_xml()
+        except Exception:
+            xml_str = ""
 
         ep_states = []
         ep_actions = []
         ep_images = {camera_name: [] for camera_name in all_camera_names}
-        ep_obs = {}
 
         while step_count < int(cfg.generate.max_steps) and not done:
             images = preprocess_observation_images(
@@ -241,20 +249,13 @@ def main(cfg: DictConfig):
             execute_steps = min(int(cfg.generate.action_horizon), action_horizon)
             for action in action_seq[:execute_steps]:
                 current_state = env.sim.get_state().flatten().copy()
-                current_obs = env._get_observations()
-                current_non_image_obs = collect_non_image_observations(current_obs)
-                current_non_image_obs["flow_multi_proprio"] = extractor.extract(current_state).astype(np.float32)
-
                 ep_states.append(current_state)
                 ep_actions.append(np.asarray(action, dtype=np.float32).copy())
 
-                for obs_key, obs_value in current_non_image_obs.items():
-                    ep_obs.setdefault(obs_key, []).append(np.asarray(obs_value).copy())
-
                 for camera_name in all_camera_names:
                     frame = env.sim.render(
-                        height=int(cfg.generate.render_height),
-                        width=int(cfg.generate.render_width),
+                        height=render_height,
+                        width=render_width,
                         camera_name=camera_name,
                     )
                     ep_images[camera_name].append(np.asarray(frame, dtype=np.uint8))
@@ -267,7 +268,7 @@ def main(cfg: DictConfig):
                     or bool(info.get("is_success", False))
                     or bool(env._check_success())
                 )
-                if done or step_count >= int(cfg.generate.max_steps):
+                if success or done or step_count >= int(cfg.generate.max_steps):
                     break
 
         save_rollout_summary(
@@ -285,13 +286,12 @@ def main(cfg: DictConfig):
                 demo_id=saved_count,
                 env_name=str(env_metadata["env_name"]),
                 env_info=env_info,
-                task_name=task_name,
-                language_instruction=language_instruction,
                 all_camera_names=all_camera_names,
                 states=ep_states,
                 actions=ep_actions,
                 images_dict=ep_images,
-                obs_dict=ep_obs,
+                render_height=render_height,
+                render_width=render_width,
                 success=success,
                 xml_str=xml_str,
             )

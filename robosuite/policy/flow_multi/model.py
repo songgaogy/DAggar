@@ -51,13 +51,22 @@ class MultiModalFlowPolicy(nn.Module):
             feature_dim=self.feature_dim,
         )
         self.language_encoder = build_language_encoder(language_encoder_cfg, feature_dim=self.feature_dim)
+
+        # apply FiLM on vision and proprio, conditioned on language
         self.language_guided_modulation = build_language_guided_modulation(modulation_cfg, feature_dim=self.feature_dim)
+
+        # transformer
+        # detail: concat modalities (add learnable + pos_ebd) -> LanguageConditionedTransformerBlock(language conditioned LN)
         self.fusion = build_fusion_module(
             fusion_cfg,
             num_image_tokens=len(self.camera_names) * int(self.image_encoder.num_tokens),
             num_proprio_tokens=int(self.proprio_tokenizer.num_tokens),
         )
+
+        # transformer: reduce dimension
         self.condition_aggregator = build_condition_aggregator(aggregator_cfg, feature_dim=self.feature_dim)
+
+        # 1D flow policy head
         self.flow_head = build_flow_head(
             head_cfg,
             action_dim=self.action_dim,
@@ -78,15 +87,21 @@ class MultiModalFlowPolicy(nn.Module):
         flat_images = images.reshape(batch_size * num_cameras, channels, height, width)
         if flat_images.device.type == "cuda":
             flat_images = flat_images.contiguous(memory_format=torch.channels_last)
+        
+        # pass through pretrained model
         image_tokens = self.image_encoder(flat_images)
         image_tokens = image_tokens.reshape(batch_size, num_cameras * image_tokens.shape[1], image_tokens.shape[2])
         proprio_tokens = self.proprio_tokenizer(proprio)
         language_tokens, language_global, language_mask = self.language_encoder(language)
+
+        # language guided pre-processing
         image_tokens, proprio_tokens = self.language_guided_modulation(
             visual_tokens=image_tokens,
             proprio_tokens=proprio_tokens,
             language_global=language_global,
         )
+
+        # language guided transformer
         fused_tokens, token_padding_mask = self.fusion(
             language_tokens=language_tokens,
             language_mask=language_mask,
@@ -94,13 +109,17 @@ class MultiModalFlowPolicy(nn.Module):
             image_tokens=image_tokens,
             language_global=language_global,
         )
+
+        # condense all the information into one token for flow head
         task_scene_cond = self.condition_aggregator(
             fused_tokens=fused_tokens,
             token_padding_mask=token_padding_mask,
             language_global=language_global,
         )
-        context_tokens = torch.cat([language_tokens, fused_tokens], dim=1)
+
+        context_tokens = torch.cat([language_tokens, fused_tokens], dim=1)      # add language again
         context_padding_mask = torch.cat([~language_mask, token_padding_mask], dim=1)
+
         return {
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
