@@ -200,6 +200,14 @@ class DynBCETrainer:
 
     def _print_model_nonfinite_state(self, state: dict[str, object], prefix: str) -> None:
         print(f"[{prefix}] first_nonfinite={state['first_nonfinite']}")
+        for name, summary in state.get("batch", []):
+            line = f"  batch {name}: nonfinite={summary['nonfinite']}/{summary['total']}"
+            if "mean" in summary:
+                line += (
+                    f" mean={summary['mean']:.4f} std={summary['std']:.4f}"
+                    f" min={summary['min']:.4f} max={summary['max']:.4f}"
+                )
+            print(line)
         for name, summary in state.get("parameters", []):
             line = f"  parameter {name}: nonfinite={summary['nonfinite']}/{summary['total']}"
             if "mean" in summary:
@@ -234,16 +242,28 @@ class DynBCETrainer:
         self._print_model_nonfinite_state(state, prefix="Startup Check")
         raise RuntimeError("Startup integrity check failed: model parameters or buffers are non-finite.")
 
+    def _scan_batch_nonfinite_state(self, batch: dict[str, torch.Tensor]) -> dict[str, object] | None:
+        batch_failures = self._scan_named_tensors((f"batch.{name}", tensor) for name, tensor in batch.items())
+        if not batch_failures:
+            return None
+        return {
+            "first_nonfinite": batch_failures[0][0],
+            "batch": batch_failures,
+        }
+
     def _raise_nonfinite_error(
         self,
         *,
         message: str,
         debug: dict[str, object] | None = None,
+        batch_state: dict[str, object] | None = None,
         model_state: dict[str, object] | None = None,
         gradient_state: dict[str, object] | None = None,
     ) -> None:
         if debug is not None:
             self._print_nonfinite_debug(debug)
+        if batch_state is not None:
+            self._print_model_nonfinite_state(batch_state, prefix="Batch NonFinite State")
         if gradient_state is not None:
             self._print_model_nonfinite_state(gradient_state, prefix="Gradient NonFinite State")
         if model_state is not None:
@@ -269,9 +289,12 @@ class DynBCETrainer:
             ("batch.next_latent", batch["next_latent"]),
             ("batch.action_sequence", batch["action_sequence"]),
             ("batch.risk_target", batch["risk_target"]),
+            ("batch.hard_label", batch["hard_label"]),
             ("batch.occ_weight", batch["occ_weight"]),
             ("batch.dyn_weight", batch["dyn_weight"]),
             ("batch.fuse_weight", batch["fuse_weight"]),
+            ("batch.task_index", batch["task_index"]),
+            ("batch.data_type_index", batch["data_type_index"]),
             ("output.task_embedding", output.task_embedding_debug),
             ("output.current_input", output.current_input_debug),
             ("output.shared_latent", output.shared_latent_debug),
@@ -282,7 +305,10 @@ class DynBCETrainer:
             ("output.occ_evidence", output.occ_evidence),
             ("output.action_feature", output.action_feature_debug),
             ("output.dyn_hidden", output.dyn_hidden_debug),
+            ("output.ensemble_mean", output.ensemble_mean),
+            ("output.ensemble_logvar", output.ensemble_logvar),
             ("output.ensemble_mean_avg", output.ensemble_mean_avg_debug),
+            ("output.ema_target", output.ema_target),
             ("output.dyn_residual", output.dyn_residual),
             ("output.dyn_evidence", output.dyn_evidence),
             ("output.epi_variance", output.epi_variance),
@@ -488,6 +514,15 @@ class DynBCETrainer:
         split_name: str | None = None,
         batch_idx: int | None = None,
     ) -> dict[str, torch.Tensor | dict[str, object] | None]:
+        batch_state = self._scan_batch_nonfinite_state(batch)
+        if batch_state is not None:
+            self._raise_nonfinite_error(
+                message=(
+                    f"Non-finite batch tensor detected at epoch={epoch} split={split_name} batch={batch_idx}."
+                ),
+                batch_state=batch_state,
+            )
+
         amp_enabled = bool(self.config.amp) and self.device.type == "cuda"
         autocast_kwargs = {
             "device_type": self.device.type,
