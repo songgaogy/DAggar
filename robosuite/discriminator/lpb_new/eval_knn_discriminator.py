@@ -83,6 +83,7 @@ def main(cfg: DictConfig) -> None:
             feature_batch_size=int(cfg.feature.batch_size),
             action_horizon=int(cfg.feature.action_horizon),
             normalize_feature=bool(cfg.feature.normalize_feature),
+            normalize_policy_chunk=bool(cfg.feature.normalize_policy_chunk),
             use_transition_error=bool(cfg.feature.use_transition_error),
             detector_device=str(cfg.detector.device),
             delta=float(cfg.detector.delta),
@@ -90,7 +91,12 @@ def main(cfg: DictConfig) -> None:
             knn_chunk_size=int(cfg.detector.knn_chunk_size),
             lambda_mode=str(cfg.detector.lambda_mode),
             lambda_window_size=int(cfg.detector.lambda_window_size),
+            feature_knn_weight=float(cfg.detector.feature_knn_weight),
             transition_aux_weight=float(cfg.detector.transition_aux_weight),
+            policy_chunk_weight=float(cfg.detector.policy_chunk_weight),
+            dynamics_weight=float(cfg.detector.dynamics_weight),
+            neighbor_topk=int(cfg.detector.neighbor_topk),
+            dynamics_temperature=float(cfg.detector.dynamics_temperature),
         )
         summary, calibration_summary, _ = evaluate_trajectory_discriminator(
             detector=detector,

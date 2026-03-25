@@ -72,6 +72,7 @@ feature:
   batch_size: 256
   action_horizon: -1
   normalize_feature: true
+  normalize_policy_chunk: true
   use_transition_error: true
 
 detector:
@@ -80,17 +81,22 @@ detector:
   delta_step: 0.5
   knn_chunk_size: 8192
   lambda_mode: "mean"
-  lambda_window_size: -1
+  lambda_window_size: 12
+  feature_knn_weight: 1.0
   transition_aux_weight: 0.5
+  policy_chunk_weight: 1.0
+  dynamics_weight: 1.0
+  neighbor_topk: 8
+  dynamics_temperature: 1.0
 
 labels:
   fail_tail_ratio: 0.2
 
 eval:
   bank_split: "train"
-  bank_data_types: ["expert"]
+  bank_data_types: ["expert", "success_rollout"]
   calibration_split: "val"
-  calibration_data_types: ["expert"]
+  calibration_data_types: ["expert", "success_rollout"]
   fail_eval_split: "test"
   fail_eval_data_types: ["fail_rollout"]
 
@@ -106,3 +112,8 @@ visualization:
   fps: 20
   camera_name: "agentview"
   flip_vertical: true
+  border_thickness: 3
+  banner_font_scale: 0.52
+  banner_thickness: 1
+  footer_font_scale: 0.40
+  footer_thickness: 1

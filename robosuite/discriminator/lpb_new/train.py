@@ -10,7 +10,11 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
 from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
-from robosuite.discriminator.lpb_new.dataset import LatentTransitionDataset, build_cached_splits
+from robosuite.discriminator.lpb_new.dataset import (
+    LatentTransitionDataset,
+    build_cached_splits,
+    filter_refs_by_data_types,
+)
 from robosuite.discriminator.lpb_new.model import LatentDynamicsModel, build_latent_dynamics_predictor
 from robosuite.discriminator.lpb_new.trainer import Trainer, TrainerConfig
 
@@ -64,15 +68,23 @@ def main(cfg: DictConfig) -> None:
             encoder=encoder,
             seed=seed,
         )
+        train_refs = filter_refs_by_data_types(
+            cached_splits["train"],
+            list(getattr(cfg.data, "train_data_types", ["expert", "success_rollout"])),
+        )
         train_dataset = LatentTransitionDataset(
-            trajectory_refs=cached_splits["train"],
+            trajectory_refs=train_refs,
             horizon=int(cfg.data.transition_horizon),
             preload_to_memory=bool(cfg.data.preload_train_to_memory),
         )
         val_dataset = None
-        if len(cached_splits["val"]) > 0:
+        val_refs = filter_refs_by_data_types(
+            cached_splits["val"],
+            list(getattr(cfg.data, "val_data_types", ["expert", "success_rollout"])),
+        )
+        if len(val_refs) > 0:
             val_dataset = LatentTransitionDataset(
-                trajectory_refs=cached_splits["val"],
+                trajectory_refs=val_refs,
                 horizon=int(cfg.data.transition_horizon),
                 preload_to_memory=bool(cfg.data.preload_eval_to_memory),
             )
@@ -81,13 +93,15 @@ def main(cfg: DictConfig) -> None:
             f"[lpb_new] train_transitions={len(train_dataset)} "
             f"expert_samples={train_dataset.num_expert_samples} "
             f"rollout_samples={train_dataset.num_rollout_samples} "
+            f"num_train_trajectories={len(train_refs)} "
             f"latent_dim={train_dataset.latent_dim} action_dim={train_dataset.action_dim}"
         )
         if val_dataset is not None:
             print(
                 f"[lpb_new] val_transitions={len(val_dataset)} "
                 f"expert_samples={val_dataset.num_expert_samples} "
-                f"rollout_samples={val_dataset.num_rollout_samples}"
+                f"rollout_samples={val_dataset.num_rollout_samples} "
+                f"num_val_trajectories={len(val_refs)}"
             )
 
         predictor = build_latent_dynamics_predictor(

@@ -85,6 +85,77 @@ def knn_min_sqdist(
     return best
 
 
+@torch.no_grad()
+def knn_topk_sqdist(
+    query: torch.Tensor,
+    bank: torch.Tensor,
+    k: int,
+    chunk_size: int = 8192,
+    exclude_range: Optional[tuple[int, int]] = None,
+    allowed_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if query.ndim != 2 or bank.ndim != 2:
+        raise ValueError(f"query/bank must be 2D, got {tuple(query.shape)} and {tuple(bank.shape)}")
+    if query.shape[1] != bank.shape[1]:
+        raise ValueError(f"dim mismatch query={query.shape[1]} bank={bank.shape[1]}")
+    if bank.shape[0] == 0:
+        raise ValueError("bank cannot be empty")
+    if allowed_mask is not None:
+        if allowed_mask.ndim != 1 or allowed_mask.shape[0] != bank.shape[0]:
+            raise ValueError(
+                f"allowed_mask must be shape ({bank.shape[0]},), got {tuple(allowed_mask.shape)}"
+            )
+        allowed_mask = allowed_mask.to(device=query.device, dtype=torch.bool)
+        valid_total = int(allowed_mask.sum().item())
+        if exclude_range is not None:
+            ex_start, ex_end = exclude_range
+            lo = max(0, int(ex_start))
+            hi = min(int(bank.shape[0]), int(ex_end))
+            if hi > lo:
+                valid_total -= int(allowed_mask[lo:hi].sum().item())
+        if valid_total <= 0:
+            raise ValueError("No valid bank entries remain after applying allowed_mask/exclude_range.")
+        k_eff = max(1, min(int(k), valid_total))
+    else:
+        k_eff = max(1, min(int(k), int(bank.shape[0])))
+
+    q = query
+    b = bank.to(device=q.device, dtype=q.dtype)
+    best_d2 = torch.full((q.shape[0], k_eff), float("inf"), device=q.device, dtype=q.dtype)
+    best_idx = torch.full((q.shape[0], k_eff), -1, device=q.device, dtype=torch.long)
+
+    ex_start, ex_end = (-1, -1) if exclude_range is None else exclude_range
+    csz = int(chunk_size)
+
+    for start in range(0, b.shape[0], csz):
+        end = min(start + csz, b.shape[0])
+        chunk = b[start:end]
+        d2 = torch.cdist(q, chunk, p=2.0).pow(2)
+
+        if allowed_mask is not None:
+            chunk_mask = allowed_mask[start:end]
+            if not bool(chunk_mask.any().item()):
+                continue
+            d2[:, ~chunk_mask] = float("inf")
+
+        if exclude_range is not None:
+            lo = max(start, ex_start)
+            hi = min(end, ex_end)
+            if hi > lo:
+                d2[:, (lo - start) : (hi - start)] = float("inf")
+
+        local_k = min(k_eff, int(chunk.shape[0]))
+        local_d2, local_idx = torch.topk(d2, k=local_k, dim=1, largest=False)
+        local_idx = local_idx + int(start)
+
+        merged_d2 = torch.cat([best_d2, local_d2], dim=1)
+        merged_idx = torch.cat([best_idx, local_idx], dim=1)
+        best_d2, order = torch.topk(merged_d2, k=k_eff, dim=1, largest=False)
+        best_idx = torch.gather(merged_idx, dim=1, index=order)
+
+    return best_d2, best_idx
+
+
 @dataclass
 class DetectionResult:
     step_scores: np.ndarray
@@ -92,6 +163,15 @@ class DetectionResult:
     thresholds: np.ndarray
     preds: np.ndarray
     delta_final: float
+
+
+@dataclass
+class EncodedTrajectoryBundle:
+    learned_features: torch.Tensor
+    policy_chunk_features: torch.Tensor
+    target_deltas: torch.Tensor
+    transition_errors: torch.Tensor
+    task_index: int
 
 
 class LPBFeatureExtractor:
@@ -106,10 +186,12 @@ class LPBFeatureExtractor:
         batch_size: int = 256,
         action_horizon: int = -1,
         normalize_feature: bool = True,
+        normalize_policy_chunk: bool = True,
     ) -> None:
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
         self.normalize_feature = bool(normalize_feature)
+        self.normalize_policy_chunk = bool(normalize_policy_chunk)
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
             checkpoint_path=checkpoint_path,
             override_action_horizon=action_horizon,
@@ -174,40 +256,10 @@ class LPBFeatureExtractor:
         return out
 
     @torch.no_grad()
-    def encode_trajectory(self, traj: LatentTrajectory) -> torch.Tensor:
+    def encode_trajectory_bundle(self, traj: LatentTrajectory) -> EncodedTrajectoryBundle:
         t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
         if t_len <= 0:
             raise ValueError("Trajectory has zero valid timesteps")
-
-        latents = self._prepare_latents(traj.latents, t_len=t_len)
-        act_chunks = self._prepare_actions(traj.actions, t_len=t_len)
-        latents_t = torch.from_numpy(latents)
-        act_t = torch.from_numpy(act_chunks)
-
-        feats = []
-        for start in range(0, t_len, self.batch_size):
-            end = min(start + self.batch_size, t_len)
-            latent_b = latents_t[start:end].to(self.device)
-            act_b = act_t[start:end].to(self.device)
-
-            feat = self.model.extract_feature(
-                current_latent=latent_b,
-                action_sequence=act_b,
-            )
-            if self.normalize_feature:
-                feat = F.normalize(feat, p=2.0, dim=-1)
-            feats.append(feat.detach().cpu())
-        return torch.cat(feats, dim=0)
-
-    @torch.no_grad()
-    def encode_trajectory_with_transition_error(
-        self,
-        traj: LatentTrajectory,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
-        if t_len <= 0:
-            raise ValueError("Trajectory has zero valid timesteps")
-
         horizon = int(self.action_horizon)
         valid_len = t_len - horizon
         if valid_len <= 0:
@@ -218,11 +270,16 @@ class LPBFeatureExtractor:
         latents_t = torch.from_numpy(latents)
         act_t = torch.from_numpy(act_chunks)
 
-        feat_all = []
-        for start in range(0, t_len, self.batch_size):
-            end = min(start + self.batch_size, t_len)
-            latent_b = latents_t[start:end].to(self.device)
-            act_b = act_t[start:end].to(self.device)
+        valid_latents_t = latents_t[:valid_len]
+        valid_act_t = act_t[:valid_len]
+        target_delta_t = latents_t[horizon : horizon + valid_len] - valid_latents_t
+
+        feats: list[torch.Tensor] = []
+        errs: list[torch.Tensor] = []
+        for start in range(0, valid_len, self.batch_size):
+            end = min(start + self.batch_size, valid_len)
+            latent_b = valid_latents_t[start:end].to(self.device)
+            act_b = valid_act_t[start:end].to(self.device)
 
             feat = self.model.extract_feature(
                 current_latent=latent_b,
@@ -230,24 +287,45 @@ class LPBFeatureExtractor:
             )
             if self.normalize_feature:
                 feat = F.normalize(feat, p=2.0, dim=-1)
-            feat_all.append(feat.detach().cpu())
-
-        latents_dev = latents_t.to(self.device)
-        act_dev = act_t.to(self.device)
-        errs = []
-        for start in range(0, valid_len, self.batch_size):
-            end = min(start + self.batch_size, valid_len)
+            feats.append(feat.detach().cpu())
             pred = self.model(
-                current_latent=latents_dev[start:end],
-                action_sequence=act_dev[start:end],
+                current_latent=latent_b,
+                action_sequence=act_b,
             )
-            target = latents_dev[start + horizon : end + horizon]
+            target = latents_t[horizon + start : horizon + end].to(self.device)
             err = (pred["pred_latent"] - target).pow(2).mean(dim=-1)
             errs.append(err.detach().cpu())
 
-        feat_all_t = torch.cat(feat_all, dim=0)
-        err_t = torch.cat(errs, dim=0)
-        return feat_all_t[:valid_len], err_t
+        policy_chunk = torch.cat(
+            [
+                valid_latents_t,
+                valid_act_t.reshape(valid_len, -1),
+            ],
+            dim=-1,
+        )
+        if self.normalize_policy_chunk:
+            policy_chunk = F.normalize(policy_chunk, p=2.0, dim=-1)
+
+        return EncodedTrajectoryBundle(
+            learned_features=torch.cat(feats, dim=0),
+            policy_chunk_features=policy_chunk,
+            target_deltas=target_delta_t,
+            transition_errors=torch.cat(errs, dim=0),
+            task_index=int(traj.task_index),
+        )
+
+    @torch.no_grad()
+    def encode_trajectory(self, traj: LatentTrajectory) -> torch.Tensor:
+        bundle = self.encode_trajectory_bundle(traj)
+        return bundle.learned_features
+
+    @torch.no_grad()
+    def encode_trajectory_with_transition_error(
+        self,
+        traj: LatentTrajectory,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bundle = self.encode_trajectory_bundle(traj)
+        return bundle.learned_features, bundle.transition_errors
 
 
 class AdaptiveKNNDiscriminator:
@@ -487,6 +565,7 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         feature_batch_size: int = 256,
         action_horizon: int = -1,
         normalize_feature: bool = True,
+        normalize_policy_chunk: bool = True,
         use_transition_error: bool = True,
         detector_device: str = "cuda",
         delta: float = 10.0,
@@ -494,7 +573,12 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         knn_chunk_size: int = 8192,
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
+        feature_knn_weight: float = 1.0,
         transition_aux_weight: float = 0.0,
+        policy_chunk_weight: float = 1.0,
+        dynamics_weight: float = 1.0,
+        neighbor_topk: int = 8,
+        dynamics_temperature: float = 1.0,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
         self.use_transition_error = bool(use_transition_error)
@@ -504,16 +588,36 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             batch_size=int(feature_batch_size),
             action_horizon=int(action_horizon),
             normalize_feature=bool(normalize_feature),
+            normalize_policy_chunk=bool(normalize_policy_chunk),
         )
+        self.feature_knn_weight = float(feature_knn_weight)
+        self.transition_aux_weight = float(transition_aux_weight)
+        self.policy_chunk_weight = float(policy_chunk_weight)
+        self.dynamics_weight = float(dynamics_weight)
+        self.neighbor_topk = max(1, int(neighbor_topk))
+        self.dynamics_temperature = max(float(dynamics_temperature), 1e-6)
+        if (
+            self.feature_knn_weight <= 0.0
+            and self.transition_aux_weight <= 0.0
+            and self.policy_chunk_weight <= 0.0
+            and self.dynamics_weight <= 0.0
+        ):
+            raise ValueError("At least one score weight must be positive.")
         self.detector = AdaptiveKNNDiscriminator(
             delta=float(delta),
             delta_step=float(delta_step),
             knn_chunk_size=int(knn_chunk_size),
             lambda_mode=str(lambda_mode),
             lambda_window_size=int(lambda_window_size),
-            aux_weight=float(transition_aux_weight),
+            aux_weight=0.0,
             device=str(detector_device),
         )
+        self.learned_bank: Optional[torch.Tensor] = None
+        self.policy_chunk_bank: Optional[torch.Tensor] = None
+        self.target_delta_bank: Optional[torch.Tensor] = None
+        self.policy_chunk_task_index_bank: Optional[torch.Tensor] = None
+        self._offsets: list[tuple[int, int]] = []
+        self._score_scales: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -522,41 +626,203 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
     def _encode_set(
         self,
         trajectories: Sequence[LatentTrajectory],
-    ) -> tuple[list[torch.Tensor], list[Optional[np.ndarray]]]:
-        features: list[torch.Tensor] = []
-        aux_values: list[Optional[np.ndarray]] = []
+    ) -> list[EncodedTrajectoryBundle]:
+        bundles: list[EncodedTrajectoryBundle] = []
         for traj in trajectories:
-            if self.use_transition_error:
-                feat, aux = self.extractor.encode_trajectory_with_transition_error(traj)
-                features.append(feat)
-                aux_values.append(aux.detach().cpu().numpy().astype(np.float32))
-            else:
-                features.append(self.extractor.encode_trajectory(traj))
-                aux_values.append(None)
-        return features, aux_values
+            bundles.append(self.extractor.encode_trajectory_bundle(traj))
+        return bundles
+
+    @staticmethod
+    def _build_offsets(bundles: Sequence[EncodedTrajectoryBundle]) -> list[tuple[int, int]]:
+        offsets: list[tuple[int, int]] = []
+        start = 0
+        for bundle in bundles:
+            end = start + int(bundle.learned_features.shape[0])
+            offsets.append((start, end))
+            start = end
+        return offsets
+
+    def _set_banks(self, bundles: Sequence[EncodedTrajectoryBundle]) -> None:
+        if not bundles:
+            raise ValueError("Cannot build banks from an empty bundle list.")
+        self._offsets = self._build_offsets(bundles)
+        self.learned_bank = torch.cat(
+            [bundle.learned_features for bundle in bundles],
+            dim=0,
+        ).to(self.detector.device, dtype=torch.float32)
+        self.policy_chunk_bank = torch.cat(
+            [bundle.policy_chunk_features for bundle in bundles],
+            dim=0,
+        ).to(self.detector.device, dtype=torch.float32)
+        self.target_delta_bank = torch.cat(
+            [bundle.target_deltas for bundle in bundles],
+            dim=0,
+        ).to(self.detector.device, dtype=torch.float32)
+        self.policy_chunk_task_index_bank = torch.cat(
+            [
+                torch.full(
+                    (int(bundle.policy_chunk_features.shape[0]),),
+                    int(bundle.task_index),
+                    dtype=torch.int64,
+                )
+                for bundle in bundles
+            ],
+            dim=0,
+        ).to(self.detector.device)
+
+    @staticmethod
+    def _compute_scale(values: np.ndarray) -> float:
+        vals = np.asarray(values, dtype=np.float32).reshape(-1)
+        finite = vals[np.isfinite(vals)]
+        if finite.size == 0:
+            return 1.0
+        scale = float(np.mean(finite))
+        return scale if scale > 1e-8 else 1.0
+
+    def _combine_component_scores(
+        self,
+        scores: dict[str, np.ndarray],
+    ) -> np.ndarray:
+        if not scores:
+            raise ValueError("scores cannot be empty")
+        lengths = {int(np.asarray(values).shape[0]) for values in scores.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"Component length mismatch: {sorted(lengths)}")
+
+        step = np.zeros((next(iter(lengths)),), dtype=np.float32)
+        for key, weight in [
+            ("feature_knn", self.feature_knn_weight),
+            ("transition_error", self.transition_aux_weight),
+            ("policy_chunk", self.policy_chunk_weight),
+            ("neighbor_dynamics", self.dynamics_weight),
+        ]:
+            if weight <= 0.0 or key not in scores:
+                continue
+            scale = float(self._score_scales.get(key, 1.0))
+            if scale <= 1e-8:
+                scale = 1.0
+            step = step + float(weight) * (np.asarray(scores[key], dtype=np.float32) / scale)
+        return step.astype(np.float32, copy=False)
+
+    def _compute_component_scores(
+        self,
+        bundle: EncodedTrajectoryBundle,
+        *,
+        exclude_range: Optional[tuple[int, int]] = None,
+    ) -> dict[str, np.ndarray]:
+        if (
+            self.learned_bank is None
+            or self.policy_chunk_bank is None
+            or self.target_delta_bank is None
+            or self.policy_chunk_task_index_bank is None
+        ):
+            raise RuntimeError("Call fit(...) before computing scores.")
+
+        scores: dict[str, np.ndarray] = {}
+        detector_device = self.detector.device
+
+        if self.feature_knn_weight > 0.0:
+            learned_query = bundle.learned_features.to(detector_device, dtype=torch.float32)
+            scores["feature_knn"] = (
+                knn_min_sqdist(
+                    query=learned_query,
+                    bank=self.learned_bank,
+                    chunk_size=self.detector.knn_chunk_size,
+                    exclude_range=exclude_range,
+                )
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+
+        if self.transition_aux_weight > 0.0 and self.use_transition_error:
+            scores["transition_error"] = (
+                bundle.transition_errors.detach().cpu().numpy().astype(np.float32)
+            )
+
+        if self.policy_chunk_weight > 0.0 or self.dynamics_weight > 0.0:
+            policy_query = bundle.policy_chunk_features.to(detector_device, dtype=torch.float32)
+            same_task_mask = self.policy_chunk_task_index_bank == int(bundle.task_index)
+            topk_d2, topk_idx = knn_topk_sqdist(
+                query=policy_query,
+                bank=self.policy_chunk_bank,
+                k=self.neighbor_topk,
+                chunk_size=self.detector.knn_chunk_size,
+                exclude_range=exclude_range,
+                allowed_mask=same_task_mask,
+            )
+            if self.policy_chunk_weight > 0.0:
+                scores["policy_chunk"] = (
+                    topk_d2.mean(dim=1).detach().cpu().numpy().astype(np.float32)
+                )
+            if self.dynamics_weight > 0.0:
+                neighbor_deltas = self.target_delta_bank[topk_idx]
+                query_delta = bundle.target_deltas.to(detector_device, dtype=torch.float32).unsqueeze(1)
+                dyn_err = (query_delta - neighbor_deltas).pow(2).mean(dim=-1)
+                weights = torch.softmax(-topk_d2 / float(self.dynamics_temperature), dim=1)
+                dyn_score = (weights * dyn_err).sum(dim=1)
+                scores["neighbor_dynamics"] = (
+                    dyn_score.detach().cpu().numpy().astype(np.float32)
+                )
+
+        return scores
 
     def fit(
         self,
         normal_bank_trajectories: Sequence[LatentTrajectory],
         calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
-        if calibration_trajectories is None:
-            calibration_trajectories = normal_bank_trajectories
+        if len(normal_bank_trajectories) == 0:
+            raise ValueError("normal_bank_trajectories cannot be empty")
 
-        bank_features, _ = self._encode_set(normal_bank_trajectories)
-        calib_features, calib_aux = self._encode_set(calibration_trajectories)
-        threshold = self.detector.fit(
-            expert_sequences=bank_features,
-            calibration_sequences=calib_features,
-            calibration_aux=None if not self.use_transition_error else calib_aux,
+        bank_bundles = self._encode_set(normal_bank_trajectories)
+        self._set_banks(bank_bundles)
+
+        calibration_bundles = bank_bundles if calibration_trajectories is None else self._encode_set(calibration_trajectories)
+        calibration_ranges = self._offsets if calibration_trajectories is None else [None] * len(calibration_bundles)
+
+        calibration_component_scores = [
+            self._compute_component_scores(bundle, exclude_range=exclude_range)
+            for bundle, exclude_range in zip(calibration_bundles, calibration_ranges)
+        ]
+        if not calibration_component_scores:
+            raise ValueError("No calibration bundles available.")
+
+        merged_component_scores: dict[str, np.ndarray] = {}
+        for key in calibration_component_scores[0].keys():
+            merged_component_scores[key] = np.concatenate(
+                [scores[key] for scores in calibration_component_scores if key in scores],
+                axis=0,
+            ).astype(np.float32)
+        self._score_scales = {
+            key: self._compute_scale(values)
+            for key, values in merged_component_scores.items()
+        }
+
+        calib_lambdas = [
+            self.detector._aggregate_lambda(self._combine_component_scores(scores))
+            for scores in calibration_component_scores
+        ]
+        self.detector._calib_lambdas = np.concatenate(calib_lambdas, axis=0).astype(np.float32)
+        self.detector.threshold = self.detector._compute_threshold(
+            self.detector._calib_lambdas,
+            self.detector.delta,
         )
+        threshold = float(self.detector.threshold)
         return DetectorCalibrationSummary(
             detector_name=self.name,
             threshold=float(threshold),
             metadata={
                 "lpb_ckpt": self.checkpoint_path,
                 "use_transition_error": bool(self.use_transition_error),
-                "transition_aux_weight": float(self.detector.aux_weight),
+                "feature_knn_weight": float(self.feature_knn_weight),
+                "transition_aux_weight": float(self.transition_aux_weight),
+                "policy_chunk_weight": float(self.policy_chunk_weight),
+                "dynamics_weight": float(self.dynamics_weight),
+                "neighbor_topk": int(self.neighbor_topk),
+                "dynamics_temperature": float(self.dynamics_temperature),
+                "score_scales": dict(self._score_scales),
                 "delta_init": float(self.detector.delta),
                 "delta_final": float(self.detector.delta),
                 "knn_chunk_size": int(self.detector.knn_chunk_size),
@@ -576,32 +842,83 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         warmup_steps: int = 0,
         update_interval: int = 1,
     ) -> TrajectoryDetectionResult:
-        if self.use_transition_error:
-            features, aux = self.extractor.encode_trajectory_with_transition_error(trajectory)
-            aux_np = aux.detach().cpu().numpy().astype(np.float32)
-        else:
-            features = self.extractor.encode_trajectory(trajectory)
-            aux_np = None
-        output = self.detector.detect_sequence(
-            features=features,
-            labels=None if labels is None else np.asarray(labels, dtype=np.int64),
-            adaptive_delta=bool(adaptive_threshold),
-            aux_scores=aux_np,
-            delta_min=float(delta_min),
-            delta_max=float(delta_max),
-            warmup_steps=int(warmup_steps),
-            update_interval=int(update_interval),
-        )
+        if self.detector.threshold is None or self.detector._calib_lambdas is None:
+            raise RuntimeError("Call fit(...) before detect_trajectory(...)")
+
+        bundle = self.extractor.encode_trajectory_bundle(trajectory)
+        component_scores = self._compute_component_scores(bundle)
+        step_scores = self._combine_component_scores(component_scores)
+        lamb = self.detector._aggregate_lambda(step_scores)
+
+        preds = np.zeros_like(lamb, dtype=np.int64)
+        ths = np.zeros_like(lamb, dtype=np.float32)
+
+        cur_delta = float(self.detector.delta)
+        cur_threshold = float(self.detector.threshold)
+        dmin = float(np.clip(delta_min, 0.0, 100.0))
+        dmax = float(np.clip(delta_max, 0.0, 100.0))
+        if dmin > dmax:
+            dmin, dmax = dmax, dmin
+        warmup = max(0, int(warmup_steps))
+        update_every = max(1, int(update_interval))
+
+        labels_np = None if labels is None else np.asarray(labels, dtype=np.int64)
+        for t in range(lamb.shape[0]):
+            pred = int(lamb[t] >= cur_threshold)
+            preds[t] = pred
+            ths[t] = float(cur_threshold)
+
+            if adaptive_threshold and labels_np is not None:
+                should_update = (t + 1) > warmup and ((t + 1 - warmup) % update_every == 0)
+                if should_update:
+                    label = int(labels_np[t])
+                    if label == 1 and pred == 0:
+                        cur_delta += self.detector.delta_step
+                    elif label == 0 and pred == 1:
+                        cur_delta -= self.detector.delta_step
+                    cur_delta = float(np.clip(cur_delta, dmin, dmax))
+                    cur_threshold = self.detector._compute_threshold(self.detector._calib_lambdas, cur_delta)
+
+        self.detector.delta = float(cur_delta)
+        self.detector.threshold = float(cur_threshold)
         return TrajectoryDetectionResult(
             detector_name=self.name,
-            step_scores=np.asarray(output.step_scores, dtype=np.float32),
-            aggregate_scores=np.asarray(output.lambda_values, dtype=np.float32),
-            thresholds=np.asarray(output.thresholds, dtype=np.float32),
-            predictions=np.asarray(output.preds, dtype=np.int64),
-            aux_scores=None if aux_np is None else np.asarray(aux_np, dtype=np.float32),
-            labels=None if labels is None else np.asarray(labels, dtype=np.int64),
+            step_scores=np.asarray(step_scores, dtype=np.float32),
+            aggregate_scores=np.asarray(lamb, dtype=np.float32),
+            thresholds=np.asarray(ths, dtype=np.float32),
+            predictions=np.asarray(preds, dtype=np.int64),
+            aux_scores=(
+                None
+                if "transition_error" not in component_scores
+                else np.asarray(component_scores["transition_error"], dtype=np.float32)
+            ),
+            labels=labels_np,
             metadata={
-                "delta_final": float(output.delta_final),
+                "delta_final": float(self.detector.delta),
                 "threshold_final": float(self.detector.threshold if self.detector.threshold is not None else np.nan),
+                "feature_knn_scores": (
+                    np.asarray(component_scores["feature_knn"], dtype=np.float32)
+                    if "feature_knn" in component_scores
+                    else None
+                ),
+                "transition_error_scores": (
+                    np.asarray(component_scores["transition_error"], dtype=np.float32)
+                    if "transition_error" in component_scores
+                    else None
+                ),
+                "policy_chunk_scores": (
+                    np.asarray(component_scores["policy_chunk"], dtype=np.float32)
+                    if "policy_chunk" in component_scores
+                    else None
+                ),
+                "neighbor_dynamics_scores": (
+                    np.asarray(component_scores["neighbor_dynamics"], dtype=np.float32)
+                    if "neighbor_dynamics" in component_scores
+                    else None
+                ),
+                "feature_knn_mean": float(np.mean(component_scores["feature_knn"])) if "feature_knn" in component_scores else float("nan"),
+                "transition_error_mean": float(np.mean(component_scores["transition_error"])) if "transition_error" in component_scores else float("nan"),
+                "policy_chunk_mean": float(np.mean(component_scores["policy_chunk"])) if "policy_chunk" in component_scores else float("nan"),
+                "neighbor_dynamics_mean": float(np.mean(component_scores["neighbor_dynamics"])) if "neighbor_dynamics" in component_scores else float("nan"),
             },
         )

@@ -19,6 +19,8 @@ data:
   encode_demo_batch_size: 8
   preload_train_to_memory: false
   preload_eval_to_memory: false
+  train_data_types: ["expert", "success_rollout"]
+  val_data_types: ["expert", "success_rollout"]
   splits:
     train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
     val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}

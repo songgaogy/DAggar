@@ -97,6 +97,7 @@ def main(cfg: DictConfig) -> None:
             feature_batch_size=int(cfg.feature.batch_size),
             action_horizon=int(cfg.feature.action_horizon),
             normalize_feature=bool(cfg.feature.normalize_feature),
+            normalize_policy_chunk=bool(cfg.feature.normalize_policy_chunk),
             use_transition_error=bool(cfg.feature.use_transition_error),
             detector_device=str(cfg.detector.device),
             delta=float(cfg.detector.delta),
@@ -104,7 +105,12 @@ def main(cfg: DictConfig) -> None:
             knn_chunk_size=int(cfg.detector.knn_chunk_size),
             lambda_mode=str(cfg.detector.lambda_mode),
             lambda_window_size=int(cfg.detector.lambda_window_size),
+            feature_knn_weight=float(cfg.detector.feature_knn_weight),
             transition_aux_weight=float(cfg.detector.transition_aux_weight),
+            policy_chunk_weight=float(cfg.detector.policy_chunk_weight),
+            dynamics_weight=float(cfg.detector.dynamics_weight),
+            neighbor_topk=int(cfg.detector.neighbor_topk),
+            dynamics_temperature=float(cfg.detector.dynamics_temperature),
         )
         calibration_summary = detector.fit(
             normal_bank_trajectories=bank_trajectories,
@@ -156,6 +162,46 @@ def main(cfg: DictConfig) -> None:
                 num_frames=int(prepared.images_hwc.shape[0]),
                 tail_fill=float(result.thresholds[-1]) if result.thresholds.size > 0 else 0.0,
             )
+            feature_knn_scores = result.metadata.get("feature_knn_scores", None)
+            transition_error_scores = result.metadata.get("transition_error_scores", None)
+            policy_chunk_scores = result.metadata.get("policy_chunk_scores", None)
+            neighbor_dynamics_scores = result.metadata.get("neighbor_dynamics_scores", None)
+            frame_feature_knn = (
+                map_step_values_to_frames(
+                    np.asarray(feature_knn_scores, dtype=np.float32),
+                    num_frames=int(prepared.images_hwc.shape[0]),
+                    tail_fill=float(np.asarray(feature_knn_scores, dtype=np.float32)[-1]),
+                )
+                if feature_knn_scores is not None
+                else None
+            )
+            frame_transition_error = (
+                map_step_values_to_frames(
+                    np.asarray(transition_error_scores, dtype=np.float32),
+                    num_frames=int(prepared.images_hwc.shape[0]),
+                    tail_fill=float(np.asarray(transition_error_scores, dtype=np.float32)[-1]),
+                )
+                if transition_error_scores is not None
+                else None
+            )
+            frame_policy_chunk = (
+                map_step_values_to_frames(
+                    np.asarray(policy_chunk_scores, dtype=np.float32),
+                    num_frames=int(prepared.images_hwc.shape[0]),
+                    tail_fill=float(np.asarray(policy_chunk_scores, dtype=np.float32)[-1]),
+                )
+                if policy_chunk_scores is not None
+                else None
+            )
+            frame_neighbor_dynamics = (
+                map_step_values_to_frames(
+                    np.asarray(neighbor_dynamics_scores, dtype=np.float32),
+                    num_frames=int(prepared.images_hwc.shape[0]),
+                    tail_fill=float(np.asarray(neighbor_dynamics_scores, dtype=np.float32)[-1]),
+                )
+                if neighbor_dynamics_scores is not None
+                else None
+            )
 
             video_path = os.path.join(
                 run_dir,
@@ -174,7 +220,29 @@ def main(cfg: DictConfig) -> None:
                         frame_rgb=frame_rgb,
                         flip_vertical=bool(cfg.visualization.flip_vertical),
                     )
-                    extra_text = f"task={ref.task_name} delta={float(result.metadata.get('delta_final', np.nan)):.2f}"
+                    footer_lines = [
+                        f"det={detector.name} dl={float(result.metadata.get('delta_final', np.nan)):.1f}",
+                        f"lam={float(frame_scores[frame_id]):.3f} th={float(frame_thresholds[frame_id]):.3f}",
+                    ]
+                    if frame_feature_knn is not None or frame_transition_error is not None:
+                        footer_lines.append(
+                            " ".join(
+                                [
+                                    f"fk={float(frame_feature_knn[frame_id]):.3f}" if frame_feature_knn is not None else "",
+                                    f"te={float(frame_transition_error[frame_id]):.3f}" if frame_transition_error is not None else "",
+                                ]
+                            ).strip()
+                        )
+                    if frame_policy_chunk is not None or frame_neighbor_dynamics is not None:
+                        footer_lines.append(
+                            " ".join(
+                                [
+                                    f"pc={float(frame_policy_chunk[frame_id]):.3f}" if frame_policy_chunk is not None else "",
+                                    f"dy={float(frame_neighbor_dynamics[frame_id]):.3f}" if frame_neighbor_dynamics is not None else "",
+                                ]
+                            ).strip()
+                        )
+                    footer_lines = [line for line in footer_lines if line]
                     frame = draw_detection_overlay(
                         frame_rgb,
                         frame_id=frame_id,
@@ -183,7 +251,12 @@ def main(cfg: DictConfig) -> None:
                         aggregate_score=float(frame_scores[frame_id]),
                         threshold=float(frame_thresholds[frame_id]),
                         detector_name=detector.name,
-                        extra_text=extra_text,
+                        footer_lines=footer_lines,
+                        border_thickness=int(cfg.visualization.border_thickness),
+                        banner_font_scale=float(cfg.visualization.banner_font_scale),
+                        banner_thickness=int(cfg.visualization.banner_thickness),
+                        footer_font_scale=float(cfg.visualization.footer_font_scale),
+                        footer_thickness=int(cfg.visualization.footer_thickness),
                     )
                     writer.append_data(frame)
             finally:
