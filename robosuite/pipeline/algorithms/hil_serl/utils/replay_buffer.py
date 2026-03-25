@@ -104,6 +104,12 @@ class HILSERLReplayBuffer:
                 "storage": list(self._storage),
             }
 
+    def snapshot_state_dict(self) -> dict[str, Any]:
+        return self.state_dict()
+
+    def snapshot_transition(self, transition: Transition) -> Transition:
+        return self._normalize_transition(transition)
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         with self._lock:
             self.name = str(state_dict["name"])
@@ -123,7 +129,11 @@ class HILSERLReplayBuffer:
                 self._reference_action = None
 
     def save(self, path: str | Path) -> None:
-        torch.save(self.state_dict(), Path(path))
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.tmp")
+        torch.save(self.state_dict(), tmp_path)
+        tmp_path.replace(path)
 
     def load(self, path: str | Path) -> None:
         state_dict = torch.load(Path(path), map_location="cpu", weights_only=False)

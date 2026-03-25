@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -80,6 +81,7 @@ def load_demo_paths(
     demo_paths: Iterable[str | Path],
     *,
     cache_dir: str | Path | None = None,
+    mirror_cache_dir: str | Path | None = None,
     hdf5_loader=None,
     max_num_trajectories: int | None = None,
     cache_key: str | None = None,
@@ -123,6 +125,7 @@ def load_demo_paths(
                     cache_stem = f"{cache_stem}_first_{len(selected_demo_names):05d}"
                 cache_path = cache_root / f"{cache_stem}.pt"
                 if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
+                    _mirror_cache_file(cache_path, mirror_cache_dir)
                     transitions.extend(load_transition_shard(cache_path))
                     if remaining_trajectories is not None:
                         remaining_trajectories -= len(selected_demo_names)
@@ -131,6 +134,7 @@ def load_demo_paths(
             transitions.extend(converted)
             if cache_path is not None:
                 save_transition_shard(cache_path, converted)
+                _mirror_cache_file(cache_path, mirror_cache_dir)
             if remaining_trajectories is not None:
                 remaining_trajectories -= len(selected_demo_names)
             continue
@@ -162,6 +166,18 @@ def read_hdf5_camera_names(path: str | Path) -> list[str]:
 
 def ensure_directory(path: str | Path) -> None:
     os.makedirs(Path(path), exist_ok=True)
+
+
+def _mirror_cache_file(source: str | Path, mirror_cache_dir: str | Path | None) -> None:
+    if mirror_cache_dir is None:
+        return
+    source_path = Path(source)
+    mirror_root = Path(mirror_cache_dir)
+    mirror_root.mkdir(parents=True, exist_ok=True)
+    destination = mirror_root / source_path.name
+    if destination.exists() and destination.stat().st_mtime >= source_path.stat().st_mtime:
+        return
+    shutil.copy2(source_path, destination)
 
 
 def _get_hdf5_demo_group(file_handle: h5py.File | h5py.Group) -> h5py.Group:

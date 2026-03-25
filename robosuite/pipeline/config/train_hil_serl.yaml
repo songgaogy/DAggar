@@ -103,10 +103,12 @@ runtime:
   policy_fps: ${runtime.control_fps}
   fps_log_interval: 1.0
   async_updates: true
-  resume: true
+  resume: false
   checkpoint: null
   load_buffers: true
   eval_deterministic: false
+  buffer_save_interval: 200
+  episode_pause_sec: 1.0
 
 logging:
   output_root: "./outputs/hil_serl"
@@ -117,3 +119,10 @@ logging:
   wandb_mode: "offline"
   log_interval: 10
   checkpoint_interval: 1000
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

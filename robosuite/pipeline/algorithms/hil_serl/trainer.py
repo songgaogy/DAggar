@@ -24,6 +24,11 @@ class HILSERLTrainer:
         self.reward_provider = reward_provider
         self.total_env_steps = 0
         self.total_updates = 0
+        self.total_critic_updates = 0
+        self.total_actor_updates = 0
+        self.total_temperature_updates = 0
+        self.total_publishes = 0
+        self.last_published_update = 0
         self._async_condition = threading.Condition()
         self._async_metrics: deque[dict[str, float]] = deque()
         self._async_thread: threading.Thread | None = None
@@ -103,15 +108,26 @@ class HILSERLTrainer:
             raise RuntimeError("Not enough data in the online/demo buffers for a mixed HIL-SERL update.")
 
         metrics = {}
+        critic_only_updates_this_step = 0
         for _ in range(max(0, int(self.config.cta_ratio) - 1)):
             critic_batch = self.agent.sample_mixed_batch(batch_size=batch_size)
             metrics = self.agent.update(batch=critic_batch, critic_only=True)
             self.total_updates += 1
+            self.total_critic_updates += 1
+            critic_only_updates_this_step += 1
 
         full_batch = self.agent.sample_mixed_batch(batch_size=batch_size)
         metrics = self.agent.update(batch=full_batch, critic_only=False)
         self.total_updates += 1
-        return metrics
+        self.total_critic_updates += 1
+        self.total_actor_updates += 1
+        if "alpha_loss" in metrics:
+            self.total_temperature_updates += 1
+
+        summarized_metrics = dict(metrics)
+        summarized_metrics["learner_critic_only_updates_this_step"] = float(critic_only_updates_this_step)
+        summarized_metrics["learner_full_updates_this_step"] = 1.0
+        return summarized_metrics
 
     def maybe_update(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:
         self._raise_async_error()
@@ -122,9 +138,9 @@ class HILSERLTrainer:
             return self.drain_async_metrics()
         metrics_list = []
         for _ in range(int(self.config.updates_per_step)):
-            metrics_list.append(self.train_step(batch_size=batch_size))
-            if self.total_updates % max(1, int(self.config.steps_per_update)) == 0:
-                self.agent.sync_inference_policy()
+            metrics = self.train_step(batch_size=batch_size)
+            published = self._maybe_publish_inference_policy()
+            metrics_list.append(self._attach_progress_metrics(metrics, published=published))
         return metrics_list
 
     def maybe_update_async(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:
@@ -213,10 +229,9 @@ class HILSERLTrainer:
 
             try:
                 metrics = self.train_step(batch_size=batch_size)
-                if self.total_updates % max(1, int(self.config.steps_per_update)) == 0:
-                    self.agent.sync_inference_policy()
+                published = self._maybe_publish_inference_policy()
                 with self._async_condition:
-                    self._async_metrics.append(metrics)
+                    self._async_metrics.append(self._attach_progress_metrics(metrics, published=published))
             except BaseException as exc:
                 with self._async_condition:
                     self._async_error = exc
@@ -233,6 +248,71 @@ class HILSERLTrainer:
             error = self._async_error
         if error is not None:
             raise RuntimeError(f"Async learner worker failed: {error}") from error
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "total_env_steps": int(self.total_env_steps),
+            "total_updates": int(self.total_updates),
+            "total_critic_updates": int(self.total_critic_updates),
+            "total_actor_updates": int(self.total_actor_updates),
+            "total_temperature_updates": int(self.total_temperature_updates),
+            "total_publishes": int(self.total_publishes),
+            "last_published_update": int(self.last_published_update),
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any] | None) -> None:
+        if not state_dict:
+            return
+        self.total_env_steps = int(state_dict.get("total_env_steps", self.total_env_steps))
+        self.total_updates = int(state_dict.get("total_updates", self.total_updates))
+        self.total_critic_updates = int(state_dict.get("total_critic_updates", self.total_updates))
+        self.total_actor_updates = int(state_dict.get("total_actor_updates", self.total_actor_updates))
+        self.total_temperature_updates = int(
+            state_dict.get("total_temperature_updates", self.total_temperature_updates)
+        )
+        self.total_publishes = int(state_dict.get("total_publishes", self.total_publishes))
+        self.last_published_update = int(state_dict.get("last_published_update", self.last_published_update))
+
+    def progress_snapshot(self) -> dict[str, int]:
+        return {
+            "env_steps": int(self.total_env_steps),
+            "total_updates": int(self.total_updates),
+            "critic_updates": int(self.total_critic_updates),
+            "actor_updates": int(self.total_actor_updates),
+            "temperature_updates": int(self.total_temperature_updates),
+            "publish_count": int(self.total_publishes),
+            "last_published_update": int(self.last_published_update),
+            "updates_until_publish": int(self.updates_until_next_publish()),
+        }
+
+    def updates_until_next_publish(self) -> int:
+        publish_interval = max(1, int(self.config.steps_per_update))
+        remainder = int(self.total_updates) % publish_interval
+        if remainder == 0:
+            return publish_interval
+        return publish_interval - remainder
+
+    def _maybe_publish_inference_policy(self) -> bool:
+        publish_interval = max(1, int(self.config.steps_per_update))
+        if self.total_updates % publish_interval != 0:
+            return False
+        self.agent.sync_inference_policy()
+        self.total_publishes += 1
+        self.last_published_update = int(self.total_updates)
+        return True
+
+    def _attach_progress_metrics(self, metrics: dict[str, float], *, published: bool) -> dict[str, float]:
+        progress = self.progress_snapshot()
+        summarized_metrics = dict(metrics)
+        summarized_metrics["learner_total_updates"] = float(progress["total_updates"])
+        summarized_metrics["learner_critic_updates"] = float(progress["critic_updates"])
+        summarized_metrics["learner_actor_updates"] = float(progress["actor_updates"])
+        summarized_metrics["learner_temperature_updates"] = float(progress["temperature_updates"])
+        summarized_metrics["learner_publish_count"] = float(progress["publish_count"])
+        summarized_metrics["learner_last_published_update"] = float(progress["last_published_update"])
+        summarized_metrics["learner_updates_until_publish"] = float(progress["updates_until_publish"])
+        summarized_metrics["learner_published"] = 1.0 if published else 0.0
+        return summarized_metrics
 
     def fit(
         self,

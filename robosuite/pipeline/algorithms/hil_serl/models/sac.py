@@ -19,6 +19,18 @@ from ..common.utils import soft_update
 LOG_PROB_EPS = 1e-6
 
 
+def _clone_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _clone_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_to_cpu(item) for item in value)
+    return copy.deepcopy(value)
+
+
 class GaussianPolicy(nn.Module):
     def __init__(
         self,
@@ -201,6 +213,13 @@ class HILSERLSAC:
         self.inference_actor.eval()
         self.inference_grasp_critic = copy.deepcopy(self.grasp_critic).to(self.inference_device)
         self.inference_grasp_critic.eval()
+        self._inference_shadow_encoder = copy.deepcopy(self.inference_encoder).to(self.inference_device)
+        self._inference_shadow_encoder.eval()
+        self._inference_shadow_actor = copy.deepcopy(self.inference_actor).to(self.inference_device)
+        self._inference_shadow_actor.eval()
+        self._inference_shadow_grasp_critic = copy.deepcopy(self.inference_grasp_critic).to(self.inference_device)
+        self._inference_shadow_grasp_critic.eval()
+        self._state_lock = threading.RLock()
         self._inference_lock = threading.Lock()
         self.sync_inference_policy()
 
@@ -211,23 +230,33 @@ class HILSERLSAC:
     def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
         obs_t = _obs_to_device(obs, self.inference_device)
         with self._inference_lock:
-            with torch.no_grad():
-                features = self.inference_encoder(obs_t)
-                continuous_action, _ = self.inference_actor.sample(features, deterministic=deterministic)
-                grasp_logits = self.inference_grasp_critic(features)
-                grasp_indices = grasp_logits.argmax(dim=-1)
-                grasp_action = self.inference_grasp_action_values.index_select(0, grasp_indices).unsqueeze(-1)
-                action = torch.cat([continuous_action, grasp_action], dim=-1)
+            inference_encoder = self.inference_encoder
+            inference_actor = self.inference_actor
+            inference_grasp_critic = self.inference_grasp_critic
+        with torch.no_grad():
+            features = inference_encoder(obs_t)
+            continuous_action, _ = inference_actor.sample(features, deterministic=deterministic)
+            grasp_logits = inference_grasp_critic(features)
+            grasp_indices = grasp_logits.argmax(dim=-1)
+            grasp_action = self.inference_grasp_action_values.index_select(0, grasp_indices).unsqueeze(-1)
+            action = torch.cat([continuous_action, grasp_action], dim=-1)
         return action.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
     def sync_inference_policy(self) -> None:
+        with self._state_lock:
+            self._inference_shadow_encoder.load_state_dict(self.encoder.state_dict())
+            self._inference_shadow_actor.load_state_dict(self.actor.state_dict())
+            self._inference_shadow_grasp_critic.load_state_dict(self.grasp_critic.state_dict())
+            self._inference_shadow_encoder.eval()
+            self._inference_shadow_actor.eval()
+            self._inference_shadow_grasp_critic.eval()
         with self._inference_lock:
-            self.inference_encoder.load_state_dict(self.encoder.state_dict())
-            self.inference_actor.load_state_dict(self.actor.state_dict())
-            self.inference_grasp_critic.load_state_dict(self.grasp_critic.state_dict())
-            self.inference_encoder.eval()
-            self.inference_actor.eval()
-            self.inference_grasp_critic.eval()
+            self.inference_encoder, self._inference_shadow_encoder = self._inference_shadow_encoder, self.inference_encoder
+            self.inference_actor, self._inference_shadow_actor = self._inference_shadow_actor, self.inference_actor
+            self.inference_grasp_critic, self._inference_shadow_grasp_critic = (
+                self._inference_shadow_grasp_critic,
+                self.inference_grasp_critic,
+            )
 
     def update(
         self,
@@ -236,58 +265,61 @@ class HILSERLSAC:
         update_actor: bool = True,
         update_temperature: bool = True,
     ) -> dict[str, float]:
-        batch = batch.to(self.device)
-        rewards = batch.rewards + float(self.config.reward_bias)
+        with self._state_lock:
+            batch = batch.to(self.device)
+            rewards = batch.rewards + float(self.config.reward_bias)
 
-        critic_info = self._update_critics(batch=batch, rewards=rewards)
-        metrics = dict(critic_info)
+            critic_info = self._update_critics(batch=batch, rewards=rewards)
+            metrics = dict(critic_info)
 
-        if update_actor:
-            actor_info = self._update_actor(batch=batch)
-            metrics.update(actor_info)
+            if update_actor:
+                actor_info = self._update_actor(batch=batch)
+                metrics.update(actor_info)
 
-        if self.config.auto_entropy_tuning and update_temperature:
-            alpha_info = self._update_temperature(batch=batch)
-            metrics.update(alpha_info)
+            if self.config.auto_entropy_tuning and update_temperature:
+                alpha_info = self._update_temperature(batch=batch)
+                metrics.update(alpha_info)
 
-        soft_update(self.target_encoder, self.encoder, tau=float(self.config.tau))
-        soft_update(self.target_critic, self.critic, tau=float(self.config.tau))
-        soft_update(self.target_grasp_critic, self.grasp_critic, tau=float(self.config.tau))
+            soft_update(self.target_encoder, self.encoder, tau=float(self.config.tau))
+            soft_update(self.target_critic, self.critic, tau=float(self.config.tau))
+            soft_update(self.target_grasp_critic, self.grasp_critic, tau=float(self.config.tau))
 
-        metrics["alpha"] = float(self.alpha.detach().cpu().item())
-        return metrics
+            metrics["alpha"] = float(self.alpha.detach().cpu().item())
+            return metrics
 
     def state_dict(self) -> dict[str, Any]:
-        return {
-            "encoder_config": asdict(self.encoder_config),
-            "config": asdict(self.config),
-            "encoder": self.encoder.state_dict(),
-            "target_encoder": self.target_encoder.state_dict(),
-            "actor": self.actor.state_dict(),
-            "critic": self.critic.state_dict(),
-            "grasp_critic": self.grasp_critic.state_dict(),
-            "target_critic": self.target_critic.state_dict(),
-            "target_grasp_critic": self.target_grasp_critic.state_dict(),
-            "log_alpha": self.log_alpha.detach().cpu(),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic_optimizer": self.critic_optimizer.state_dict(),
-            "alpha_optimizer": self.alpha_optimizer.state_dict(),
-            "target_entropy": self.target_entropy,
-        }
+        with self._state_lock:
+            return {
+                "encoder_config": asdict(self.encoder_config),
+                "config": asdict(self.config),
+                "encoder": _clone_to_cpu(self.encoder.state_dict()),
+                "target_encoder": _clone_to_cpu(self.target_encoder.state_dict()),
+                "actor": _clone_to_cpu(self.actor.state_dict()),
+                "critic": _clone_to_cpu(self.critic.state_dict()),
+                "grasp_critic": _clone_to_cpu(self.grasp_critic.state_dict()),
+                "target_critic": _clone_to_cpu(self.target_critic.state_dict()),
+                "target_grasp_critic": _clone_to_cpu(self.target_grasp_critic.state_dict()),
+                "log_alpha": self.log_alpha.detach().cpu().clone(),
+                "actor_optimizer": _clone_to_cpu(self.actor_optimizer.state_dict()),
+                "critic_optimizer": _clone_to_cpu(self.critic_optimizer.state_dict()),
+                "alpha_optimizer": _clone_to_cpu(self.alpha_optimizer.state_dict()),
+                "target_entropy": float(self.target_entropy),
+            }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.encoder.load_state_dict(state_dict["encoder"])
-        self.target_encoder.load_state_dict(state_dict["target_encoder"])
-        self.actor.load_state_dict(state_dict["actor"])
-        self.critic.load_state_dict(state_dict["critic"])
-        self.grasp_critic.load_state_dict(state_dict["grasp_critic"])
-        self.target_critic.load_state_dict(state_dict["target_critic"])
-        self.target_grasp_critic.load_state_dict(state_dict["target_grasp_critic"])
-        self.log_alpha.data.copy_(torch.as_tensor(state_dict["log_alpha"], device=self.device))
-        self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
-        self.alpha_optimizer.load_state_dict(state_dict["alpha_optimizer"])
-        self.target_entropy = float(state_dict.get("target_entropy", self.target_entropy))
+        with self._state_lock:
+            self.encoder.load_state_dict(state_dict["encoder"])
+            self.target_encoder.load_state_dict(state_dict["target_encoder"])
+            self.actor.load_state_dict(state_dict["actor"])
+            self.critic.load_state_dict(state_dict["critic"])
+            self.grasp_critic.load_state_dict(state_dict["grasp_critic"])
+            self.target_critic.load_state_dict(state_dict["target_critic"])
+            self.target_grasp_critic.load_state_dict(state_dict["target_grasp_critic"])
+            self.log_alpha.data.copy_(torch.as_tensor(state_dict["log_alpha"], device=self.device))
+            self.actor_optimizer.load_state_dict(state_dict["actor_optimizer"])
+            self.critic_optimizer.load_state_dict(state_dict["critic_optimizer"])
+            self.alpha_optimizer.load_state_dict(state_dict["alpha_optimizer"])
+            self.target_entropy = float(state_dict.get("target_entropy", self.target_entropy))
         self.sync_inference_policy()
 
     def _update_critics(self, batch: ReplayBatch, rewards: torch.Tensor) -> dict[str, float]:

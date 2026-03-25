@@ -8,18 +8,21 @@ DEMO_TASK_NAME="PandaLift"  # demo data
 NUM_TRAJECTORIES=20
 INTERACTIVE=true
 VIEWER_ENABLED=true
-VIEWER_BACKEND=auto
-VIEWER_STARTUP_DELAY="1"
-VIEWER_RESET_WARMUP_FRAMES=2
 VISUALIZE_GRIPPER_MARKERS=true
 IMAGE_OBS_FPS="10"
 INTERVENTION_ENABLED=true
 ASYNC_UPDATES=true
 LEARNER_DEVICE="cuda:0"
-INFERENCE_DEVICE="cuda:1"
+INFERENCE_DEVICE="auto"
 LOGGING_USE_WANDB=true
-RESUME="${RESUME:-true}"
+
+# previous log & ckpt path & data
+LOAD="/home/dodo/Documents/DAggar/robosuite/outputs/hil_serl/hil_serl_Lift_2026-03-25_23-51-47"
+
+# previous ckpt only, not useful
+RESUME="${RESUME:-false}"
 CHECKPOINT="${CHECKPOINT:-null}"
+EPISODE_PAUSE_SEC=2
 
 EXTRA_ARGS=("$@")
 
@@ -49,18 +52,39 @@ if [[ "${INTERVENTION_ENABLED}" == "true" && -z "${DISPLAY:-}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
+
+if [[ -n "${LOAD}" && "${LOAD}" != "null" ]]; then
+  if [[ -d "${LOAD}" ]]; then
+    if [[ -f "${LOAD}/checkpoints/latest.pt" ]]; then
+      CHECKPOINT="${LOAD}/checkpoints/latest.pt"
+    elif [[ -f "${LOAD}/latest.pt" ]]; then
+      CHECKPOINT="${LOAD}/latest.pt"
+    else
+      echo "[ERROR] LOAD points to a directory, but no latest checkpoint was found under ${LOAD}" >&2
+      exit 1
+    fi
+  else
+    CHECKPOINT="${LOAD}"
+  fi
+  RESUME=true
+fi
+
+if [[ "${CHECKPOINT}" != "null" && ! -f "${CHECKPOINT}" ]]; then
+  echo "[ERROR] Checkpoint file does not exist: ${CHECKPOINT}" >&2
+  exit 1
+fi
+
 python -m robosuite.pipeline.train_hil_serl \
   env.environment="${ENVIRONMENT}" \
+  env.renderer="mjviewer" \
   data.task_name="${DEMO_TASK_NAME}" \
   data.num_trajectories="${NUM_TRAJECTORIES}" \
   runtime.interactive="${INTERACTIVE}" \
   runtime.viewer_enabled="${VIEWER_ENABLED}" \
-  runtime.viewer_backend="${VIEWER_BACKEND}" \
-  runtime.viewer_startup_delay="${VIEWER_STARTUP_DELAY}" \
-  runtime.viewer_reset_warmup_frames="${VIEWER_RESET_WARMUP_FRAMES}" \
   runtime.visualize_gripper_markers="${VISUALIZE_GRIPPER_MARKERS}" \
   runtime.image_obs_fps="${IMAGE_OBS_FPS}" \
   runtime.async_updates="${ASYNC_UPDATES}" \
+  runtime.episode_pause_sec="${EPISODE_PAUSE_SEC}" \
   intervention.enabled="${INTERVENTION_ENABLED}" \
   runtime.resume="${RESUME}" \
   runtime.checkpoint="${CHECKPOINT}" \
@@ -87,15 +111,16 @@ python -m robosuite.pipeline.train_hil_serl \
 # 5. Disable async learner to isolate timing-sensitive crashes:
 #    ASYNC_UPDATES=false bash robosuite/pipeline/scripts/train_hil_serl.sh
 #
-# 6. Force mjviewer back on for experiments:
-#    VIEWER_BACKEND=mjviewer VIEWER_STARTUP_DELAY=0.2 \
+# 6. Load from a previous run directory or a checkpoint file:
+#    LOAD=outputs/hil_serl/hil_serl_Lift_2026-03-25_21-14-34 \
 #    bash robosuite/pipeline/scripts/train_hil_serl.sh
+#    LOAD=/abs/path/to/checkpoints/latest.pt bash robosuite/pipeline/scripts/train_hil_serl.sh
 #
-# 7. Increase OpenCV reset warmup if preview still shows snow after reset:
-#    VIEWER_RESET_WARMUP_FRAMES=4 bash robosuite/pipeline/scripts/train_hil_serl.sh
-#
-# 8. Disable gripper visualization markers if needed:
+# 7. Disable gripper visualization markers if needed:
 #    VISUALIZE_GRIPPER_MARKERS=false bash robosuite/pipeline/scripts/train_hil_serl.sh
+#
+# 8. Change the episode pause after each finished task:
+#    EPISODE_PAUSE_SEC=0.2 bash robosuite/pipeline/scripts/train_hil_serl.sh
 #
 # 9. Run with slower image observations and auto dual-GPU split:
 #    IMAGE_OBS_FPS=10 LEARNER_DEVICE=cuda:0 INFERENCE_DEVICE=auto \

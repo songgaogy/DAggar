@@ -187,8 +187,15 @@ class HILSERLAgent:
         )
 
     def save_checkpoint(self, path: str | Path, include_buffers: bool = True, extra: dict[str, Any] | None = None) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.build_checkpoint_payload(include_buffers=include_buffers, extra=extra)
+        self.write_checkpoint_payload(path, payload)
+
+    def build_checkpoint_payload(
+        self,
+        *,
+        include_buffers: bool = True,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = {
             "encoder_config": asdict(self.encoder_config),
             "sac_config": asdict(self.sac_config),
@@ -200,6 +207,11 @@ class HILSERLAgent:
             payload["demo_buffer"] = self.demo_buffer.state_dict()
         if extra is not None:
             payload["extra"] = extra
+        return payload
+
+    def write_checkpoint_payload(self, path: str | Path, payload: dict[str, Any]) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(f".{path.name}.tmp")
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path)
