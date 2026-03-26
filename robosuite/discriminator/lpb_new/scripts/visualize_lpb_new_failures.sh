@@ -14,6 +14,7 @@ ENCODER_BATCH_SIZE=96
 NUM_VIDEOS=10
 FPS=20
 CAMERA_NAME="agentview"
+HIS_CHUNK=4
 
 if [[ -z "${LPB_CKPT}" ]]; then
   LPB_CKPT="$(find "${ROOT}/checkpoints/multitask_6/lpb_new" -maxdepth 2 -type f -name 'lpb_new_*.pt' ! -name '*_ep*.pt' | sort | tail -n 1)"
@@ -45,4 +46,5 @@ echo "[visualize_lpb_new] model.lpb_ckpt=${LPB_CKPT}"
   visualization.num_videos="${NUM_VIDEOS}" \
   visualization.fps="${FPS}" \
   visualization.camera_name="${CAMERA_NAME}" \
+  feature.policy_history_steps=$HIS_CHUNK \
   "$@"

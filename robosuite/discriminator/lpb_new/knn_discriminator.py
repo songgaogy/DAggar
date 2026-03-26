@@ -187,11 +187,13 @@ class LPBFeatureExtractor:
         action_horizon: int = -1,
         normalize_feature: bool = True,
         normalize_policy_chunk: bool = True,
+        policy_history_steps: int = 4,
     ) -> None:
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
         self.normalize_feature = bool(normalize_feature)
         self.normalize_policy_chunk = bool(normalize_policy_chunk)
+        self.policy_history_steps = max(1, int(policy_history_steps))
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
             checkpoint_path=checkpoint_path,
             override_action_horizon=action_horizon,
@@ -255,6 +257,18 @@ class LPBFeatureExtractor:
                 out[t, chunk.shape[0] :] = pad_value
         return out
 
+    def _build_policy_state_history(self, latents: torch.Tensor, valid_len: int) -> torch.Tensor:
+        hist = max(1, int(self.policy_history_steps))
+        history_chunks = []
+        for t in range(valid_len):
+            start = max(0, t - hist + 1)
+            chunk = latents[start : t + 1]
+            if int(chunk.shape[0]) < hist:
+                pad = chunk[:1].expand(hist - int(chunk.shape[0]), -1)
+                chunk = torch.cat([pad, chunk], dim=0)
+            history_chunks.append(chunk.reshape(-1))
+        return torch.stack(history_chunks, dim=0)
+
     @torch.no_grad()
     def encode_trajectory_bundle(self, traj: LatentTrajectory) -> EncodedTrajectoryBundle:
         t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
@@ -296,9 +310,10 @@ class LPBFeatureExtractor:
             err = (pred["pred_latent"] - target).pow(2).mean(dim=-1)
             errs.append(err.detach().cpu())
 
+        policy_state_history = self._build_policy_state_history(valid_latents_t, valid_len=valid_len)
         policy_chunk = torch.cat(
             [
-                valid_latents_t,
+                policy_state_history,
                 valid_act_t.reshape(valid_len, -1),
             ],
             dim=-1,
@@ -566,6 +581,7 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         action_horizon: int = -1,
         normalize_feature: bool = True,
         normalize_policy_chunk: bool = True,
+        policy_history_steps: int = 4,
         use_transition_error: bool = True,
         detector_device: str = "cuda",
         delta: float = 10.0,
@@ -589,6 +605,7 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             action_horizon=int(action_horizon),
             normalize_feature=bool(normalize_feature),
             normalize_policy_chunk=bool(normalize_policy_chunk),
+            policy_history_steps=int(policy_history_steps),
         )
         self.feature_knn_weight = float(feature_knn_weight)
         self.transition_aux_weight = float(transition_aux_weight)

@@ -51,6 +51,59 @@ def map_step_values_to_frames(
     return out
 
 
+def _draw_text_with_box(
+    image_bgr: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    *,
+    font_scale: float,
+    thickness: int,
+    text_color: tuple[int, int, int],
+    box_color: tuple[int, int, int],
+    outline_color: Optional[tuple[int, int, int]] = None,
+    padding_x: int = 8,
+    padding_y: int = 6,
+) -> None:
+    if cv2 is None:
+        return
+    x, y = int(origin[0]), int(origin[1])
+    fs = float(font_scale)
+    th = max(1, int(thickness))
+    (text_w, text_h), baseline = cv2.getTextSize(
+        str(text),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        fs,
+        th,
+    )
+    x0 = max(0, x - int(padding_x))
+    y0 = max(0, y - text_h - int(padding_y))
+    x1 = min(int(image_bgr.shape[1]) - 1, x + text_w + int(padding_x))
+    y1 = min(int(image_bgr.shape[0]) - 1, y + baseline + int(padding_y))
+    cv2.rectangle(image_bgr, (x0, y0), (x1, y1), box_color, -1)
+    if outline_color is not None:
+        outline_thickness = max(2, th + 2)
+        cv2.putText(
+            image_bgr,
+            str(text),
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            fs,
+            outline_color,
+            outline_thickness,
+            cv2.LINE_AA,
+        )
+    cv2.putText(
+        image_bgr,
+        str(text),
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        fs,
+        text_color,
+        th,
+        cv2.LINE_AA,
+    )
+
+
 def draw_detection_overlay(
     frame_rgb: np.ndarray,
     *,
@@ -61,6 +114,7 @@ def draw_detection_overlay(
     threshold: float,
     detector_name: str,
     extra_text: Optional[str] = None,
+    footer_lines: Optional[Sequence[str]] = None,
     border_thickness: int = 5,
     banner_font_scale: float = 1.0,
     banner_thickness: int = 2,
@@ -81,50 +135,52 @@ def draw_detection_overlay(
 
     if pred_fail_flag:
         cv2.rectangle(bgr, (3, 3), (w - 4, h - 4), (0, 0, 255), int(border_thickness))
-        cv2.putText(
+        _draw_text_with_box(
             bgr,
             "FAILURE DETECTED",
-            (20, 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            float(banner_font_scale),
-            (0, 0, 255),
-            int(banner_thickness),
-            cv2.LINE_AA,
+            (18, 30),
+            font_scale=float(banner_font_scale),
+            thickness=int(banner_thickness),
+            text_color=(255, 255, 255),
+            box_color=(0, 0, 180),
+            outline_color=(0, 0, 0),
         )
 
-    line_1 = f"{detector_name} frame={int(frame_id) + 1}"
-    line_2 = f"lambda={float(aggregate_score):.5f} threshold={float(threshold):.5f}"
-    cv2.putText(
-        bgr,
-        line_1,
-        (20, h - 42),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        float(footer_font_scale),
-        (255, 255, 255),
-        int(footer_thickness),
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        bgr,
-        line_2,
-        (20, h - 16),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        float(footer_font_scale),
-        (255, 255, 255),
-        int(footer_thickness),
-        cv2.LINE_AA,
-    )
+    if footer_lines is not None:
+        lines = [str(line) for line in footer_lines if str(line)]
+    else:
+        lines = [
+            f"{detector_name} frame={int(frame_id) + 1}",
+            f"lambda={float(aggregate_score):.5f} threshold={float(threshold):.5f}",
+        ]
+        if extra_text:
+            lines.insert(0, str(extra_text))
 
-    if extra_text:
-        cv2.putText(
+    if lines:
+        line_gap = max(20, int(28 * float(footer_font_scale)))
+        start_y = h - 16 - (len(lines) - 1) * line_gap
+        for idx, line in enumerate(lines):
+            _draw_text_with_box(
+                bgr,
+                line,
+                (20, start_y + idx * line_gap),
+                font_scale=float(footer_font_scale),
+                thickness=int(footer_thickness),
+                text_color=(255, 255, 255),
+                box_color=(0, 0, 0),
+                outline_color=(32, 32, 32),
+            )
+
+    elif extra_text:
+        _draw_text_with_box(
             bgr,
             str(extra_text),
-            (20, h - 68),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            float(footer_font_scale),
-            (255, 255, 255),
-            int(footer_thickness),
-            cv2.LINE_AA,
+            (20, h - 16),
+            font_scale=float(footer_font_scale),
+            thickness=int(footer_thickness),
+            text_color=(255, 255, 255),
+            box_color=(0, 0, 0),
+            outline_color=(32, 32, 32),
         )
 
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)

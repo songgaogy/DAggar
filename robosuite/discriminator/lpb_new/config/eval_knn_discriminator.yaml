@@ -73,6 +73,7 @@ feature:
   action_horizon: -1
   normalize_feature: true
   normalize_policy_chunk: true
+  policy_history_steps: 4
   use_transition_error: true
 
 detector:

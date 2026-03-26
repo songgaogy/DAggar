@@ -84,6 +84,7 @@ def main(cfg: DictConfig) -> None:
             action_horizon=int(cfg.feature.action_horizon),
             normalize_feature=bool(cfg.feature.normalize_feature),
             normalize_policy_chunk=bool(cfg.feature.normalize_policy_chunk),
+            policy_history_steps=int(cfg.feature.policy_history_steps),
             use_transition_error=bool(cfg.feature.use_transition_error),
             detector_device=str(cfg.detector.device),
             delta=float(cfg.detector.delta),
