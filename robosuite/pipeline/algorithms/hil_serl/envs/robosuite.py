@@ -357,6 +357,7 @@ class RobosuiteInterventionRuntime:
         self.goal_update_mode = str(goal_update_mode)
         self.all_prev_gripper_actions = []
         self._episode_active = False
+        self._last_grasp_states: list[list[bool]] = []
 
     def start_episode(self) -> None:
         self.device.start_control()
@@ -368,6 +369,7 @@ class RobosuiteInterventionRuntime:
             }
             for robot in self.env.robots
         ]
+        self._last_grasp_states = _snapshot_device_grasp_states(self.device)
         self._episode_active = True
 
     def stop_episode(self) -> None:
@@ -381,7 +383,8 @@ class RobosuiteInterventionRuntime:
         if input_ac_dict is None:
             return None, False, True
 
-        if not check_intervention(self.device, input_ac_dict):
+        grasp_state_changed = self._consume_grasp_state_change()
+        if not (check_intervention(self.device, input_ac_dict) or grasp_state_changed):
             return np.asarray(policy_action, dtype=np.float32), False, False
 
         active_robot = self.env.robots[self.device.active_robot]
@@ -418,16 +421,87 @@ class RobosuiteInterventionRuntime:
         except Exception:
             pass
 
+    def _consume_grasp_state_change(self) -> bool:
+        current_grasp_states = _snapshot_device_grasp_states(self.device)
+        changed = current_grasp_states != self._last_grasp_states
+        self._last_grasp_states = current_grasp_states
+        return changed
+
 
 def check_intervention(device, input_ac_dict) -> bool:
     if input_ac_dict is None:
         return True
+    control_gripper = getattr(device, "control_gripper", None)
+    if control_gripper is not None and abs(float(control_gripper)) > 1e-3:
+        return True
     threshold = 0.1
     total_mag = 0.0
     for key, value in input_ac_dict.items():
-        if ("delta" in key) and isinstance(value, np.ndarray):
+        if not isinstance(value, np.ndarray):
+            continue
+        if "delta" in key:
             total_mag += np.linalg.norm(value)
     return total_mag > threshold
+
+
+def _snapshot_device_grasp_states(device) -> list[list[bool]]:
+    grasp_states = getattr(device, "grasp_states", [])
+    return [[bool(value) for value in robot_states] for robot_states in grasp_states]
+
+
+def estimate_gripper_openness(env) -> float | None:
+    openness_values: list[float] = []
+    for robot in getattr(env, "robots", []):
+        for arm in robot.arms:
+            if not robot.has_gripper.get(arm, False):
+                continue
+            qpos_indexes = robot._ref_gripper_joint_pos_indexes.get(arm)
+            joint_ids = robot._ref_joints_indexes_dict.get(robot.get_gripper_name(arm))
+            if not qpos_indexes or not joint_ids:
+                continue
+
+            joint_qpos = np.asarray([env.sim.data.qpos[index] for index in qpos_indexes], dtype=np.float32)
+            joint_ranges = np.asarray([env.sim.model.jnt_range[joint_id] for joint_id in joint_ids], dtype=np.float32)
+            if joint_qpos.shape[0] != joint_ranges.shape[0]:
+                continue
+
+            span = joint_ranges[:, 1] - joint_ranges[:, 0]
+            valid = span > 1e-6
+            if not np.any(valid):
+                continue
+
+            normalized = np.zeros_like(joint_qpos, dtype=np.float32)
+            normalized[valid] = np.clip((joint_qpos[valid] - joint_ranges[valid, 0]) / span[valid], 0.0, 1.0)
+            openness_values.append(float(normalized[valid].mean()))
+
+    if len(openness_values) == 0:
+        return None
+    return float(np.mean(openness_values))
+
+
+def compute_grasp_penalty(
+    env,
+    action: np.ndarray,
+    *,
+    penalty: float = -0.02,
+    command_threshold: float = 0.5,
+    open_threshold: float = 0.9,
+    closed_threshold: float = 0.1,
+) -> float | None:
+    action_array = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action_array.size == 0:
+        return None
+
+    openness = estimate_gripper_openness(env)
+    if openness is None:
+        return None
+
+    gripper_action = float(action_array[-1])
+    if gripper_action >= float(command_threshold) and openness <= float(closed_threshold):
+        return float(penalty)
+    if gripper_action <= -float(command_threshold) and openness >= float(open_threshold):
+        return float(penalty)
+    return 0.0
 
 
 def build_device(env, device_cfg):
@@ -560,6 +634,7 @@ def load_hdf5_demos_into_transitions(
                     env.sim.set_state_from_flattened(states[step_idx])
                     env.sim.forward()
                     raw_obs = env._get_observations(force_update=True)
+                    grasp_penalty = compute_grasp_penalty(env, actions[step_idx])
                     current_images = _resolve_demo_images(
                         demo_images=demo_images,
                         adapter=adapter,
@@ -574,6 +649,9 @@ def load_hdf5_demos_into_transitions(
                         next_raw_obs, _, env_done, info = step_output
                     next_obs = adapter.transform(next_raw_obs)
                     reward, success = sparse_success_reward(env, info)
+                    info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
+                    if grasp_penalty is not None:
+                        info_payload.setdefault("grasp_penalty", float(grasp_penalty))
                     done = bool(env_done or success or (successful and step_idx == len(actions) - 1))
                     transitions.append(
                         Transition(
@@ -582,8 +660,9 @@ def load_hdf5_demos_into_transitions(
                             reward=reward,
                             next_obs=next_obs,
                             done=done,
+                            grasp_penalty=grasp_penalty,
                             is_intervention=bool(intervention_labels[step_idx]),
-                            info=dict(info) if isinstance(info, dict) else {"raw_info": info},
+                            info=info_payload,
                             reward_source="env_success",
                             demo_source="offline_demo",
                         )

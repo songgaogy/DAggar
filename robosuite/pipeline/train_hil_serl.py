@@ -27,6 +27,7 @@ from robosuite.pipeline.algorithms.hil_serl.envs import (
     RobosuiteRuntimeConfig,
     build_device,
     build_robosuite_env,
+    compute_grasp_penalty,
     load_hdf5_demos_into_transitions,
     make_checkpoint_directory,
     sparse_success_reward,
@@ -958,6 +959,7 @@ def main(cfg: DictConfig) -> None:
         print(f"[INFO] Inference device: {inference_device}")
         if learner_device.startswith("cuda") and inference_device == "cpu":
             print("[INFO] Inference policy is running on CPU to reduce render-time stutter on single-GPU setups.")
+            
     agent = build_algorithm(
         algorithm_cfg,
         observation_example=initial_obs,
@@ -1335,12 +1337,15 @@ def main(cfg: DictConfig) -> None:
                 is_intervention = True
 
             # collect current transition
+            grasp_penalty = compute_grasp_penalty(env, env_action)
             step_output = env.step(env_action)
             if len(step_output) == 5:
                 raw_next_obs, _, done, truncated, info = step_output
                 done = bool(done or truncated)
             else:
                 raw_next_obs, _, done, info = step_output
+            if isinstance(info, dict) and grasp_penalty is not None:
+                info.setdefault("grasp_penalty", float(grasp_penalty))
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
             next_obs = adapter.transform(raw_next_obs)
             done = bool(done or success)

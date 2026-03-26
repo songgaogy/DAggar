@@ -13,11 +13,11 @@ IMAGE_OBS_FPS="10"
 INTERVENTION_ENABLED=true
 ASYNC_UPDATES=true
 LEARNER_DEVICE="cuda:0"
-INFERENCE_DEVICE="auto"
+INFERENCE_DEVICE="cuda:1"
 LOGGING_USE_WANDB=true
 
 # previous log & ckpt path & data
-LOAD="/home/dodo/Documents/DAggar/robosuite/outputs/hil_serl/hil_serl_Lift_2026-03-25_23-51-47"
+LOAD="/home/dodo/Documents/DAggar/robosuite/outputs/hil_serl/hil_serl_Lift_2026-03-26_13-53-07"
 
 # previous ckpt only, not useful
 RESUME="${RESUME:-false}"

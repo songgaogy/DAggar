@@ -1,4 +1,5 @@
 from .robosuite import (
+    compute_grasp_penalty,
     choose_viewer_backend,
     RobosuiteInterventionRuntime,
     RobosuiteObservationAdapter,
@@ -13,6 +14,7 @@ from .robosuite import (
 )
 
 __all__ = [
+    "compute_grasp_penalty",
     "choose_viewer_backend",
     "RobosuiteInterventionRuntime",
     "RobosuiteObservationAdapter",
