@@ -23,8 +23,8 @@ from robosuite.pipeline.envs import (
     make_checkpoint_directory,
     sparse_success_reward,
 )
-from robosuite.pipeline.utils import load_demo_paths
-from robosuite.pipeline.train_hil_serl import (
+from robosuite.pipeline.utils import (
+    load_demo_paths,
     AsyncCheckpointWriter,
     AsyncTransitionChunkWriter,
     ConsoleLogCapture,
@@ -32,6 +32,7 @@ from robosuite.pipeline.train_hil_serl import (
     FixedRateLimiter,
     IntervalGate,
     JsonlEventLogger,
+    now_readable,
     build_runtime_cfg,
     checkpoint_path,
     checkpoint_step_path,
@@ -54,10 +55,6 @@ from robosuite.pipeline.train_hil_serl import (
     write_resolved_config,
     write_run_info,
 )
-
-
-def now_readable() -> str:
-    return datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
