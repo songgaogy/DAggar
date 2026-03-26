@@ -18,9 +18,13 @@ from .hil_serl import (
     load_transition_shard,
     save_transition_shard,
 )
+from .hg_dagger import BCConfig, HGDaggerAgent, HGDaggerTrainer
 
 __all__ = [
+    "BCConfig",
     "EncoderConfig",
+    "HGDaggerAgent",
+    "HGDaggerTrainer",
     "HILSERLAgent",
     "HILSERLReplayBuffer",
     "HILSERLSAC",
