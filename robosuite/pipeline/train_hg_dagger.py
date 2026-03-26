@@ -57,6 +57,31 @@ from robosuite.pipeline.utils import (
 )
 
 
+def resolve_base_policy_directory(output_root: Path) -> Path:
+    return output_root / "base_policy"
+
+
+def format_base_policy_trajectory_tag(max_num_trajectories: int | None) -> str:
+    if max_num_trajectories is None:
+        return "all"
+    return f"{int(max_num_trajectories):05d}"
+
+
+def resolve_base_policy_checkpoint_path(
+    output_root: Path,
+    *,
+    env_name: str,
+    demo_source_name: str,
+    max_num_trajectories: int | None,
+    pretrain_steps: int,
+) -> Path:
+    trajectory_tag = format_base_policy_trajectory_tag(max_num_trajectories)
+    checkpoint_name = (
+        f"{env_name}__{demo_source_name}__traj_{trajectory_tag}__pretrain_{int(pretrain_steps):08d}.pt"
+    )
+    return resolve_base_policy_directory(output_root) / checkpoint_name
+
+
 def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
     output_root = Path(to_absolute_path(str(cfg.logging.output_root)))
     explicit_run_name = cfg.logging.run_name
@@ -156,11 +181,19 @@ def format_runtime_line(
 
 
 def format_train_line(step: int, metrics: dict[str, float], pending_updates: int) -> str:
+    gripper_suffix = ""
+    if "gripper_loss" in metrics:
+        gripper_suffix = (
+            f" grip_loss={metrics.get('gripper_loss', float('nan')):.4f} "
+            f"grip_acc={metrics.get('gripper_accuracy', float('nan')):.3f} "
+            f"grip_mse={metrics.get('gripper_mse', float('nan')):.4f}"
+        )
     return (
         f"[train] step={step} "
         f"actor_loss={metrics.get('actor_loss', float('nan')):.4f} "
         f"mse={metrics.get('mse', float('nan')):.4f} "
         f"log_prob={metrics.get('log_prob', float('nan')):.4f} "
+        f"{gripper_suffix}"
         f"bc_updates={int(metrics.get('learner_actor_updates', 0.0))} "
         f"next_publish_in={int(metrics.get('learner_updates_until_publish', 0.0))} pending={pending_updates}"
     )
@@ -413,6 +446,45 @@ def main(cfg: DictConfig) -> None:
     else:
         print(f"[INFO] Reusing checkpoint demo buffer with {len(agent.demo_buffer)} transitions")
 
+    requested_pretrain_steps = max(0, int(cfg.algorithm.trainer.pretrain_steps))
+    base_policy_checkpoint = resolve_base_policy_checkpoint_path(
+        output_root,
+        env_name=str(cfg.env.environment),
+        demo_source_name=demo_source_name,
+        max_num_trajectories=max_num_trajectories,
+        pretrain_steps=requested_pretrain_steps,
+    )
+    base_policy_metadata = {
+        "env_name": str(cfg.env.environment),
+        "demo_source_name": demo_source_name,
+        "num_trajectories": None if max_num_trajectories is None else int(max_num_trajectories),
+        "offline_transition_count": int(len(transitions)),
+        "pretrain_steps": int(requested_pretrain_steps),
+        "checkpoint_path": str(base_policy_checkpoint),
+    }
+    base_policy_reused = False
+    if loaded_checkpoint is None:
+        if base_policy_checkpoint.exists():
+            try:
+                extra = agent.load_checkpoint(base_policy_checkpoint, load_buffers=False)
+                trainer.load_state_dict(extra.get("trainer_state"))
+                loaded_checkpoint = base_policy_checkpoint
+                base_policy_reused = True
+                print(
+                    "[base_policy] reusing "
+                    f"{base_policy_checkpoint.name} "
+                    f"(trajectories={format_base_policy_trajectory_tag(max_num_trajectories)}, "
+                    f"pretrain_steps={requested_pretrain_steps})"
+                )
+            except Exception as exc:
+                print(f"[WARN] Failed to load reusable base policy {base_policy_checkpoint}: {exc}")
+        elif requested_pretrain_steps <= 0:
+            raise ValueError(
+                "Base policy checkpoint is missing and algorithm.trainer.pretrain_steps <= 0. "
+                "Set a positive pretrain_steps value to build the base policy from offline demos, "
+                "or provide an existing checkpoint."
+            )
+
     if bool(cfg.runtime.load_buffers):
         online_chunk_dir, demo_chunk_dir = resolve_buffer_chunk_dirs(loaded_checkpoint)
         loaded_online_transitions = 0
@@ -582,22 +654,12 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[ckpt] step={step} pending={pending_updates} queued={step_checkpoint.name}")
 
-    requested_pretrain_steps = max(0, int(cfg.algorithm.trainer.pretrain_steps))
-    pretrain_steps = requested_pretrain_steps
-    if bool(cfg.intervention.enabled) and bool(cfg.runtime.interactive) and pretrain_steps > 0:
+    if loaded_checkpoint is None and start_step == 0:
+        completed_pretrain_steps = int(trainer.total_pretrain_updates)
+        remaining_pretrain_steps = requested_pretrain_steps - completed_pretrain_steps
         print(
-            "[INFO] Skipping blocking offline BC pretraining because interactive intervention is enabled. "
-            "This keeps SpaceMouse teleoperation available immediately, matching the existing HIL-SERL "
-            "robosuite workflow more closely. Run with intervention.enabled=false if you want offline "
-            f"pretraining first (requested pretrain_steps={requested_pretrain_steps})."
-        )
-        pretrain_steps = 0
-    completed_pretrain_steps = int(trainer.total_pretrain_updates)
-    if completed_pretrain_steps < pretrain_steps:
-        remaining_pretrain_steps = pretrain_steps - completed_pretrain_steps
-        print(
-            f"[pretrain] starting remaining_pretrain_steps={remaining_pretrain_steps} "
-            f"(completed={completed_pretrain_steps}, target={pretrain_steps})"
+            f"[base_policy] training remaining_pretrain_steps={remaining_pretrain_steps} "
+            f"(completed={completed_pretrain_steps}, target={requested_pretrain_steps})"
         )
         for local_step in range(remaining_pretrain_steps):
             metrics = trainer.pretrain(1)[-1]
@@ -609,12 +671,22 @@ def main(cfg: DictConfig) -> None:
                     step=absolute_pretrain_step,
                 )
                 print(
-                    "[pretrain] "
+                    "[base_policy] "
                     f"step={absolute_pretrain_step} actor_loss={metrics.get('actor_loss', float('nan')):.4f} "
                     f"mse={metrics.get('mse', float('nan')):.4f}"
                 )
             maybe_print_publish_events([metrics])
-        request_checkpoint_save(start_step - 1, tag=f"pretrain_{pretrain_steps:08d}")
+        base_policy_extra = {
+            "global_step": -1,
+            "episode_index": 0,
+            "success_count": 0,
+            "trainer_state": trainer.state_dict(),
+            "base_policy_metadata": dict(base_policy_metadata),
+        }
+        agent.save_checkpoint(base_policy_checkpoint, include_buffers=False, extra=base_policy_extra)
+        print(f"[base_policy] saved {base_policy_checkpoint}")
+    elif base_policy_reused:
+        print(f"[base_policy] ready from checkpoint={base_policy_checkpoint}")
 
     if bool(cfg.intervention.enabled):
         device = build_device(env, cfg.intervention)
@@ -877,6 +949,9 @@ def main(cfg: DictConfig) -> None:
                 "success_count": int(success_count),
                 "latest_checkpoint": str(checkpoint_path(checkpoint_dir, "latest")),
                 "trainer_state": trainer.state_dict(),
+                "base_policy_checkpoint": str(base_policy_checkpoint),
+                "base_policy_reused": bool(base_policy_reused),
+                "base_policy_metadata": dict(base_policy_metadata),
             },
         )
         if async_updates:

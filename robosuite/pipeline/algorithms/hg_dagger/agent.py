@@ -108,6 +108,9 @@ class HGDaggerAgent:
             log_std_min=float(cfg_get(bc_cfg, "log_std_min", -5.0)),
             log_std_max=float(cfg_get(bc_cfg, "log_std_max", 2.0)),
             tanh_squash_distribution=bool(cfg_get(bc_cfg, "tanh_squash_distribution", True)),
+            hybrid_gripper_head=bool(cfg_get(bc_cfg, "hybrid_gripper_head", True)),
+            num_gripper_actions=int(cfg_get(bc_cfg, "num_gripper_actions", 3)),
+            gripper_loss_weight=float(cfg_get(bc_cfg, "gripper_loss_weight", 1.0)),
             device=str(device or cfg_get(bc_cfg, "device", cfg_get(cfg, "device", "cpu"))),
             inference_device=inference_device,
         )

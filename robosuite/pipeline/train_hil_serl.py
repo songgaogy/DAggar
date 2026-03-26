@@ -7,7 +7,6 @@ from typing import Any
 
 import hydra
 import numpy as np
-import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
@@ -16,7 +15,6 @@ from robosuite.pipeline.algorithms.hil_serl import HILSERLTrainer
 from robosuite.pipeline.envs import (
     RobosuiteInterventionRuntime,
     RobosuiteObservationAdapter,
-    RobosuiteRuntimeConfig,
     build_device,
     build_robosuite_env,
     compute_grasp_penalty,

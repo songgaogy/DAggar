@@ -42,6 +42,9 @@ algorithm:
     log_std_min: -5.0
     log_std_max: 2.0
     tanh_squash_distribution: true
+    hybrid_gripper_head: true
+    num_gripper_actions: 3
+    gripper_loss_weight: 1.0
     device: "cuda:0"
     inference_device: "auto"
 
@@ -57,7 +60,7 @@ algorithm:
     updates_per_step: 1
     steps_per_update: 50
     random_steps: 0
-    pretrain_steps: 0
+    pretrain_steps: 10000
 
 intervention:
   enabled: true

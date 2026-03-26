@@ -12,12 +12,12 @@ VISUALIZE_GRIPPER_MARKERS=true
 IMAGE_OBS_FPS="10"
 INTERVENTION_ENABLED=true
 ASYNC_UPDATES=true
-PRETRAIN_STEPS=0
+PRETRAIN_STEPS=5000
 LEARNER_DEVICE="cuda:0"
 INFERENCE_DEVICE="cuda:1"
 LOGGING_USE_WANDB=true
 
-LOAD="${LOAD:-null}"
+LOAD="/home/dodo/Documents/DAggar/robosuite/outputs/HG-DAgger/hg_dagger_Lift_2026-03-26_19-48-12"
 RESUME="${RESUME:-false}"
 CHECKPOINT="${CHECKPOINT:-null}"
 EPISODE_PAUSE_SEC=2
@@ -104,8 +104,10 @@ python -m robosuite.pipeline.train_hg_dagger \
 #    INTERACTIVE=false VIEWER_ENABLED=false INTERVENTION_ENABLED=false \
 #    bash robosuite/pipeline/scripts/train_hg_dagger.sh
 #
-# 4. Change BC pretraining length:
+# 4. Change base-policy offline training length:
 #    PRETRAIN_STEPS=5000 bash robosuite/pipeline/scripts/train_hg_dagger.sh
+#    Base-policy checkpoints are saved under outputs/HG-DAgger/base_policy and
+#    automatically reused when task + NUM_TRAJECTORIES + PRETRAIN_STEPS match.
 #
 # 5. Resume from a previous run directory or checkpoint:
 #    LOAD=outputs/HG-DAgger/hg_dagger_Lift_2026-03-26_12-00-00 \

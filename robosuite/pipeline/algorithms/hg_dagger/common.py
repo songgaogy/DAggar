@@ -19,6 +19,9 @@ class BCConfig:
     log_std_min: float = -5.0
     log_std_max: float = 2.0
     tanh_squash_distribution: bool = True
+    hybrid_gripper_head: bool = True
+    num_gripper_actions: int = 3
+    gripper_loss_weight: float = 1.0
     device: str = "cpu"
     inference_device: Optional[str] = None
 
