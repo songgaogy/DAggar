@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
-from robosuite.pipeline.algorithms.hil_serl.common.types import (
+from robosuite.pipeline.common.types import (
     EncoderConfig,
     ReplayBatch,
     ReplayBufferConfig,

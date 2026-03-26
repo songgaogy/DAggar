@@ -7,14 +7,14 @@ from typing import Any
 
 import torch
 
-from robosuite.pipeline.algorithms.hil_serl.common.types import EncoderConfig, ReplayBufferConfig, Transition
-from robosuite.pipeline.algorithms.hil_serl.common.utils import (
+from robosuite.pipeline.common.types import EncoderConfig, ReplayBufferConfig, Transition
+from robosuite.pipeline.common.utils import (
     cfg_get,
     infer_action_bounds,
     infer_action_dim,
     infer_observation_example,
 )
-from robosuite.pipeline.algorithms.hil_serl.utils.replay_buffer import HILSERLReplayBuffer
+from robosuite.pipeline.utils.replay_buffer import HILSERLReplayBuffer
 
 from .common import BCConfig, TrainerConfig
 from .models import HGDaggerBC

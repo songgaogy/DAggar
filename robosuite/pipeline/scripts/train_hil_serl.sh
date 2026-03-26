@@ -17,7 +17,7 @@ INFERENCE_DEVICE="cuda:1"
 LOGGING_USE_WANDB=true
 
 # previous log & ckpt path & data
-LOAD="/home/dodo/Documents/DAggar/robosuite/outputs/hil_serl/hil_serl_Lift_2026-03-26_13-53-07"
+LOAD="null"
 
 # previous ckpt only, not useful
 RESUME="${RESUME:-false}"

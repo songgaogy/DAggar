@@ -13,19 +13,17 @@ from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.algorithms.hg_dagger import HGDaggerTrainer
 from robosuite.pipeline.factory import build_algorithm
-from robosuite.pipeline.algorithms.hil_serl import (
+from robosuite.pipeline.envs import (
     RobosuiteInterventionRuntime,
     RobosuiteObservationAdapter,
-    load_demo_paths,
-    load_hdf5_demos_into_transitions,
-    build_robosuite_env,
-)
-from robosuite.pipeline.algorithms.hil_serl.envs import (
     build_device,
+    build_robosuite_env,
     compute_grasp_penalty,
+    load_hdf5_demos_into_transitions,
     make_checkpoint_directory,
     sparse_success_reward,
 )
+from robosuite.pipeline.utils import load_demo_paths
 from robosuite.pipeline.train_hil_serl import (
     AsyncCheckpointWriter,
     AsyncTransitionChunkWriter,

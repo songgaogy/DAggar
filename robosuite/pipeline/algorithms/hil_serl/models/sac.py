@@ -10,10 +10,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+from robosuite.pipeline.common import EncoderConfig, ReplayBatch, SACConfig, soft_update
+from robosuite.pipeline.models import MLP, build_encoder
 
-from .encoders import MLP, build_encoder
-from ..common.types import EncoderConfig, ReplayBatch, SACConfig
-from ..common.utils import soft_update
 
 
 LOG_PROB_EPS = 1e-6

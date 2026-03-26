@@ -7,9 +7,9 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
+from robosuite.pipeline.common import RewardProvider, TrainerConfig, Transition
 
 from .agent import HILSERLAgent
-from .common.types import RewardProvider, TrainerConfig, Transition
 
 
 class HILSERLTrainer:

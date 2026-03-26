@@ -5,7 +5,7 @@ import time
 from collections import deque
 from typing import Any
 
-from robosuite.pipeline.algorithms.hil_serl.common.types import Transition
+from robosuite.pipeline.common.types import Transition
 
 from .agent import HGDaggerAgent
 

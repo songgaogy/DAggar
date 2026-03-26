@@ -7,16 +7,22 @@ from typing import Any
 
 import torch
 
-from .utils.replay_buffer import HILSERLReplayBuffer
-from .models.sac import HILSERLSAC
-from .common.types import EncoderConfig, ReplayBatch, ReplayBufferConfig, SACConfig, TrainerConfig, Transition
-from .common.utils import (
+from robosuite.pipeline.common import (
+    EncoderConfig,
+    ReplayBatch,
+    ReplayBufferConfig,
+    SACConfig,
+    TrainerConfig,
+    Transition,
     cfg_get,
     concat_replay_batches,
     infer_action_bounds,
     infer_action_dim,
     infer_observation_example,
 )
+from robosuite.pipeline.utils import HILSERLReplayBuffer
+
+from .models.sac import HILSERLSAC
 
 
 class HILSERLAgent:

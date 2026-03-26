@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from robosuite.pipeline.algorithms.hil_serl.common.types import EncoderConfig, ReplayBatch
-from robosuite.pipeline.algorithms.hil_serl.common.utils import nested_to_torch
-from robosuite.pipeline.algorithms.hil_serl.models.encoders import MLP, build_encoder
+from robosuite.pipeline.common.types import EncoderConfig, ReplayBatch
+from robosuite.pipeline.common.utils import nested_to_torch
+from robosuite.pipeline.models.encoders import MLP, build_encoder
 
 from ..common import BCConfig
 
