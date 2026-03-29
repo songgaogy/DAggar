@@ -1,5 +1,7 @@
 from .algorithms import (
     EncoderConfig,
+    FlowDaggerAgent,
+    FlowDaggerTrainer,
     HILSERLAgent,
     HILSERLReplayBuffer,
     HILSERLSAC,
@@ -33,6 +35,8 @@ __all__ = [
     "BasePolicyRuntime",
     "DummyPolicyRuntime",
     "EncoderConfig",
+    "FlowDaggerAgent",
+    "FlowDaggerTrainer",
     "FlowMultiPolicyRuntime",
     "HILSERLAgent",
     "HILSERLReplayBuffer",
