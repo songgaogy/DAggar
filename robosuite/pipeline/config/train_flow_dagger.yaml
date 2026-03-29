@@ -10,7 +10,7 @@ env:
   controller: null
   renderer: "mjviewer"
   render_camera: "agentview"
-  camera_names: ["agentview", "robot0_eye_in_hand"]
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
   proprio_keys: []
   img_height: 128
   img_width: 128
@@ -27,19 +27,18 @@ algorithm:
 
   flow:
     action_horizon: 8
-    execute_horizon: 4
+    execute_horizon: 1
     image_size: ${env.img_height}
     learning_rate: 1.0e-4
     weight_decay: 1.0e-6
     grad_clip_norm: 1.0
     lambda_endpoint: 0.5
     lambda_smooth: 0.05
-    n_ode_steps: 20
+    n_ode_steps: 8
     device: "cuda:0"
     inference_device: "auto"
     task_prompt_map: null
-    camera_aliases:
-      robot0_robotview: "agentview"
+    camera_aliases: {}
 
     augmentation:
       minimal_shift_pad: 2
@@ -149,11 +148,13 @@ runtime:
   visualize_gripper_markers: true
   control_fps: ${env.control_freq}
   render_fps: ${runtime.control_fps}
-  image_obs_fps: 10.0
+  image_obs_fps: ${runtime.control_fps}
   spacemouse_fps: ${runtime.control_fps}
   policy_fps: ${runtime.control_fps}
   fps_log_interval: 1.0
   async_updates: true
+  online_updates_enabled: true
+  eval_episode_max_steps: 300
   resume: false
   checkpoint: null
   init_checkpoint: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"

@@ -141,7 +141,12 @@ class FlowDaggerPolicy:
         self.reset_action_chunk()
 
     def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
-        if self.current_chunk is None or self.step_in_chunk >= int(self.config.execute_horizon):
+        execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
+        if (
+            self.current_chunk is None
+            or self.step_in_chunk >= execute_horizon
+            or self.step_in_chunk >= len(self.current_chunk)
+        ):
             images = []
             for camera_name in self.camera_names:
                 image = np.asarray(obs[camera_name], dtype=np.uint8)

@@ -17,14 +17,13 @@ from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.envs import (
     RobosuiteInterventionRuntime,
-    RobosuiteObservationAdapter,
     build_device,
     build_robosuite_env,
     compute_grasp_penalty,
     make_checkpoint_directory,
     sparse_success_reward,
 )
-from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor
+from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
 from robosuite.pipeline.utils import (
     AsyncCheckpointWriter,
     AsyncTransitionChunkWriter,
@@ -33,7 +32,6 @@ from robosuite.pipeline.utils import (
     FixedRateLimiter,
     IntervalGate,
     JsonlEventLogger,
-    build_runtime_cfg,
     checkpoint_path,
     checkpoint_step_path,
     format_episode_line,
@@ -43,7 +41,6 @@ from robosuite.pipeline.utils import (
     maybe_log,
     maybe_wrap_visualization,
     now_readable,
-    reset_observation_adapter,
     resolve_buffer_chunk_dirs,
     resolve_buffer_snapshot_paths,
     resolve_camera_names,
@@ -57,10 +54,32 @@ from robosuite.pipeline.utils import (
     write_resolved_config,
     write_run_info,
 )
+from robosuite.pipeline.utils.train_utils import reset_robosuite_env
+from robosuite.pipeline.envs.robosuite import build_runtime_config_from_env_info
 
 
 def resolve_base_policy_directory(output_root: Path) -> Path:
     return output_root / "base_policy"
+
+
+def maybe_set_seed(seed_value: Any) -> None:
+    if seed_value is None:
+        print("[INFO] Running without a fixed random seed.")
+        return
+    normalized = str(seed_value).strip().lower()
+    if normalized in {"", "none", "null"}:
+        print("[INFO] Running without a fixed random seed.")
+        return
+    set_seed(int(seed_value))
+
+
+def serialize_seed(seed_value: Any) -> int | None:
+    if seed_value is None:
+        return None
+    normalized = str(seed_value).strip().lower()
+    if normalized in {"", "none", "null"}:
+        return None
+    return int(seed_value)
 
 
 def format_base_policy_trajectory_tag(max_num_trajectories: int | None) -> str:
@@ -234,14 +253,6 @@ def bind_flow_proprio_extractor(env, env_metadata: dict[str, Any] | None = None)
     return extractor
 
 
-def replace_obs_state_with_flow_proprio(obs: dict[str, Any], env, extractor: RobosuiteProprioExtractor | None):
-    if extractor is None:
-        return obs
-    flow_obs = dict(obs)
-    flow_obs["state"] = extractor.extract(env.sim.get_state().flatten()).astype(np.float32)
-    return flow_obs
-
-
 def normalize_policy_observation(
     obs: dict[str, Any],
     *,
@@ -261,6 +272,81 @@ def normalize_policy_observation(
             )
         normalized_obs[camera_name] = np.asarray(obs[alias_source], dtype=np.uint8)
     return normalized_obs
+
+
+def convert_env_camera_observation(
+    raw_obs: dict[str, Any],
+    *,
+    env,
+    extractor: RobosuiteProprioExtractor,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+) -> dict[str, Any]:
+    converted_obs: dict[str, Any] = {}
+    for camera_name in policy_camera_names:
+        source_camera = camera_aliases.get(camera_name, camera_name)
+        source_key = camera_obs_key(source_camera)
+        if source_key not in raw_obs:
+            raise KeyError(
+                f"Unable to resolve env camera observation for '{camera_name}'. "
+                f"Expected key '{source_key}' in env obs keys {sorted(raw_obs.keys())}."
+            )
+        converted_obs[camera_name] = np.asarray(raw_obs[source_key], dtype=np.uint8)
+    converted_obs["state"] = extractor.extract(env.sim.get_state().flatten()).astype(np.float32)
+    return converted_obs
+
+
+def reset_flow_policy_observation(
+    env,
+    *,
+    preserve_mjviewer: bool,
+    extractor: RobosuiteProprioExtractor,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_obs, info = reset_robosuite_env(env, preserve_mjviewer=preserve_mjviewer)
+    return (
+        convert_env_camera_observation(
+            raw_obs,
+            env=env,
+            extractor=extractor,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+        ),
+        info,
+    )
+
+
+def build_flow_runtime_cfg(
+    cfg: DictConfig,
+    *,
+    env_metadata: dict[str, Any] | None,
+    camera_names: list[str],
+    has_renderer: bool,
+    has_offscreen_renderer: bool,
+    use_camera_obs: bool = False,
+    renderer: str | None = None,
+):
+    if env_metadata is None:
+        raise ValueError("flow-dagger requires env metadata to build a flow-aligned runtime config.")
+
+    runtime_cfg = build_runtime_config_from_env_info(
+        env_metadata,
+        camera_names=camera_names,
+        img_height=int(cfg.env.img_height),
+        img_width=int(cfg.env.img_width),
+        proprio_keys=tuple(cfg.env.proprio_keys or []),
+        has_renderer=has_renderer,
+        renderer=str(cfg.env.renderer) if renderer is None else str(renderer),
+        reward_shaping=False,
+        control_freq=int(cfg.env.control_freq),
+    )
+    if cfg.env.horizon is not None:
+        runtime_cfg.horizon = int(cfg.env.horizon)
+    runtime_cfg.use_camera_obs = bool(use_camera_obs)
+    if use_camera_obs:
+        runtime_cfg.has_offscreen_renderer = True
+    return runtime_cfg
 
 
 def _resolve_hdf5_demo_group(file_handle: h5py.File | h5py.Group) -> h5py.Group:
@@ -381,16 +467,18 @@ def load_hdf5_demos_into_flow_transitions(
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="train_flow_dagger")
 def main(cfg: DictConfig) -> None:
-    set_seed(int(cfg.seed))
+    maybe_set_seed(getattr(cfg, "seed", None))
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     task_name = str(cfg.env.environment)
-    render_camera_names = resolve_camera_names(cfg)
+    requested_camera_names = resolve_camera_names(cfg)
+    flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
     if bool(getattr(cfg.runtime, "use_init_checkpoint_camera_names", True)) and init_payload is not None:
         policy_camera_names = [str(name) for name in init_payload.get("camera_names", [])]
         if len(policy_camera_names) == 0:
-            policy_camera_names = list(render_camera_names)
+            policy_camera_names = list(requested_camera_names)
     else:
-        policy_camera_names = list(render_camera_names)
+        policy_camera_names = list(requested_camera_names)
+    render_camera_names = list(policy_camera_names)
     cfg.algorithm.camera_names = list(policy_camera_names)
     camera_aliases = {
         str(key): str(value)
@@ -432,6 +520,12 @@ def main(cfg: DictConfig) -> None:
     )
     print(f"[view] render_camera={resolve_render_camera(cfg, render_camera_names)}")
     visualize_gripper_markers = bool(getattr(cfg.runtime, "visualize_gripper_markers", True))
+    frozen_eval_mode = (
+        (not bool(getattr(cfg.runtime, "online_updates_enabled", True)))
+        and (not bool(cfg.intervention.enabled))
+    )
+    if len(render_camera_names) == 0:
+        raise ValueError("flow-dagger requires at least one policy camera.")
 
     main_has_renderer = bool(cfg.runtime.interactive) and bool(cfg.runtime.viewer_enabled)
     main_renderer = str(cfg.env.renderer)
@@ -441,57 +535,42 @@ def main(cfg: DictConfig) -> None:
             "robosuite's native window renderer."
         )
         main_renderer = "mjviewer"
-
-    main_runtime_cfg = build_runtime_cfg(
+    main_runtime_cfg = build_flow_runtime_cfg(
         cfg,
+        env_metadata=flow_env_metadata,
         camera_names=render_camera_names,
         has_renderer=main_has_renderer,
-        has_offscreen_renderer=False,
+        has_offscreen_renderer=True,
+        use_camera_obs=True,
         renderer=main_renderer,
     )
+    if visualize_gripper_markers:
+        print(
+            "[INFO] Disabling gripper visualization markers on the main env because its camera observations "
+            "are feeding the policy."
+        )
     main_env = build_robosuite_env(main_runtime_cfg)
     main_env = maybe_wrap_visualization(
         main_env,
-        enabled=visualize_gripper_markers,
+        enabled=False,
         label="training env",
     )
+    print("[INFO] Using camera observations directly from the main env.")
 
-    obs_runtime_cfg = build_runtime_cfg(
-        cfg,
-        camera_names=render_camera_names,
-        has_renderer=False,
-        has_offscreen_renderer=bool(len(render_camera_names) > 0),
-    )
-    obs_render_env = build_robosuite_env(obs_runtime_cfg)
-    obs_render_env = maybe_wrap_visualization(
-        obs_render_env,
-        enabled=visualize_gripper_markers,
-        label="observation render env",
-    )
-    obs_render_env.reset()
-
-    adapter = RobosuiteObservationAdapter(
-        main_env,
-        render_env=obs_render_env,
-        camera_names=render_camera_names,
-        img_height=int(cfg.env.img_height),
-        img_width=int(cfg.env.img_width),
-        proprio_keys=tuple(cfg.env.proprio_keys or []),
-        image_obs_fps=float(getattr(cfg.runtime, "image_obs_fps", cfg.runtime.control_fps)),
-    )
-    flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
     flow_proprio_extractor = bind_flow_proprio_extractor(main_env, flow_env_metadata)
-    initial_obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=main_has_renderer)
-    initial_obs = replace_obs_state_with_flow_proprio(initial_obs, main_env, flow_proprio_extractor)
-    initial_obs = normalize_policy_observation(
-        initial_obs,
+    initial_obs, _ = reset_flow_policy_observation(
+        main_env,
+        preserve_mjviewer=main_has_renderer,
+        extractor=flow_proprio_extractor,
         policy_camera_names=policy_camera_names,
         camera_aliases=camera_aliases,
     )
     if main_has_renderer and getattr(main_env, "viewer", None) is not None and hasattr(main_env.viewer, "update"):
         main_env.viewer.update()
 
-    action_low, action_high = adapter.action_spec()
+    action_low, action_high = main_env.action_spec
+    action_low = np.asarray(action_low, dtype=np.float32)
+    action_high = np.asarray(action_high, dtype=np.float32)
     algorithm_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
     if isinstance(algorithm_cfg, dict):
         algorithm_cfg["camera_names"] = list(policy_camera_names)
@@ -505,7 +584,7 @@ def main(cfg: DictConfig) -> None:
                 flow_cfg["task_prompt_map"] = init_payload["task_prompt_map"]
             if init_payload.get("act_mean") is not None:
                 flow_cfg["action_horizon"] = int(np.asarray(init_payload["act_mean"]).shape[0])
-                flow_cfg.setdefault("execute_horizon", min(4, int(flow_cfg["action_horizon"])))
+                flow_cfg.setdefault("execute_horizon", 1)
         model_cfg = flow_cfg.setdefault("model", {})
         image_encoder_cfg = model_cfg.get("image_encoder", None)
         if isinstance(image_encoder_cfg, dict) and image_encoder_cfg.get("pretrained_path"):
@@ -546,6 +625,8 @@ def main(cfg: DictConfig) -> None:
     image_obs_fps = resolve_runtime_fps(cfg, "image_obs_fps", control_fps)
     fps_log_interval = max(0.1, float(getattr(cfg.runtime, "fps_log_interval", 1.0)))
     async_updates = bool(getattr(cfg.runtime, "async_updates", False))
+    online_updates_enabled = bool(getattr(cfg.runtime, "online_updates_enabled", True))
+    eval_episode_max_steps = int(getattr(cfg.runtime, "eval_episode_max_steps", 300))
     if abs(control_fps - float(cfg.env.control_freq)) > 1e-6:
         print(
             "[WARN] runtime.control_fps does not match env.control_freq. "
@@ -556,11 +637,13 @@ def main(cfg: DictConfig) -> None:
             "[INFO] Image observations are rate-limited below control frequency "
             f"({image_obs_fps:.2f}Hz images vs {control_fps:.2f}Hz control)."
         )
-
-    if main_has_renderer:
+    if not online_updates_enabled:
+        print("[INFO] Online learner updates are disabled. Policy parameters will stay frozen during rollout.")
+    print("[INFO] Main env camera observations are being used for policy inference.")
+    if frozen_eval_mode:
         print(
-            "[INFO] Main training env owns the robosuite mjviewer window; "
-            "image observations are rendered from a separate headless env."
+            f"[INFO] Frozen-policy eval mode will reset episodes after {eval_episode_max_steps} steps "
+            "if not terminated earlier."
         )
 
     loaded_checkpoint = None
@@ -614,7 +697,7 @@ def main(cfg: DictConfig) -> None:
             "initialized_checkpoint": None if initialized_checkpoint is None else str(initialized_checkpoint),
             "resume_enabled": bool(cfg.runtime.resume),
             "load_buffers": bool(cfg.runtime.load_buffers),
-            "seed": int(cfg.seed),
+            "seed": serialize_seed(getattr(cfg, "seed", None)),
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
             "buffer_dir": str(checkpoint_dir / "buffers"),
@@ -930,9 +1013,24 @@ def main(cfg: DictConfig) -> None:
             device=device,
             goal_update_mode=str(cfg.intervention.goal_update_mode),
         )
+
+    # Refresh the rollout episode after model / demo bootstrap so the first episode starts from the
+    # same phase as the original flow_multi eval path, which resets immediately before inference.
+    obs, _ = reset_flow_policy_observation(
+        env,
+        preserve_mjviewer=main_has_renderer,
+        extractor=flow_proprio_extractor,
+        policy_camera_names=policy_camera_names,
+        camera_aliases=camera_aliases,
+    )
+    refresh_main_viewer()
+    agent.reset_policy_state()
+    policy_gate.force_ready()
+    spacemouse_gate.force_ready()
+    if intervention_runtime is not None:
         intervention_runtime.start_episode()
 
-    if async_updates:
+    if async_updates and online_updates_enabled:
         trainer.start_async_worker()
 
     try:
@@ -971,10 +1069,10 @@ def main(cfg: DictConfig) -> None:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
                     break
-                obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=main_has_renderer)
-                obs = replace_obs_state_with_flow_proprio(obs, env, flow_proprio_extractor)
-                obs = normalize_policy_observation(
-                    obs,
+                obs, _ = reset_flow_policy_observation(
+                    env,
+                    preserve_mjviewer=main_has_renderer,
+                    extractor=flow_proprio_extractor,
                     policy_camera_names=policy_camera_names,
                     camera_aliases=camera_aliases,
                 )
@@ -1007,13 +1105,15 @@ def main(cfg: DictConfig) -> None:
             if isinstance(info, dict) and grasp_penalty is not None:
                 info.setdefault("grasp_penalty", float(grasp_penalty))
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
-            next_obs = adapter.transform(raw_next_obs)
-            next_obs = replace_obs_state_with_flow_proprio(next_obs, env, flow_proprio_extractor)
-            next_obs = normalize_policy_observation(
-                next_obs,
+            next_obs = convert_env_camera_observation(
+                raw_next_obs,
+                env=env,
+                extractor=flow_proprio_extractor,
                 policy_camera_names=policy_camera_names,
                 camera_aliases=camera_aliases,
             )
+            if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
+                done = True
             done = bool(done or success)
             recorded_transition = trainer.record_transition(
                 obs=obs,
@@ -1060,10 +1160,13 @@ def main(cfg: DictConfig) -> None:
             episode_length += 1
             success_count += int(success)
 
-            if async_updates:
-                update_metrics_list = trainer.maybe_update_async()
+            if online_updates_enabled:
+                if async_updates:
+                    update_metrics_list = trainer.maybe_update_async()
+                else:
+                    update_metrics_list = trainer.maybe_update()
             else:
-                update_metrics_list = trainer.maybe_update()
+                update_metrics_list = []
             if update_metrics_list:
                 maybe_print_publish_events(update_metrics_list)
                 update_metrics = update_metrics_list[-1]
@@ -1124,10 +1227,10 @@ def main(cfg: DictConfig) -> None:
                 )
                 if episode_pause_sec > 0.0:
                     time.sleep(episode_pause_sec)
-                obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=main_has_renderer)
-                obs = replace_obs_state_with_flow_proprio(obs, env, flow_proprio_extractor)
-                obs = normalize_policy_observation(
-                    obs,
+                obs, _ = reset_flow_policy_observation(
+                    env,
+                    preserve_mjviewer=main_has_renderer,
+                    extractor=flow_proprio_extractor,
                     policy_camera_names=policy_camera_names,
                     camera_aliases=camera_aliases,
                 )
@@ -1203,7 +1306,7 @@ def main(cfg: DictConfig) -> None:
                 "initialized_checkpoint": None if initialized_checkpoint is None else str(initialized_checkpoint),
                 "resume_enabled": bool(cfg.runtime.resume),
                 "load_buffers": bool(cfg.runtime.load_buffers),
-                "seed": int(cfg.seed),
+                "seed": serialize_seed(getattr(cfg, "seed", None)),
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
                 "buffer_dir": str(checkpoint_dir / "buffers"),
@@ -1229,22 +1332,19 @@ def main(cfg: DictConfig) -> None:
             env.close()
         finally:
             try:
-                obs_render_env.close()
+                if flow_proprio_extractor is not None:
+                    flow_proprio_extractor.close()
             finally:
                 try:
-                    if flow_proprio_extractor is not None:
-                        flow_proprio_extractor.close()
+                    checkpoint_writer.close()
                 finally:
                     try:
-                        checkpoint_writer.close()
+                        runtime_logger.close()
                     finally:
                         try:
-                            runtime_logger.close()
+                            buffer_writer.close()
                         finally:
-                            try:
-                                buffer_writer.close()
-                            finally:
-                                console_capture.stop()
+                            console_capture.stop()
 
 
 if __name__ == "__main__":

@@ -138,10 +138,11 @@ class FlowDaggerReplayBuffer:
             self._validate_transition(normalized)
             if len(self._storage) < self.capacity:
                 self._storage.append(normalized)
+                self._append_valid_start_locked()
             else:
                 self._storage[self._position] = normalized
+                self._rebuild_valid_start_cache_locked()
             self._position = (self._position + 1) % self.capacity
-            self._valid_start_cache = None
 
     def extend(self, transitions: list[Transition]) -> None:
         for transition in transitions:
@@ -263,13 +264,13 @@ class FlowDaggerReplayBuffer:
             self.image_size = int(state_dict.get("image_size", self.image_size))
             self._position = int(state_dict.get("position", 0))
             self._storage = list(state_dict.get("storage", []))
-            self._valid_start_cache = None
             if self._storage:
                 self._reference_obs = clone_array_tree(self._storage[0].obs)
                 self._reference_action = to_numpy(self._storage[0].action, dtype=np.float32).reshape(-1)
             else:
                 self._reference_obs = None
                 self._reference_action = None
+            self._rebuild_valid_start_cache_locked()
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -326,14 +327,27 @@ class FlowDaggerReplayBuffer:
 
     def _get_valid_start_indices_locked(self) -> list[int]:
         if self._valid_start_cache is not None:
-            return list(self._valid_start_cache)
+            return self._valid_start_cache
+        return self._rebuild_valid_start_cache_locked()
+
+    def _append_valid_start_locked(self) -> None:
+        if self._valid_start_cache is None:
+            self._rebuild_valid_start_cache_locked()
+            return
+        start = len(self._storage) - self.action_horizon
+        if start < 0:
+            return
+        if self._is_valid_sequence_start_locked(start):
+            self._valid_start_cache.append(int(start))
+
+    def _rebuild_valid_start_cache_locked(self) -> list[int]:
         valid_starts = []
         max_start = len(self._storage) - self.action_horizon + 1
         for start in range(max_start):
             if self._is_valid_sequence_start_locked(start):
                 valid_starts.append(int(start))
-        self._valid_start_cache = list(valid_starts)
-        return valid_starts
+        self._valid_start_cache = valid_starts
+        return self._valid_start_cache
 
     def _is_valid_sequence_start_locked(self, start: int) -> bool:
         first = self._storage[start]

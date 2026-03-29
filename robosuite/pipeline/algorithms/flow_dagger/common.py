@@ -23,14 +23,14 @@ class FlowDaggerConfig:
     action_dim: int
     proprio_dim: int
     action_horizon: int = 8
-    execute_horizon: int = 4
+    execute_horizon: int = 1
     image_size: int = 128
     learning_rate: float = 1e-4
     weight_decay: float = 1e-6
     grad_clip_norm: float = 1.0
     lambda_endpoint: float = 0.5
     lambda_smooth: float = 0.05
-    n_ode_steps: int = 20
+    n_ode_steps: int = 8
     device: str = "cpu"
     inference_device: Optional[str] = None
     task_name: Optional[str] = None
