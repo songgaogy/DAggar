@@ -78,6 +78,8 @@ def build_robosuite_env(runtime_cfg: RobosuiteRuntimeConfig):
         env_kwargs["render_camera"] = str(render_camera)
     if runtime_cfg.use_camera_obs and runtime_cfg.camera_names:
         env_kwargs["camera_names"] = list(runtime_cfg.camera_names)
+        env_kwargs["camera_heights"] = int(runtime_cfg.img_height)
+        env_kwargs["camera_widths"] = int(runtime_cfg.img_width)
     if runtime_cfg.env_configuration and "TwoArm" in runtime_cfg.env_name:
         env_kwargs["env_configuration"] = runtime_cfg.env_configuration
     if runtime_cfg.horizon is not None:

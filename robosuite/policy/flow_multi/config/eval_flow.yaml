@@ -11,7 +11,7 @@ eval:
   device: "cuda"
   episodes: 5
   succ_rate: false
-  succ_rate_episodes: 100
+  succ_rate_episodes: 50
   max_steps: 300
   n_ode_steps: 20
   action_horizon: 4

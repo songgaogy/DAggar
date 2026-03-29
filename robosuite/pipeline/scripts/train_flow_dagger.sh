@@ -16,9 +16,11 @@ LEARNER_DEVICE="${LEARNER_DEVICE:-cuda:0}"
 INFERENCE_DEVICE="${INFERENCE_DEVICE:-cuda:1}"
 ACTION_HORIZON="${ACTION_HORIZON:-8}"
 EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
-N_ODE_STEPS="${N_ODE_STEPS:-20}"
+N_ODE_STEPS=10
 EVAL_EPISODE_MAX_STEPS="${EVAL_EPISODE_MAX_STEPS:-300}"
 INIT_CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+FPS_LOG_INTERVAL="${FPS_LOG_INTERVAL:-3.0}"
+UNTHROTTLED="${UNTHROTTLED:-false}"
 
 case "${FLOW_DAGGER_MODE}" in
   eval)
@@ -27,15 +29,33 @@ case "${FLOW_DAGGER_MODE}" in
     ASYNC_UPDATES="${ASYNC_UPDATES:-false}"
     VISUALIZE_GRIPPER_MARKERS="${VISUALIZE_GRIPPER_MARKERS:-false}"
     LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
+    VIEWER_ASYNC="${VIEWER_ASYNC:-false}"
+    VIEWER_BACKEND="${VIEWER_BACKEND:-mjviewer}"
+    RENDER_FPS="${RENDER_FPS:-20}"
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+    BUFFER_SAVE_INTERVAL="${BUFFER_SAVE_INTERVAL:-1000}"
+    CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-5000}"
+    LOG_INTERVAL="${LOG_INTERVAL:-50}"
+    PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-100}"
     SEED_VALUE="${SEED:-null}"
+    EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-2}"
     ;;
   train)
     ONLINE_UPDATES="${ONLINE_UPDATES:-true}"
     INTERVENTION_ENABLED="${INTERVENTION_ENABLED:-true}"
     ASYNC_UPDATES="${ASYNC_UPDATES:-true}"
     VISUALIZE_GRIPPER_MARKERS="${VISUALIZE_GRIPPER_MARKERS:-true}"
-    LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-true}"
+    LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
+    VIEWER_ASYNC="${VIEWER_ASYNC:-true}"
+    VIEWER_BACKEND="${VIEWER_BACKEND:-mjviewer}"
+    RENDER_FPS="${RENDER_FPS:-10}"
+    TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+    BUFFER_SAVE_INTERVAL="${BUFFER_SAVE_INTERVAL:-5000}"
+    CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10000}"
+    LOG_INTERVAL="${LOG_INTERVAL:-100}"
+    PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-300}"
     SEED_VALUE="${SEED:-42}"
+    EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-0}"
     ;;
   *)
     echo "[ERROR] Unsupported FLOW_DAGGER_MODE='${FLOW_DAGGER_MODE}'. Use 'eval' or 'train'." >&2
@@ -46,8 +66,6 @@ esac
 LOAD="${LOAD:-null}"
 RESUME="${RESUME:-false}"
 CHECKPOINT="${CHECKPOINT:-null}"
-EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-2}"
-
 EXTRA_ARGS=("$@")
 
 export ROOT_DIR
@@ -108,6 +126,12 @@ python -m robosuite.pipeline.train_flow_dagger \
   runtime.viewer_enabled="${VIEWER_ENABLED}" \
   runtime.visualize_gripper_markers="${VISUALIZE_GRIPPER_MARKERS}" \
   runtime.image_obs_fps="${IMAGE_OBS_FPS}" \
+  runtime.render_fps="${RENDER_FPS}" \
+  runtime.viewer_async="${VIEWER_ASYNC}" \
+  runtime.viewer_backend="${VIEWER_BACKEND}" \
+  runtime.fps_log_interval="${FPS_LOG_INTERVAL}" \
+  runtime.buffer_save_interval="${BUFFER_SAVE_INTERVAL}" \
+  runtime.unthrottled="${UNTHROTTLED}" \
   runtime.async_updates="${ASYNC_UPDATES}" \
   runtime.online_updates_enabled="${ONLINE_UPDATES}" \
   runtime.eval_episode_max_steps="${EVAL_EPISODE_MAX_STEPS}" \
@@ -122,7 +146,11 @@ python -m robosuite.pipeline.train_flow_dagger \
   algorithm.flow.action_horizon="${ACTION_HORIZON}" \
   algorithm.flow.execute_horizon="${EXECUTE_HORIZON}" \
   algorithm.flow.n_ode_steps="${N_ODE_STEPS}" \
+  algorithm.trainer.batch_size="${TRAIN_BATCH_SIZE}" \
+  algorithm.trainer.steps_per_update="${PUBLISH_INTERVAL}" \
   logging.use_wandb="${LOGGING_USE_WANDB}" \
+  logging.log_interval="${LOG_INTERVAL}" \
+  logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \
   "${EXTRA_ARGS[@]}"
 
 # Evaluate with window rendering:

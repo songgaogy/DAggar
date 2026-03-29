@@ -17,10 +17,13 @@ from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.envs import (
     RobosuiteInterventionRuntime,
+    RobosuiteViewerRuntime,
     build_device,
     build_robosuite_env,
+    choose_viewer_backend,
     compute_grasp_penalty,
     make_checkpoint_directory,
+    snapshot_env_state,
     sparse_success_reward,
 )
 from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
@@ -281,6 +284,8 @@ def convert_env_camera_observation(
     extractor: RobosuiteProprioExtractor,
     policy_camera_names: list[str],
     camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
 ) -> dict[str, Any]:
     converted_obs: dict[str, Any] = {}
     for camera_name in policy_camera_names:
@@ -291,7 +296,11 @@ def convert_env_camera_observation(
                 f"Unable to resolve env camera observation for '{camera_name}'. "
                 f"Expected key '{source_key}' in env obs keys {sorted(raw_obs.keys())}."
             )
-        converted_obs[camera_name] = np.asarray(raw_obs[source_key], dtype=np.uint8)
+        converted_obs[camera_name] = _center_crop_resize_image(
+            np.asarray(raw_obs[source_key], dtype=np.uint8),
+            img_height=img_height,
+            img_width=img_width,
+        )
     converted_obs["state"] = extractor.extract(env.sim.get_state().flatten()).astype(np.float32)
     return converted_obs
 
@@ -303,6 +312,8 @@ def reset_flow_policy_observation(
     extractor: RobosuiteProprioExtractor,
     policy_camera_names: list[str],
     camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     raw_obs, info = reset_robosuite_env(env, preserve_mjviewer=preserve_mjviewer)
     return (
@@ -312,6 +323,8 @@ def reset_flow_policy_observation(
             extractor=extractor,
             policy_camera_names=policy_camera_names,
             camera_aliases=camera_aliases,
+            img_height=img_height,
+            img_width=img_width,
         ),
         info,
     )
@@ -468,6 +481,11 @@ def load_hdf5_demos_into_flow_transitions(
 @hydra.main(version_base="1.2", config_path="./config", config_name="train_flow_dagger")
 def main(cfg: DictConfig) -> None:
     maybe_set_seed(getattr(cfg, "seed", None))
+    torch.set_float32_matmul_precision("high")
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     task_name = str(cfg.env.environment)
     requested_camera_names = resolve_camera_names(cfg)
@@ -527,9 +545,12 @@ def main(cfg: DictConfig) -> None:
     if len(render_camera_names) == 0:
         raise ValueError("flow-dagger requires at least one policy camera.")
 
-    main_has_renderer = bool(cfg.runtime.interactive) and bool(cfg.runtime.viewer_enabled)
+    online_updates_enabled = bool(getattr(cfg.runtime, "online_updates_enabled", True))
+    viewer_enabled = bool(cfg.runtime.interactive) and bool(cfg.runtime.viewer_enabled)
+    decoupled_viewer_enabled = viewer_enabled and online_updates_enabled
+    rollout_has_renderer = viewer_enabled and (not decoupled_viewer_enabled)
     main_renderer = str(cfg.env.renderer)
-    if main_has_renderer and main_renderer != "mjviewer":
+    if viewer_enabled and main_renderer != "mjviewer":
         print(
             f"[WARN] Overriding env.renderer='{main_renderer}' to 'mjviewer' so the main training env uses "
             "robosuite's native window renderer."
@@ -539,7 +560,7 @@ def main(cfg: DictConfig) -> None:
         cfg,
         env_metadata=flow_env_metadata,
         camera_names=render_camera_names,
-        has_renderer=main_has_renderer,
+        has_renderer=rollout_has_renderer,
         has_offscreen_renderer=True,
         use_camera_obs=True,
         renderer=main_renderer,
@@ -560,12 +581,14 @@ def main(cfg: DictConfig) -> None:
     flow_proprio_extractor = bind_flow_proprio_extractor(main_env, flow_env_metadata)
     initial_obs, _ = reset_flow_policy_observation(
         main_env,
-        preserve_mjviewer=main_has_renderer,
+        preserve_mjviewer=rollout_has_renderer,
         extractor=flow_proprio_extractor,
         policy_camera_names=policy_camera_names,
         camera_aliases=camera_aliases,
+        img_height=int(cfg.env.img_height),
+        img_width=int(cfg.env.img_width),
     )
-    if main_has_renderer and getattr(main_env, "viewer", None) is not None and hasattr(main_env.viewer, "update"):
+    if rollout_has_renderer and getattr(main_env, "viewer", None) is not None and hasattr(main_env.viewer, "update"):
         main_env.viewer.update()
 
     action_low, action_high = main_env.action_spec
@@ -620,13 +643,55 @@ def main(cfg: DictConfig) -> None:
     env = main_env
     obs = initial_obs
     control_fps = resolve_runtime_fps(cfg, "control_fps", float(cfg.env.control_freq))
+    render_fps = resolve_runtime_fps(cfg, "render_fps", control_fps)
     policy_fps = resolve_runtime_fps(cfg, "policy_fps", control_fps)
     spacemouse_fps = resolve_runtime_fps(cfg, "spacemouse_fps", control_fps)
     image_obs_fps = resolve_runtime_fps(cfg, "image_obs_fps", control_fps)
     fps_log_interval = max(0.1, float(getattr(cfg.runtime, "fps_log_interval", 1.0)))
+    unthrottled_runtime = bool(getattr(cfg.runtime, "unthrottled", False))
     async_updates = bool(getattr(cfg.runtime, "async_updates", False))
-    online_updates_enabled = bool(getattr(cfg.runtime, "online_updates_enabled", True))
     eval_episode_max_steps = int(getattr(cfg.runtime, "eval_episode_max_steps", 300))
+    viewer_runtime: RobosuiteViewerRuntime | None = None
+    if decoupled_viewer_enabled:
+        viewer_requested_backend = str(getattr(cfg.runtime, "viewer_backend", "auto"))
+        if viewer_requested_backend.lower() == "auto" and main_renderer == "mjviewer":
+            viewer_backend = "mjviewer"
+        else:
+            viewer_backend = choose_viewer_backend(
+                main_renderer,
+                render_camera_names,
+                requested_backend=viewer_requested_backend,
+            )
+        viewer_runtime_cfg = build_flow_runtime_cfg(
+            cfg,
+            env_metadata=flow_env_metadata,
+            camera_names=render_camera_names,
+            has_renderer=True,
+            has_offscreen_renderer=False,
+            use_camera_obs=False,
+            renderer=main_renderer,
+        )
+        viewer_runtime_cfg.render_camera = resolve_render_camera(cfg, render_camera_names)
+        viewer_env = build_robosuite_env(viewer_runtime_cfg)
+        viewer_env = maybe_wrap_visualization(
+            viewer_env,
+            enabled=visualize_gripper_markers,
+            label="viewer env",
+        )
+        viewer_runtime = RobosuiteViewerRuntime(
+            viewer_env,
+            render_fps=render_fps,
+            async_mode=bool(getattr(cfg.runtime, "viewer_async", False)),
+            preview_camera=resolve_render_camera(cfg, render_camera_names),
+            backend=viewer_backend,
+        )
+        viewer_runtime.start()
+        viewer_startup_delay = max(0.0, float(getattr(cfg.runtime, "viewer_startup_delay", 0.0)))
+        if viewer_startup_delay > 0.0:
+            time.sleep(viewer_startup_delay)
+    if unthrottled_runtime and bool(cfg.intervention.enabled):
+        print("[WARN] runtime.unthrottled=true is incompatible with human intervention. Falling back to throttled mode.")
+        unthrottled_runtime = False
     if abs(control_fps - float(cfg.env.control_freq)) > 1e-6:
         print(
             "[WARN] runtime.control_fps does not match env.control_freq. "
@@ -640,11 +705,18 @@ def main(cfg: DictConfig) -> None:
     if not online_updates_enabled:
         print("[INFO] Online learner updates are disabled. Policy parameters will stay frozen during rollout.")
     print("[INFO] Main env camera observations are being used for policy inference.")
+    if decoupled_viewer_enabled:
+        print(
+            "[INFO] Training viewer is decoupled from rollout. "
+            f"Window refresh runs at {render_fps:.2f}Hz while policy observations still come from the rollout env."
+        )
     if frozen_eval_mode:
         print(
             f"[INFO] Frozen-policy eval mode will reset episodes after {eval_episode_max_steps} steps "
             "if not terminated earlier."
         )
+    if unthrottled_runtime:
+        print("[INFO] Running without real-time control throttling.")
 
     loaded_checkpoint = None
     initialized_checkpoint = None
@@ -825,7 +897,7 @@ def main(cfg: DictConfig) -> None:
     episode_step_index = 0
     success_count = 0
     last_step = start_step - 1
-    control_limiter = FixedRateLimiter(control_fps)
+    control_limiter = None if unthrottled_runtime else FixedRateLimiter(control_fps)
     policy_gate = IntervalGate(policy_fps)
     spacemouse_gate = IntervalGate(spacemouse_fps)
     overall_fps_tracker = EMAFpsTracker()
@@ -850,12 +922,25 @@ def main(cfg: DictConfig) -> None:
         }
 
     def refresh_main_viewer() -> None:
-        if not main_has_renderer:
+        if viewer_runtime is not None:
+            viewer_runtime.publish_from_env(env)
+            viewer_runtime.render_if_due()
+            return
+        if not rollout_has_renderer:
             return
         if getattr(env, "viewer", None) is None and hasattr(env, "initialize_renderer"):
             env.initialize_renderer()
         if getattr(env, "viewer", None) is not None and hasattr(env.viewer, "update"):
             env.viewer.update()
+
+    def reset_viewer_preview() -> None:
+        if viewer_runtime is None:
+            refresh_main_viewer()
+            return
+        viewer_runtime.reset_preview(
+            snapshot_env_state(env),
+            warmup_frames=int(getattr(cfg.runtime, "viewer_reset_warmup_frames", 2)),
+        )
 
     def maybe_print_publish_events(metrics_list: list[dict[str, float]]) -> None:
         nonlocal last_reported_publish_count
@@ -1018,12 +1103,14 @@ def main(cfg: DictConfig) -> None:
     # same phase as the original flow_multi eval path, which resets immediately before inference.
     obs, _ = reset_flow_policy_observation(
         env,
-        preserve_mjviewer=main_has_renderer,
+        preserve_mjviewer=rollout_has_renderer,
         extractor=flow_proprio_extractor,
         policy_camera_names=policy_camera_names,
         camera_aliases=camera_aliases,
+        img_height=int(cfg.env.img_height),
+        img_width=int(cfg.env.img_width),
     )
-    refresh_main_viewer()
+    reset_viewer_preview()
     agent.reset_policy_state()
     policy_gate.force_ready()
     spacemouse_gate.force_ready()
@@ -1036,10 +1123,10 @@ def main(cfg: DictConfig) -> None:
     try:
         for step in range(start_step, int(cfg.runtime.max_steps)):
             last_step = step
-            loop_start = control_limiter.wait()
+            loop_start = time.monotonic() if control_limiter is None else control_limiter.wait()
             overall_fps_tracker.mark()
 
-            if policy_gate.ready(loop_start):
+            if unthrottled_runtime or policy_gate.ready(loop_start):
                 if step < int(cfg.algorithm.trainer.random_steps):
                     cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
                 else:
@@ -1048,7 +1135,7 @@ def main(cfg: DictConfig) -> None:
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
             is_intervention = False
             reset_requested = False
-            if intervention_runtime is not None and spacemouse_gate.ready(loop_start):
+            if intervention_runtime is not None and (unthrottled_runtime or spacemouse_gate.ready(loop_start)):
                 override_action, sampled_is_intervention, reset_requested = intervention_runtime.maybe_override_action(
                     cached_policy_action
                 )
@@ -1071,12 +1158,14 @@ def main(cfg: DictConfig) -> None:
                     break
                 obs, _ = reset_flow_policy_observation(
                     env,
-                    preserve_mjviewer=main_has_renderer,
+                    preserve_mjviewer=rollout_has_renderer,
                     extractor=flow_proprio_extractor,
                     policy_camera_names=policy_camera_names,
                     camera_aliases=camera_aliases,
+                    img_height=int(cfg.env.img_height),
+                    img_width=int(cfg.env.img_width),
                 )
-                refresh_main_viewer()
+                reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
                 episode_length = 0
@@ -1111,7 +1200,10 @@ def main(cfg: DictConfig) -> None:
                 extractor=flow_proprio_extractor,
                 policy_camera_names=policy_camera_names,
                 camera_aliases=camera_aliases,
+                img_height=int(cfg.env.img_height),
+                img_width=int(cfg.env.img_width),
             )
+            refresh_main_viewer()
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
                 done = True
             done = bool(done or success)
@@ -1229,12 +1321,14 @@ def main(cfg: DictConfig) -> None:
                     time.sleep(episode_pause_sec)
                 obs, _ = reset_flow_policy_observation(
                     env,
-                    preserve_mjviewer=main_has_renderer,
+                    preserve_mjviewer=rollout_has_renderer,
                     extractor=flow_proprio_extractor,
                     policy_camera_names=policy_camera_names,
                     camera_aliases=camera_aliases,
+                    img_height=int(cfg.env.img_height),
+                    img_width=int(cfg.env.img_width),
                 )
-                refresh_main_viewer()
+                reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
                 episode_length = 0
@@ -1332,19 +1426,23 @@ def main(cfg: DictConfig) -> None:
             env.close()
         finally:
             try:
-                if flow_proprio_extractor is not None:
-                    flow_proprio_extractor.close()
+                if viewer_runtime is not None:
+                    viewer_runtime.close()
             finally:
                 try:
-                    checkpoint_writer.close()
+                    if flow_proprio_extractor is not None:
+                        flow_proprio_extractor.close()
                 finally:
                     try:
-                        runtime_logger.close()
+                        checkpoint_writer.close()
                     finally:
                         try:
-                            buffer_writer.close()
+                            runtime_logger.close()
                         finally:
-                            console_capture.stop()
+                            try:
+                                buffer_writer.close()
+                            finally:
+                                console_capture.stop()
 
 
 if __name__ == "__main__":

@@ -141,6 +141,7 @@ runtime:
   max_steps: 100000
   interactive: true
   viewer_enabled: true
+  unthrottled: false
   viewer_backend: "auto"
   viewer_async: false
   viewer_startup_delay: 0.0

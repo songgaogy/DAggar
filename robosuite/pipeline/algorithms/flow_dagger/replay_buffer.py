@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import torch
@@ -288,7 +288,8 @@ class FlowDaggerReplayBuffer:
             if self._reference_obs is None or self._reference_action is None:
                 return True
             try:
-                assert_same_structure(self._reference_obs, obs, path=f"{self.name}.obs")
+                normalized_obs = self._normalize_observation(obs)
+                assert_same_structure(self._reference_obs, normalized_obs, path=f"{self.name}.obs")
                 action_array = to_numpy(action, dtype=np.float32).reshape(-1)
                 return tuple(self._reference_action.shape) == tuple(action_array.shape)
             except Exception:
@@ -301,10 +302,10 @@ class FlowDaggerReplayBuffer:
             raise ValueError(f"{self.name} requires next_obs for every transition.")
         action = to_numpy(transition.action, dtype=np.float32).reshape(-1)
         return Transition(
-            obs=clone_array_tree(transition.obs),
+            obs=self._normalize_observation(transition.obs),
             action=action,
             reward=float(transition.reward),
-            next_obs=clone_array_tree(transition.next_obs),
+            next_obs=self._normalize_observation(transition.next_obs),
             done=bool(transition.done),
             grasp_penalty=None if transition.grasp_penalty is None else float(transition.grasp_penalty),
             is_intervention=bool(transition.is_intervention),
@@ -312,6 +313,25 @@ class FlowDaggerReplayBuffer:
             reward_source=transition.reward_source,
             demo_source=transition.demo_source,
         )
+
+    def _normalize_observation(self, obs: Any) -> Any:
+        normalized = clone_array_tree(obs)
+        if not isinstance(normalized, Mapping):
+            return normalized
+
+        normalized_obs = dict(normalized)
+        if "state" in normalized_obs:
+            normalized_obs["state"] = np.asarray(normalized_obs["state"], dtype=np.float32)
+        for camera_name in self.camera_names:
+            if camera_name not in normalized_obs:
+                continue
+            image = np.asarray(normalized_obs[camera_name], dtype=np.uint8)
+            if image.ndim != 3:
+                raise ValueError(
+                    f"{self.name}.{camera_name} expected an HWC image, got shape {tuple(image.shape)}."
+                )
+            normalized_obs[camera_name] = _center_crop_resize(image, self.image_size)
+        return normalized_obs
 
     def _validate_transition(self, transition: Transition) -> None:
         if self._reference_obs is None:
