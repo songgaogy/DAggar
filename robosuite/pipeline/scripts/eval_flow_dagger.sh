@@ -3,13 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
-ENV_NAME="${ENV_NAME:-PickPlaceBread}"
+ENV_NAME="PickPlaceBread"
 TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/flow-DAgger/flow_dagger_PickPlaceBread_2026-03-30_01-54-07/checkpoints/step_00010000_updates_00009645_ep_00034.pt"
+CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/flow-DAgger/flow_dagger_PickPlaceBread_2026-03-30_12-16-18/checkpoints/step_00010000_updates_00009424_ep_00023.pt"
 EPISODES=20
 EVAL_EPISODE_MAX_STEPS=700
 VIDEO_OUTPUT="true"
-VIDEO_IMAGE_SIZE=1024
+VIDEO_IMAGE_SIZE=512
 
 INTERACTIVE="false"
 VIEWER_ENABLED="false"

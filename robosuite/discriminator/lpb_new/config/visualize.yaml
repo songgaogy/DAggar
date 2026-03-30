@@ -112,6 +112,8 @@ visualization:
   num_videos: 3
   fps: 20
   camera_name: "agentview"
+  save_pdf: true
+  num_plot_frames: 4
   flip_vertical: true
   border_thickness: 3
   banner_font_scale: 0.52
