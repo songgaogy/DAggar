@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from .algorithms.dipole import DipoleAgent
 from .algorithms.flow_dagger import FlowDaggerAgent
 from .algorithms.hg_dagger import HGDaggerAgent
 from .algorithms.hil_serl import HILSERLAgent
@@ -130,6 +131,29 @@ def _build_flow_dagger_algorithm(
     device: str | None = None,
 ) -> FlowDaggerAgent:
     return FlowDaggerAgent.from_config(
+        cfg=cfg,
+        observation_space=observation_space,
+        action_space=action_space,
+        observation_example=observation_example,
+        sample_action=sample_action,
+        action_low=action_low,
+        action_high=action_high,
+        device=device,
+    )
+
+
+@register_algorithm("dipole")
+def _build_dipole_algorithm(
+    cfg: Any,
+    observation_space=None,
+    action_space=None,
+    observation_example=None,
+    sample_action=None,
+    action_low=None,
+    action_high=None,
+    device: str | None = None,
+) -> DipoleAgent:
+    return DipoleAgent.from_config(
         cfg=cfg,
         observation_space=observation_space,
         action_space=action_space,

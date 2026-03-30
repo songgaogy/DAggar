@@ -1,0 +1,293 @@
+defaults:
+  - _self_
+
+seed: 42
+
+env:
+  environment: "Lift"
+  robots: ["Panda"]
+  config: "default"
+  controller: null
+  renderer: "mjviewer"
+  render_camera: "agentview"
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
+  proprio_keys: []
+  img_height: 128
+  img_width: 128
+  control_freq: 20
+  horizon: null
+
+algorithm:
+  type: "dipole"
+  camera_names: ${env.camera_names}
+  task_name: ${env.environment}
+
+  encoder:
+    encoder_type: "flow-multi"
+
+  dipole:
+    action_horizon: 8
+    execute_horizon: 1
+    image_size: ${env.img_height}
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    grad_clip_norm: 1.0
+    lambda_endpoint: 0.5
+    lambda_smooth: 0.05
+    beta: 1.0
+    guidance_scale: 1.0
+    positive_loss_scale: 1.0
+    negative_loss_scale: 1.0
+    n_ode_steps: 10
+    device: "cuda:0"
+    inference_device: "cuda:1"
+    task_prompt_map: null
+    camera_aliases: {}
+
+    augmentation:
+      minimal_shift_pad: 2
+      eye_in_hand_crop_scale: 0.88
+
+    model:
+      image_encoder:
+        type: "shared_resnet18_spatial_softmax"
+        feature_dim: 256
+        pretrained_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"
+        freeze_backbone: true
+        trainable_stages: ["layer3", "layer4"]
+        train_token_projections: true
+        include_spatial_softmax: true
+        layer3_pool_size: 2
+        layer4_pool_size: 2
+
+      proprio_encoder:
+        type: "mlp"
+        hidden_dim: 256
+        num_tokens: 2
+
+      language_encoder:
+        type: "clip_text"
+        pretrained_name: "/home/dodo/Documents/DAggar/robosuite/data/pretrained/clip-vit-base-patch32"
+        max_length: 77
+        freeze_backbone: true
+        local_files_only: true
+
+      modulation:
+        type: "film"
+        hidden_dim: 512
+        modulate_visual: true
+        modulate_proprio: false
+
+      fusion:
+        type: "transformer"
+        feature_dim: 256
+        max_language_tokens: 77
+        num_heads: 8
+        depth: 3
+        dropout: 0.1
+        use_language_adaln: false
+
+      aggregator:
+        type: "attention_pool"
+        hidden_dim: 512
+        output_dim: 256
+
+      head:
+        type: "unet_1d"
+        hidden_dim: 128
+        time_dim: 128
+        cond_dim: 256
+        channel_mults: [1, 2, 2, 2]
+        dropout: 0.05
+        cross_attention:
+          enabled: true
+          attn_dim: 256
+          num_heads: 4
+          dropout: 0.05
+          mid: true
+          down_layers: []
+          up_layers: [0, 1]
+        action_step_embedding:
+          enabled: true
+          embedding_dim: 64
+
+  online_buffer:
+    capacity: 200000
+
+  demo_buffer:
+    capacity: 200000
+
+  trainer:
+    batch_size: 64
+    warmup_steps: 0
+    updates_per_step: 1
+    steps_per_update: 50
+    random_steps: 0
+    pretrain_steps: 10000
+    online_fraction: 0.5
+
+discriminator:
+  enabled: true
+  type: "lpb_new"
+  seed: ${seed}
+
+  policy:
+    ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+    device: "cuda:0"
+    encoder_batch_size: 96
+
+  monitor:
+    eval_interval: 1
+    min_history: 8
+
+  data:
+    image_size: 128
+    transition_horizon: 1
+    cache_dir: "./data/.lpb_new_cache"
+    encode_demo_batch_size: 8
+    splits:
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    tasks:
+      PandaLift:
+        expert_dir: "./data/PandaLift/expert"
+        success_rollout_dir: "./data/PandaLift/success_rollout"
+        fail_rollout_dir: "./data/PandaLift/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 0}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 0}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 0}
+      PandaPickPlaceCan:
+        expert_dir: "./data/PandaPickPlaceCan/expert"
+        success_rollout_dir: "./data/PandaPickPlaceCan/success_rollout"
+        fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      PandaStack:
+        expert_dir: "./data/PandaStack/expert"
+        success_rollout_dir: "./data/PandaStack/success_rollout"
+        fail_rollout_dir: "./data/PandaStack/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      PickPlaceBread:
+        expert_dir: "./data/PickPlaceBread/expert"
+        success_rollout_dir: "./data/PickPlaceBread/success_rollout"
+        fail_rollout_dir: "./data/PickPlaceBread/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      PickPlaceCereal:
+        expert_dir: "./data/PickPlaceCereal/expert"
+        success_rollout_dir: "./data/PickPlaceCereal/success_rollout"
+        fail_rollout_dir: "./data/PickPlaceCereal/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      PickPlaceMilk:
+        expert_dir: "./data/PickPlaceMilk/expert"
+        success_rollout_dir: "./data/PickPlaceMilk/success_rollout"
+        fail_rollout_dir: "./data/PickPlaceMilk/fail_rollout"
+        train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+        val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+        test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+
+  model:
+    lpb_ckpt: "./checkpoints/multitask_6/lpb_new/lpb_new_20260324_232921/lpb_new_20260324_232921_ep0050.pt"
+
+  feature:
+    device: "cuda:0"
+    batch_size: 256
+    action_horizon: -1
+    normalize_feature: true
+    normalize_policy_chunk: true
+    use_transition_error: true
+
+  detector:
+    device: "cuda:0"
+    delta: 10.0
+    delta_step: 0.5
+    knn_chunk_size: 8192
+    lambda_mode: "mean"
+    lambda_window_size: 12
+    feature_knn_weight: 1.0
+    transition_aux_weight: 0.5
+    policy_chunk_weight: 1.0
+    dynamics_weight: 1.0
+    neighbor_topk: 8
+    dynamics_temperature: 1.0
+
+  eval:
+    bank_split: "train"
+    bank_data_types: ["expert", "success_rollout"]
+    calibration_split: "val"
+    calibration_data_types: ["expert", "success_rollout"]
+
+  online:
+    adaptive_delta: false
+    delta_min: 2.0
+    delta_max: 40.0
+    warmup_steps: 20
+    update_interval: 5
+
+intervention:
+  enabled: true
+  device: "spacemouse"
+  pos_sensitivity: 1.0
+  rot_sensitivity: 1.0
+  reverse_xy: false
+  goal_update_mode: "target"
+  device_reset_as_episode_reset: true
+
+data:
+  demo_paths: []
+  task_name: null
+  demo_root: "./data"
+  demo_split: "expert"
+  num_trajectories: null
+
+runtime:
+  max_steps: 100000
+  interactive: true
+  viewer_enabled: true
+  unthrottled: false
+  viewer_backend: "auto"
+  viewer_async: false
+  viewer_startup_delay: 0.0
+  viewer_reset_warmup_frames: 2
+  visualize_gripper_markers: true
+  control_fps: ${env.control_freq}
+  render_fps: ${runtime.control_fps}
+  spacemouse_fps: ${runtime.control_fps}
+  policy_fps: ${runtime.control_fps}
+  fps_log_interval: 1.0
+  async_updates: true
+  online_updates_enabled: true
+  eval_episode_max_steps: 300
+  resume: false
+  checkpoint: null
+  init_checkpoint: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  use_init_checkpoint_camera_names: true
+  use_init_checkpoint_model: true
+  load_buffers: true
+  eval_deterministic: false
+  buffer_save_interval: 200
+  episode_pause_sec: 1.0
+
+logging:
+  output_root: "./outputs/dipole"
+  run_name: null
+  project: "DIPOLE_AIR"
+  entity: "songgao-personal"
+  use_wandb: true
+  wandb_mode: "offline"
+  log_interval: 10
+  checkpoint_interval: 1000
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

@@ -1,4 +1,6 @@
 from .algorithms import (
+    DipoleAgent,
+    DipoleTrainer,
     EncoderConfig,
     FlowDaggerAgent,
     FlowDaggerTrainer,
@@ -33,6 +35,8 @@ from .factory import build_algorithm, build_online_discriminator, build_policy
 __all__ = [
     "BaseOnlineDiscriminator",
     "BasePolicyRuntime",
+    "DipoleAgent",
+    "DipoleTrainer",
     "DummyPolicyRuntime",
     "EncoderConfig",
     "FlowDaggerAgent",
