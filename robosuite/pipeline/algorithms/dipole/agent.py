@@ -33,6 +33,8 @@ def _resolve_language_instruction(task_name: str, task_prompt_map: dict[str, Any
 
 
 class DipoleAgent:
+    """Own buffers, policy state, and checkpoint I/O for pipeline DIPOLE."""
+
     def __init__(
         self,
         *,
@@ -61,6 +63,7 @@ class DipoleAgent:
             action_horizon=int(dipole_config.action_horizon),
             image_size=int(dipole_config.image_size),
             augmentation_config=dipole_config.augmentation,
+            force_positive_enabled=bool(dipole_config.force_positive_enabled),
         )
         self.demo_buffer = DipoleReplayBuffer(
             demo_buffer_config or ReplayBufferConfig(batch_size=self.trainer_config.batch_size),
@@ -69,6 +72,7 @@ class DipoleAgent:
             action_horizon=int(dipole_config.action_horizon),
             image_size=int(dipole_config.image_size),
             augmentation_config=dipole_config.augmentation,
+            force_positive_enabled=bool(dipole_config.force_positive_enabled),
         )
         self.core = DipoleFlowPolicy(
             model_cfg=self.model_cfg,
@@ -91,6 +95,7 @@ class DipoleAgent:
         action_high: Any = None,
         device: str | None = None,
     ) -> "DipoleAgent":
+        """Build a DipoleAgent from the pipeline config tree."""
         observation_example = infer_observation_example(
             observation_space=observation_space,
             observation_example=observation_example,
@@ -136,10 +141,12 @@ class DipoleAgent:
             lambda_endpoint=float(cfg_get(dipole_cfg, "lambda_endpoint", 0.5)),
             lambda_smooth=float(cfg_get(dipole_cfg, "lambda_smooth", 0.05)),
             beta=float(cfg_get(dipole_cfg, "beta", 2.0)),
+            margin_scale_floor=float(cfg_get(dipole_cfg, "margin_scale_floor", 0.1)),
             guidance_scale=float(cfg_get(dipole_cfg, "guidance_scale", 1.0)),
             positive_loss_scale=float(cfg_get(dipole_cfg, "positive_loss_scale", 1.0)),
             negative_loss_scale=float(cfg_get(dipole_cfg, "negative_loss_scale", 1.0)),
             n_ode_steps=int(cfg_get(dipole_cfg, "n_ode_steps", 8)),
+            force_positive_enabled=bool(cfg_get(dipole_cfg, "force_positive_enabled", True)),
             device=resolved_device,
             inference_device=inference_device,
             task_name=task_name,
@@ -196,6 +203,7 @@ class DipoleAgent:
         return self.core.clone_observation(obs)
 
     def fit_normalizers_from_transitions(self, transitions: list[Transition]) -> None:
+        """Estimate action and proprio normalizers from offline trajectories."""
         trajectories: list[list[Transition]] = []
         current_trajectory: list[Transition] = []
         for transition in transitions:
@@ -294,6 +302,7 @@ class DipoleAgent:
         )
 
     def sample_mixed_batch(self, batch_size: int | None = None):
+        """Mix positive demo data with labeled online data for DIPOLE updates."""
         batch_size = int(batch_size or self.trainer_config.batch_size)
         online_valid = self.online_buffer.num_valid_sequences()
         demo_valid = self.demo_buffer.num_valid_sequences()
@@ -322,6 +331,7 @@ class DipoleAgent:
         return self.demo_buffer.num_valid_sequences() > 0 and self.has_normalizers()
 
     def update(self, *, batch=None, batch_size: int | None = None, use_demo_only: bool = False) -> dict[str, float]:
+        """Run one learner step from either demo-only or mixed replay data."""
         if batch is None:
             batch = self.sample_demo_batch(batch_size=batch_size) if use_demo_only else self.sample_mixed_batch(batch_size=batch_size)
         return self.core.update(batch=batch)
@@ -361,6 +371,7 @@ class DipoleAgent:
         os.replace(tmp_path, path)
 
     def load_flow_policy_checkpoint(self, path: str | Path, *, task_name: str | None = None) -> dict[str, Any]:
+        """Initialize both Dipole heads from the pretrained flow policy checkpoint."""
         path = Path(path)
         try:
             payload = torch.load(path, map_location="cpu", weights_only=False)

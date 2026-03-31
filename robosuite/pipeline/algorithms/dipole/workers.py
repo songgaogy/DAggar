@@ -21,6 +21,8 @@ class DipoleDiscriminatorLabel:
 
 
 class DipolePolicyWorker:
+    """Run policy inference on a dedicated worker thread."""
+
     def __init__(self, agent) -> None:
         self.agent = agent
         self._condition = threading.Condition()
@@ -41,6 +43,7 @@ class DipolePolicyWorker:
             self._thread.start()
 
     def select_action(self, obs, deterministic: bool = False, timeout: float | None = None) -> np.ndarray:
+        """Request one action from the policy worker and wait for the result."""
         self._raise_error()
         request_id = self._enqueue_command(
             {
@@ -153,6 +156,8 @@ class DipolePolicyWorker:
 
 
 class DipoleDiscriminatorWorker:
+    """Evaluate online discriminator labels without blocking environment stepping."""
+
     def __init__(self, cfg: Any, *, task_name: str) -> None:
         self.cfg = cfg
         self.task_name = str(task_name)
@@ -192,6 +197,7 @@ class DipoleDiscriminatorWorker:
         initial_images: dict[str, np.ndarray],
         episode_index: int,
     ) -> None:
+        """Start a fresh episode prefix for online discriminator evaluation."""
         self._enqueue_command(
             {
                 "type": "reset",
@@ -214,6 +220,7 @@ class DipoleDiscriminatorWorker:
         episode_index: int,
         global_step: int,
     ) -> None:
+        """Append one rollout step to the discriminator prefix stream."""
         self._enqueue_command(
             {
                 "type": "record_step",
@@ -229,6 +236,7 @@ class DipoleDiscriminatorWorker:
         )
 
     def drain_results(self) -> list[DipoleDiscriminatorLabel]:
+        """Fetch newly available discriminator labels from the worker thread."""
         self._raise_error()
         with self._condition:
             results = list(self._results)
@@ -282,6 +290,17 @@ class DipoleDiscriminatorWorker:
                 if self._stop_requested and not self._pending_commands:
                     return
                 command = self._pending_commands.popleft()
+                batched_record_steps: list[dict[str, Any]] | None = None
+                if str(command["type"]) == "record_step":
+                    batched_record_steps = [command]
+                    while self._pending_commands:
+                        next_command = self._pending_commands[0]
+                        if (
+                            str(next_command["type"]) != "record_step"
+                            or int(next_command["episode_index"]) != int(command["episode_index"])
+                        ):
+                            break
+                        batched_record_steps.append(self._pending_commands.popleft())
                 self._busy = True
             try:
                 command_type = str(command["type"])
@@ -294,7 +313,7 @@ class DipoleDiscriminatorWorker:
                     self._episode_index = int(command["episode_index"])
                     self._last_available_steps = 0
                 elif command_type == "record_step":
-                    self._handle_record_step(command)
+                    self._handle_record_steps(batched_record_steps or [command])
                 else:
                     raise KeyError(f"Unsupported DipoleDiscriminatorWorker command: {command_type}")
             except BaseException as exc:
@@ -308,14 +327,19 @@ class DipoleDiscriminatorWorker:
                     self._busy = False
                     self._condition.notify_all()
 
-    def _handle_record_step(self, command: dict[str, Any]) -> None:
-        if int(command["episode_index"]) != self._episode_index:
+    def _handle_record_steps(self, commands: list[dict[str, Any]]) -> None:
+        """Label newly available prefix steps after appending a batch of queued rollout steps."""
+        if not commands:
+            return
+        final_command = commands[-1]
+        if int(final_command["episode_index"]) != self._episode_index:
             return
 
-        self.runtime.action_history.append(command["action"])
-        self.runtime.state_history.append(command["next_state"])
-        for camera_name in self.runtime.camera_names:
-            self.runtime.image_history[camera_name].append(command["next_images"][camera_name])
+        for command in commands:
+            self.runtime.action_history.append(command["action"])
+            self.runtime.state_history.append(command["next_state"])
+            for camera_name in self.runtime.camera_names:
+                self.runtime.image_history[camera_name].append(command["next_images"][camera_name])
 
         trajectory = self.runtime._build_prefix_trajectory()
         if trajectory is None:
@@ -343,8 +367,8 @@ class DipoleDiscriminatorWorker:
             )
             new_labels.append(
                 DipoleDiscriminatorLabel(
-                    global_step=int(command["global_step"]),
-                    episode_index=int(command["episode_index"]),
+                    global_step=int(final_command["global_step"]),
+                    episode_index=int(final_command["episode_index"]),
                     labeled_episode_step=int(labeled_index),
                     decision=decision,
                 )

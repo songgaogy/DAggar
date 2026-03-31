@@ -11,6 +11,8 @@ from .agent import DipoleAgent
 
 
 class DipoleTrainer:
+    """Coordinate online updates, pretraining, and policy publishing."""
+
     def __init__(self, agent: DipoleAgent, config=None) -> None:
         self.agent = agent
         self.config = config or agent.trainer_config
@@ -30,6 +32,7 @@ class DipoleTrainer:
         self._async_error: BaseException | None = None
 
     def bootstrap_demo_buffer(self, transitions: list[Transition], demo_source: str = "offline_demo") -> None:
+        """Load offline transitions into the demo buffer with episode metadata."""
         episode_index = int(self._offline_bootstrap_episodes)
         episode_step = 0
         for transition in transitions:
@@ -73,6 +76,7 @@ class DipoleTrainer:
         episode_index: int | None = None,
         episode_step: int | None = None,
     ) -> Transition:
+        """Store one environment step and advance the learner step counter."""
         info_payload = {} if info is None else dict(info)
         if episode_index is not None:
             info_payload.setdefault("episode_index", int(episode_index))
@@ -95,6 +99,7 @@ class DipoleTrainer:
         return transition
 
     def pretrain(self, num_steps: int, batch_size: int | None = None) -> list[dict[str, float]]:
+        """Run demo-only learner updates before online interaction starts."""
         metrics_list: list[dict[str, float]] = []
         for _ in range(int(num_steps)):
             metrics = self.train_step(batch_size=batch_size, use_demo_only=True)
@@ -104,6 +109,7 @@ class DipoleTrainer:
         return metrics_list
 
     def train_step(self, batch_size: int | None = None, *, use_demo_only: bool = False) -> dict[str, float]:
+        """Execute a single learner update."""
         if not self.agent.ready_for_update(batch_size=batch_size):
             raise RuntimeError("Not enough valid dipole sequences are available for an update.")
         metrics = self.agent.update(batch_size=batch_size, use_demo_only=use_demo_only)
@@ -111,6 +117,7 @@ class DipoleTrainer:
         return metrics
 
     def maybe_update(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:
+        """Run synchronous learner updates when the rollout state allows it."""
         self._raise_async_error()
         current_step = self.total_env_steps if env_step is None else int(env_step)
         if current_step < int(self.config.warmup_steps):
@@ -125,6 +132,7 @@ class DipoleTrainer:
         return metrics_list
 
     def maybe_update_async(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:
+        """Queue learner work on the background thread and drain finished metrics."""
         self._raise_async_error()
         current_step = self.total_env_steps if env_step is None else int(env_step)
         if current_step >= int(self.config.warmup_steps) and self.agent.ready_for_update(batch_size=batch_size):
@@ -134,6 +142,28 @@ class DipoleTrainer:
                 self._async_pending_batch_size = None if batch_size is None else int(batch_size)
                 self._async_condition.notify_all()
         return self.drain_async_metrics()
+
+    def train_fixed_steps(
+        self,
+        num_steps: int,
+        *,
+        env_step: int | None = None,
+        batch_size: int | None = None,
+    ) -> list[dict[str, float]]:
+        """Run up to a fixed number of synchronous learner updates."""
+        self._raise_async_error()
+        current_step = self.total_env_steps if env_step is None else int(env_step)
+        if current_step < int(self.config.warmup_steps):
+            return self.drain_async_metrics()
+
+        metrics_list: list[dict[str, float]] = []
+        for _ in range(max(0, int(num_steps))):
+            if not self.agent.ready_for_update(batch_size=batch_size):
+                break
+            metrics = self.train_step(batch_size=batch_size, use_demo_only=False)
+            published = self._maybe_publish_inference_policy()
+            metrics_list.append(self._attach_progress_metrics(metrics, published=published))
+        return metrics_list
 
     def start_async_worker(self) -> None:
         self._raise_async_error()
@@ -233,6 +263,7 @@ class DipoleTrainer:
         return publish_interval - remainder
 
     def _maybe_publish_inference_policy(self) -> bool:
+        """Refresh the inference copy after a fixed number of learner steps."""
         publish_interval = max(1, int(self.config.steps_per_update))
         if self.total_updates % publish_interval != 0:
             return False
@@ -253,6 +284,7 @@ class DipoleTrainer:
         return summarized_metrics
 
     def _async_update_loop(self) -> None:
+        """Consume queued learner work without blocking the rollout thread."""
         while True:
             with self._async_condition:
                 while self._async_pending_updates == 0 and not self._async_stop_requested:

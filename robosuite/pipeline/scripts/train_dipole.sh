@@ -3,22 +3,31 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
-ENVIRONMENT="${ENVIRONMENT:-Lift}"
-DEMO_TASK_NAME="${DEMO_TASK_NAME:-}"
-NUM_TRAJECTORIES="${NUM_TRAJECTORIES:-20}"
-DIPOLE_MODE="${DIPOLE_MODE:-train}"    # eval or train
+ENVIRONMENT="Stack"
+DEMO_TASK_NAME="PandaStack"
+TRAIN_EPISODE_MAX_STEPS=400
+NUM_TRAJECTORIES=20
+DIPOLE_MODE="train"     # eval or train
+BETA=1
+GUIDANCE_SCALE=1
+ONLINE_RATIO=0.5
+NUM_TRAIN_STEP=300
+FORCE_POSITIVE="false"  # recommanded: true
 
 INTERACTIVE="${INTERACTIVE:-true}"
 VIEWER_ENABLED="${VIEWER_ENABLED:-true}"
-PRETRAIN_STEPS="${PRETRAIN_STEPS:-0}"
-LEARNER_DEVICE="${LEARNER_DEVICE:-cuda:0}"
-INFERENCE_DEVICE="${INFERENCE_DEVICE:-cuda:1}"
-DISCRIMINATOR_DEVICE="${DISCRIMINATOR_DEVICE:-cuda:0}"
-ACTION_HORIZON="${ACTION_HORIZON:-8}"
-EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
-N_ODE_STEPS="${N_ODE_STEPS:-10}"
-BETA="${BETA:-2.0}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+
+# discriminator consumes a lot of computation
+# NOTE: since discriminator and inference should be on different GPU, and inference 
+#       does detemine the overall fps, so train and inference are no longer performing in parallel
+LEARNER_DEVICE="cuda:0"
+INFERENCE_DEVICE="cuda:0"
+DISCRIMINATOR_DEVICE="cuda:1"
+ACTION_HORIZON=8
+EXECUTE_HORIZON=4
+PRETRAIN_STEPS=0
+N_ODE_STEPS=8
+
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 LPB_CHECKPOINT="${LPB_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_new/lpb_new_20260324_232921/lpb_new_20260324_232921_ep0050.pt}"
 FPS_LOG_INTERVAL="${FPS_LOG_INTERVAL:-3.0}"
@@ -40,6 +49,7 @@ case "${DIPOLE_MODE}" in
     PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-100}"
     SEED_VALUE="${SEED:-null}"
     EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-2}"
+    TRAIN_EPISODE_MAX_STEPS="${TRAIN_EPISODE_MAX_STEPS:-500}"
     ;;
   train)
     ONLINE_UPDATES="${ONLINE_UPDATES:-true}"
@@ -56,6 +66,7 @@ case "${DIPOLE_MODE}" in
     PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-300}"
     SEED_VALUE="${SEED:-42}"
     EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-0}"
+    TRAIN_EPISODE_MAX_STEPS="${TRAIN_EPISODE_MAX_STEPS:-300}"
     ;;
   *)
     echo "[ERROR] Unsupported DIPOLE_MODE='${DIPOLE_MODE}'. Use 'eval' or 'train'." >&2
@@ -139,6 +150,8 @@ python -m robosuite.pipeline.train_dipole \
   runtime.async_updates="${ASYNC_UPDATES}" \
   runtime.online_updates_enabled="${ONLINE_UPDATES}" \
   runtime.episode_pause_sec="${EPISODE_PAUSE_SEC}" \
+  runtime.train_episode_max_steps="${TRAIN_EPISODE_MAX_STEPS}" \
+  runtime.num_train_step="${NUM_TRAIN_STEP}" \
   intervention.enabled="${INTERVENTION_ENABLED}" \
   runtime.resume="${RESUME}" \
   runtime.checkpoint="${CHECKPOINT}" \
@@ -149,6 +162,7 @@ python -m robosuite.pipeline.train_dipole \
   discriminator.feature.device="${DISCRIMINATOR_DEVICE}" \
   discriminator.detector.device="${DISCRIMINATOR_DEVICE}" \
   algorithm.trainer.pretrain_steps="${PRETRAIN_STEPS}" \
+  algorithm.trainer.online_fraction="${ONLINE_RATIO}" \
   algorithm.dipole.device="${LEARNER_DEVICE}" \
   algorithm.dipole.inference_device="${INFERENCE_DEVICE}" \
   algorithm.dipole.action_horizon="${ACTION_HORIZON}" \
@@ -156,6 +170,7 @@ python -m robosuite.pipeline.train_dipole \
   algorithm.dipole.n_ode_steps="${N_ODE_STEPS}" \
   algorithm.dipole.beta="${BETA}" \
   algorithm.dipole.guidance_scale="${GUIDANCE_SCALE}" \
+  algorithm.dipole.force_positive_enabled="${FORCE_POSITIVE}" \
   algorithm.trainer.batch_size="${TRAIN_BATCH_SIZE}" \
   algorithm.trainer.steps_per_update="${PUBLISH_INTERVAL}" \
   logging.log_interval="${LOG_INTERVAL}" \

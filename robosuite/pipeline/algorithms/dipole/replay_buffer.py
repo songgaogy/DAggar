@@ -109,7 +109,7 @@ def _dipole_info(info: dict[str, Any] | None) -> dict[str, Any]:
     return {}
 
 
-def _is_force_positive_transition(transition: Transition) -> bool:
+def _uses_positive_demo_defaults(transition: Transition) -> bool:
     demo_source = str(transition.demo_source or "").strip().lower()
     if demo_source in {"offline_demo", "intervention"}:
         return True
@@ -177,6 +177,7 @@ class DipoleReplayBuffer:
         action_horizon: int,
         image_size: int,
         augmentation_config: FlowAugmentationConfig | None = None,
+        force_positive_enabled: bool = True,
     ) -> None:
         self.config = config
         self.name = str(name)
@@ -185,6 +186,7 @@ class DipoleReplayBuffer:
         self.action_horizon = int(action_horizon)
         self.image_size = int(image_size)
         self.augmentation_config = augmentation_config or FlowAugmentationConfig()
+        self.force_positive_enabled = bool(force_positive_enabled)
         self._storage: list[Transition] = []
         self._position = 0
         self._reference_obs: Any = None
@@ -284,6 +286,7 @@ class DipoleReplayBuffer:
         proprio_batch = []
         action_batch = []
         lambda_batch = []
+        threshold_batch = []
         force_positive_batch = []
         episode_ids = []
         episode_steps = []
@@ -306,6 +309,7 @@ class DipoleReplayBuffer:
             episode_steps.append(int(info.get("episode_step", -1)))
             dipole_fields = get_transition_dipole_fields(first)
             lambda_batch.append(dipole_fields["lambda"])
+            threshold_batch.append(dipole_fields["threshold"])
             force_positive_batch.append(1.0 if dipole_fields["force_positive"] else 0.0)
             dipole_sources.append(dipole_fields["source"])
 
@@ -313,6 +317,7 @@ class DipoleReplayBuffer:
         proprio_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(proprio_batch, axis=0)))
         action_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(action_batch, axis=0)))
         lambda_tensor = torch.as_tensor(np.asarray(lambda_batch, dtype=np.float32).reshape(-1, 1))
+        threshold_tensor = torch.as_tensor(np.asarray(threshold_batch, dtype=np.float32).reshape(-1, 1))
         force_positive_tensor = torch.as_tensor(np.asarray(force_positive_batch, dtype=np.float32).reshape(-1, 1))
         is_online_tensor = torch.full(
             (int(batch_size), 1),
@@ -343,6 +348,7 @@ class DipoleReplayBuffer:
             proprio=proprio_tensor,
             action_sequences=action_tensor,
             lambda_values=lambda_tensor,
+            threshold_values=threshold_tensor,
             force_positive=force_positive_tensor,
             is_online=is_online_tensor,
             metadata={
@@ -368,6 +374,7 @@ class DipoleReplayBuffer:
                 "camera_names": list(self.camera_names),
                 "action_horizon": int(self.action_horizon),
                 "image_size": int(self.image_size),
+                "force_positive_enabled": bool(self.force_positive_enabled),
                 "position": int(self._position),
                 "storage": list(self._storage),
             }
@@ -390,6 +397,7 @@ class DipoleReplayBuffer:
             self.camera_names = [str(name) for name in state_dict.get("camera_names", self.camera_names)]
             self.action_horizon = int(state_dict.get("action_horizon", self.action_horizon))
             self.image_size = int(state_dict.get("image_size", self.image_size))
+            self.force_positive_enabled = bool(state_dict.get("force_positive_enabled", self.force_positive_enabled))
             self._position = int(state_dict.get("position", 0))
             self._storage = list(state_dict.get("storage", []))
             if self._storage:
@@ -447,21 +455,29 @@ class DipoleReplayBuffer:
     def _initialize_dipole_info(self, transition: Transition) -> Transition:
         info = {} if transition.info is None else dict(transition.info)
         nested = dict(_dipole_info(info))
-        force_positive = bool(nested.get("force_positive", _is_force_positive_transition(transition)))
-        label_ready = bool(nested.get("label_ready", force_positive))
-        lambda_value = float(nested.get("lambda", 0.0 if force_positive else float("nan")))
+        positive_demo_defaults = _uses_positive_demo_defaults(transition)
+        force_positive = bool(nested.get("force_positive", self.force_positive_enabled and positive_demo_defaults))
+        label_ready = bool(nested.get("label_ready", force_positive or positive_demo_defaults))
+        lambda_value = float(nested.get("lambda", 0.0 if label_ready else float("nan")))
         if not np.isfinite(lambda_value):
             lambda_value = 0.0
+        threshold_value = float(nested.get("threshold", 0.0 if label_ready else float("nan")))
+        if not np.isfinite(threshold_value) and label_ready:
+            threshold_value = 0.0
         nested.update(
             {
                 "lambda": float(lambda_value),
-                "threshold": float(nested.get("threshold", float("nan"))),
+                "threshold": float(threshold_value),
                 "prediction": int(nested.get("prediction", 0)),
                 "raw_step_score": float(nested.get("raw_step_score", float("nan"))),
                 "source": str(
                     nested.get(
                         "source",
-                        "force_positive" if force_positive else "pending_discriminator",
+                        (
+                            "force_positive"
+                            if force_positive
+                            else ("ready_without_force_positive" if label_ready else "pending_discriminator")
+                        ),
                     )
                 ),
                 "label_ready": bool(label_ready),

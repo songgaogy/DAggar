@@ -4,26 +4,18 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
 ENV_NAME="Stack"
-TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/flow-DAgger/flow_dagger_Stack_2026-03-31_22-07-09/checkpoints/step_00010000_updates_00010000_ep_00049.pt"
+TASK_NAME="PandaStack"
+CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/dipole/dipole_Stack_2026-03-31_21-17-49/checkpoints/step_00010000_updates_00011100_ep_00037.pt"
 EPISODES=20
-EVAL_EPISODE_MAX_STEPS=700
-VIDEO_OUTPUT="true"
-VIDEO_IMAGE_SIZE=512
+EVAL_EPISODE_MAX_STEPS=500
+VIDEO_OUTPUT="${VIDEO_OUTPUT:-true}"
+VIDEO_IMAGE_SIZE="${VIDEO_IMAGE_SIZE:-512}"
 
-INTERACTIVE="false"
-VIEWER_ENABLED="false"
-VISUALIZE_GRIPPER_MARKERS="false"
-IMAGE_OBS_FPS="20"
-RENDER_FPS="20"
-FPS_LOG_INTERVAL="3.0"
-UNTHROTTLED="false"
-NUM_TRAJECTORIES="20"
-MAX_STEPS="$((EPISODES * EVAL_EPISODE_MAX_STEPS))"
-EPISODE_PAUSE_SEC="0"
-EVAL_DETERMINISTIC="false"
-VIDEO_OUTPUT="${VIDEO_OUTPUT:-false}"
-SEED_VALUE="null"
+INTERACTIVE="${INTERACTIVE:-false}"
+VIDEO_CAMERA="${VIDEO_CAMERA:-agentview}"
+VIDEO_FPS="${VIDEO_FPS:-20}"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-false}"
+INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 
 EXTRA_ARGS=("$@")
 
@@ -51,7 +43,7 @@ cd "${ROOT_DIR}"
 if [[ -z "${CHECKPOINT}" ]]; then
   echo "[ERROR] Missing CHECKPOINT." >&2
   echo "Usage:" >&2
-  echo "  CHECKPOINT=/abs/path/to/ckpt.pt [ENV_NAME=PickPlaceBread] [TASK_NAME=PickPlaceBread] [EPISODES=5] bash robosuite/pipeline/scripts/eval_flow_dagger.sh" >&2
+  echo "  CHECKPOINT=/abs/path/to/dipole_ckpt.pt [ENV_NAME=Stack] [TASK_NAME=PandaStack] [EPISODES=5] bash robosuite/pipeline/scripts/eval_dipole.sh" >&2
   exit 1
 fi
 
@@ -62,7 +54,7 @@ fi
 
 echo "[eval] checkpoint=${CHECKPOINT}"
 echo "[eval] env=${ENV_NAME} task=${TASK_NAME} episodes=${EPISODES} video_output=${VIDEO_OUTPUT}"
-echo "[eval] results_dir=${ROOT_DIR}/outputs/flow-DAgger/eval"
+echo "[eval] results_dir=${ROOT_DIR}/outputs/dipole/eval"
 
 PY_ARGS=(
   --checkpoint "${CHECKPOINT}"
@@ -70,11 +62,17 @@ PY_ARGS=(
   --task-name "${TASK_NAME}"
   --episodes "${EPISODES}"
   --episode-max-steps "${EVAL_EPISODE_MAX_STEPS}"
-  --output-root "./outputs/flow-DAgger/eval"
+  --output-root "./outputs/dipole/eval"
   --video-output "${VIDEO_OUTPUT}"
+  --video-camera "${VIDEO_CAMERA}"
+  --video-fps "${VIDEO_FPS}"
   --video-height "${VIDEO_IMAGE_SIZE}"
   --video-width "${VIDEO_IMAGE_SIZE}"
 )
+
+if [[ -n "${INIT_CHECKPOINT}" ]]; then
+  PY_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT}")
+fi
 
 if [[ "${INTERACTIVE}" == "true" ]]; then
   PY_ARGS+=(--interactive)
@@ -84,12 +82,12 @@ if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
   PY_ARGS+=(--deterministic)
 fi
 
-python -m robosuite.pipeline.eval_flow_dagger \
+python -m robosuite.pipeline.eval_dipole \
   "${PY_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
 
 # Examples:
-#   CHECKPOINT=/abs/path/to/latest.pt bash robosuite/pipeline/scripts/eval_flow_dagger.sh
-#   CHECKPOINT=/abs/path/to/latest.pt ENV_NAME=PickPlaceBread TASK_NAME=PickPlaceBread EPISODES=10 \
-#     bash robosuite/pipeline/scripts/eval_flow_dagger.sh
-#   VIDEO_OUTPUT=true bash robosuite/pipeline/scripts/eval_flow_dagger.sh
+#   CHECKPOINT=/abs/path/to/latest.pt bash robosuite/pipeline/scripts/eval_dipole.sh
+#   CHECKPOINT=/abs/path/to/latest.pt ENV_NAME=Stack TASK_NAME=PandaStack EPISODES=10 \
+#     bash robosuite/pipeline/scripts/eval_dipole.sh
+#   CHECKPOINT=/abs/path/to/latest.pt VIDEO_OUTPUT=true bash robosuite/pipeline/scripts/eval_dipole.sh

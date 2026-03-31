@@ -46,17 +46,21 @@ def _sample_action_sequence(
     guidance_scale: float,
     deterministic: bool,
 ) -> torch.Tensor:
+    """Integrate the Dipole vector field to produce one action chunk."""
     batch_size = proprio.shape[0]
+
     # Reuse the conditioning context across ODE steps for the same observation.
     context = model.encode_multimodal_context(
         images=images,
         proprio=proprio,
         language=language,
     )
+
     if deterministic:
         x = torch.zeros(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
     else:
         x = torch.randn(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
+
     dt = 1.0 / float(n_steps)
     for step in range(n_steps):
         t = torch.full((batch_size,), float(step) / float(n_steps), device=proprio.device, dtype=proprio.dtype)
@@ -67,10 +71,13 @@ def _sample_action_sequence(
         )
         v = (1.0 + float(guidance_scale)) * v_pos - float(guidance_scale) * v_neg
         x = x + dt * v
+
     return x.transpose(1, 2)
 
 
 class DipoleFlowModel(nn.Module):
+    """Shared multimodal encoder with positive and negative Dipole heads."""
+
     def __init__(
         self,
         *,
@@ -105,6 +112,7 @@ class DipoleFlowModel(nn.Module):
         proprio: torch.Tensor,
         language: list[str] | tuple[str, ...] | str,
     ) -> dict[str, torch.Tensor]:
+        """Encode the observation once and reuse it across both Dipole heads."""
         batch_size, num_cameras, channels, height, width = images.shape
         if num_cameras != len(self.camera_names):
             raise ValueError(f"Expected {len(self.camera_names)} cameras, got {num_cameras}")
@@ -137,6 +145,7 @@ class DipoleFlowModel(nn.Module):
         )
         context_tokens = torch.cat([language_tokens, fused_tokens], dim=1)
         context_padding_mask = torch.cat([~language_mask, token_padding_mask], dim=1)
+
         return {
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
@@ -161,6 +170,7 @@ class DipoleFlowModel(nn.Module):
         t: torch.Tensor,
         context: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict both branch vector fields from a shared encoded context."""
         pos = self.flow_head_pos(
             x_t=x_t,
             timesteps=t,
@@ -179,6 +189,8 @@ class DipoleFlowModel(nn.Module):
 
 
 class DipoleFlowPolicy:
+    """Train and serve the two-headed Dipole flow policy."""
+
     def __init__(
         self,
         *,
@@ -269,6 +281,7 @@ class DipoleFlowPolicy:
         self.reset_action_chunk()
 
     def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
+        """Sample or reuse an action chunk for environment interaction."""
         execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
         if (
             self.current_chunk is None
@@ -297,9 +310,10 @@ class DipoleFlowPolicy:
                     language=[self.language_instruction],
                     action_horizon=int(self.config.action_horizon),
                     n_steps=int(self.config.n_ode_steps),
-                    guidance_scale=float(self.config.guidance_scale),
+                    guidance_scale=float(self.config.guidance_scale),   # w
                     deterministic=bool(deterministic),
                 )[0].detach().cpu().numpy().astype(np.float32)
+
             if self.act_mean is not None and self.act_std is not None:
                 action_seq = action_seq * self.act_std + self.act_mean
             self.current_chunk = action_seq
@@ -310,12 +324,21 @@ class DipoleFlowPolicy:
         return action
 
     def _compute_branch_weights(self, batch: DipoleBatch) -> tuple[torch.Tensor, torch.Tensor]:
-        lambda_values = batch.lambda_values
+        """Convert discriminator labels into normalized Dipole branch weights."""
+        lambda_values = torch.nan_to_num(batch.lambda_values, nan=0.0, posinf=0.0, neginf=0.0)
+        threshold_values = torch.nan_to_num(batch.threshold_values, nan=0.0, posinf=0.0, neginf=0.0)
         force_positive = batch.force_positive
-        # High discriminator lambda should emphasize the failure-oriented branch.
-        negative_weight = torch.sigmoid(float(self.config.beta) * lambda_values)
+
+        # Use the normalized signed distance to the discriminator boundary:
+        #   G = (lambda - threshold) / max(|threshold|, margin_scale_floor)
+        margin = lambda_values - threshold_values
+        scale = torch.clamp(torch.abs(threshold_values), min=float(self.config.margin_scale_floor))
+        normalized_margin = margin / scale
+
+        negative_weight = torch.sigmoid(float(self.config.beta) * normalized_margin)
         negative_weight = negative_weight * (1.0 - force_positive)
         positive_weight = force_positive + (1.0 - force_positive) * (1.0 - negative_weight)
+        
         return positive_weight, negative_weight
 
     def _branch_loss(
@@ -328,20 +351,35 @@ class DipoleFlowPolicy:
         action_sequences: torch.Tensor,
         weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the weighted training objective for one Dipole branch.
+
+        Both Dipole heads solve the same flow-matching problem, but they use
+        different sample weights derived from the discriminator lambda.
+
+        For one sample, the branch loss is:
+            L_branch = L_flow + lambda_endpoint * L_end + lambda_smooth * L_smooth
+        """
         flat_weights = weights.reshape(-1)
+
+        # Main flow-matching loss for the current branch.
         flow_per_sample = torch.mean((v_pred - v_target) ** 2, dim=(1, 2))
         flow_loss = _weighted_mean(flow_per_sample, flat_weights)
+
+        # Recover the clean endpoint implied by the predicted vector field.
         x1_pred = x_t + (1.0 - timesteps).view(-1, 1, 1) * v_pred
         endpoint_per_sample = torch.mean(
             (x1_pred - action_sequences) ** 2,
             dim=(1, 2),
         )
         endpoint_loss = _weighted_mean(endpoint_per_sample, flat_weights)
+
+        # Encourage neighboring actions inside the chunk to change smoothly.
         if action_sequences.shape[1] > 1:
             smooth_per_sample = torch.mean((x1_pred[:, 1:] - x1_pred[:, :-1]) ** 2, dim=(1, 2))
             smooth_loss = _weighted_mean(smooth_per_sample, flat_weights)
         else:
             smooth_loss = torch.zeros((), device=self.device, dtype=action_sequences.dtype)
+
         total = (
             flow_loss
             + float(self.config.lambda_endpoint) * endpoint_loss
@@ -350,9 +388,11 @@ class DipoleFlowPolicy:
         return total, flow_loss, endpoint_loss, smooth_loss
 
     def update(self, batch: DipoleBatch) -> dict[str, float]:
+        """Run one DIPOLE learner update on a mixed batch of action chunks."""
         batch = batch.to(self.device)
         self.model.train(True)
 
+        # flow matching
         noise = torch.randn_like(batch.action_sequences)
         timesteps = torch.rand(batch.batch_size, device=self.device)
         x_t = (
@@ -362,9 +402,16 @@ class DipoleFlowPolicy:
         v_target = batch.action_sequences - noise
         language = [self.language_instruction] * batch.batch_size
         pos_weight, neg_weight = self._compute_branch_weights(batch)
+        lambda_values = torch.nan_to_num(batch.lambda_values, nan=0.0, posinf=0.0, neginf=0.0)
+        threshold_values = torch.nan_to_num(batch.threshold_values, nan=0.0, posinf=0.0, neginf=0.0)
+        margin_values = lambda_values - threshold_values
+        margin_scale = torch.clamp(torch.abs(threshold_values), min=float(self.config.margin_scale_floor))
+        normalized_margin = margin_values / margin_scale
 
         self.optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
+            # NOTE: encode the observation once, then score both branches against the
+            #       same multimodal context to keep the two heads directly comparable.
             context = self.model.encode_multimodal_context(
                 images=batch.image_obs,
                 proprio=batch.proprio,
@@ -377,6 +424,7 @@ class DipoleFlowPolicy:
             )
             v_pos = v_pos.transpose(1, 2)
             v_neg = v_neg.transpose(1, 2)
+
             pos_total, pos_flow, pos_endpoint, pos_smooth = self._branch_loss(
                 v_pred=v_pos,
                 v_target=v_target,
@@ -394,7 +442,7 @@ class DipoleFlowPolicy:
                 weights=neg_weight,
             )
 
-            # DIPOLE loss
+            # Dipole loss
             loss = (
                 float(self.config.positive_loss_scale) * pos_total
                 + float(self.config.negative_loss_scale) * neg_total
@@ -416,8 +464,11 @@ class DipoleFlowPolicy:
             "neg_endpoint_loss": float(neg_endpoint.detach().cpu().item()),
             "pos_smooth_loss": float(pos_smooth.detach().cpu().item()),
             "neg_smooth_loss": float(neg_smooth.detach().cpu().item()),
-            "mean_lambda": float(batch.lambda_values.detach().mean().cpu().item()),
-            "max_lambda": float(batch.lambda_values.detach().max().cpu().item()),
+            "mean_lambda": float(lambda_values.detach().mean().cpu().item()),
+            "max_lambda": float(lambda_values.detach().max().cpu().item()),
+            "mean_threshold": float(threshold_values.detach().mean().cpu().item()),
+            "mean_margin": float(margin_values.detach().mean().cpu().item()),
+            "mean_normalized_margin": float(normalized_margin.detach().mean().cpu().item()),
             "mean_pos_weight": float(pos_weight.detach().mean().cpu().item()),
             "mean_neg_weight": float(neg_weight.detach().mean().cpu().item()),
             "force_positive_ratio": float(batch.force_positive.detach().mean().cpu().item()),
@@ -425,6 +476,7 @@ class DipoleFlowPolicy:
         }
 
     def sync_inference_policy(self) -> None:
+        """Swap the latest learner weights into the inference copy."""
         with self._state_lock:
             self._inference_shadow_model.load_state_dict(self.model.state_dict())
             self._inference_shadow_model.eval()

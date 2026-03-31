@@ -31,10 +31,12 @@ class DipoleConfig:
     lambda_endpoint: float = 0.5
     lambda_smooth: float = 0.05
     beta: float = 2.0
+    margin_scale_floor: float = 0.1
     guidance_scale: float = 1.0
     positive_loss_scale: float = 1.0
     negative_loss_scale: float = 1.0
     n_ode_steps: int = 8
+    force_positive_enabled: bool = True
     device: str = "cpu"
     inference_device: Optional[str] = None
     task_name: Optional[str] = None
@@ -59,6 +61,7 @@ class DipoleBatch:
     proprio: torch.Tensor
     action_sequences: torch.Tensor
     lambda_values: torch.Tensor
+    threshold_values: torch.Tensor
     force_positive: torch.Tensor
     is_online: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -69,6 +72,7 @@ class DipoleBatch:
             proprio=self.proprio.to(device),
             action_sequences=self.action_sequences.to(device),
             lambda_values=self.lambda_values.to(device),
+            threshold_values=self.threshold_values.to(device),
             force_positive=self.force_positive.to(device),
             is_online=self.is_online.to(device),
             metadata=self.metadata,
@@ -99,6 +103,7 @@ class DipoleBatch:
             proprio=torch.cat([batch.proprio for batch in valid_batches], dim=0),
             action_sequences=torch.cat([batch.action_sequences for batch in valid_batches], dim=0),
             lambda_values=torch.cat([batch.lambda_values for batch in valid_batches], dim=0),
+            threshold_values=torch.cat([batch.threshold_values for batch in valid_batches], dim=0),
             force_positive=torch.cat([batch.force_positive for batch in valid_batches], dim=0),
             is_online=torch.cat([batch.is_online for batch in valid_batches], dim=0),
             metadata=metadata,

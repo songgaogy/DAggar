@@ -190,7 +190,7 @@ def format_train_line(step: int, metrics: dict[str, float], pending_updates: int
         f"loss={metrics.get('loss', float('nan')):8.4f} | "
         f"pos={metrics.get('pos_loss', float('nan')):8.4f} | "
         f"neg={metrics.get('neg_loss', float('nan')):8.4f} | "
-        f"lambda={metrics.get('mean_lambda', float('nan')):7.4f} | "
+        f"margin={metrics.get('mean_normalized_margin', float('nan')):7.4f} | "
         f"w_neg={metrics.get('mean_neg_weight', float('nan')):7.4f} | "
         f"publish_in={int(metrics.get('learner_updates_until_publish', 0.0)):4d} | "
         f"pending={pending_updates:4d}"
@@ -230,6 +230,7 @@ def _initial_discriminator_images(obs: dict[str, Any], camera_names: list[str]) 
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="train_dipole")
 def main(cfg: DictConfig) -> None:
+    """Run the human-in-the-loop Dipole training pipeline."""
     maybe_set_seed(getattr(cfg, "seed", None))
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -237,11 +238,12 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # read flow policy checkpoint
+    # Build the online system around the pretrained flow backbone.
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     task_name = str(cfg.env.environment)
 
-    # extract camera info / meta info
+    # Resolve task-specific camera layout and robosuite metadata first so the
+    # rollout env, viewer env, and policy all agree on observation structure.
     requested_camera_names = resolve_camera_names(cfg)
     flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
     if bool(getattr(cfg.runtime, "use_init_checkpoint_camera_names", True)) and init_payload is not None:
@@ -257,7 +259,8 @@ def main(cfg: DictConfig) -> None:
         for key, value in dict(getattr(cfg.algorithm.dipole, "camera_aliases", {}) or {}).items()
     }
 
-    # init running
+    # Set up logging and checkpointing before any expensive initialization so
+    # early failures are still captured in the run directory.
     run_name, checkpoint_dir = resolve_run_directory(cfg)
     output_root = Path(to_absolute_path(str(cfg.logging.output_root)))
     run_started_at = datetime.datetime.now().isoformat(timespec="seconds")
@@ -406,6 +409,9 @@ def main(cfg: DictConfig) -> None:
     fps_log_interval = max(0.1, float(getattr(cfg.runtime, "fps_log_interval", 1.0)))
     unthrottled_runtime = bool(getattr(cfg.runtime, "unthrottled", False))
     async_updates = bool(getattr(cfg.runtime, "async_updates", False))
+    num_train_step = int(getattr(cfg.runtime, "num_train_step", -1))
+    stream_training_during_rollout = num_train_step < 0
+    train_episode_max_steps = max(0, int(getattr(cfg.runtime, "train_episode_max_steps", 0) or 0))
     eval_episode_max_steps = int(getattr(cfg.runtime, "eval_episode_max_steps", 300))
 
     viewer_runtime: RobosuiteViewerRuntime | None = None
@@ -452,6 +458,13 @@ def main(cfg: DictConfig) -> None:
         unthrottled_runtime = False
     if not online_updates_enabled:
         print("[INFO] Online learner updates are disabled. Policy parameters will stay frozen during rollout.")
+    elif stream_training_during_rollout:
+        print("[INFO] Online learner updates run concurrently with rollout.")
+    else:
+        print(
+            f"[INFO] Episodic learner mode enabled. The rollout loop only runs inference/discriminator; "
+            f"each episode end triggers up to {num_train_step} learner updates."
+        )
     if decoupled_viewer_enabled:
         print(
             "[INFO] Training viewer is decoupled from rollout. "
@@ -460,6 +473,11 @@ def main(cfg: DictConfig) -> None:
     if frozen_eval_mode:
         print(
             f"[INFO] Frozen-policy eval mode will reset episodes after {eval_episode_max_steps} steps "
+            "if not terminated earlier."
+        )
+    elif train_episode_max_steps > 0:
+        print(
+            f"[INFO] Training mode will reset episodes after {train_episode_max_steps} steps "
             "if not terminated earlier."
         )
     if unthrottled_runtime:
@@ -706,6 +724,7 @@ def main(cfg: DictConfig) -> None:
             last_reported_publish_count = publish_count
 
     def drain_discriminator_results() -> None:
+        """Patch newly arrived discriminator labels back into replay storage."""
         if discriminator_worker is None:
             return
         for label in discriminator_worker.drain_results():
@@ -765,6 +784,7 @@ def main(cfg: DictConfig) -> None:
             buffer_writer.request_transition(online_transition=transition)
 
     def maybe_report_runtime(step: int) -> None:
+        """Emit compact runtime telemetry without spamming every control step."""
         nonlocal last_fps_log_time
         now = time.monotonic()
         elapsed = now - last_fps_log_time
@@ -814,6 +834,7 @@ def main(cfg: DictConfig) -> None:
         last_fps_log_time = now
 
     def request_checkpoint_save(step: int, tag: str | None = None) -> None:
+        """Schedule asynchronous checkpoint writes for the current training state."""
         checkpoint_extra = {
             "global_step": int(step),
             "episode_index": int(episode_index),
@@ -907,8 +928,29 @@ def main(cfg: DictConfig) -> None:
             episode_index=episode_index,
         )
 
-    if async_updates and online_updates_enabled:
+    if async_updates and online_updates_enabled and stream_training_during_rollout:
         trainer.start_async_worker()
+
+    def run_episode_training(step: int) -> list[dict[str, float]]:
+        """Run burst learner updates after an episode when configured."""
+        if not online_updates_enabled or stream_training_during_rollout or num_train_step == 0:
+            return []
+        metrics_list = trainer.train_fixed_steps(num_train_step, env_step=step)
+        if not metrics_list:
+            print(f"[train_burst] step={step} requested={num_train_step} completed=0")
+            return []
+        maybe_print_publish_events(metrics_list)
+        final_metrics = metrics_list[-1]
+        maybe_log(wandb_run, final_metrics, step=step)
+        print(
+            format_train_line(
+                step=step,
+                metrics=final_metrics,
+                pending_updates=0,
+            )
+        )
+        print(f"[train_burst] step={step} requested={num_train_step} completed={len(metrics_list)}")
+        return metrics_list
 
     try:
         for step in range(start_step, int(cfg.runtime.max_steps)):
@@ -927,6 +969,7 @@ def main(cfg: DictConfig) -> None:
             is_intervention = False
             reset_requested = False
             if intervention_runtime is not None and (unthrottled_runtime or spacemouse_gate.ready(loop_start)):
+                # human intervention override
                 override_action, sampled_is_intervention, reset_requested = intervention_runtime.maybe_override_action(
                     cached_policy_action
                 )
@@ -944,10 +987,13 @@ def main(cfg: DictConfig) -> None:
                     cached_is_intervention = False
 
             if reset_requested:
+                # NOTE: spacemouse may send reset request for current task
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
                     break
+                
                 finalize_pending_episode(episode_index)
+                run_episode_training(step)
                 obs, _ = reset_flow_policy_observation(
                     env,
                     preserve_mjviewer=rollout_has_renderer,
@@ -1006,6 +1052,8 @@ def main(cfg: DictConfig) -> None:
             next_images_for_disc = _initial_discriminator_images(next_obs, discriminator_worker.runtime.camera_names) if discriminator_worker is not None else {}
             refresh_main_viewer()
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
+                done = True
+            elif (not frozen_eval_mode) and train_episode_max_steps > 0 and (episode_length + 1) >= train_episode_max_steps:
                 done = True
             done = bool(done or success)
 
@@ -1075,8 +1123,10 @@ def main(cfg: DictConfig) -> None:
             episode_length += 1
             success_count += int(success)
 
+            # Online data only becomes trainable after the discriminator worker
+            # has attached lambda labels to the corresponding chunk starts.
             drain_discriminator_results()
-            if online_updates_enabled:
+            if online_updates_enabled and stream_training_during_rollout:
                 update_metrics_list = trainer.maybe_update_async() if async_updates else trainer.maybe_update()
             else:
                 update_metrics_list = []
@@ -1095,6 +1145,7 @@ def main(cfg: DictConfig) -> None:
 
             if done:
                 finalize_pending_episode(episode_index)
+                run_episode_training(step)
                 episode_payload = {
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),
@@ -1130,6 +1181,8 @@ def main(cfg: DictConfig) -> None:
                 )
                 if episode_pause_sec > 0.0:
                     time.sleep(episode_pause_sec)
+
+                # reset all
                 obs, _ = reset_flow_policy_observation(
                     env,
                     preserve_mjviewer=rollout_has_renderer,

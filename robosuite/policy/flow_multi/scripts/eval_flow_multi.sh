@@ -12,8 +12,8 @@ export MUJOCO_GL=egl
 
 python /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_multi/eval_flow.py \
   eval.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt" \
-  eval.task_name='["PickPlaceCereal"]' \
-  eval.video_dir="/home/dodo/Documents/DAggar/robosuite/outputs/flow-DAgger/flow_dagger_PickPlaceCereal_2026-03-30_11-30-35/checkpoints/base/video" \
+  eval.task_name='["Stack"]' \
+  eval.video_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/video/ep100-stack" \
   eval.episodes=5 \
   eval.max_steps=500 \
   eval.succ_rate=true \
