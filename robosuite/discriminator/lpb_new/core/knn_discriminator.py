@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from robosuite.discriminator.utils.base import OfflineTrajectoryDiscriminator
 from robosuite.discriminator.utils.types import DetectorCalibrationSummary, TrajectoryDetectionResult
 
-from robosuite.discriminator.lpb_new.dataset import LatentTrajectory
-from robosuite.discriminator.lpb_new.model import LatentDynamicsModel, build_latent_dynamics_predictor
+from .dataset import LatentTrajectory
+from .model import LatentDynamicsModel, build_latent_dynamics_predictor
 
 
 def _cfg_get(cfg: Any, path: str, default: Any) -> Any:
@@ -258,6 +258,7 @@ class LPBFeatureExtractor:
         return out
 
     def _build_policy_state_history(self, latents: torch.Tensor, valid_len: int) -> torch.Tensor:
+        """Flatten a short latent history so policy neighborhoods retain temporal context."""
         hist = max(1, int(self.policy_history_steps))
         history_chunks = []
         for t in range(valid_len):
@@ -271,6 +272,7 @@ class LPBFeatureExtractor:
 
     @torch.no_grad()
     def encode_trajectory_bundle(self, traj: LatentTrajectory) -> EncodedTrajectoryBundle:
+        """Encode one trajectory into all feature banks used by the discriminator."""
         t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
         if t_len <= 0:
             raise ValueError("Trajectory has zero valid timesteps")
@@ -295,6 +297,7 @@ class LPBFeatureExtractor:
             latent_b = valid_latents_t[start:end].to(self.device)
             act_b = valid_act_t[start:end].to(self.device)
 
+            # Reuse the frozen dynamics model for both KNN features and prediction error.
             feat = self.model.extract_feature(
                 current_latent=latent_b,
                 action_sequence=act_b,
@@ -572,6 +575,13 @@ class AdaptiveKNNDiscriminator:
 
 
 class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
+    COMPONENT_ORDER: tuple[str, ...] = (
+        "feature_knn",
+        "transition_error",
+        "policy_chunk",
+        "neighbor_dynamics",
+    )
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -696,6 +706,112 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         scale = float(np.mean(finite))
         return scale if scale > 1e-8 else 1.0
 
+    def _component_weights(self) -> list[tuple[str, float]]:
+        return [
+            ("feature_knn", float(self.feature_knn_weight)),
+            ("transition_error", float(self.transition_aux_weight)),
+            ("policy_chunk", float(self.policy_chunk_weight)),
+            ("neighbor_dynamics", float(self.dynamics_weight)),
+        ]
+
+    def _compute_weighted_component_scores(
+        self,
+        scores: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Apply calibration scaling and configured weights to each raw component."""
+        weighted: dict[str, np.ndarray] = {}
+        for key, weight in self._component_weights():
+            if weight <= 0.0 or key not in scores:
+                continue
+            scale = float(self._score_scales.get(key, 1.0))
+            if scale <= 1e-8:
+                scale = 1.0
+            weighted[key] = (
+                float(weight) * (np.asarray(scores[key], dtype=np.float32) / scale)
+            ).astype(np.float32, copy=False)
+        return weighted
+
+    def _compute_lambda_support_indices(
+        self,
+        step_scores: np.ndarray,
+    ) -> np.ndarray:
+        vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
+        n = int(vals.shape[0])
+        support = np.zeros((n,), dtype=np.int64)
+        if n == 0:
+            return support
+
+        window = int(self.detector.lambda_window_size)
+        full_prefix = window <= 0
+
+        if full_prefix:
+            best_idx = 0
+            best_val = float(vals[0])
+            for idx in range(n):
+                cur = float(vals[idx])
+                if cur >= best_val:
+                    best_val = cur
+                    best_idx = idx
+                support[idx] = int(best_idx)
+            return support
+
+        dq: deque[int] = deque()
+        for idx in range(n):
+            while dq and dq[0] <= idx - window:
+                dq.popleft()
+            while dq and float(vals[dq[-1]]) <= float(vals[idx]):
+                dq.pop()
+            dq.append(idx)
+            support[idx] = int(dq[0])
+        return support
+
+    def _aggregate_component_contributions(
+        self,
+        weighted_scores: dict[str, np.ndarray],
+        step_scores: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Project step-wise contributions into the same lambda space as the detector."""
+        if self.detector.lambda_mode == "mean":
+            return {
+                key: self.detector._aggregate_lambda(values)
+                for key, values in weighted_scores.items()
+            }
+
+        support = self._compute_lambda_support_indices(step_scores)
+        return {
+            key: np.asarray(values, dtype=np.float32)[support].astype(np.float32, copy=False)
+            for key, values in weighted_scores.items()
+        }
+
+    @staticmethod
+    def _compute_component_shares(
+        contributions: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        if not contributions:
+            return {}
+        keys = list(contributions.keys())
+        total = np.zeros_like(np.asarray(contributions[keys[0]], dtype=np.float32), dtype=np.float32)
+        for values in contributions.values():
+            total = total + np.asarray(values, dtype=np.float32)
+        safe_total = np.where(np.abs(total) > 1e-8, total, 1.0).astype(np.float32)
+        return {
+            key: (np.asarray(values, dtype=np.float32) / safe_total).astype(np.float32, copy=False)
+            for key, values in contributions.items()
+        }
+
+    def _dominant_component_terms(
+        self,
+        contributions: dict[str, np.ndarray],
+    ) -> list[str]:
+        if not contributions:
+            return []
+        keys = [key for key in self.COMPONENT_ORDER if key in contributions]
+        if not keys:
+            keys = list(contributions.keys())
+        stacked = np.stack([np.asarray(contributions[key], dtype=np.float32) for key in keys], axis=0)
+        dominant_idx = np.argmax(stacked, axis=0)
+        return [str(keys[int(idx)]) for idx in dominant_idx.tolist()]
+
     def _combine_component_scores(
         self,
         scores: dict[str, np.ndarray],
@@ -706,27 +822,20 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         if len(lengths) != 1:
             raise ValueError(f"Component length mismatch: {sorted(lengths)}")
 
+        weighted_scores = self._compute_weighted_component_scores(scores)
         step = np.zeros((next(iter(lengths)),), dtype=np.float32)
-        for key, weight in [
-            ("feature_knn", self.feature_knn_weight),
-            ("transition_error", self.transition_aux_weight),
-            ("policy_chunk", self.policy_chunk_weight),
-            ("neighbor_dynamics", self.dynamics_weight),
-        ]:
-            if weight <= 0.0 or key not in scores:
-                continue
-            scale = float(self._score_scales.get(key, 1.0))
-            if scale <= 1e-8:
-                scale = 1.0
-            step = step + float(weight) * (np.asarray(scores[key], dtype=np.float32) / scale)
+        for values in weighted_scores.values():
+            step = step + np.asarray(values, dtype=np.float32)
         return step.astype(np.float32, copy=False)
 
     def _compute_component_scores(
         self,
-        bundle: EncodedTrajectoryBundle,
+        bundle: EncodedTrajectoryBundle,    # a set for all features
         *,
         exclude_range: Optional[tuple[int, int]] = None,
     ) -> dict[str, np.ndarray]:
+        """Compute the four discriminator components before weighting and aggregation."""
+        # check whether all banks exist
         if (
             self.learned_bank is None
             or self.policy_chunk_bank is None
@@ -738,8 +847,9 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         scores: dict[str, np.ndarray] = {}
         detector_device = self.detector.device
 
+        # 1) KNN using `bundle.learned_features` -> z = f(s,a)
         if self.feature_knn_weight > 0.0:
-            learned_query = bundle.learned_features.to(detector_device, dtype=torch.float32)
+            learned_query = bundle.learned_features.to(detector_device, dtype=torch.float32)    # NOTE: using all tasks features
             scores["feature_knn"] = (
                 knn_min_sqdist(
                     query=learned_query,
@@ -753,14 +863,19 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 .astype(np.float32)
             )
 
-        if self.transition_aux_weight > 0.0 and self.use_transition_error:
+        # 2) transition error
+        if self.transition_aux_weight > 0.0 and self.use_transition_error:      # NOTE: using all tasks features
             scores["transition_error"] = (
                 bundle.transition_errors.detach().cpu().numpy().astype(np.float32)
             )
-
+        
+        # 3) & 4) 
         if self.policy_chunk_weight > 0.0 or self.dynamics_weight > 0.0:
+            # retrive policy encoded features
             policy_query = bundle.policy_chunk_features.to(detector_device, dtype=torch.float32)
+            # restrict policy-neighbor lookup to the same task to avoid trivial multitask leakage.
             same_task_mask = self.policy_chunk_task_index_bank == int(bundle.task_index)
+
             topk_d2, topk_idx = knn_topk_sqdist(
                 query=policy_query,
                 bank=self.policy_chunk_bank,
@@ -769,10 +884,14 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 exclude_range=exclude_range,
                 allowed_mask=same_task_mask,
             )
+
+            # 3) policy encoded features top-k square distance
             if self.policy_chunk_weight > 0.0:
                 scores["policy_chunk"] = (
                     topk_d2.mean(dim=1).detach().cpu().numpy().astype(np.float32)
                 )
+
+            #  4) dynamic difference between current and expert
             if self.dynamics_weight > 0.0:
                 neighbor_deltas = self.target_delta_bank[topk_idx]
                 query_delta = bundle.target_deltas.to(detector_device, dtype=torch.float32).unsqueeze(1)
@@ -790,6 +909,7 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         normal_bank_trajectories: Sequence[LatentTrajectory],
         calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
+        """Encode the normal bank and calibrate score scales plus the lambda threshold."""
         if len(normal_bank_trajectories) == 0:
             raise ValueError("normal_bank_trajectories cannot be empty")
 
@@ -859,14 +979,37 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         warmup_steps: int = 0,
         update_interval: int = 1,
     ) -> TrajectoryDetectionResult:
+        """
+        Run detection on one trajectory and attach per-term attribution metadata.
+        """
+        # make sure dectector has been initialized
         if self.detector.threshold is None or self.detector._calib_lambdas is None:
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
+        # pre-process, create bundle for fast operation later
         bundle = self.extractor.encode_trajectory_bundle(trajectory)
-        component_scores = self._compute_component_scores(bundle)
-        step_scores = self._combine_component_scores(component_scores)
-        lamb = self.detector._aggregate_lambda(step_scores)
 
+        # [MAIN] lambda computing ######################################
+        # compute 4 components
+        component_scores = self._compute_component_scores(bundle)
+        # normalize @ add weight
+        step_scores = self._combine_component_scores(component_scores)
+        # aggregate and post-process (like sliding windows)
+        lamb = self.detector._aggregate_lambda(step_scores)
+        ################################################################
+
+        # [test] for anaylising importance for different components
+        weighted_component_scores = self._compute_weighted_component_scores(component_scores)
+        aggregate_contributions = self._aggregate_component_contributions(
+            weighted_component_scores,
+            step_scores=step_scores,
+        )
+        step_contribution_shares = self._compute_component_shares(weighted_component_scores)
+        aggregate_contribution_shares = self._compute_component_shares(aggregate_contributions)
+        dominant_step_terms = self._dominant_component_terms(weighted_component_scores)
+        dominant_aggregate_terms = self._dominant_component_terms(aggregate_contributions)
+
+        # [MAIN] failure discriminating ############################################################################
         preds = np.zeros_like(lamb, dtype=np.int64)
         ths = np.zeros_like(lamb, dtype=np.float32)
 
@@ -886,6 +1029,7 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             ths[t] = float(cur_threshold)
 
             if adaptive_threshold and labels_np is not None:
+                # Online delta adaptation only nudges the threshold every few steps.
                 should_update = (t + 1) > warmup and ((t + 1 - warmup) % update_every == 0)
                 if should_update:
                     label = int(labels_np[t])
@@ -896,8 +1040,30 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                     cur_delta = float(np.clip(cur_delta, dmin, dmax))
                     cur_threshold = self.detector._compute_threshold(self.detector._calib_lambdas, cur_delta)
 
+        ######################################################################################################
+
         self.detector.delta = float(cur_delta)
         self.detector.threshold = float(cur_threshold)
+        first_crossing_idx = np.where(preds == 1)[0]
+        first_crossing_index = int(first_crossing_idx[0]) if first_crossing_idx.size > 0 else None
+        first_crossing_dominant_term = (
+            str(dominant_aggregate_terms[first_crossing_index])
+            if first_crossing_index is not None and first_crossing_index < len(dominant_aggregate_terms)
+            else None
+        )
+        first_crossing_term_shares = (
+            {
+                key: float(np.asarray(values, dtype=np.float32)[first_crossing_index])
+                for key, values in aggregate_contribution_shares.items()
+            }
+            if first_crossing_index is not None
+            else {}
+        )
+        mean_aggregate_share = {
+            key: float(np.mean(np.asarray(values, dtype=np.float32)))
+            for key, values in aggregate_contribution_shares.items()
+        }
+
         return TrajectoryDetectionResult(
             detector_name=self.name,
             step_scores=np.asarray(step_scores, dtype=np.float32),
@@ -913,6 +1079,29 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             metadata={
                 "delta_final": float(self.detector.delta),
                 "threshold_final": float(self.detector.threshold if self.detector.threshold is not None else np.nan),
+                "score_scales": dict(self._score_scales),
+                "weighted_step_contributions": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in weighted_component_scores.items()
+                },
+                "aggregate_contributions": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in aggregate_contributions.items()
+                },
+                "step_contribution_shares": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in step_contribution_shares.items()
+                },
+                "aggregate_contribution_shares": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in aggregate_contribution_shares.items()
+                },
+                "dominant_step_terms": list(dominant_step_terms),
+                "dominant_aggregate_terms": list(dominant_aggregate_terms),
+                "first_crossing_index": first_crossing_index,
+                "first_crossing_dominant_term": first_crossing_dominant_term,
+                "first_crossing_term_shares": dict(first_crossing_term_shares),
+                "mean_aggregate_share": dict(mean_aggregate_share),
                 "feature_knn_scores": (
                     np.asarray(component_scores["feature_knn"], dtype=np.float32)
                     if "feature_knn" in component_scores

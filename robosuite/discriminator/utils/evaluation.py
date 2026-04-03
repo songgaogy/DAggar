@@ -163,6 +163,7 @@ def evaluate_trajectory_discriminator(
             ),
         },
     }
+    
     return summary, calibration_summary, {
         "expert": expert_results,
         "success": success_results,
