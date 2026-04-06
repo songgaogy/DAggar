@@ -56,6 +56,9 @@ def build_flow_encoder(cfg: Any) -> FrozenFlowMultitaskEncoder:
 
 def build_lpb_knn_discriminator(cfg: Any) -> LPBKNNDiscriminator:
     """Construct the LPB KNN discriminator from Hydra config."""
+    weight_json_path = getattr(cfg.detector, "weight_json_path", None)
+    if weight_json_path not in (None, "", "None", "null"):
+        weight_json_path = to_absolute_path(str(weight_json_path))
     return LPBKNNDiscriminator(
         checkpoint_path=to_absolute_path(str(cfg.model.lpb_ckpt)),
         feature_device=str(cfg.feature.device),
@@ -77,6 +80,7 @@ def build_lpb_knn_discriminator(cfg: Any) -> LPBKNNDiscriminator:
         dynamics_weight=float(cfg.detector.dynamics_weight),
         neighbor_topk=int(cfg.detector.neighbor_topk),
         dynamics_temperature=float(cfg.detector.dynamics_temperature),
+        weight_json_path=weight_json_path,
     )
 
 

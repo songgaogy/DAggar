@@ -8,7 +8,8 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 SEED=42
 CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
 LPB_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_new/lpb_new_20260324_232921/lpb_new_20260324_232921_ep0050.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_new/visualize}"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_new/visualize_suboptimal}"
+NUM_OUTPUT=8
 IMAGE_SIZE=128
 ENCODER_BATCH_SIZE=96
 NUM_VIDEOS=10
@@ -37,6 +38,8 @@ export CUDA_VISIBLE_DEVICES=0
 echo "[visualize_lpb_new] ROOT=${ROOT}"
 echo "[visualize_lpb_new] policy.ckpt=${CKPT}"
 echo "[visualize_lpb_new] model.lpb_ckpt=${LPB_CKPT}"
+echo "[visualize_lpb_new] visualization.data_source=suboptimal"
+echo "[visualize_lpb_new] suboptimal.source_split=eval"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_new/visualize_failures.py" \
   seed="${SEED}" \
@@ -50,5 +53,8 @@ echo "[visualize_lpb_new] model.lpb_ckpt=${LPB_CKPT}"
   visualization.camera_name="${CAMERA_NAME}" \
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
+  visualization.data_source="suboptimal" \
+  suboptimal.source_split="eval" \
   feature.policy_history_steps=$HIS_CHUNK \
+  visualization.num_videos=$NUM_OUTPUT \
   "$@"

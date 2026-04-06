@@ -22,6 +22,10 @@ from robosuite.discriminator.lpb_new.analysis.attribution import (
     ordered_term_keys,
     summarize_trajectory_term_attribution,
 )
+from robosuite.discriminator.lpb_new.analyse import (
+    _encode_suboptimal_refs,
+    _list_suboptimal_demo_refs,
+)
 from robosuite.discriminator.lpb_new.app.pipeline import (
     build_flow_encoder,
     build_lpb_knn_discriminator,
@@ -30,6 +34,7 @@ from robosuite.discriminator.lpb_new.app.pipeline import (
 )
 from robosuite.discriminator.lpb_new.core.dataset import (
     EncodedTrajectoryRef,
+    LatentTrajectory,
     build_cached_splits,
     load_latent_trajectories,
 )
@@ -114,6 +119,7 @@ def _save_failure_plot_pdf(
     aggregate_contribution_shares: dict[str, np.ndarray],
     first_crossing_index: int | None,
     first_crossing_dominant_term: str | None,
+    gt_fail_mask: np.ndarray | None = None,
 ) -> None:
     """Save a PDF page with both score traces and term attributions."""
     num_frames = int(np.asarray(frame_scores).shape[0])
@@ -156,6 +162,30 @@ def _save_failure_plot_pdf(
         linestyle="--",
         label="threshold",
     )
+    if gt_fail_mask is not None:
+        gt_mask = np.asarray(gt_fail_mask, dtype=bool)
+        if gt_mask.shape[0] == num_frames and np.any(gt_mask):
+            in_region = False
+            start_idx = 0
+            for frame_idx, flag in enumerate(gt_mask.tolist()):
+                if flag and not in_region:
+                    start_idx = int(frame_idx)
+                    in_region = True
+                if in_region and ((not flag) or frame_idx == num_frames - 1):
+                    end_idx = int(frame_idx if not flag else frame_idx + 1)
+                    score_ax.axvspan(
+                        times[start_idx],
+                        times[min(end_idx - 1, num_frames - 1)],
+                        color="#d62728",
+                        alpha=0.12,
+                    )
+                    contrib_ax.axvspan(
+                        times[start_idx],
+                        times[min(end_idx - 1, num_frames - 1)],
+                        color="#d62728",
+                        alpha=0.10,
+                    )
+                    in_region = False
     if first_crossing_index is not None and 0 <= int(first_crossing_index) < num_frames:
         score_ax.axvline(
             times[int(first_crossing_index)],
@@ -243,13 +273,107 @@ def _save_failure_plot_pdf(
     plt.close(fig)
 
 
+def _load_visualization_targets(
+    cfg: DictConfig,
+    *,
+    encoder,
+    cached_splits: dict[str, list[EncodedTrajectoryRef]],
+    task_to_index: dict[str, int],
+    seed: int,
+    num_videos: int,
+    horizon: int,
+) -> tuple[list[object], list[LatentTrajectory], list[np.ndarray | None], dict[str, object]]:
+    data_source = str(getattr(cfg.visualization, "data_source", "fail_rollout"))
+    if data_source != "suboptimal":
+        fail_refs = select_split_refs(
+            cached_splits=cached_splits,
+            split_name=str(cfg.eval.fail_eval_split),
+            data_types=list(cfg.eval.fail_eval_data_types),
+        )
+        selected_fail_refs = _sample_refs(
+            refs=fail_refs,
+            num_samples=int(num_videos),
+            seed=int(seed),
+        )
+        if not selected_fail_refs:
+            raise RuntimeError("No fail trajectories selected for visualization.")
+        fail_trajectories = load_latent_trajectories(selected_fail_refs)
+        return (
+            list(selected_fail_refs),
+            list(fail_trajectories),
+            [None for _ in range(len(fail_trajectories))],
+            {
+                "data_source": data_source,
+                "split_name": str(cfg.eval.fail_eval_split),
+                "num_available": int(len(fail_refs)),
+                "num_selected": int(len(selected_fail_refs)),
+            },
+        )
+
+    requested_split = str(cfg.suboptimal.source_split)
+    suboptimal_refs, suboptimal_split_summary = _list_suboptimal_demo_refs(cfg)
+    source_refs = [ref for ref in suboptimal_refs if str(ref.split) == requested_split]
+    selected_refs = _sample_refs(
+        refs=source_refs,
+        num_samples=int(num_videos),
+        seed=int(seed),
+    )
+    if not selected_refs:
+        raise RuntimeError(f"No suboptimal trajectories selected for visualization from split={requested_split}.")
+
+    labeled_trajectories, encode_summary = _encode_suboptimal_refs(
+        refs=selected_refs,
+        encoder=encoder,
+        task_to_index=task_to_index,
+        horizon=int(horizon),
+        batch_size=int(cfg.data.encode_demo_batch_size),
+    )
+    selected_lookup = {
+        (ref.file_path, ref.demo_key): ref
+        for ref in selected_refs
+    }
+    labeled_lookup = {
+        (item.trajectory.file_path, item.trajectory.demo_key): item
+        for item in labeled_trajectories
+    }
+
+    ordered_refs: list[object] = []
+    ordered_trajectories: list[LatentTrajectory] = []
+    ordered_labels: list[np.ndarray | None] = []
+    for ref in selected_refs:
+        key = (ref.file_path, ref.demo_key)
+        labeled = labeled_lookup.get(key)
+        if labeled is None:
+            continue
+        ordered_refs.append(selected_lookup[key])
+        ordered_trajectories.append(labeled.trajectory)
+        ordered_labels.append(np.asarray(labeled.labels, dtype=np.int64))
+
+    if not ordered_refs:
+        raise RuntimeError("No encoded suboptimal trajectories remain for visualization.")
+
+    return (
+        ordered_refs,
+        ordered_trajectories,
+        ordered_labels,
+        {
+            "data_source": data_source,
+            "split_name": requested_split,
+            "num_available": int(len(source_refs)),
+            "num_selected": int(len(selected_refs)),
+            "suboptimal_split_summary": suboptimal_split_summary,
+            "suboptimal_encode_summary": encode_summary,
+        },
+    )
+
+
 def run_visualize(cfg: DictConfig) -> None:
     detector = None
     encoder = build_flow_encoder(cfg)   # reuse policy encoder
 
     try:
         # 1) create banks
-        cached_splits, split_summary, _ = build_cached_splits(
+        cached_splits, split_summary, task_to_index = build_cached_splits(
             cfg_data=cfg.data,
             encoder=encoder,
             seed=int(cfg.seed),
@@ -264,23 +388,9 @@ def run_visualize(cfg: DictConfig) -> None:
             split_name=str(cfg.eval.calibration_split),
             data_types=list(cfg.eval.calibration_data_types),
         )
-        fail_refs = select_split_refs(
-            cached_splits=cached_splits,
-            split_name=str(cfg.eval.fail_eval_split),
-            data_types=list(cfg.eval.fail_eval_data_types),
-        )
-        selected_fail_refs = _sample_refs(      # for output visualization
-            refs=fail_refs,
-            num_samples=int(cfg.visualization.num_videos),
-            seed=int(cfg.seed),
-        )
-        if not selected_fail_refs:
-            raise RuntimeError("No fail trajectories selected for visualization.")
-        
         # 2) create / load latent after dynamic model
         bank_trajectories = load_latent_trajectories(bank_refs)
         calibration_trajectories = load_latent_trajectories(calibration_refs)
-        fail_trajectories = load_latent_trajectories(selected_fail_refs)
         if not bank_trajectories:
             raise RuntimeError("No bank trajectories found for visualization.")
         if not calibration_trajectories:
@@ -288,6 +398,15 @@ def run_visualize(cfg: DictConfig) -> None:
 
         # 3) init detector, get threshold
         detector = build_lpb_knn_discriminator(cfg)
+        selected_fail_refs, fail_trajectories, gt_label_sequences, target_summary = _load_visualization_targets(
+            cfg,
+            encoder=encoder,
+            cached_splits=cached_splits,
+            task_to_index=task_to_index,
+            seed=int(cfg.seed),
+            num_videos=int(cfg.visualization.num_videos),
+            horizon=int(detector.extractor.action_horizon),
+        )
         calibration_summary = detector.fit(
             normal_bank_trajectories=bank_trajectories,
             calibration_trajectories=calibration_trajectories,
@@ -302,7 +421,9 @@ def run_visualize(cfg: DictConfig) -> None:
         print("\n[INFO] start discriminating:\n")
         records: list[VideoRenderRecord] = []
         try:
-            for traj_idx, (ref, latent_traj) in enumerate(zip(selected_fail_refs, fail_trajectories)):
+            for traj_idx, (ref, latent_traj, gt_labels) in enumerate(
+                zip(selected_fail_refs, fail_trajectories, gt_label_sequences)
+            ):
                 # run detector
                 result = detector.detect_trajectory(
                     latent_traj,
@@ -329,6 +450,15 @@ def run_visualize(cfg: DictConfig) -> None:
                     result.thresholds,
                     num_frames=int(prepared.images_hwc.shape[0]),
                     tail_fill=float(result.thresholds[-1]) if result.thresholds.size > 0 else 0.0,
+                )
+                frame_gt_fail = (
+                    map_step_values_to_frames(
+                        np.asarray(gt_labels, dtype=np.float32),
+                        num_frames=int(prepared.images_hwc.shape[0]),
+                        tail_fill=float(np.asarray(gt_labels, dtype=np.float32)[-1]),
+                    ).astype(np.int64)
+                    if gt_labels is not None and np.asarray(gt_labels).size > 0
+                    else np.zeros((int(prepared.images_hwc.shape[0]),), dtype=np.int64)
                 )
                 aggregate_contribution_shares = (
                     result.metadata.get("aggregate_contribution_shares", {}) or {}
@@ -377,6 +507,12 @@ def run_visualize(cfg: DictConfig) -> None:
                     if neighbor_dynamics_scores is not None
                     else None
                 )
+                active_metric_flags = {
+                    "feature_knn": bool(float(getattr(detector, "feature_knn_weight", 0.0)) > 0.0),
+                    "transition_error": bool(float(getattr(detector, "transition_aux_weight", 0.0)) > 0.0),
+                    "policy_chunk": bool(float(getattr(detector, "policy_chunk_weight", 0.0)) > 0.0),
+                    "neighbor_dynamics": bool(float(getattr(detector, "dynamics_weight", 0.0)) > 0.0),
+                }
                 term_summary = summarize_trajectory_term_attribution(result)
 
                 stem = (
@@ -411,21 +547,45 @@ def run_visualize(cfg: DictConfig) -> None:
                             footer_lines.append(
                                 f"dom={TERM_SHORT_LABELS.get(dominant_term, dominant_term)} {100.0 * dominant_share:.0f}%"
                             )
-                        if frame_feature_knn is not None or frame_transition_error is not None:
+                        if (
+                            active_metric_flags["feature_knn"] and frame_feature_knn is not None
+                        ) or (
+                            active_metric_flags["transition_error"] and frame_transition_error is not None
+                        ):
                             footer_lines.append(
                                 " ".join(
                                     [
-                                        f"fk={float(frame_feature_knn[frame_id]):.3f}" if frame_feature_knn is not None else "",
-                                        f"te={float(frame_transition_error[frame_id]):.3f}" if frame_transition_error is not None else "",
+                                        (
+                                            f"fk={float(frame_feature_knn[frame_id]):.3f}"
+                                            if active_metric_flags["feature_knn"] and frame_feature_knn is not None
+                                            else ""
+                                        ),
+                                        (
+                                            f"te={float(frame_transition_error[frame_id]):.3f}"
+                                            if active_metric_flags["transition_error"] and frame_transition_error is not None
+                                            else ""
+                                        ),
                                     ]
                                 ).strip()
                             )
-                        if frame_policy_chunk is not None or frame_neighbor_dynamics is not None:
+                        if (
+                            active_metric_flags["policy_chunk"] and frame_policy_chunk is not None
+                        ) or (
+                            active_metric_flags["neighbor_dynamics"] and frame_neighbor_dynamics is not None
+                        ):
                             footer_lines.append(
                                 " ".join(
                                     [
-                                        f"pc={float(frame_policy_chunk[frame_id]):.3f}" if frame_policy_chunk is not None else "",
-                                        f"dy={float(frame_neighbor_dynamics[frame_id]):.3f}" if frame_neighbor_dynamics is not None else "",
+                                        (
+                                            f"pc={float(frame_policy_chunk[frame_id]):.3f}"
+                                            if active_metric_flags["policy_chunk"] and frame_policy_chunk is not None
+                                            else ""
+                                        ),
+                                        (
+                                            f"dy={float(frame_neighbor_dynamics[frame_id]):.3f}"
+                                            if active_metric_flags["neighbor_dynamics"] and frame_neighbor_dynamics is not None
+                                            else ""
+                                        ),
                                     ]
                                 ).strip()
                             )
@@ -434,7 +594,7 @@ def run_visualize(cfg: DictConfig) -> None:
                             frame_rgb,
                             frame_id=frame_id,
                             pred_fail_flag=bool(frame_preds[frame_id]),
-                            gt_fail_flag=False,
+                            gt_fail_flag=bool(frame_gt_fail[frame_id]),
                             aggregate_score=float(frame_scores[frame_id]),
                             threshold=float(frame_thresholds[frame_id]),
                             detector_name=detector.name,
@@ -477,13 +637,15 @@ def run_visualize(cfg: DictConfig) -> None:
                         threshold_final=float(result.metadata.get("threshold_final", np.nan)),
                         aggregate_contribution_shares={
                             key: np.asarray(values, dtype=np.float32)
-                            for key, values in aggregate_contribution_shares.items()
+                            for key, values in frame_aggregate_share_by_term.items()
                         },
                         first_crossing_index=result.metadata.get("first_crossing_index", None),
                         first_crossing_dominant_term=result.metadata.get("first_crossing_dominant_term", None),
+                        gt_fail_mask=np.asarray(frame_gt_fail, dtype=np.int64),
                     )
 
                 first_pred_failure = np.where(frame_preds == 1)[0]
+                first_gt_failure = np.where(frame_gt_fail == 1)[0]
                 records.append(
                     VideoRenderRecord(
                         trajectory_id=int(traj_idx),
@@ -494,7 +656,7 @@ def run_visualize(cfg: DictConfig) -> None:
                             int(first_pred_failure[0] + 1) if first_pred_failure.size > 0 else None
                         ),
                         pred_failure_frame_count=int(np.sum(frame_preds)),
-                        gt_failure_frame_count=0,
+                        gt_failure_frame_count=int(np.sum(frame_gt_fail)),
                         video_path=str(video_path),
                         metadata={
                             "task_name": ref.task_name,
@@ -505,6 +667,9 @@ def run_visualize(cfg: DictConfig) -> None:
                             ),
                             "threshold_final": float(result.metadata.get("threshold_final", np.nan)),
                             "delta_final": float(result.metadata.get("delta_final", np.nan)),
+                            "first_gt_failure_frame": (
+                                int(first_gt_failure[0] + 1) if first_gt_failure.size > 0 else None
+                            ),
                             "plot_pdf_path": plot_pdf_path,
                             "term_attribution": term_summary,
                         },
@@ -529,8 +694,12 @@ def run_visualize(cfg: DictConfig) -> None:
                 **dict(calibration_summary.metadata),
             },
             "visualization": {
+                "data_source": str(target_summary.get("data_source")),
+                "source_split": str(target_summary.get("split_name")),
                 "num_requested": int(cfg.visualization.num_videos),
                 "num_rendered": len(records),
+                "num_available": int(target_summary.get("num_available", len(records))),
+                "num_selected": int(target_summary.get("num_selected", len(records))),
                 "fps": int(cfg.visualization.fps),
                 "flip_vertical": bool(cfg.visualization.flip_vertical),
                 "save_pdf": bool(cfg.visualization.save_pdf),
@@ -541,6 +710,7 @@ def run_visualize(cfg: DictConfig) -> None:
                     else str(encoder.camera_names[0])
                 ),
             },
+            "target_summary": target_summary,
             "videos": [asdict(record) for record in records],
         }
         summary_path = os.path.join(run_dir, "summary.json")

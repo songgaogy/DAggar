@@ -1,4 +1,3 @@
-from .eval import run_eval
 from .pipeline import (
     EvalTrajectorySplits,
     TrainingDatasets,
@@ -24,6 +23,5 @@ __all__ = [
     "build_training_datasets",
     "load_eval_trajectory_splits",
     "run_train",
-    "run_eval",
     "run_visualize",
 ]

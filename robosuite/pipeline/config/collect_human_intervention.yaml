@@ -108,12 +108,13 @@ discriminator:
     knn_chunk_size: 8192
     lambda_mode: "mean"
     lambda_window_size: 12
-    feature_knn_weight: 1.0
-    transition_aux_weight: 0.5
-    policy_chunk_weight: 1.0
-    dynamics_weight: 1.0
+    feature_knn_weight: 0.35469082
+    transition_aux_weight: 0.0
+    policy_chunk_weight: 0.64530921
+    dynamics_weight: 0.0
     neighbor_topk: 8
     dynamics_temperature: 1.0
+    weight_json_path: null
 
     batch_size: 512
     action_horizon: -1

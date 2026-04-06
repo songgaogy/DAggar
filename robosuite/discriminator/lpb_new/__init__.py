@@ -17,7 +17,6 @@ from .app import (
     load_eval_trajectory_splits,
     load_split_trajectories,
     now_tag,
-    run_eval,
     run_train,
     run_visualize,
     select_split_refs,
@@ -86,6 +85,5 @@ __all__ = [
     "build_training_datasets",
     "load_eval_trajectory_splits",
     "run_train",
-    "run_eval",
     "run_visualize",
 ]

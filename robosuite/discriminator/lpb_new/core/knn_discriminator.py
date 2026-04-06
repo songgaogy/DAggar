@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import json
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -599,12 +600,13 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         knn_chunk_size: int = 8192,
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
-        feature_knn_weight: float = 1.0,
+        feature_knn_weight: float = 0.354690819978714,
         transition_aux_weight: float = 0.0,
-        policy_chunk_weight: float = 1.0,
-        dynamics_weight: float = 1.0,
+        policy_chunk_weight: float = 0.6453092098236084,
+        dynamics_weight: float = 0.0,
         neighbor_topk: int = 8,
         dynamics_temperature: float = 1.0,
+        weight_json_path: Optional[str] = None,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
         self.use_transition_error = bool(use_transition_error)
@@ -623,6 +625,14 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self.dynamics_weight = float(dynamics_weight)
         self.neighbor_topk = max(1, int(neighbor_topk))
         self.dynamics_temperature = max(float(dynamics_temperature), 1e-6)
+        self.weight_json_path = (
+            None
+            if weight_json_path in {None, "", "None", "null"}
+            else str(weight_json_path)
+        )
+        self._weight_artifact_payload: Optional[dict[str, Any]] = None
+        if self.weight_json_path is not None:
+            self._load_metric_weights_from_json(self.weight_json_path)
         if (
             self.feature_knn_weight <= 0.0
             and self.transition_aux_weight <= 0.0
@@ -649,6 +659,31 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
     @property
     def name(self) -> str:
         return "lpb_new_knn"
+
+    def _load_metric_weights_from_json(self, path: str) -> None:
+        with open(path, "r", encoding="utf-8") as file_handle:
+            payload = json.load(file_handle)
+        weight_payload = payload.get("weights", payload)
+        if not isinstance(weight_payload, dict):
+            raise ValueError(f"Invalid weight artifact at {path}: expected mapping under `weights`.")
+
+        loaded_weights = {
+            key: max(0.0, float(weight_payload.get(key, 0.0)))
+            for key in self.COMPONENT_ORDER
+        }
+        if not self.use_transition_error:
+            loaded_weights["transition_error"] = 0.0
+
+        self.feature_knn_weight = float(loaded_weights["feature_knn"])
+        self.transition_aux_weight = float(loaded_weights["transition_error"])
+        self.policy_chunk_weight = float(loaded_weights["policy_chunk"])
+        self.dynamics_weight = float(loaded_weights["neighbor_dynamics"])
+        self._weight_artifact_payload = {
+            "path": str(path),
+            "active_metrics": [key for key, value in loaded_weights.items() if value > 0.0],
+            "weights": dict(loaded_weights),
+            "raw_payload": payload,
+        }
 
     def _encode_set(
         self,
@@ -965,6 +1000,17 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "knn_chunk_size": int(self.detector.knn_chunk_size),
                 "lambda_mode": str(self.detector.lambda_mode),
                 "lambda_window_size": int(self.detector.lambda_window_size),
+                "weight_json_path": self.weight_json_path,
+                "loaded_metric_weights": (
+                    None
+                    if self._weight_artifact_payload is None
+                    else dict(self._weight_artifact_payload["weights"])
+                ),
+                "active_metrics": (
+                    [key for key, weight in self._component_weights() if weight > 0.0]
+                    if self._weight_artifact_payload is None
+                    else list(self._weight_artifact_payload["active_metrics"])
+                ),
             },
         )
 
@@ -1080,6 +1126,12 @@ class LPBKNNDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "delta_final": float(self.detector.delta),
                 "threshold_final": float(self.detector.threshold if self.detector.threshold is not None else np.nan),
                 "score_scales": dict(self._score_scales),
+                "weight_json_path": self.weight_json_path,
+                "loaded_metric_weights": (
+                    None
+                    if self._weight_artifact_payload is None
+                    else dict(self._weight_artifact_payload["weights"])
+                ),
                 "weighted_step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in weighted_component_scores.items()
