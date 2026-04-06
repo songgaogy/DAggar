@@ -15,13 +15,13 @@ from robosuite.discriminator.bce.dataset import (
 from robosuite.discriminator.bce.tpud_discriminator import TPUDDiscriminator
 from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
 from robosuite.discriminator.dyn_bce.task_registry import normalize_task_name, resolve_checkpoint_task_name
-from robosuite.discriminator.lpb_new.dataset import (
+from robosuite.discriminator.lpb_new.core.dataset import (
     LatentTrajectory,
     build_cached_splits as build_lpb_cached_splits,
     filter_refs_by_data_types as filter_lpb_refs_by_data_types,
     load_latent_trajectories as load_lpb_latent_trajectories,
 )
-from robosuite.discriminator.lpb_new.knn_discriminator import LPBKNNDiscriminator
+from robosuite.discriminator.lpb_new.core.knn_discriminator import LPBKNNDiscriminator
 from robosuite.policy.flow_multi.eval_flow import (
     center_crop_resize,
     resolve_language_instruction,

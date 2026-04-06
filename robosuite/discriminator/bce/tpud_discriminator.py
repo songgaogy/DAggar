@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from robosuite.discriminator.bce.model import build_temporal_pu_discriminator
-from robosuite.discriminator.lpb_new.dataset import LatentTrajectory
+from robosuite.discriminator.lpb_new.core.dataset import LatentTrajectory
 from robosuite.discriminator.utils.base import OfflineTrajectoryDiscriminator
 from robosuite.discriminator.utils.types import DetectorCalibrationSummary, TrajectoryDetectionResult
 

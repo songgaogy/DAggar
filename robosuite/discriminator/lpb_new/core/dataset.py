@@ -116,6 +116,7 @@ def _get_eval_split_cfg(cfg: Any, default: Any = None) -> Any:
 
 
 def parse_task_specs(cfg_data: Any) -> dict[str, TaskDataSpec]:
+    """Normalize per-task config into absolute paths and split counts."""
     specs: dict[str, TaskDataSpec] = {}
     tasks_cfg = _cfg_get(cfg_data, "tasks")
     global_splits = _cfg_get(cfg_data, "splits")
@@ -204,6 +205,7 @@ def build_split_refs(
     cfg_data: Any,
     seed: int,
 ) -> tuple[dict[str, list[DemoRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
+    """Sample demo references for train/val/test across all tasks and buckets."""
     task_specs = parse_task_specs(cfg_data)
     split_refs = {"train": [], "val": [], "test": []}
     split_summary: dict[str, dict[str, dict[str, int]]] = {}
@@ -263,6 +265,7 @@ def prepare_cached_trajectories(
     task_to_index: dict[str, int],
     encode_demo_batch_size: int = 8,
 ) -> list[EncodedTrajectoryRef]:
+    """Encode raw demos once and persist latent caches for later reuse."""
     cache_root = to_absolute_path(str(cache_root))
     os.makedirs(cache_root, exist_ok=True)
     batch_size = max(1, int(encode_demo_batch_size))
@@ -275,6 +278,7 @@ def prepare_cached_trajectories(
         nonlocal prepared_batch, prepared_meta
         if not prepared_batch:
             return
+        # Batch encoding amortizes the frozen policy forward pass.
         encoded_batch = encoder.encode_prepared_demos(prepared_batch)
         encoded_lookup = {
             (encoded.file_path, encoded.demo_key): encoded
@@ -333,7 +337,7 @@ def prepare_cached_trajectories(
             if len(prepared_batch) >= batch_size:
                 flush_batch()
 
-        if (idx + 1) % 50 == 0 or (idx + 1) == len(refs):
+        if (idx + 1) % 1000 == 0 or (idx + 1) == len(refs):
             print(f"[lpb_new] prepared_cached_trajectories {idx + 1}/{len(refs)}")
 
     flush_batch()
@@ -373,6 +377,8 @@ def filter_refs_by_data_types(
 
 
 class LatentTransitionDataset(Dataset):
+    """World-model training dataset over cached latent transitions."""
+
     def __init__(
         self,
         trajectory_refs: Sequence[EncodedTrajectoryRef],
@@ -416,6 +422,7 @@ class LatentTransitionDataset(Dataset):
                     )
             for t in range(usable):
                 is_expert = ref.data_type == "expert"
+                # Each prefix becomes one transition prediction example.
                 self._transition_refs.append(
                     TransitionRef(
                         trajectory_index=traj_idx,
@@ -485,11 +492,17 @@ def build_cached_splits(
     encoder: FrozenFlowMultitaskEncoder,
     seed: int,
 ) -> tuple[dict[str, list[EncodedTrajectoryRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
+    """
+    Build split refs, then ensure every selected demo has a latent cache on disk.  
+    Build splits for expert / success_rollout / fail_rollout.
+    """
     split_refs, split_summary, task_to_index = build_split_refs(cfg_data=cfg_data, seed=seed)
     _print_split_summary(split_summary)
+
     cached_splits: dict[str, list[EncodedTrajectoryRef]] = {}
     cache_root = to_absolute_path(str(_cfg_get(cfg_data, "cache_dir")))
     batch_size = int(_cfg_get(cfg_data, "encode_demo_batch_size", 8))
+
     for split_name, refs in split_refs.items():
         print(f"[lpb_new] building latent cache for split={split_name} num_trajectories={len(refs)}")
         cached_splits[split_name] = prepare_cached_trajectories(

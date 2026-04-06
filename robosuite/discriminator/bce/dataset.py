@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
-from robosuite.discriminator.lpb_new.dataset import (
+from robosuite.discriminator.lpb_new.core.dataset import (
     DATA_TYPE_ORDER,
     EncodedTrajectoryRef,
     LatentTrajectory,
