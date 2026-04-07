@@ -1,42 +1,99 @@
-# Context: Refactoring LPB-New to Denoising Score Matching (DSM)
+# LPB Score DSM Implementation Summary
 
-You are an expert AI and Robotics engineer. We are refactoring the `lpb_new` offline failure detector. 
-Currently, it uses a forward-prediction latent world model and a heuristic 4-metric KNN discriminator (Feature KNN, Transition Error, Policy Chunk, Neighbor Dynamics) with learned linear weights. 
+This module now uses a **Three-Headed Conditional Denoising Score Matching (DSM)** detector for offline failure detection on latent transitions.
 
-We want to upgrade this to a rigorous **Denoising Score Matching (DSM)** framework on the joint manifold of transitions. The core idea is to treat the transition tuple `[z_t, a_{t:t+H-1}, z_{t+H}]` as a single joint vector `tau_t`, inject Gaussian noise during training, and train a Denoising Autoencoder (DAE). During inference, the OOD anomaly score is simply the **Denoising Error** (which is mathematically proportional to the Score Norm / Energy of the distribution).
+## Overview
 
-## Constraints
-1. **DO NOT change the policy encoder.** The `FrozenFlowMultitaskEncoder` extracting `z_t = E(o_{\le t})` remains completely unchanged.
-2. **Keep code comments short, precise, and ONLY in English.**
-3. **Preserve the visualization logic.** We still need to attribute failures and render videos, but the attribution targets will change (see Step 4).
+Given a transition tuple
 
-## Step 1: Modify the Model (`core/model.py`)
-Rewrite the `LatentWorldModelPredictor` into a `JointManifoldDenoiser`.
-* **Input:** Concatenate `z_t`, the action sequence `a_{t:t+H-1}`, and `z_{t+H}` into a single flat continuous vector `tau_t`.
-* **Forward Pass (Training):** * Sample Gaussian noise `epsilon ~ N(0, sigma^2 * I)`.
-  * Add noise to get `tau_noisy = tau_t + epsilon`.
-  * Pass `tau_noisy` through the MLP backbone.
-  * Predict the clean `tau_t` (or predict the noise `epsilon` and subtract it).
-* **Loss:** Simple Mean Squared Error (MSE) between the predicted `tau` and the ground truth clean `tau_t`. Remove the NLL/uncertainty head.
+`(z_t, a_{t:t+H-1}, z_{t+H})`
 
-## Step 2: Modify the Discriminator (`core/knn_discriminator.py`)
-Rename to `core/dsm_discriminator.py` (or keep the name but change the class to `DSMDiscriminator`).
-* **Remove ALL KNN logic.** Delete `feature_knn`, `policy_chunk`, `neighbor_dynamics`, and `transition_error`. Delete all bank caching logic.
-* **New Anomaly Score:** For a given test transition `tau_t` (without adding noise), pass it through the trained DAE. 
-  * The raw step score `u_t` is the MSE reconstruction error: `u_t = ||tau_t - D_theta(tau_t)||_2^2`.
-* **Temporal Aggregation:** Keep the existing `lambda_mode` (mean/max) and `lambda_window_size` to aggregate `u_t` into `lambda_t` for temporal smoothing.
+the model does not denoise the whole tuple with one joint head. Instead, it factorizes the conditional reconstruction into three heads:
 
-## Step 3: Simplify the Analyzer (`analyse.py`)
-* **Remove Weight Search:** Since we only have ONE score (`u_t`) instead of 4 metrics, we no longer need the BCE linear weighting optimization or simplex constraints.
-* **New Task:** The script should now only iterate over the clean validation/calibration dataset to compute the distribution of `lambda_t`. 
-* Output a simple JSON saving the quantile threshold `eta` based on the configured `delta` parameter (same logic as the old `AdaptiveKNNDiscriminator.fit()`), along with basic distribution statistics.
+1. **State head**
+   Input: noisy `z_t`
+   Target: clean `z_t`
 
-## Step 4: Adapt Visualization & Attribution (`visualize_failures.py`)
-We still want to know *why* a failure crossed the threshold. 
-* Instead of attributing to the old 4 metrics, decompose the scalar denoising error `||tau_t - \hat{tau}_t||^2` into 3 sub-components based on their vector indices:
-  1. `state_error`: Reconstruction error of `z_t`.
-  2. `action_error`: Reconstruction error of `a_{t:t+H-1}`.
-  3. `next_state_error`: Reconstruction error of `z_{t+H}`.
-* Feed these 3 components into the existing plotting and video rendering pipeline. If the robot enters an OOD state, `state_error` will spike. If it executes an out-of-distribution action, `action_error` will spike. If the dynamics are violated, `next_state_error` will spike. 
+2. **Actor head**
+   Input: clean `z_t` and noisy action chunk `a_{t:t+H-1}`
+   Target: clean action chunk `a_{t:t+H-1}`
 
-Please provide the updated implementations for `core/model.py`, `core/dsm_discriminator.py`, and the core logic updates for `analyse.py` and `visualize_failures.py`.
+3. **Dynamics head**
+   Input: clean `z_t`, clean action chunk `a_{t:t+H-1}`, and noisy `z_{t+H}`
+   Target: clean `z_{t+H}`
+
+This matches the intended causal factorization:
+
+`p(z_t, a, z_{t+H}) = p(z_t) p(a | z_t) p(z_{t+H} | z_t, a)`
+
+## Model Implementation
+
+File: `core/model.py`
+
+- `ConditionalManifoldDenoiser` contains three separate towers:
+  - `state_tower`
+  - `actor_tower`
+  - `dynamics_tower`
+- `DSMModel.forward(...)` builds clean inputs, optionally adds Gaussian noise, and routes each branch with the correct conditioning:
+  - state branch uses `state_input = z_t + eps_z`
+  - actor branch uses clean `z_t` and `action_input = a + eps_a`
+  - dynamics branch uses clean `z_t`, clean `a`, and `next_state_input = z_{t+H} + eps_next`
+- Noise is scaled by dataset statistics:
+  - latent noise uses `sqrt(latent_var)`
+  - action noise uses `sqrt(action_var)`
+
+## Loss and Energy
+
+Training uses per-head reconstruction error with variance scaling:
+
+- `state_energy = mean((z_hat - z_t)^2 / var_z)`
+- `action_energy = mean((a_hat - a)^2 / var_a)`
+- `next_state_energy = mean((z_next_hat - z_{t+H})^2 / var_z)`
+
+The total DSM score is:
+
+`u_t = state_energy + action_energy + next_state_energy`
+
+Dataset variances are computed from expert trajectories and stored in the checkpoint as:
+
+- `latent_mean`
+- `latent_var`
+- `action_mean`
+- `action_var`
+
+## Inference and Discriminator
+
+File: `core/dsm_discriminator.py`
+
+- Inference calls `model.forward(..., add_noise=False)`
+- No Gaussian noise is added at test time
+- Each transition produces three energy terms:
+  - `state_energy`
+  - `action_energy` / policy energy
+  - `next_state_energy` / dynamics energy
+- The step anomaly score is their sum:
+
+`u_t = state_energy + policy_energy + dynamics_energy`
+
+- Temporal smoothing is still handled by the existing `lambda_mode` and `lambda_window_size`
+
+## Visualization Mapping
+
+Files:
+
+- `visualize_failures.py`
+- `app/visualize.py`
+
+The visualization pipeline now displays the DSM decomposition with:
+
+- `state_error -> state_energy`
+- `action_error -> policy_energy`
+- `next_state_error -> dynamics_energy`
+
+These values are passed through metadata and rendered in plots / videos using the `st`, `pi`, and `dy` labels.
+
+## Notes
+
+- The frozen policy / visual encoder remains unchanged
+- KNN-based metrics are no longer used in the DSM detector path
+- Attribution is now based on reconstruction energy decomposition rather than heuristic metric weights

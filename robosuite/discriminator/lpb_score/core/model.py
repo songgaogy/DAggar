@@ -114,7 +114,7 @@ class ConditionalDenoisingTower(nn.Module):
 
 
 class ConditionalManifoldDenoiser(nn.Module):
-    """Condition on z_t and denoise action and next state with separate heads."""
+    """Three-headed denoiser over state, action, and next state."""
 
     def __init__(
         self,
@@ -129,6 +129,15 @@ class ConditionalManifoldDenoiser(nn.Module):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.action_flat_dim = int(action_flat_dim)
+        self.state_tower = ConditionalDenoisingTower(
+            input_dim=self.latent_dim,
+            output_dim=self.latent_dim,
+            backbone_dim=backbone_dim,
+            backbone_num_blocks=backbone_num_blocks,
+            head_hidden_dim=head_hidden_dim,
+            head_num_blocks=head_num_blocks,
+            dropout=dropout,
+        )
         self.actor_tower = ConditionalDenoisingTower(
             input_dim=int(self.latent_dim + self.action_flat_dim),
             output_dim=self.action_flat_dim,
@@ -151,16 +160,19 @@ class ConditionalManifoldDenoiser(nn.Module):
     def forward(
         self,
         *,
+        state_input: torch.Tensor,
         current_latent: torch.Tensor,
         action_input: torch.Tensor,
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        state_hat = self.state_tower(state_input)
         actor_input = torch.cat([current_latent, action_input], dim=-1)
         action_hat = self.actor_tower(actor_input)
         dynamics_input = torch.cat([current_latent, action_clean, next_state_input], dim=-1)
         next_state_hat = self.dynamics_tower(dynamics_input)
         return {
+            "state_hat": state_hat,
             "action_hat": action_hat,
             "next_state_hat": next_state_hat,
         }
@@ -170,7 +182,7 @@ JointManifoldDenoiser = ConditionalManifoldDenoiser
 
 
 class DSMModel(nn.Module):
-    """Condition on z_t and denoise action and next state."""
+    """Denoise state, action, and next state with variance scaling."""
 
     def __init__(
         self,
@@ -310,21 +322,28 @@ class DSMModel(nn.Module):
     def add_noise(
         self,
         *,
+        state_clean: torch.Tensor,
         action_clean: torch.Tensor,
         next_state_clean: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         if self.noise_sigma <= 0.0:
             return {
+                "state_input": state_clean,
+                "state_noise": torch.zeros_like(state_clean),
                 "action_input": action_clean,
                 "action_noise": torch.zeros_like(action_clean),
                 "next_state_input": next_state_clean,
                 "next_state_noise": torch.zeros_like(next_state_clean),
             }
+        state_std = torch.sqrt(self.latent_var).to(device=state_clean.device, dtype=state_clean.dtype)
         action_std = torch.sqrt(self.action_var_flat).to(device=action_clean.device, dtype=action_clean.dtype)
         next_state_std = torch.sqrt(self.latent_var).to(device=next_state_clean.device, dtype=next_state_clean.dtype)
+        state_noise = torch.randn_like(state_clean) * state_std.unsqueeze(0) * float(self.noise_sigma)
         action_noise = torch.randn_like(action_clean) * action_std.unsqueeze(0) * float(self.noise_sigma)
         next_state_noise = torch.randn_like(next_state_clean) * next_state_std.unsqueeze(0) * float(self.noise_sigma)
         return {
+            "state_input": state_clean + state_noise,
+            "state_noise": state_noise,
             "action_input": action_clean + action_noise,
             "action_noise": action_noise,
             "next_state_input": next_state_clean + next_state_noise,
@@ -334,23 +353,20 @@ class DSMModel(nn.Module):
     def reconstruction_components(
         self,
         *,
+        state_clean: torch.Tensor,
+        state_hat: torch.Tensor,
         action_clean: torch.Tensor,
         action_hat: torch.Tensor,
         next_state_clean: torch.Tensor,
         next_state_hat: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        batch_size = int(action_clean.shape[0])
+        state_sq = (state_hat - state_clean).pow(2)
         action_sq = (action_hat - action_clean).pow(2)
         next_state_sq = (next_state_hat - next_state_clean).pow(2)
-        state_sq = torch.zeros(
-            (batch_size, self.latent_dim),
-            dtype=action_clean.dtype,
-            device=action_clean.device,
-        )
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
-        latent_var = self.latent_var.to(device=next_state_clean.device, dtype=next_state_clean.dtype)
+        latent_var = self.latent_var.to(device=state_clean.device, dtype=state_clean.dtype)
         action_var_flat = self.action_var_flat.to(device=action_clean.device, dtype=action_clean.dtype)
-        state_energy = torch.zeros((batch_size,), dtype=action_clean.dtype, device=action_clean.device)
+        state_energy = (state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
         action_energy = (action_sq / action_var_flat.unsqueeze(0)).mean(dim=-1)
         next_state_energy = (next_state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
         return {
@@ -377,9 +393,12 @@ class DSMModel(nn.Module):
         *,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
+        state_clean = current_latent
         action_clean = self.flatten_action_sequence(action_sequence)
         next_state_clean = target_latent
         noisy = {
+            "state_input": state_clean,
+            "state_noise": torch.zeros_like(state_clean),
             "action_input": action_clean,
             "action_noise": torch.zeros_like(action_clean),
             "next_state_input": next_state_clean,
@@ -387,10 +406,12 @@ class DSMModel(nn.Module):
         }
         if add_noise:
             noisy = self.add_noise(
+                state_clean=state_clean,
                 action_clean=action_clean,
                 next_state_clean=next_state_clean,
             )
         preds = self.predictor(
+            state_input=noisy["state_input"],
             current_latent=current_latent,
             action_input=noisy["action_input"],
             action_clean=action_clean,
@@ -398,6 +419,10 @@ class DSMModel(nn.Module):
         )
         return {
             "current_latent": current_latent,
+            "state_clean": state_clean,
+            "state_input": noisy["state_input"],
+            "state_hat": preds["state_hat"],
+            "state_noise": noisy["state_noise"],
             "action_clean": action_clean,
             "action_input": noisy["action_input"],
             "action_hat": preds["action_hat"],
@@ -421,6 +446,8 @@ class DSMModel(nn.Module):
             add_noise=True,
         )
         recon = self.reconstruction_components(
+            state_clean=out["state_clean"],
+            state_hat=out["state_hat"],
             action_clean=out["action_clean"],
             action_hat=out["action_hat"],
             next_state_clean=out["next_state_clean"],
@@ -438,6 +465,9 @@ class DSMModel(nn.Module):
             "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
             "current_latent": out["current_latent"],
+            "state_clean": out["state_clean"],
+            "state_input": out["state_input"],
+            "state_hat": out["state_hat"],
             "action_clean": out["action_clean"],
             "action_input": out["action_input"],
             "action_hat": out["action_hat"],

@@ -199,6 +199,8 @@ class DSMTransitionScorer:
                 add_noise=False,
             )
             recon = self.model.reconstruction_components(
+                state_clean=out["state_clean"],
+                state_hat=out["state_hat"],
                 action_clean=out["action_clean"],
                 action_hat=out["action_hat"],
                 next_state_clean=out["next_state_clean"],

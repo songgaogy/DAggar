@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED="${SEED:-42}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_211052/lpb_score_dsm_20260407_211052.pt"
+DSM_CKPT="checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_220112/lpb_score_dsm_20260407_220112_ep0030.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/analyse}"
 
 if [[ ! -f "${CKPT}" ]]; then
