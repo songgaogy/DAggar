@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=1
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="${DSM_CKPT:-}"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260408_011247/lpb_score_dsm_20260408_011247_ep0030.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_new_cache}"
 NUM_VIDEOS=8
@@ -45,6 +45,48 @@ if [[ ! -f "${DSM_CKPT}" ]]; then
   echo "[visualize_lpb_score_dsm] Set DSM_CKPT=/abs/path/to/lpb_score_dsm_*.pt if you want a specific run." >&2
   exit 1
 fi
+
+validate_policy_ckpt() {
+  "${PYTHON_BIN}" - "${1}" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+try:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(path, map_location="cpu")
+
+if "camera_names" not in payload or "model_cfg" not in payload:
+    raise SystemExit(
+        f"[visualize_lpb_score_dsm] Invalid policy checkpoint: {path}\n"
+        "Expected a flow policy checkpoint with keys like `camera_names` and `model_cfg`.\n"
+        "It looks like you may have passed a DSM checkpoint as policy.ckpt."
+    )
+PY
+}
+
+validate_dsm_ckpt() {
+  "${PYTHON_BIN}" - "${1}" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+try:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(path, map_location="cpu")
+
+if "model" not in payload or "latent_dim" not in payload or "action_dim" not in payload:
+    raise SystemExit(
+        f"[visualize_lpb_score_dsm] Invalid DSM checkpoint: {path}\n"
+        "Expected an lpb_score DSM checkpoint with keys like `model`, `latent_dim`, and `action_dim`."
+    )
+PY
+}
+
+validate_policy_ckpt "${CKPT}"
+validate_dsm_ckpt "${DSM_CKPT}"
 
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 

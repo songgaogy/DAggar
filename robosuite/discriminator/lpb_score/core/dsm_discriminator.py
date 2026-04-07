@@ -442,7 +442,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             threshold=float(self.threshold),
             metadata={
                 "dsm_ckpt": self.checkpoint_path,
-                "noise_sigma": float(self.extractor.model.noise_sigma),
+                "noise_scale": float(self.extractor.model.noise_scale),
+                "noise_sigma": float(self.extractor.model.noise_scale),
+                "std_clamp_min": float(self.extractor.model.std_clamp_min),
                 "latent_dim": int(self.extractor.latent_dim),
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),

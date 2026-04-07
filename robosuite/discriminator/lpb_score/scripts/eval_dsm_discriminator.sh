@@ -23,6 +23,48 @@ if [[ ! -f "${DSM_CKPT}" ]]; then
   exit 1
 fi
 
+validate_policy_ckpt() {
+  "${PYTHON_BIN}" - "${1}" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+try:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(path, map_location="cpu")
+
+if "camera_names" not in payload or "model_cfg" not in payload:
+    raise SystemExit(
+        f"[eval_dsm_discriminator] Invalid policy checkpoint: {path}\n"
+        "Expected a flow policy checkpoint with keys like `camera_names` and `model_cfg`.\n"
+        "It looks like you may have passed a DSM checkpoint as policy.ckpt."
+    )
+PY
+}
+
+validate_dsm_ckpt() {
+  "${PYTHON_BIN}" - "${1}" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+try:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+except TypeError:
+    payload = torch.load(path, map_location="cpu")
+
+if "model" not in payload or "latent_dim" not in payload or "action_dim" not in payload:
+    raise SystemExit(
+        f"[eval_dsm_discriminator] Invalid DSM checkpoint: {path}\n"
+        "Expected an lpb_score DSM checkpoint with keys like `model`, `latent_dim`, and `action_dim`."
+    )
+PY
+}
+
+validate_policy_ckpt "${CKPT}"
+validate_dsm_ckpt "${DSM_CKPT}"
+
 export CUDA_VISIBLE_DEVICES="${GPU:-0}"
 
 echo "[eval_dsm_discriminator] ROOT=${ROOT}"

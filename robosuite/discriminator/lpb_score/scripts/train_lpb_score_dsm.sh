@@ -21,7 +21,8 @@ LR="${LR:-2e-4}"
 IMAGE_SIZE=128
 HORIZON=2   # I'm not sure?
 ENCODER_BATCH_SIZE=128
-NOISE_SIGMA="${NOISE_SIGMA:-0.05}"
+STD_CLAMP_MIN="${STD_CLAMP_MIN:-0.05}"
+NOISE_SCALE="${NOISE_SCALE:-0.08}"
 
 if [[ ! -f "${CKPT}" ]]; then
   echo "[train_lpb_score_dsm] Missing policy checkpoint: ${CKPT}" >&2
@@ -43,7 +44,8 @@ echo "[train_lpb_score_dsm] save_dir=${SAVE_DIR}"
   policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
   data.image_size="${IMAGE_SIZE}" \
   data.transition_horizon="${HORIZON}" \
-  model.noise_sigma="${NOISE_SIGMA}" \
+  model.std_clamp_min="${STD_CLAMP_MIN}" \
+  model.noise_scale="${NOISE_SCALE}" \
   training.batch_size="${BATCH_SIZE}" \
   training.num_workers="${NUM_WORKERS}" \
   training.epochs="${EPOCHS}" \

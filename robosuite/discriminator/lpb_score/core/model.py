@@ -185,14 +185,17 @@ class DSMModel(nn.Module):
         latent_dim: int,
         action_dim: int,
         transition_horizon: int,
-        noise_sigma: float,
+        noise_scale: float,
+        std_clamp_min: float,
     ) -> None:
         super().__init__()
         self.predictor = predictor
         self.latent_dim = int(latent_dim)
         self.action_dim = int(action_dim)
         self.transition_horizon = int(transition_horizon)
-        self.noise_sigma = float(noise_sigma)
+        self.noise_scale = float(noise_scale)
+        self.noise_sigma = self.noise_scale
+        self.std_clamp_min = float(std_clamp_min)
         self.action_flat_dim = int(self.action_dim * self.transition_horizon)
         self.tau_dim = int(2 * self.latent_dim + self.action_flat_dim)
 
@@ -253,11 +256,11 @@ class DSMModel(nn.Module):
 
     @property
     def latent_std(self) -> torch.Tensor:
-        return torch.sqrt(self.latent_var)
+        return torch.clamp(torch.sqrt(self.latent_var), min=float(self.std_clamp_min))
 
     @property
     def action_std_flat(self) -> torch.Tensor:
-        return torch.sqrt(self.action_var_flat)
+        return torch.clamp(torch.sqrt(self.action_var_flat), min=float(self.std_clamp_min))
 
     @property
     def tau_noise_scale(self) -> torch.Tensor:
@@ -341,7 +344,7 @@ class DSMModel(nn.Module):
         action_clean: torch.Tensor,
         next_state_clean: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        sigma = max(float(self.noise_sigma), 0.05)
+        sigma = float(self.noise_scale)
         state_noise = torch.randn_like(state_clean) * sigma
         action_noise = torch.randn_like(action_clean) * sigma
         next_state_noise = torch.randn_like(next_state_clean) * sigma
@@ -364,13 +367,13 @@ class DSMModel(nn.Module):
         next_state_clean: torch.Tensor,
         next_state_hat: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        state_sq = (state_hat - state_clean).pow(2)
-        action_sq = (action_hat - action_clean).pow(2)
-        next_state_sq = (next_state_hat - next_state_clean).pow(2)
+        state_sq = F.mse_loss(state_hat, state_clean, reduction="none")
+        action_sq = F.mse_loss(action_hat, action_clean, reduction="none")
+        next_state_sq = F.mse_loss(next_state_hat, next_state_clean, reduction="none")
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
-        state_energy = state_sq.sum(dim=-1)
-        action_energy = action_sq.sum(dim=-1)
-        next_state_energy = next_state_sq.sum(dim=-1)
+        state_energy = state_sq.mean(dim=-1)
+        action_energy = action_sq.mean(dim=-1)
+        next_state_energy = next_state_sq.mean(dim=-1)
         return {
             "error_sq": error_sq,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
@@ -532,5 +535,6 @@ def build_dsm_model(
         latent_dim=int(latent_dim),
         action_dim=int(action_dim),
         transition_horizon=int(transition_horizon),
-        noise_sigma=float(_cfg_get(cfg_model, "noise_sigma", 0.05)),
+        noise_scale=float(_cfg_get(cfg_model, "noise_scale", _cfg_get(cfg_model, "noise_sigma", 0.08))),
+        std_clamp_min=float(_cfg_get(cfg_model, "std_clamp_min", 0.05)),
     )

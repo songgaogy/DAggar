@@ -59,6 +59,13 @@ class FrozenFlowMultitaskEncoder:
 
         checkpoint = _torch_load_checkpoint(self.checkpoint_path)
         self.checkpoint = checkpoint
+        if "camera_names" not in checkpoint or "model_cfg" not in checkpoint:
+            raise ValueError(
+                "Invalid flow policy checkpoint: "
+                f"{self.checkpoint_path}. Expected keys like `camera_names` and `model_cfg`, "
+                "but they were missing. This usually means policy.ckpt was set to a DSM "
+                "checkpoint instead of the frozen flow policy checkpoint."
+            )
         self.camera_names = [str(name) for name in checkpoint["camera_names"]]
         self.task_prompt_map = dict(checkpoint.get("task_prompt_map", {}))
         self.task_metadata_map = dict(checkpoint.get("task_metadata_map", {}))
