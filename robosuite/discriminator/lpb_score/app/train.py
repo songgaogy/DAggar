@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
@@ -14,9 +15,58 @@ from robosuite.discriminator.lpb_score.app.pipeline import (
 from robosuite.discriminator.lpb_score.core.dataset import (
     LatentTransitionDataset,
     build_cached_splits,
+    load_cached_latent_trajectory,
 )
 from robosuite.discriminator.lpb_score.core.model import DSMModel, build_dsm_model
 from robosuite.discriminator.lpb_score.core.trainer import Trainer, TrainerConfig
+
+
+def _compute_expert_normalization_stats(
+    *,
+    expert_refs,
+    min_variance: float = 1e-6,
+) -> dict[str, np.ndarray]:
+    if not expert_refs:
+        raise RuntimeError("Expected non-empty expert refs to compute normalization stats.")
+
+    latent_sum = None
+    latent_sq_sum = None
+    action_sum = None
+    action_sq_sum = None
+    latent_count = 0
+    action_count = 0
+
+    for ref in expert_refs:
+        traj = load_cached_latent_trajectory(ref)
+        latents = np.asarray(traj.latents, dtype=np.float64)
+        actions = np.asarray(traj.actions, dtype=np.float64)
+        if latent_sum is None:
+            latent_sum = np.zeros((latents.shape[1],), dtype=np.float64)
+            latent_sq_sum = np.zeros((latents.shape[1],), dtype=np.float64)
+            action_sum = np.zeros((actions.shape[1],), dtype=np.float64)
+            action_sq_sum = np.zeros((actions.shape[1],), dtype=np.float64)
+        latent_sum += latents.sum(axis=0)
+        latent_sq_sum += np.square(latents).sum(axis=0)
+        action_sum += actions.sum(axis=0)
+        action_sq_sum += np.square(actions).sum(axis=0)
+        latent_count += int(latents.shape[0])
+        action_count += int(actions.shape[0])
+
+    if latent_count <= 0 or action_count <= 0:
+        raise RuntimeError("Expert normalization stats require positive latent/action counts.")
+
+    latent_mean = latent_sum / float(latent_count)
+    latent_var = np.maximum(latent_sq_sum / float(latent_count) - np.square(latent_mean), float(min_variance))
+    action_mean = action_sum / float(action_count)
+    action_var = np.maximum(action_sq_sum / float(action_count) - np.square(action_mean), float(min_variance))
+    return {
+        "latent_mean": latent_mean.astype(np.float32),
+        "latent_var": latent_var.astype(np.float32),
+        "action_mean": action_mean.astype(np.float32),
+        "action_var": action_var.astype(np.float32),
+        "latent_count": np.asarray(latent_count, dtype=np.int64),
+        "action_count": np.asarray(action_count, dtype=np.int64),
+    }
 
 
 def _build_payload(
@@ -28,6 +78,7 @@ def _build_payload(
     task_to_index: dict[str, int],
     split_summary: dict[str, dict[str, dict[str, int]]],
     epoch: int,
+    normalization_stats: dict[str, np.ndarray],
 ) -> dict:
     """Package model state and run metadata into a checkpoint payload."""
     return {
@@ -43,6 +94,10 @@ def _build_payload(
         "policy_ckpt": to_absolute_path(str(cfg.policy.ckpt)),
         "image_size": int(cfg.data.image_size),
         "epoch": int(epoch),
+        "normalization_stats": {
+            key: np.asarray(value)
+            for key, value in normalization_stats.items()
+        },
     }
 
 
@@ -95,6 +150,7 @@ def run_train(cfg: DictConfig) -> None:
         val_dataset = datasets.val_dataset
         train_refs = datasets.train_refs
         val_refs = datasets.val_refs
+        expert_train_refs = [ref for ref in train_refs if ref.data_type == "expert"]
 
         print(
             f"[lpb_score] train_transitions={len(train_dataset)} "
@@ -116,6 +172,17 @@ def run_train(cfg: DictConfig) -> None:
             action_dim=int(train_dataset.action_dim),
             cfg_model=cfg.model,
             transition_horizon=int(cfg.data.transition_horizon),
+        )
+        normalization_stats = _compute_expert_normalization_stats(expert_refs=expert_train_refs)
+        model.set_normalization_stats(
+            latent_mean=normalization_stats["latent_mean"],
+            latent_var=normalization_stats["latent_var"],
+            action_mean=normalization_stats["action_mean"],
+            action_var=normalization_stats["action_var"],
+        )
+        print(
+            f"[lpb_score] expert_norm_stats latent_count={int(normalization_stats['latent_count'])} "
+            f"action_count={int(normalization_stats['action_count'])}"
         )
 
         trainer = _build_trainer(
@@ -148,6 +215,7 @@ def run_train(cfg: DictConfig) -> None:
                 task_to_index=task_to_index,
                 split_summary=split_summary,
                 epoch=epoch,
+                normalization_stats=normalization_stats,
             )
             torch.save(payload, periodic_path)
             print(f"[lpb_score] Saved checkpoint to: {periodic_path}")
@@ -166,6 +234,7 @@ def run_train(cfg: DictConfig) -> None:
             task_to_index=task_to_index,
             split_summary=split_summary,
             epoch=int(cfg.training.epochs),
+            normalization_stats=normalization_stats,
         )
         torch.save(final_payload, save_path_final)
         print(f"[lpb_score] Saved final checkpoint to: {save_path_final}")

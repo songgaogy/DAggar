@@ -135,10 +135,53 @@ class DSMModel(nn.Module):
         self.action_slice = slice(self.latent_dim, self.latent_dim + self.action_flat_dim)
         self.next_state_slice = slice(self.latent_dim + self.action_flat_dim, self.tau_dim)
 
+        self.register_buffer("latent_mean", torch.zeros(self.latent_dim, dtype=torch.float32))
+        self.register_buffer("latent_var", torch.ones(self.latent_dim, dtype=torch.float32))
+        self.register_buffer("action_mean", torch.zeros(self.action_dim, dtype=torch.float32))
+        self.register_buffer("action_var", torch.ones(self.action_dim, dtype=torch.float32))
+
         if int(self.predictor.tau_dim) != self.tau_dim:
             raise ValueError(
                 f"predictor tau_dim mismatch: expected {self.tau_dim}, got {self.predictor.tau_dim}"
             )
+
+    def set_normalization_stats(
+        self,
+        *,
+        latent_mean: torch.Tensor,
+        latent_var: torch.Tensor,
+        action_mean: torch.Tensor,
+        action_var: torch.Tensor,
+        min_variance: float = 1e-6,
+    ) -> None:
+        latent_mean = torch.as_tensor(latent_mean, dtype=torch.float32, device=self.latent_mean.device).reshape(-1)
+        latent_var = torch.as_tensor(latent_var, dtype=torch.float32, device=self.latent_var.device).reshape(-1)
+        action_mean = torch.as_tensor(action_mean, dtype=torch.float32, device=self.action_mean.device).reshape(-1)
+        action_var = torch.as_tensor(action_var, dtype=torch.float32, device=self.action_var.device).reshape(-1)
+        if latent_mean.shape[0] != self.latent_dim or latent_var.shape[0] != self.latent_dim:
+            raise ValueError(
+                f"Latent stats must have shape ({self.latent_dim},), "
+                f"got mean={tuple(latent_mean.shape)} var={tuple(latent_var.shape)}"
+            )
+        if action_mean.shape[0] != self.action_dim or action_var.shape[0] != self.action_dim:
+            raise ValueError(
+                f"Action stats must have shape ({self.action_dim},), "
+                f"got mean={tuple(action_mean.shape)} var={tuple(action_var.shape)}"
+            )
+        self.latent_mean.copy_(latent_mean)
+        self.latent_var.copy_(torch.clamp(latent_var, min=float(min_variance)))
+        self.action_mean.copy_(action_mean)
+        self.action_var.copy_(torch.clamp(action_var, min=float(min_variance)))
+
+    @property
+    def action_var_flat(self) -> torch.Tensor:
+        return self.action_var.repeat(self.transition_horizon)
+
+    @property
+    def tau_noise_scale(self) -> torch.Tensor:
+        latent_std = torch.sqrt(self.latent_var)
+        action_std = torch.sqrt(self.action_var_flat)
+        return torch.cat([latent_std, action_std, latent_std], dim=0)
 
     def build_tau(
         self,
@@ -191,7 +234,8 @@ class DSMModel(nn.Module):
         if self.noise_sigma <= 0.0:
             eps = torch.zeros_like(tau)
             return tau, eps
-        eps = torch.randn_like(tau) * float(self.noise_sigma)
+        noise_scale = self.tau_noise_scale.to(device=tau.device, dtype=tau.dtype).unsqueeze(0)
+        eps = torch.randn_like(tau) * noise_scale * float(self.noise_sigma)
         return tau + eps, eps
 
     def denoise_tau(self, tau: torch.Tensor, *, add_noise: bool) -> dict[str, torch.Tensor]:
@@ -216,6 +260,11 @@ class DSMModel(nn.Module):
         state_sq = error_sq[:, self.state_slice]
         action_sq = error_sq[:, self.action_slice]
         next_state_sq = error_sq[:, self.next_state_slice]
+        latent_var = self.latent_var.to(device=tau.device, dtype=tau.dtype)
+        action_var_flat = self.action_var_flat.to(device=tau.device, dtype=tau.dtype)
+        state_energy = (state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
+        action_energy = (action_sq / action_var_flat.unsqueeze(0)).mean(dim=-1)
+        next_state_energy = (next_state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
         return {
             "error_sq": error_sq,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
@@ -226,6 +275,10 @@ class DSMModel(nn.Module):
             "state_sse_per_sample": state_sq.sum(dim=-1),
             "action_sse_per_sample": action_sq.sum(dim=-1),
             "next_state_sse_per_sample": next_state_sq.sum(dim=-1),
+            "state_energy_per_sample": state_energy,
+            "action_energy_per_sample": action_energy,
+            "next_state_energy_per_sample": next_state_energy,
+            "score_per_sample": state_energy + action_energy + next_state_energy,
         }
 
     def forward(
@@ -256,13 +309,17 @@ class DSMModel(nn.Module):
             add_noise=True,
         )
         recon = self.reconstruction_components(tau=out["tau"], tau_hat=out["tau_hat"])
-        loss = recon["tau_mse_per_sample"].mean()
+        loss = recon["score_per_sample"].mean()
         return {
             "loss": loss,
+            "score": recon["score_per_sample"].mean(),
             "tau_mse": recon["tau_mse_per_sample"].mean(),
             "state_mse": recon["state_mse_per_sample"].mean(),
             "action_mse": recon["action_mse_per_sample"].mean(),
             "next_state_mse": recon["next_state_mse_per_sample"].mean(),
+            "state_energy": recon["state_energy_per_sample"].mean(),
+            "action_energy": recon["action_energy_per_sample"].mean(),
+            "next_state_energy": recon["next_state_energy_per_sample"].mean(),
             "tau": out["tau"],
             "tau_input": out["tau_input"],
             "tau_hat": out["tau_hat"],

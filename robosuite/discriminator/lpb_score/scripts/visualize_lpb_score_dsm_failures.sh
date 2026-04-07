@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=1
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_172214/lpb_score_dsm_20260407_172214.pt"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_201707/lpb_score_dsm_20260407_201707.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_new_cache}"
 NUM_VIDEOS=8

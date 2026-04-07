@@ -101,7 +101,22 @@ class DSMTransitionScorer:
             cfg_model=_cfg_get(cfg, "model", {}),
             transition_horizon=action_horizon,
         )
-        model.load_state_dict(payload["model"], strict=True)
+        normalization_stats = payload.get("normalization_stats", None)
+        if normalization_stats is not None:
+            model.set_normalization_stats(
+                latent_mean=normalization_stats["latent_mean"],
+                latent_var=normalization_stats["latent_var"],
+                action_mean=normalization_stats["action_mean"],
+                action_var=normalization_stats["action_var"],
+            )
+        load_result = model.load_state_dict(payload["model"], strict=False)
+        allowed_missing = {"latent_mean", "latent_var", "action_mean", "action_var"}
+        missing = set(load_result.missing_keys)
+        unexpected = set(load_result.unexpected_keys)
+        if unexpected:
+            raise RuntimeError(f"Unexpected checkpoint keys: {sorted(unexpected)}")
+        if missing and not missing.issubset(allowed_missing):
+            raise RuntimeError(f"Missing checkpoint keys: {sorted(missing)}")
         model.to(self.device)
         model.eval()
         return model, action_horizon, action_dim, latent_dim
@@ -174,13 +189,13 @@ class DSMTransitionScorer:
             tau_b = tau[start:end].to(self.device)
             out = self.model.denoise_tau(tau=tau_b, add_noise=False)
             recon = self.model.reconstruction_components(tau=out["tau"], tau_hat=out["tau_hat"])
-            step_scores.append(recon["tau_sse_per_sample"].detach().cpu())
-            state_scores.append(recon["state_sse_per_sample"].detach().cpu())
-            action_scores.append(recon["action_sse_per_sample"].detach().cpu())
-            next_state_scores.append(recon["next_state_sse_per_sample"].detach().cpu())
-            state_contrib.append(recon["state_sse_per_sample"].detach().cpu())
-            action_contrib.append(recon["action_sse_per_sample"].detach().cpu())
-            next_state_contrib.append(recon["next_state_sse_per_sample"].detach().cpu())
+            step_scores.append(recon["score_per_sample"].detach().cpu())
+            state_scores.append(recon["state_energy_per_sample"].detach().cpu())
+            action_scores.append(recon["action_energy_per_sample"].detach().cpu())
+            next_state_scores.append(recon["next_state_energy_per_sample"].detach().cpu())
+            state_contrib.append(recon["state_energy_per_sample"].detach().cpu())
+            action_contrib.append(recon["action_energy_per_sample"].detach().cpu())
+            next_state_contrib.append(recon["next_state_energy_per_sample"].detach().cpu())
 
         return TrajectoryScoreBundle(
             step_scores=torch.cat(step_scores, dim=0).numpy().astype(np.float32),

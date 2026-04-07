@@ -134,10 +134,14 @@ class Trainer:
 
         return {
             "loss": float(stats["loss"].detach().item()),
+            "score": float(stats["score"].detach().item()),
             "tau_mse": float(stats["tau_mse"].detach().item()),
             "state_mse": float(stats["state_mse"].detach().item()),
             "action_mse": float(stats["action_mse"].detach().item()),
             "next_state_mse": float(stats["next_state_mse"].detach().item()),
+            "state_energy": float(stats["state_energy"].detach().item()),
+            "action_energy": float(stats["action_energy"].detach().item()),
+            "next_state_energy": float(stats["next_state_energy"].detach().item()),
         }
 
     @staticmethod
@@ -156,9 +160,11 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f}"
+                    f"next_state_mse={out['next_state_mse']:.6f} "
+                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
+                    f"next_state_energy={out['next_state_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
 
@@ -174,9 +180,11 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f}"
+                    f"next_state_mse={out['next_state_mse']:.6f} "
+                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
+                    f"next_state_energy={out['next_state_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
 
