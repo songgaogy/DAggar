@@ -59,24 +59,17 @@ def run_analyse(cfg: DictConfig) -> None:
             encoder=encoder,
             seed=seed,
         )
-        bank_refs = filter_refs_by_data_types(
-            cached_splits[str(cfg.eval.bank_split)],
-            list(cfg.eval.bank_data_types),
-        )
         calibration_refs = filter_refs_by_data_types(
             cached_splits[str(cfg.eval.calibration_split)],
             list(cfg.eval.calibration_data_types),
         )
-        bank_trajectories = load_latent_trajectories(bank_refs)
         calibration_trajectories = load_latent_trajectories(calibration_refs)
-        if not bank_trajectories:
-            raise RuntimeError("Analysis requires non-empty clean bank trajectories.")
         if not calibration_trajectories:
             raise RuntimeError("Analysis requires non-empty clean calibration trajectories.")
 
         detector = build_dsm_discriminator(cfg)
         calibration_summary = detector.fit(
-            normal_bank_trajectories=bank_trajectories,
+            normal_bank_trajectories=calibration_trajectories,
             calibration_trajectories=calibration_trajectories,
         )
         lambda_values = np.asarray(detector._calib_lambdas, dtype=np.float32)
@@ -96,15 +89,28 @@ def run_analyse(cfg: DictConfig) -> None:
             "source_dsm_ckpt": str(cfg.model.dsm_ckpt),
             "delta": float(cfg.detector.delta),
             "threshold": float(threshold),
+            "thresholds_by_task": {
+                task_name: float(task_threshold)
+                for task_name, task_threshold in sorted(detector.thresholds_by_task.items())
+            },
             "lambda_stats": _summary_stats(lambda_values),
+            "lambda_stats_by_task": {
+                task_name: _summary_stats(task_values)
+                for task_name, task_values in sorted(
+                    detector._calib_lambdas_by_task.items()
+                )
+            },
             "counts": {
-                "num_bank_trajectories": int(len(bank_trajectories)),
                 "num_calibration_trajectories": int(len(calibration_trajectories)),
                 "num_lambda_steps": int(lambda_values.size),
+                "num_calibration_trajectories_by_task": {
+                    task_name: int(
+                        sum(1 for traj in calibration_trajectories if str(traj.task_name) == task_name)
+                    )
+                    for task_name in sorted(detector.thresholds_by_task.keys())
+                },
             },
             "calibration": {
-                "bank_split": str(cfg.eval.bank_split),
-                "bank_data_types": list(cfg.eval.bank_data_types),
                 "calibration_split": str(cfg.eval.calibration_split),
                 "calibration_data_types": list(cfg.eval.calibration_data_types),
                 "lambda_mode": str(cfg.detector.lambda_mode),

@@ -7,7 +7,7 @@ seed: 42
 save_dir: "./checkpoints/multitask_6/lpb_score/eval"
 
 policy:
-  ckpt: "./checkpoints/multitask_6/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
   device: "cuda"
   encoder_batch_size: 96
 

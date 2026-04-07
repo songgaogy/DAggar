@@ -1,0 +1,121 @@
+hydra:
+  run:
+    dir: outputs/dyn_bce
+
+seed: 42
+
+save_dir: "./checkpoints/multitask_6/dyn_bce"
+save_name: "dyn_bce.pt"
+
+policy:
+  ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  device: "cuda"
+  encoder_batch_size: 96
+
+data:
+  image_size: 128
+  transition_horizon: 1
+  cache_dir: "./data/.dyn_bce_cache"
+  memmap:
+    dir: "./data/.dyn_bce_memmap"
+    max_transitions_per_shard: 32768
+    num_build_workers: 8
+    encode_demo_batch_size: 8
+    max_pending_raw_demos: 16
+    rebuild: false
+  splits:
+    train: {num_expert_traj: 240, num_success_traj: 240, num_fail_traj: 240}
+    eval: {num_expert_traj: 30, num_success_traj: 30, num_fail_traj: 30}
+    test: {num_expert_traj: 30, num_success_traj: 30, num_fail_traj: 30}
+  tasks:
+    PandaLift:
+      expert_dir: "./data/PandaLift/expert"
+      success_rollout_dir: "./data/PandaLift/success_rollout"
+      fail_rollout_dir: "./data/PandaLift/fail_rollout"
+    PandaPickPlaceCan:
+      expert_dir: "./data/PandaPickPlaceCan/expert"
+      success_rollout_dir: "./data/PandaPickPlaceCan/success_rollout"
+      fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
+    PandaStack:
+      expert_dir: "./data/PandaStack/expert"
+      success_rollout_dir: "./data/PandaStack/success_rollout"
+      fail_rollout_dir: "./data/PandaStack/fail_rollout"
+    PickPlaceBread:
+      expert_dir: "./data/PickPlaceBread/expert"
+      success_rollout_dir: "./data/PickPlaceBread/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceBread/fail_rollout"
+    PickPlaceCereal:
+      expert_dir: "./data/PickPlaceCereal/expert"
+      success_rollout_dir: "./data/PickPlaceCereal/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceCereal/fail_rollout"
+    PickPlaceMilk:
+      expert_dir: "./data/PickPlaceMilk/expert"
+      success_rollout_dir: "./data/PickPlaceMilk/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceMilk/fail_rollout"
+
+labels:
+  fail_onset_ratio: 0.5
+  risk_temperature: 0.08
+  fuse_prefix_min_weight: 0.35
+  dyn_prefix_min_weight: 0.0
+  occ_fail_prefix_min_weight: 0.1
+
+model:
+  shared_dim: 256
+  occ_private_dim: 256
+  dyn_private_dim: 256
+  task_embed_dim: 64
+  trunk_hidden_dim: 1024
+  head_hidden_dim: 1024
+  action_model_dim: 256
+  action_num_layers: 3
+  action_num_heads: 4
+  action_dropout: 0.1
+  max_action_horizon: 8
+  ensemble_size: 5
+  judge_hidden_dim: 384
+  dyn_model_dim: 1536
+  dyn_backbone_num_blocks: 3
+  dyn_head_hidden_dim: 768
+  dyn_head_num_blocks: 1
+  trunk_num_blocks: 2
+  head_num_blocks: 1
+  judge_num_blocks: 2
+  swiglu_hidden_ratio: 0.67
+  occupancy_use_spectral_norm: false
+  judge_use_spectral_norm: false
+  occ_logit_scale: 8.0
+  occ_logit_temperature: 4.0
+  zero_init_residual: true
+  occ_calibrator_momentum: 0.05
+  evidence_calibrator_eps: 1e-6
+  dropout: 0.1
+
+loss:
+  alpha_dyn: 1.0
+  eta_decor: 0.05
+  xi_fuse: 1.0
+  beta_nll: 0.5
+  occupancy_positive_prior: null
+  occupancy_nnpu: true
+
+training:
+  device: "cuda"
+  batch_size: 256
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  epochs: 50
+  save_freq: 10
+  lr: 2e-4
+  weight_decay: 1e-4
+  grad_clip_norm: 1.0
+  amp: false
+  ema_decay: 0.995
+  log_every: 500
+
+logging:
+  use_wandb: true
+  project: "robosuite-dyn-bce"
+  entity: "songgao-personal"
+  mode: "offline"

@@ -14,7 +14,7 @@ policy:
 data:
   image_size: 128
   transition_horizon: 1
-  cache_dir: "./data/.lpb_score_cache"
+  cache_dir: "./data/.lpb_new_cache"
   encode_demo_batch_size: 8
   splits:
     train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
@@ -81,7 +81,7 @@ detector:
 
 eval:
   bank_split: "train"
-  bank_data_types: ["expert", "success_rollout"]
+  bank_data_types: ["success_rollout"]
   calibration_split: "val"
   calibration_data_types: ["expert", "success_rollout"]
   fail_eval_split: "test"
@@ -95,6 +95,8 @@ online:
   update_interval: 5
 
 visualization:
+  bank_size: 100
+  calibration_seed: 42
   data_source: "fail_rollout"
   num_videos: 3
   fps: 20

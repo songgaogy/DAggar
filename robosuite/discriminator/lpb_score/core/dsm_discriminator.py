@@ -88,6 +88,11 @@ class DSMTransitionScorer:
         latent_dim = int(payload.get("latent_dim"))
         action_dim = int(payload.get("action_dim"))
         horizon_ckpt = int(payload.get("horizon", 1))
+        if int(override_action_horizon) > 0 and int(override_action_horizon) != horizon_ckpt:
+            raise ValueError(
+                "Inference action_horizon must match the training horizon stored in the checkpoint: "
+                f"got override={int(override_action_horizon)}, checkpoint={horizon_ckpt}"
+            )
         action_horizon = horizon_ckpt if int(override_action_horizon) <= 0 else int(override_action_horizon)
 
         model = build_dsm_model(
@@ -169,10 +174,10 @@ class DSMTransitionScorer:
             tau_b = tau[start:end].to(self.device)
             out = self.model.denoise_tau(tau=tau_b, add_noise=False)
             recon = self.model.reconstruction_components(tau=out["tau"], tau_hat=out["tau_hat"])
-            step_scores.append(recon["tau_mse_per_sample"].detach().cpu())
-            state_scores.append(recon["state_mse_per_sample"].detach().cpu())
-            action_scores.append(recon["action_mse_per_sample"].detach().cpu())
-            next_state_scores.append(recon["next_state_mse_per_sample"].detach().cpu())
+            step_scores.append(recon["tau_sse_per_sample"].detach().cpu())
+            state_scores.append(recon["state_sse_per_sample"].detach().cpu())
+            action_scores.append(recon["action_sse_per_sample"].detach().cpu())
+            next_state_scores.append(recon["next_state_sse_per_sample"].detach().cpu())
             state_contrib.append(recon["state_sse_per_sample"].detach().cpu())
             action_contrib.append(recon["action_sse_per_sample"].detach().cpu())
             next_state_contrib.append(recon["next_state_sse_per_sample"].detach().cpu())
@@ -226,7 +231,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             raise ValueError("lambda_window_size must be -1 or >=1")
 
         self._calib_lambdas: Optional[np.ndarray] = None
+        self._calib_lambdas_by_task: dict[str, np.ndarray] = {}
         self.threshold: Optional[float] = None
+        self.thresholds_by_task: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -236,7 +243,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
     def _compute_threshold(values: np.ndarray, delta: float) -> float:
         if values.size == 0:
             raise ValueError("Cannot calibrate threshold from empty values")
-        q = 100.0 * (1.0 - float(delta) / 100.0)
+        clipped_delta = float(np.clip(delta, 0.0, 100.0))
+        q = 100.0 * (1.0 - clipped_delta / 100.0)
         return float(np.percentile(values.astype(np.float64), q=q))
 
     @staticmethod
@@ -373,12 +381,24 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         if len(calibration_set) == 0:
             raise ValueError("Calibration requires at least one trajectory.")
 
-        calib_lambdas = [
-            self._aggregate_lambda(self.extractor.score_trajectory(traj).step_scores)
-            for traj in calibration_set
-        ]
+        calib_lambdas: list[np.ndarray] = []
+        calib_lambdas_by_task: dict[str, list[np.ndarray]] = {}
+        for traj in calibration_set:
+            lambdas = self._aggregate_lambda(self.extractor.score_trajectory(traj).step_scores)
+            calib_lambdas.append(lambdas)
+            calib_lambdas_by_task.setdefault(str(traj.task_name), []).append(lambdas)
+
         self._calib_lambdas = np.concatenate(calib_lambdas, axis=0).astype(np.float32)
+        self._calib_lambdas_by_task = {
+            task_name: np.concatenate(task_values, axis=0).astype(np.float32)
+            for task_name, task_values in calib_lambdas_by_task.items()
+            if len(task_values) > 0
+        }
         self.threshold = self._compute_threshold(self._calib_lambdas, self.delta)
+        self.thresholds_by_task = {
+            task_name: self._compute_threshold(task_values, self.delta)
+            for task_name, task_values in self._calib_lambdas_by_task.items()
+        }
         return DetectorCalibrationSummary(
             detector_name=self.name,
             threshold=float(self.threshold),
@@ -394,6 +414,14 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "lambda_mode": str(self.lambda_mode),
                 "lambda_window_size": int(self.lambda_window_size),
                 "num_calibration_trajectories": int(len(calibration_set)),
+                "num_calibration_trajectories_by_task": {
+                    task_name: int(len(task_values))
+                    for task_name, task_values in calib_lambdas_by_task.items()
+                },
+                "thresholds_by_task": {
+                    task_name: float(threshold)
+                    for task_name, threshold in self.thresholds_by_task.items()
+                },
             },
         )
 
@@ -437,8 +465,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         preds = np.zeros_like(lamb, dtype=np.int64)
         ths = np.zeros_like(lamb, dtype=np.float32)
 
+        task_name = str(trajectory.task_name)
+        task_calib_lambdas = self._calib_lambdas_by_task.get(task_name, None)
+        task_threshold = self.thresholds_by_task.get(task_name, None)
         cur_delta = float(self.delta)
-        cur_threshold = float(self.threshold)
+        cur_threshold = float(task_threshold if task_threshold is not None else self.threshold)
         dmin = float(np.clip(delta_min, 0.0, 100.0))
         dmax = float(np.clip(delta_max, 0.0, 100.0))
         if dmin > dmax:
@@ -447,6 +478,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         update_every = max(1, int(update_interval))
 
         labels_np = None if labels is None else np.asarray(labels, dtype=np.int64).reshape(-1)
+        if adaptive_threshold and labels_np is not None and labels_np.shape[0] != lamb.shape[0]:
+            raise ValueError(
+                "labels length must match the number of aggregate scores when adaptive_threshold=True: "
+                f"got labels={labels_np.shape[0]}, scores={lamb.shape[0]}"
+            )
         for t in range(lamb.shape[0]):
             pred = int(lamb[t] >= cur_threshold)
             preds[t] = pred
@@ -461,10 +497,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                     elif label == 0 and pred == 1:
                         cur_delta -= self.delta_step
                     cur_delta = float(np.clip(cur_delta, dmin, dmax))
-                    cur_threshold = self._compute_threshold(self._calib_lambdas, cur_delta)
+                    threshold_source_values = task_calib_lambdas if task_calib_lambdas is not None else self._calib_lambdas
+                    cur_threshold = self._compute_threshold(threshold_source_values, cur_delta)
 
-        self.delta = float(cur_delta)
-        self.threshold = float(cur_threshold)
         first_crossing_idx = np.where(preds == 1)[0]
         first_crossing_index = int(first_crossing_idx[0]) if first_crossing_idx.size > 0 else None
         first_crossing_dominant_term = (
@@ -490,8 +525,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             aux_scores=None,
             labels=labels_np,
             metadata={
-                "delta_final": float(self.delta),
-                "threshold_final": float(self.threshold if self.threshold is not None else np.nan),
+                "task_name": task_name,
+                "threshold_source": "task" if task_threshold is not None else "global",
+                "threshold_init": float(task_threshold if task_threshold is not None else self.threshold),
+                "delta_final": float(cur_delta),
+                "threshold_final": float(cur_threshold),
                 "state_error_scores": component_scores["state_error"],
                 "action_error_scores": component_scores["action_error"],
                 "next_state_error_scores": component_scores["next_state_error"],

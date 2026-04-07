@@ -558,23 +558,28 @@ def run_visualize(cfg: DictConfig) -> None:
             cfg_data=cfg.data,
             encoder=encoder,
             seed=int(cfg.seed),
+            build_missing_cache=False,
         )
         bank_refs = select_split_refs(
             cached_splits=cached_splits,
             split_name=str(cfg.eval.bank_split),
             data_types=list(cfg.eval.bank_data_types),
         )
-        calibration_refs = select_split_refs(
-            cached_splits=cached_splits,
-            split_name=str(cfg.eval.calibration_split),
-            data_types=list(cfg.eval.calibration_data_types),
+        bank_size = int(getattr(cfg.visualization, "bank_size", -1))
+        calibration_seed = int(getattr(cfg.visualization, "calibration_seed", cfg.seed))
+        sampled_bank_refs = (
+            _sample_refs(
+                refs=bank_refs,
+                num_samples=bank_size,
+                seed=calibration_seed,
+            )
+            if bank_size > 0
+            else list(bank_refs)
         )
-        bank_trajectories = load_latent_trajectories(bank_refs)
-        calibration_trajectories = load_latent_trajectories(calibration_refs)
-        if not bank_trajectories:
+        bank_trajectories = load_latent_trajectories(sampled_bank_refs)
+        calibration_trajectories = list(bank_trajectories)
+        if not sampled_bank_refs:
             raise RuntimeError("No bank trajectories found for visualization.")
-        if not calibration_trajectories:
-            raise RuntimeError("No calibration trajectories found for visualization.")
 
         detector = build_dsm_discriminator(cfg)
         selected_refs, target_trajectories, gt_label_sequences, target_summary = _load_visualization_targets(
@@ -827,6 +832,14 @@ def run_visualize(cfg: DictConfig) -> None:
                 ),
             },
             "target_summary": target_summary,
+            "calibration_summary": {
+                "source_split": str(cfg.eval.bank_split),
+                "source_data_types": list(cfg.eval.bank_data_types),
+                "num_available": int(len(bank_refs)),
+                "num_selected": int(len(sampled_bank_refs)),
+                "bank_size": int(bank_size),
+                "calibration_seed": int(calibration_seed),
+            },
             "videos": [asdict(record) for record in records],
         }
         summary_path = os.path.join(run_dir, "summary.json")

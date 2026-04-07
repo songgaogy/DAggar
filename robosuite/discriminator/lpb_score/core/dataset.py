@@ -264,11 +264,14 @@ def prepare_cached_trajectories(
     cache_root: str,
     task_to_index: dict[str, int],
     encode_demo_batch_size: int = 8,
+    fallback_cache_roots: Sequence[str] | None = None,
+    build_missing_cache: bool = True,
 ) -> list[EncodedTrajectoryRef]:
     """Encode raw demos once and persist latent caches for later reuse."""
     cache_root = to_absolute_path(str(cache_root))
     os.makedirs(cache_root, exist_ok=True)
     batch_size = max(1, int(encode_demo_batch_size))
+    fallback_roots = [to_absolute_path(str(root)) for root in (fallback_cache_roots or [])]
 
     prepared_batch = []
     prepared_meta: list[DemoRef] = []
@@ -312,7 +315,20 @@ def prepare_cached_trajectories(
             file_path=ref.file_path,
             demo_key=ref.demo_key,
         )
-        if os.path.isfile(cache_path):
+        resolved_cache_path = cache_path
+        if not os.path.isfile(resolved_cache_path):
+            for legacy_root in fallback_roots:
+                legacy_cache_path = encoder.cache_path(
+                    cache_root=legacy_root,
+                    task_name=ref.task_name,
+                    file_path=ref.file_path,
+                    demo_key=ref.demo_key,
+                )
+                if os.path.isfile(legacy_cache_path):
+                    resolved_cache_path = legacy_cache_path
+                    break
+
+        if os.path.isfile(resolved_cache_path):
             encoded_refs.append(
                 EncodedTrajectoryRef(
                     task_name=ref.task_name,
@@ -322,10 +338,16 @@ def prepare_cached_trajectories(
                     split=ref.split,
                     file_path=ref.file_path,
                     demo_key=ref.demo_key,
-                    cache_path=cache_path,
+                    cache_path=resolved_cache_path,
                 )
             )
         else:
+            if not bool(build_missing_cache):
+                raise FileNotFoundError(
+                    "Missing latent cache while build_missing_cache=False: "
+                    f"task={ref.task_name} data_type={ref.data_type} split={ref.split} "
+                    f"file={ref.file_path} demo={ref.demo_key}"
+                )
             prepared_batch.append(
                 encoder.load_demo_raw(
                     task_name=ref.task_name,
@@ -491,6 +513,7 @@ def build_cached_splits(
     cfg_data: Any,
     encoder: FrozenFlowMultitaskEncoder,
     seed: int,
+    build_missing_cache: bool = True,
 ) -> tuple[dict[str, list[EncodedTrajectoryRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
     """
     Build split refs, then ensure every selected demo has a latent cache on disk.  
@@ -502,14 +525,22 @@ def build_cached_splits(
     cached_splits: dict[str, list[EncodedTrajectoryRef]] = {}
     cache_root = to_absolute_path(str(_cfg_get(cfg_data, "cache_dir")))
     batch_size = int(_cfg_get(cfg_data, "encode_demo_batch_size", 8))
+    legacy_cache_root = to_absolute_path("./data/.lpb_new_cache")
+    fallback_cache_roots: list[str] = []
+    if os.path.abspath(cache_root) != os.path.abspath(legacy_cache_root) and os.path.isdir(legacy_cache_root):
+        fallback_cache_roots.append(legacy_cache_root)
+        print(f"[lpb_score] Reusing legacy cache when available: {legacy_cache_root}")
 
     for split_name, refs in split_refs.items():
-        print(f"[lpb_score] building latent cache for split={split_name} num_trajectories={len(refs)}")
+        action_label = "building latent cache" if bool(build_missing_cache) else "loading latent cache"
+        print(f"[lpb_score] {action_label} for split={split_name} num_trajectories={len(refs)}")
         cached_splits[split_name] = prepare_cached_trajectories(
             refs=refs,
             encoder=encoder,
             cache_root=cache_root,
             task_to_index=task_to_index,
             encode_demo_batch_size=batch_size,
+            fallback_cache_roots=fallback_cache_roots,
+            build_missing_cache=bool(build_missing_cache),
         )
     return cached_splits, split_summary, task_to_index

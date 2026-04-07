@@ -219,6 +219,7 @@ class DSMModel(nn.Module):
         return {
             "error_sq": error_sq,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
+            "tau_sse_per_sample": error_sq.sum(dim=-1),
             "state_mse_per_sample": state_sq.mean(dim=-1),
             "action_mse_per_sample": action_sq.mean(dim=-1),
             "next_state_mse_per_sample": next_state_sq.mean(dim=-1),
