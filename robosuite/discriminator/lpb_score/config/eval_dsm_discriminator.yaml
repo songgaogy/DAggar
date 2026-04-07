@@ -1,0 +1,102 @@
+hydra:
+  run:
+    dir: outputs/lpb_score_eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 42
+
+save_dir: "./checkpoints/multitask_6/lpb_score/eval"
+
+policy:
+  ckpt: "./checkpoints/multitask_6/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  device: "cuda"
+  encoder_batch_size: 96
+
+data:
+  image_size: 128
+  transition_horizon: 1
+  cache_dir: "./data/.lpb_score_cache"
+  encode_demo_batch_size: 8
+  splits:
+    train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+    val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+    test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+  tasks:
+    PandaLift:
+      expert_dir: "./data/PandaLift/expert"
+      success_rollout_dir: "./data/PandaLift/success_rollout"
+      fail_rollout_dir: "./data/PandaLift/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 0}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 0}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 0}
+    PandaPickPlaceCan:
+      expert_dir: "./data/PandaPickPlaceCan/expert"
+      success_rollout_dir: "./data/PandaPickPlaceCan/success_rollout"
+      fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    PandaStack:
+      expert_dir: "./data/PandaStack/expert"
+      success_rollout_dir: "./data/PandaStack/success_rollout"
+      fail_rollout_dir: "./data/PandaStack/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    PickPlaceBread:
+      expert_dir: "./data/PickPlaceBread/expert"
+      success_rollout_dir: "./data/PickPlaceBread/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceBread/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    PickPlaceCereal:
+      expert_dir: "./data/PickPlaceCereal/expert"
+      success_rollout_dir: "./data/PickPlaceCereal/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceCereal/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    PickPlaceMilk:
+      expert_dir: "./data/PickPlaceMilk/expert"
+      success_rollout_dir: "./data/PickPlaceMilk/success_rollout"
+      fail_rollout_dir: "./data/PickPlaceMilk/fail_rollout"
+      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
+      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
+      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+
+model:
+  dsm_ckpt: "./checkpoints/multitask_6/lpb_score/lpb_score_dsm.pt"
+
+feature:
+  device: "cuda"
+  batch_size: 256
+  action_horizon: -1
+
+detector:
+  device: "cuda"
+  delta: 10.0
+  delta_step: 0.5
+  lambda_mode: "mean"
+  lambda_window_size: 12
+
+labels:
+  fail_tail_ratio: 0.2
+
+eval:
+  bank_split: "train"
+  bank_data_types: ["expert", "success_rollout"]
+  calibration_split: "val"
+  calibration_data_types: ["expert", "success_rollout"]
+  expert_eval_split: "test"
+  expert_eval_data_types: ["expert"]
+  success_eval_split: "test"
+  success_eval_data_types: ["success_rollout"]
+  fail_eval_split: "test"
+  fail_eval_data_types: ["fail_rollout"]
+
+online:
+  adaptive_delta: true
+  delta_min: 2.0
+  delta_max: 40.0
+  warmup_steps: 20
+  update_interval: 5
