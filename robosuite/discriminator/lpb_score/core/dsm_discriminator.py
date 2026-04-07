@@ -67,9 +67,11 @@ class DSMTransitionScorer:
         device: str = "cuda",
         batch_size: int = 256,
         action_horizon: int = -1,
+        policy_weight: float = 0.2,
     ) -> None:
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
+        self.policy_weight = float(policy_weight)
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
             checkpoint_path=checkpoint_path,
             override_action_horizon=action_horizon,
@@ -210,9 +212,10 @@ class DSMTransitionScorer:
                 next_state_hat=out["next_state_hat"],
             )
             state_energy = recon["state_energy_per_sample"].detach().cpu()
-            policy_energy = recon["action_energy_per_sample"].detach().cpu()
+            raw_policy_energy = recon["action_energy_per_sample"].detach().cpu()
+            policy_energy = raw_policy_energy * float(self.policy_weight)
             dynamics_energy = recon["next_state_energy_per_sample"].detach().cpu()
-            step_scores.append(recon["score_per_sample"].detach().cpu())
+            step_scores.append((state_energy + policy_energy + dynamics_energy).detach().cpu())
             state_scores.append(state_energy)
             action_scores.append(policy_energy)
             next_state_scores.append(dynamics_energy)
@@ -250,13 +253,18 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         delta_step: float = 0.5,
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
+        policy_weight: float = 0.2,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
+        self.policy_weight = float(policy_weight)
+        if not (0.0 < self.policy_weight <= 1.0):
+            raise ValueError("policy_weight must be in (0, 1].")
         self.extractor = DSMTransitionScorer(
             checkpoint_path=self.checkpoint_path,
             device=str(feature_device),
             batch_size=int(feature_batch_size),
             action_horizon=int(action_horizon),
+            policy_weight=self.policy_weight,
         )
         self.device = _resolve_device(detector_device)
         self.delta = float(delta)
@@ -449,6 +457,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),
                 "tau_dim": int(self.extractor.model.tau_dim),
+                "policy_weight": float(self.policy_weight),
                 "delta_init": float(self.delta),
                 "delta_final": float(self.delta),
                 "lambda_mode": str(self.lambda_mode),
@@ -568,6 +577,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "task_name": task_name,
                 "threshold_source": "task" if task_threshold is not None else "global",
                 "threshold_init": float(task_threshold if task_threshold is not None else self.threshold),
+                "policy_weight": float(self.policy_weight),
                 "delta_final": float(cur_delta),
                 "threshold_final": float(cur_threshold),
                 "state_error_scores": component_scores["state_error"],

@@ -1,99 +1,200 @@
-# LPB Score DSM Implementation Summary
+# LPB Score Three-Headed DSM
 
-This module now uses a **Three-Headed Conditional Denoising Score Matching (DSM)** detector for offline failure detection on latent transitions.
+This module implements an offline failure detector based on a **Three-Headed Conditional Denoising Score Matching (DSM)** model over latent transitions.
 
-## Overview
+## Goal
 
-Given a transition tuple
+Given a transition
 
 `(z_t, a_{t:t+H-1}, z_{t+H})`
 
-the model does not denoise the whole tuple with one joint head. Instead, it factorizes the conditional reconstruction into three heads:
+the detector estimates how far this transition is from the expert manifold. The latent `z_t` is produced by the frozen flow policy encoder and is not changed by this module.
 
-1. **State head**
-   Input: noisy `z_t`
-   Target: clean `z_t`
+The detector is designed to answer three questions at every step:
 
-2. **Actor head**
-   Input: clean `z_t` and noisy action chunk `a_{t:t+H-1}`
-   Target: clean action chunk `a_{t:t+H-1}`
+1. Is the current latent state itself unusual?
+2. Is the action sequence unusual given the current state?
+3. Is the realized transition unusual given the current state and action?
 
-3. **Dynamics head**
-   Input: clean `z_t`, clean action chunk `a_{t:t+H-1}`, and noisy `z_{t+H}`
-   Target: clean `z_{t+H}`
+## Conditional Factorization
 
-This matches the intended causal factorization:
+Instead of reconstructing the entire transition tuple with a single head, the model uses the causal factorization
 
 `p(z_t, a, z_{t+H}) = p(z_t) p(a | z_t) p(z_{t+H} | z_t, a)`
 
-## Model Implementation
+and matches it with three denoising heads:
 
-File: `core/model.py`
+1. **State Head**
+   Input: noisy normalized `z_t`
+   Target: clean normalized `z_t`
 
-- `ConditionalManifoldDenoiser` contains three separate towers:
-  - `state_tower`
-  - `actor_tower`
-  - `dynamics_tower`
-- `DSMModel.forward(...)` builds clean inputs, optionally adds Gaussian noise, and routes each branch with the correct conditioning:
-  - state branch uses `state_input = z_t + eps_z`
-  - actor branch uses clean `z_t` and `action_input = a + eps_a`
-  - dynamics branch uses clean `z_t`, clean `a`, and `next_state_input = z_{t+H} + eps_next`
-- Noise is scaled by dataset statistics:
-  - latent noise uses `sqrt(latent_var)`
-  - action noise uses `sqrt(action_var)`
+2. **Actor Head**
+   Input: clean normalized `z_t` and noisy normalized action chunk
+   Target: clean normalized action chunk
 
-## Loss and Energy
+3. **Dynamics Head**
+   Input: clean normalized `z_t`, clean normalized action chunk, and noisy normalized `z_{t+H}`
+   Target: normalized residual
 
-Training uses per-head reconstruction error with variance scaling:
+The dynamics head does **not** predict absolute next state anymore. It predicts the residual
 
-- `state_energy = mean((z_hat - z_t)^2 / var_z)`
-- `action_energy = mean((a_hat - a)^2 / var_a)`
-- `next_state_energy = mean((z_next_hat - z_{t+H})^2 / var_z)`
+`delta_z = z_{t+H}^{norm} - z_t^{norm}`
 
-The total DSM score is:
+which preserves local transition geometry and gives sharper dynamics sensitivity.
 
-`u_t = state_energy + action_energy + next_state_energy`
+## Normalization
 
-Dataset variances are computed from expert trajectories and stored in the checkpoint as:
+Before denoising, the latent and action features are standardized using dataset statistics computed from expert trajectories:
 
 - `latent_mean`
 - `latent_var`
 - `action_mean`
 - `action_var`
 
-## Inference and Discriminator
+The corresponding standard deviations are clamped:
+
+`std = clamp(sqrt(var), min=std_clamp_min)`
+
+with default
+
+`std_clamp_min = 0.05`
+
+This prevents near-constant features from exploding during normalization.
+
+## Training Objective
+
+File: `core/model.py`
+
+Training happens in normalized space.
+
+Let
+
+- `z_t_norm` be the normalized current latent
+- `a_norm` be the normalized flattened action chunk
+- `z_next_norm` be the normalized future latent
+- `delta_z_norm = z_next_norm - z_t_norm`
+
+Gaussian noise is injected **after** normalization:
+
+- `z_noisy = z_t_norm + eps_z`
+- `a_noisy = a_norm + eps_a`
+- `z_next_noisy = z_next_norm + eps_next`
+
+with default
+
+`noise_scale = 0.08`
+
+The three heads are trained with per-dimension mean squared error:
+
+- `state_energy = mean((state_hat - z_t_norm)^2)`
+- `policy_energy_raw = mean((action_hat - a_norm)^2)`
+- `dynamics_energy = mean((delta_hat - delta_z_norm)^2)`
+
+The training loss is
+
+`loss = state_energy + policy_energy_raw + dynamics_energy`
+
+Important implementation choices:
+
+- all Dropout layers were removed to avoid mean-collapse
+- the dynamics head predicts residual `delta_z_norm`
+- reduction across feature dimensions uses `mean(dim=-1)`, not `sum(dim=-1)`, so state and action heads are normalized by their own degrees of freedom
+
+## Inference Score
 
 File: `core/dsm_discriminator.py`
 
-- Inference calls `model.forward(..., add_noise=False)`
-- No Gaussian noise is added at test time
-- Each transition produces three energy terms:
-  - `state_energy`
-  - `action_energy` / policy energy
-  - `next_state_energy` / dynamics energy
-- The step anomaly score is their sum:
+At test time, the model runs with
+
+`add_noise = False`
+
+so no Gaussian perturbation is added during scoring.
+
+For each timestep, the model computes:
+
+- `state_energy`
+- `policy_energy_raw`
+- `dynamics_energy`
+
+To reflect the fact that expert action behavior is naturally more stochastic than physical state and dynamics, the policy term is temperature-scaled by a dedicated factor:
+
+`policy_energy = policy_weight * policy_energy_raw`
+
+with default
+
+`policy_weight = 0.2`
+
+The final step score is
 
 `u_t = state_energy + policy_energy + dynamics_energy`
 
-- Temporal smoothing is still handled by the existing `lambda_mode` and `lambda_window_size`
+This keeps degree-of-freedom normalization from `mean(dim=-1)` while softly suppressing false positives caused by natural action jitter.
 
-## Visualization Mapping
+## Temporal Aggregation
+
+The per-step score `u_t` is smoothed into `lambda_t` using the existing temporal aggregation logic:
+
+- `lambda_mode = mean` or `max`
+- `lambda_window_size` controls prefix or rolling aggregation
+
+Thresholds are then calibrated from clean validation trajectories using the configured `delta` percentile rule.
+
+## Visualization Semantics
 
 Files:
 
+- `core/dsm_discriminator.py`
 - `visualize_failures.py`
 - `app/visualize.py`
 
-The visualization pipeline now displays the DSM decomposition with:
+The visualization pipeline uses the already-scaled component energies exported by the discriminator:
 
 - `state_error -> state_energy`
-- `action_error -> policy_energy`
+- `action_error -> scaled policy_energy`
 - `next_state_error -> dynamics_energy`
 
-These values are passed through metadata and rendered in plots / videos using the `st`, `pi`, and `dy` labels.
+This means the contribution shares and stacked area plots are consistent with the actual detection score:
 
-## Notes
+`u_t = state_energy + scaled_policy_energy + dynamics_energy`
 
-- The frozen policy / visual encoder remains unchanged
-- KNN-based metrics are no longer used in the DSM detector path
-- Attribution is now based on reconstruction energy decomposition rather than heuristic metric weights
+The policy attribution shown in plots is therefore intentionally temperature-reduced rather than raw.
+
+## Main Hyperparameters
+
+Relevant tuning knobs:
+
+- `std_clamp_min`
+  Lower bound for normalization standard deviation
+  Default: `0.05`
+
+- `noise_scale`
+  Gaussian noise scale used during training after normalization
+  Default: `0.08`
+
+- `policy_weight`
+  Temperature on the policy head during inference and visualization
+  Default: `0.2`
+
+- `lambda_mode`
+  Temporal aggregation mode for `u_t`
+
+- `lambda_window_size`
+  Window size for rolling aggregation
+
+- `delta`
+  Quantile parameter for threshold calibration
+
+## Practical Interpretation
+
+- `state_energy` rises when the visual / latent state itself becomes unfamiliar
+- `policy_energy` rises when the chosen action is atypical for the current latent context
+- `dynamics_energy` rises when the realized transition violates learned physical transition structure
+
+For failures like object drops or severe scene deviations, the most informative terms are usually `state_energy` and `dynamics_energy`, while `policy_energy` is treated as a softer behavioral prior.
+
+## Implementation Notes
+
+- the frozen flow policy encoder is unchanged
+- KNN-based LPB metrics are no longer used in the DSM path
+- policy checkpoints and DSM checkpoints are now validated separately in the helper scripts
+- visualization, evaluation, and analysis all consume the same scaled inference energies

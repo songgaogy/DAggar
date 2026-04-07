@@ -66,6 +66,7 @@ def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
         delta_step=float(cfg.detector.delta_step),
         lambda_mode=str(cfg.detector.lambda_mode),
         lambda_window_size=int(cfg.detector.lambda_window_size),
+        policy_weight=float(getattr(cfg.detector, "policy_weight", 0.2)),
     )
 
 
