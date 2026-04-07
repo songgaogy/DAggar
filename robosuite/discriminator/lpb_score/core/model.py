@@ -63,12 +63,13 @@ class MLPHead(nn.Module):
         return self.net(x)
 
 
-class JointManifoldDenoiser(nn.Module):
-    """MLP denoiser on the joint transition manifold."""
+class ConditionalDenoisingTower(nn.Module):
+    """One conditional denoising tower."""
 
     def __init__(
         self,
-        tau_dim: int,
+        input_dim: int,
+        output_dim: int,
         backbone_dim: int = 1024,
         backbone_num_blocks: int = 4,
         head_hidden_dim: int = 1024,
@@ -76,9 +77,10 @@ class JointManifoldDenoiser(nn.Module):
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
-        self.tau_dim = int(tau_dim)
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
         self.input_proj = nn.Sequential(
-            nn.Linear(self.tau_dim, backbone_dim),
+            nn.Linear(self.input_dim, backbone_dim),
             nn.LayerNorm(backbone_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -98,25 +100,81 @@ class JointManifoldDenoiser(nn.Module):
         self.head = MLPHead(
             input_dim=backbone_dim,
             hidden_dim=head_hidden_dim,
-            output_dim=self.tau_dim,
+            output_dim=self.output_dim,
             num_blocks=int(head_num_blocks),
             dropout=dropout,
         )
 
-    def forward(self, tau_noisy: torch.Tensor) -> torch.Tensor:
-        h = self.input_proj(tau_noisy)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input_proj(x)
         for block in self.backbone:
             h = block(h)
         h = self.backbone_norm(h)
         return self.head(h)
 
 
-class DSMModel(nn.Module):
-    """Build and denoise the joint vector [z_t, a_{t:t+H-1}, z_{t+H}]."""
+class ConditionalManifoldDenoiser(nn.Module):
+    """Condition on z_t and denoise action and next state with separate heads."""
 
     def __init__(
         self,
-        predictor: JointManifoldDenoiser,
+        latent_dim: int,
+        action_flat_dim: int,
+        backbone_dim: int = 1024,
+        backbone_num_blocks: int = 4,
+        head_hidden_dim: int = 1024,
+        head_num_blocks: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.latent_dim = int(latent_dim)
+        self.action_flat_dim = int(action_flat_dim)
+        self.actor_tower = ConditionalDenoisingTower(
+            input_dim=int(self.latent_dim + self.action_flat_dim),
+            output_dim=self.action_flat_dim,
+            backbone_dim=backbone_dim,
+            backbone_num_blocks=backbone_num_blocks,
+            head_hidden_dim=head_hidden_dim,
+            head_num_blocks=head_num_blocks,
+            dropout=dropout,
+        )
+        self.dynamics_tower = ConditionalDenoisingTower(
+            input_dim=int(2 * self.latent_dim + self.action_flat_dim),
+            output_dim=self.latent_dim,
+            backbone_dim=backbone_dim,
+            backbone_num_blocks=backbone_num_blocks,
+            head_hidden_dim=head_hidden_dim,
+            head_num_blocks=head_num_blocks,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        *,
+        current_latent: torch.Tensor,
+        action_input: torch.Tensor,
+        action_clean: torch.Tensor,
+        next_state_input: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        actor_input = torch.cat([current_latent, action_input], dim=-1)
+        action_hat = self.actor_tower(actor_input)
+        dynamics_input = torch.cat([current_latent, action_clean, next_state_input], dim=-1)
+        next_state_hat = self.dynamics_tower(dynamics_input)
+        return {
+            "action_hat": action_hat,
+            "next_state_hat": next_state_hat,
+        }
+
+
+JointManifoldDenoiser = ConditionalManifoldDenoiser
+
+
+class DSMModel(nn.Module):
+    """Condition on z_t and denoise action and next state."""
+
+    def __init__(
+        self,
+        predictor: ConditionalManifoldDenoiser,
         latent_dim: int,
         action_dim: int,
         transition_horizon: int,
@@ -140,9 +198,14 @@ class DSMModel(nn.Module):
         self.register_buffer("action_mean", torch.zeros(self.action_dim, dtype=torch.float32))
         self.register_buffer("action_var", torch.ones(self.action_dim, dtype=torch.float32))
 
-        if int(self.predictor.tau_dim) != self.tau_dim:
+        if int(self.predictor.latent_dim) != self.latent_dim:
             raise ValueError(
-                f"predictor tau_dim mismatch: expected {self.tau_dim}, got {self.predictor.tau_dim}"
+                f"predictor latent_dim mismatch: expected {self.latent_dim}, got {self.predictor.latent_dim}"
+            )
+        if int(self.predictor.action_flat_dim) != self.action_flat_dim:
+            raise ValueError(
+                "predictor action_flat_dim mismatch: "
+                f"expected {self.action_flat_dim}, got {self.predictor.action_flat_dim}"
             )
 
     def set_normalization_stats(
@@ -183,6 +246,20 @@ class DSMModel(nn.Module):
         action_std = torch.sqrt(self.action_var_flat)
         return torch.cat([latent_std, action_std, latent_std], dim=0)
 
+    def flatten_action_sequence(self, action_sequence: torch.Tensor) -> torch.Tensor:
+        if action_sequence.ndim != 3:
+            raise ValueError(f"Expected action_sequence shape (B,H,A), got {tuple(action_sequence.shape)}")
+        if int(action_sequence.shape[1]) != self.transition_horizon:
+            raise ValueError(
+                "action_sequence horizon mismatch: "
+                f"expected {self.transition_horizon}, got {action_sequence.shape[1]}"
+            )
+        if int(action_sequence.shape[2]) != self.action_dim:
+            raise ValueError(
+                f"action_sequence dim mismatch: expected {self.action_dim}, got {action_sequence.shape[2]}"
+            )
+        return action_sequence.reshape(action_sequence.shape[0], self.action_flat_dim)
+
     def build_tau(
         self,
         current_latent: torch.Tensor,
@@ -215,7 +292,7 @@ class DSMModel(nn.Module):
         return torch.cat(
             [
                 current_latent,
-                action_sequence.reshape(action_sequence.shape[0], -1),
+                self.flatten_action_sequence(action_sequence),
                 target_latent,
             ],
             dim=-1,
@@ -230,39 +307,50 @@ class DSMModel(nn.Module):
             "next_state": tau[:, self.next_state_slice],
         }
 
-    def add_noise(self, tau: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def add_noise(
+        self,
+        *,
+        action_clean: torch.Tensor,
+        next_state_clean: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         if self.noise_sigma <= 0.0:
-            eps = torch.zeros_like(tau)
-            return tau, eps
-        noise_scale = self.tau_noise_scale.to(device=tau.device, dtype=tau.dtype).unsqueeze(0)
-        eps = torch.randn_like(tau) * noise_scale * float(self.noise_sigma)
-        return tau + eps, eps
-
-    def denoise_tau(self, tau: torch.Tensor, *, add_noise: bool) -> dict[str, torch.Tensor]:
-        tau_in = tau
-        eps = torch.zeros_like(tau)
-        if add_noise:
-            tau_in, eps = self.add_noise(tau)
-        tau_hat = self.predictor(tau_in)
+            return {
+                "action_input": action_clean,
+                "action_noise": torch.zeros_like(action_clean),
+                "next_state_input": next_state_clean,
+                "next_state_noise": torch.zeros_like(next_state_clean),
+            }
+        action_std = torch.sqrt(self.action_var_flat).to(device=action_clean.device, dtype=action_clean.dtype)
+        next_state_std = torch.sqrt(self.latent_var).to(device=next_state_clean.device, dtype=next_state_clean.dtype)
+        action_noise = torch.randn_like(action_clean) * action_std.unsqueeze(0) * float(self.noise_sigma)
+        next_state_noise = torch.randn_like(next_state_clean) * next_state_std.unsqueeze(0) * float(self.noise_sigma)
         return {
-            "tau": tau,
-            "tau_input": tau_in,
-            "tau_hat": tau_hat,
-            "noise": eps,
+            "action_input": action_clean + action_noise,
+            "action_noise": action_noise,
+            "next_state_input": next_state_clean + next_state_noise,
+            "next_state_noise": next_state_noise,
         }
 
     def reconstruction_components(
         self,
-        tau: torch.Tensor,
-        tau_hat: torch.Tensor,
+        *,
+        action_clean: torch.Tensor,
+        action_hat: torch.Tensor,
+        next_state_clean: torch.Tensor,
+        next_state_hat: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        error_sq = (tau_hat - tau).pow(2)
-        state_sq = error_sq[:, self.state_slice]
-        action_sq = error_sq[:, self.action_slice]
-        next_state_sq = error_sq[:, self.next_state_slice]
-        latent_var = self.latent_var.to(device=tau.device, dtype=tau.dtype)
-        action_var_flat = self.action_var_flat.to(device=tau.device, dtype=tau.dtype)
-        state_energy = (state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
+        batch_size = int(action_clean.shape[0])
+        action_sq = (action_hat - action_clean).pow(2)
+        next_state_sq = (next_state_hat - next_state_clean).pow(2)
+        state_sq = torch.zeros(
+            (batch_size, self.latent_dim),
+            dtype=action_clean.dtype,
+            device=action_clean.device,
+        )
+        error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
+        latent_var = self.latent_var.to(device=next_state_clean.device, dtype=next_state_clean.dtype)
+        action_var_flat = self.action_var_flat.to(device=action_clean.device, dtype=action_clean.dtype)
+        state_energy = torch.zeros((batch_size,), dtype=action_clean.dtype, device=action_clean.device)
         action_energy = (action_sq / action_var_flat.unsqueeze(0)).mean(dim=-1)
         next_state_energy = (next_state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
         return {
@@ -289,12 +377,36 @@ class DSMModel(nn.Module):
         *,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
-        tau = self.build_tau(
+        action_clean = self.flatten_action_sequence(action_sequence)
+        next_state_clean = target_latent
+        noisy = {
+            "action_input": action_clean,
+            "action_noise": torch.zeros_like(action_clean),
+            "next_state_input": next_state_clean,
+            "next_state_noise": torch.zeros_like(next_state_clean),
+        }
+        if add_noise:
+            noisy = self.add_noise(
+                action_clean=action_clean,
+                next_state_clean=next_state_clean,
+            )
+        preds = self.predictor(
             current_latent=current_latent,
-            action_sequence=action_sequence,
-            target_latent=target_latent,
+            action_input=noisy["action_input"],
+            action_clean=action_clean,
+            next_state_input=noisy["next_state_input"],
         )
-        return self.denoise_tau(tau=tau, add_noise=add_noise)
+        return {
+            "current_latent": current_latent,
+            "action_clean": action_clean,
+            "action_input": noisy["action_input"],
+            "action_hat": preds["action_hat"],
+            "action_noise": noisy["action_noise"],
+            "next_state_clean": next_state_clean,
+            "next_state_input": noisy["next_state_input"],
+            "next_state_hat": preds["next_state_hat"],
+            "next_state_noise": noisy["next_state_noise"],
+        }
 
     def compute_dsm_loss(
         self,
@@ -308,7 +420,12 @@ class DSMModel(nn.Module):
             target_latent=target_latent,
             add_noise=True,
         )
-        recon = self.reconstruction_components(tau=out["tau"], tau_hat=out["tau_hat"])
+        recon = self.reconstruction_components(
+            action_clean=out["action_clean"],
+            action_hat=out["action_hat"],
+            next_state_clean=out["next_state_clean"],
+            next_state_hat=out["next_state_hat"],
+        )
         loss = recon["score_per_sample"].mean()
         return {
             "loss": loss,
@@ -320,24 +437,41 @@ class DSMModel(nn.Module):
             "state_energy": recon["state_energy_per_sample"].mean(),
             "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
-            "tau": out["tau"],
-            "tau_input": out["tau_input"],
-            "tau_hat": out["tau_hat"],
+            "current_latent": out["current_latent"],
+            "action_clean": out["action_clean"],
+            "action_input": out["action_input"],
+            "action_hat": out["action_hat"],
+            "next_state_clean": out["next_state_clean"],
+            "next_state_input": out["next_state_input"],
+            "next_state_hat": out["next_state_hat"],
         }
+
+
+def build_conditional_manifold_denoiser(
+    *,
+    latent_dim: int,
+    action_flat_dim: int,
+    cfg_model: Any,
+) -> ConditionalManifoldDenoiser:
+    return ConditionalManifoldDenoiser(
+        latent_dim=int(latent_dim),
+        action_flat_dim=int(action_flat_dim),
+        backbone_dim=int(_cfg_get(cfg_model, "backbone_dim", 1024)),
+        backbone_num_blocks=int(_cfg_get(cfg_model, "backbone_num_blocks", 4)),
+        head_hidden_dim=int(_cfg_get(cfg_model, "head_hidden_dim", 1024)),
+        head_num_blocks=int(_cfg_get(cfg_model, "head_num_blocks", 2)),
+        dropout=float(_cfg_get(cfg_model, "dropout", 0.1)),
+    )
 
 
 def build_joint_manifold_denoiser(
     *,
     tau_dim: int,
     cfg_model: Any,
-) -> JointManifoldDenoiser:
-    return JointManifoldDenoiser(
-        tau_dim=int(tau_dim),
-        backbone_dim=int(_cfg_get(cfg_model, "backbone_dim", 1024)),
-        backbone_num_blocks=int(_cfg_get(cfg_model, "backbone_num_blocks", 4)),
-        head_hidden_dim=int(_cfg_get(cfg_model, "head_hidden_dim", 1024)),
-        head_num_blocks=int(_cfg_get(cfg_model, "head_num_blocks", 2)),
-        dropout=float(_cfg_get(cfg_model, "dropout", 0.1)),
+) -> ConditionalManifoldDenoiser:
+    raise ValueError(
+        "build_joint_manifold_denoiser requires the old joint interface. "
+        "Use build_conditional_manifold_denoiser with latent_dim and action_flat_dim."
     )
 
 
@@ -348,9 +482,10 @@ def build_dsm_model(
     cfg_model: Any,
     transition_horizon: int,
 ) -> DSMModel:
-    tau_dim = int(2 * latent_dim + action_dim * transition_horizon)
-    predictor = build_joint_manifold_denoiser(
-        tau_dim=tau_dim,
+    action_flat_dim = int(action_dim * transition_horizon)
+    predictor = build_conditional_manifold_denoiser(
+        latent_dim=int(latent_dim),
+        action_flat_dim=action_flat_dim,
         cfg_model=cfg_model,
     )
     return DSMModel(

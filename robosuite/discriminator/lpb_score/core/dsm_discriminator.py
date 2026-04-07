@@ -114,9 +114,17 @@ class DSMTransitionScorer:
         missing = set(load_result.missing_keys)
         unexpected = set(load_result.unexpected_keys)
         if unexpected:
-            raise RuntimeError(f"Unexpected checkpoint keys: {sorted(unexpected)}")
+            raise RuntimeError(
+                "Checkpoint architecture mismatch. "
+                "Please retrain the two-headed conditional DSM checkpoint. "
+                f"Unexpected keys: {sorted(unexpected)}"
+            )
         if missing and not missing.issubset(allowed_missing):
-            raise RuntimeError(f"Missing checkpoint keys: {sorted(missing)}")
+            raise RuntimeError(
+                "Checkpoint architecture mismatch. "
+                "Please retrain the two-headed conditional DSM checkpoint. "
+                f"Missing keys: {sorted(missing)}"
+            )
         model.to(self.device)
         model.eval()
         return model, action_horizon, action_dim, latent_dim
@@ -170,11 +178,6 @@ class DSMTransitionScorer:
         current_t = latents_t[:valid_len]
         action_chunk_t = action_t[:valid_len]
         target_t = latents_t[horizon : horizon + valid_len]
-        tau = self.model.build_tau(
-            current_latent=current_t,
-            action_sequence=action_chunk_t,
-            target_latent=target_t,
-        )
 
         step_scores: list[torch.Tensor] = []
         state_scores: list[torch.Tensor] = []
@@ -186,9 +189,21 @@ class DSMTransitionScorer:
 
         for start in range(0, valid_len, self.batch_size):
             end = min(start + self.batch_size, valid_len)
-            tau_b = tau[start:end].to(self.device)
-            out = self.model.denoise_tau(tau=tau_b, add_noise=False)
-            recon = self.model.reconstruction_components(tau=out["tau"], tau_hat=out["tau_hat"])
+            current_b = current_t[start:end].to(self.device)
+            action_b = action_chunk_t[start:end].to(self.device)
+            target_b = target_t[start:end].to(self.device)
+            out = self.model.forward(
+                current_latent=current_b,
+                action_sequence=action_b,
+                target_latent=target_b,
+                add_noise=False,
+            )
+            recon = self.model.reconstruction_components(
+                action_clean=out["action_clean"],
+                action_hat=out["action_hat"],
+                next_state_clean=out["next_state_clean"],
+                next_state_hat=out["next_state_hat"],
+            )
             step_scores.append(recon["score_per_sample"].detach().cpu())
             state_scores.append(recon["state_energy_per_sample"].detach().cpu())
             action_scores.append(recon["action_energy_per_sample"].detach().cpu())
@@ -548,6 +563,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_error_scores": component_scores["state_error"],
                 "action_error_scores": component_scores["action_error"],
                 "next_state_error_scores": component_scores["next_state_error"],
+                "policy_energy_scores": component_scores["action_error"],
+                "dynamics_energy_scores": component_scores["next_state_error"],
                 "weighted_step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in component_contrib.items()
@@ -572,6 +589,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_error_mean": float(np.mean(component_scores["state_error"])),
                 "action_error_mean": float(np.mean(component_scores["action_error"])),
                 "next_state_error_mean": float(np.mean(component_scores["next_state_error"])),
+                "policy_energy_mean": float(np.mean(component_scores["action_error"])),
+                "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
             },
         )
 

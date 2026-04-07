@@ -707,8 +707,8 @@ def run_visualize(cfg: DictConfig) -> None:
                             " ".join(
                                 [
                                     f"st={float(frame_component_scores['state_error_scores'][frame_id]):.3f}",
-                                    f"ac={float(frame_component_scores['action_error_scores'][frame_id]):.3f}",
-                                    f"ns={float(frame_component_scores['next_state_error_scores'][frame_id]):.3f}",
+                                    f"pi={float(frame_component_scores['action_error_scores'][frame_id]):.3f}",
+                                    f"dy={float(frame_component_scores['next_state_error_scores'][frame_id]):.3f}",
                                 ]
                             )
                         )

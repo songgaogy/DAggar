@@ -16,14 +16,14 @@ TERM_ORDER: tuple[str, ...] = (
 
 TERM_LABELS: dict[str, str] = {
     "state_error": "State Error",
-    "action_error": "Action Error",
-    "next_state_error": "Next-State Error",
+    "action_error": "Policy Energy",
+    "next_state_error": "Dynamics Energy",
 }
 
 TERM_SHORT_LABELS: dict[str, str] = {
     "state_error": "ST",
-    "action_error": "AC",
-    "next_state_error": "NS",
+    "action_error": "PI",
+    "next_state_error": "DY",
 }
 
 TERM_COLORS: dict[str, str] = {

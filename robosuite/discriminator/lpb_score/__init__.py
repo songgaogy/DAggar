@@ -22,6 +22,7 @@ from .app import (
     select_split_refs,
 )
 from .core import (
+    ConditionalManifoldDenoiser,
     DATA_TYPE_ORDER,
     DSMDiscriminator,
     DSMModel,
@@ -35,6 +36,7 @@ from .core import (
     Trainer,
     TrainerConfig,
     TrajectoryScoreBundle,
+    build_conditional_manifold_denoiser,
     build_cached_splits,
     build_dsm_model,
     build_joint_manifold_denoiser,
@@ -53,6 +55,7 @@ __all__ = [
     "map_term_values_to_frames",
     "summarize_trajectory_term_attribution",
     "summarize_result_set_term_attribution",
+    "ConditionalManifoldDenoiser",
     "DATA_TYPE_ORDER",
     "SplitCounts",
     "TaskDataSpec",
@@ -66,6 +69,7 @@ __all__ = [
     "prepare_cached_trajectories",
     "JointManifoldDenoiser",
     "DSMModel",
+    "build_conditional_manifold_denoiser",
     "build_joint_manifold_denoiser",
     "build_dsm_model",
     "TrainerConfig",
