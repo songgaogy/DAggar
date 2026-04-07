@@ -11,7 +11,10 @@ DSM_CKPT="checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_172214/lpb_sc
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_new_cache}"
 NUM_VIDEOS=8
+
 BANK_SIZE=100
+WINDOW_SIZE=6
+
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-96}"
 FPS="${FPS:-20}"
@@ -56,4 +59,5 @@ echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEE
   visualization.camera_name="${CAMERA_NAME}" \
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
+  detector.lambda_window_size=$WINDOW_SIZE \
   "$@"
