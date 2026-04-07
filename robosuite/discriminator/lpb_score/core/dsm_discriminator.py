@@ -116,13 +116,16 @@ class DSMTransitionScorer:
         if unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                "Please retrain the two-headed conditional DSM checkpoint. "
+                f"Expected a three-headed DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"{checkpoint_path}. "
+                "This often happens when model.dsm_ckpt points to a legacy lpb_new world-model checkpoint. "
                 f"Unexpected keys: {sorted(unexpected)}"
             )
         if missing and not missing.issubset(allowed_missing):
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                "Please retrain the two-headed conditional DSM checkpoint. "
+                f"Expected a three-headed DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"{checkpoint_path}. "
                 f"Missing keys: {sorted(missing)}"
             )
         model.to(self.device)
@@ -206,13 +209,16 @@ class DSMTransitionScorer:
                 next_state_clean=out["next_state_clean"],
                 next_state_hat=out["next_state_hat"],
             )
+            state_energy = recon["state_energy_per_sample"].detach().cpu()
+            policy_energy = recon["action_energy_per_sample"].detach().cpu()
+            dynamics_energy = recon["next_state_energy_per_sample"].detach().cpu()
             step_scores.append(recon["score_per_sample"].detach().cpu())
-            state_scores.append(recon["state_energy_per_sample"].detach().cpu())
-            action_scores.append(recon["action_energy_per_sample"].detach().cpu())
-            next_state_scores.append(recon["next_state_energy_per_sample"].detach().cpu())
-            state_contrib.append(recon["state_energy_per_sample"].detach().cpu())
-            action_contrib.append(recon["action_energy_per_sample"].detach().cpu())
-            next_state_contrib.append(recon["next_state_energy_per_sample"].detach().cpu())
+            state_scores.append(state_energy)
+            action_scores.append(policy_energy)
+            next_state_scores.append(dynamics_energy)
+            state_contrib.append(state_energy)
+            action_contrib.append(policy_energy)
+            next_state_contrib.append(dynamics_energy)
 
         return TrajectoryScoreBundle(
             step_scores=torch.cat(step_scores, dim=0).numpy().astype(np.float32),
@@ -565,6 +571,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_error_scores": component_scores["state_error"],
                 "action_error_scores": component_scores["action_error"],
                 "next_state_error_scores": component_scores["next_state_error"],
+                "state_energy_scores": component_scores["state_error"],
                 "policy_energy_scores": component_scores["action_error"],
                 "dynamics_energy_scores": component_scores["next_state_error"],
                 "weighted_step_contributions": {
@@ -591,6 +598,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_error_mean": float(np.mean(component_scores["state_error"])),
                 "action_error_mean": float(np.mean(component_scores["action_error"])),
                 "next_state_error_mean": float(np.mean(component_scores["next_state_error"])),
+                "state_energy_mean": float(np.mean(component_scores["state_error"])),
                 "policy_energy_mean": float(np.mean(component_scores["action_error"])),
                 "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
             },

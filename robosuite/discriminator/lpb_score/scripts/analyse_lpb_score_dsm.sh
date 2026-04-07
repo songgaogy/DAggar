@@ -7,8 +7,19 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED="${SEED:-42}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260407_220112/lpb_score_dsm_20260407_220112_ep0030.pt"
+DSM_CKPT="${DSM_CKPT:-}"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/analyse}"
+
+if [[ -z "${DSM_CKPT}" ]]; then
+  mapfile -t DSM_CKPT_CANDIDATES < <(
+    find "${ROOT}/checkpoints/multitask_6/lpb_score" -type f -name 'lpb_score_dsm_*.pt' ! -name '*_ep*.pt' | sort
+  )
+  if [[ "${#DSM_CKPT_CANDIDATES[@]}" -gt 0 ]]; then
+    DSM_CKPT="${DSM_CKPT_CANDIDATES[-1]}"
+  else
+    DSM_CKPT="${ROOT}/checkpoints/multitask_6/lpb_score/lpb_score_dsm.pt"
+  fi
+fi
 
 if [[ ! -f "${CKPT}" ]]; then
   echo "[analyse_lpb_score_dsm] Missing policy checkpoint: ${CKPT}" >&2
@@ -17,6 +28,7 @@ fi
 
 if [[ ! -f "${DSM_CKPT}" ]]; then
   echo "[analyse_lpb_score_dsm] Missing DSM checkpoint: ${DSM_CKPT}" >&2
+  echo "[analyse_lpb_score_dsm] Set DSM_CKPT=/abs/path/to/lpb_score_dsm_*.pt if you want a specific run." >&2
   exit 1
 fi
 

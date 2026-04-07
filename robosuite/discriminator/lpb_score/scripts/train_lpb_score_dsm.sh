@@ -21,7 +21,7 @@ LR="${LR:-2e-4}"
 IMAGE_SIZE=128
 HORIZON=2   # I'm not sure?
 ENCODER_BATCH_SIZE=128
-NOISE_SIGMA="${NOISE_SIGMA:-0.1}"
+NOISE_SIGMA="${NOISE_SIGMA:-0.05}"
 
 if [[ ! -f "${CKPT}" ]]; then
   echo "[train_lpb_score_dsm] Missing policy checkpoint: ${CKPT}" >&2

@@ -22,15 +22,12 @@ class ResidualMLPBlock(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.fc_1 = nn.Linear(dim, 2 * self.hidden_dim)
         self.fc_2 = nn.Linear(self.hidden_dim, dim)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         gate, value = self.fc_1(h).chunk(2, dim=-1)
         h = F.silu(gate) * value
-        h = self.dropout(h)
         h = self.fc_2(h)
-        h = self.dropout(h)
         return x + h
 
 
@@ -52,7 +49,6 @@ class MLPHead(nn.Module):
                 [
                     nn.Linear(in_dim, hidden_dim),
                     nn.GELU(),
-                    nn.Dropout(dropout),
                 ]
             )
             in_dim = int(hidden_dim)
@@ -83,7 +79,6 @@ class ConditionalDenoisingTower(nn.Module):
             nn.Linear(self.input_dim, backbone_dim),
             nn.LayerNorm(backbone_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
         )
         block_hidden_dim = int(2 * head_hidden_dim)
         self.backbone = nn.ModuleList(
@@ -253,10 +248,30 @@ class DSMModel(nn.Module):
         return self.action_var.repeat(self.transition_horizon)
 
     @property
+    def action_mean_flat(self) -> torch.Tensor:
+        return self.action_mean.repeat(self.transition_horizon)
+
+    @property
+    def latent_std(self) -> torch.Tensor:
+        return torch.sqrt(self.latent_var)
+
+    @property
+    def action_std_flat(self) -> torch.Tensor:
+        return torch.sqrt(self.action_var_flat)
+
+    @property
     def tau_noise_scale(self) -> torch.Tensor:
-        latent_std = torch.sqrt(self.latent_var)
-        action_std = torch.sqrt(self.action_var_flat)
-        return torch.cat([latent_std, action_std, latent_std], dim=0)
+        return torch.ones(self.tau_dim, dtype=self.latent_var.dtype, device=self.latent_var.device)
+
+    def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        latent_mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype)
+        latent_std = self.latent_std.to(device=latent.device, dtype=latent.dtype)
+        return (latent - latent_mean.unsqueeze(0)) / latent_std.unsqueeze(0)
+
+    def normalize_action_flat(self, action_flat: torch.Tensor) -> torch.Tensor:
+        action_mean = self.action_mean_flat.to(device=action_flat.device, dtype=action_flat.dtype)
+        action_std = self.action_std_flat.to(device=action_flat.device, dtype=action_flat.dtype)
+        return (action_flat - action_mean.unsqueeze(0)) / action_std.unsqueeze(0)
 
     def flatten_action_sequence(self, action_sequence: torch.Tensor) -> torch.Tensor:
         if action_sequence.ndim != 3:
@@ -326,21 +341,10 @@ class DSMModel(nn.Module):
         action_clean: torch.Tensor,
         next_state_clean: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        if self.noise_sigma <= 0.0:
-            return {
-                "state_input": state_clean,
-                "state_noise": torch.zeros_like(state_clean),
-                "action_input": action_clean,
-                "action_noise": torch.zeros_like(action_clean),
-                "next_state_input": next_state_clean,
-                "next_state_noise": torch.zeros_like(next_state_clean),
-            }
-        state_std = torch.sqrt(self.latent_var).to(device=state_clean.device, dtype=state_clean.dtype)
-        action_std = torch.sqrt(self.action_var_flat).to(device=action_clean.device, dtype=action_clean.dtype)
-        next_state_std = torch.sqrt(self.latent_var).to(device=next_state_clean.device, dtype=next_state_clean.dtype)
-        state_noise = torch.randn_like(state_clean) * state_std.unsqueeze(0) * float(self.noise_sigma)
-        action_noise = torch.randn_like(action_clean) * action_std.unsqueeze(0) * float(self.noise_sigma)
-        next_state_noise = torch.randn_like(next_state_clean) * next_state_std.unsqueeze(0) * float(self.noise_sigma)
+        sigma = max(float(self.noise_sigma), 0.05)
+        state_noise = torch.randn_like(state_clean) * sigma
+        action_noise = torch.randn_like(action_clean) * sigma
+        next_state_noise = torch.randn_like(next_state_clean) * sigma
         return {
             "state_input": state_clean + state_noise,
             "state_noise": state_noise,
@@ -364,11 +368,9 @@ class DSMModel(nn.Module):
         action_sq = (action_hat - action_clean).pow(2)
         next_state_sq = (next_state_hat - next_state_clean).pow(2)
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
-        latent_var = self.latent_var.to(device=state_clean.device, dtype=state_clean.dtype)
-        action_var_flat = self.action_var_flat.to(device=action_clean.device, dtype=action_clean.dtype)
-        state_energy = (state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
-        action_energy = (action_sq / action_var_flat.unsqueeze(0)).mean(dim=-1)
-        next_state_energy = (next_state_sq / latent_var.unsqueeze(0)).mean(dim=-1)
+        state_energy = state_sq.sum(dim=-1)
+        action_energy = action_sq.sum(dim=-1)
+        next_state_energy = next_state_sq.sum(dim=-1)
         return {
             "error_sq": error_sq,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
@@ -393,26 +395,30 @@ class DSMModel(nn.Module):
         *,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
-        state_clean = current_latent
-        action_clean = self.flatten_action_sequence(action_sequence)
-        next_state_clean = target_latent
+        state_clean_raw = current_latent
+        action_clean_raw = self.flatten_action_sequence(action_sequence)
+        next_state_clean_raw = target_latent
+        state_clean = self.normalize_latent(state_clean_raw)
+        action_clean = self.normalize_action_flat(action_clean_raw)
+        next_state_norm_clean = self.normalize_latent(next_state_clean_raw)
+        delta_clean = next_state_norm_clean - state_clean
         noisy = {
             "state_input": state_clean,
             "state_noise": torch.zeros_like(state_clean),
             "action_input": action_clean,
             "action_noise": torch.zeros_like(action_clean),
-            "next_state_input": next_state_clean,
-            "next_state_noise": torch.zeros_like(next_state_clean),
+            "next_state_input": next_state_norm_clean,
+            "next_state_noise": torch.zeros_like(next_state_norm_clean),
         }
         if add_noise:
             noisy = self.add_noise(
                 state_clean=state_clean,
                 action_clean=action_clean,
-                next_state_clean=next_state_clean,
+                next_state_clean=next_state_norm_clean,
             )
         preds = self.predictor(
             state_input=noisy["state_input"],
-            current_latent=current_latent,
+            current_latent=state_clean,
             action_input=noisy["action_input"],
             action_clean=action_clean,
             next_state_input=noisy["next_state_input"],
@@ -427,10 +433,13 @@ class DSMModel(nn.Module):
             "action_input": noisy["action_input"],
             "action_hat": preds["action_hat"],
             "action_noise": noisy["action_noise"],
-            "next_state_clean": next_state_clean,
+            "next_state_clean": delta_clean,
+            "next_state_norm_clean": next_state_norm_clean,
             "next_state_input": noisy["next_state_input"],
             "next_state_hat": preds["next_state_hat"],
             "next_state_noise": noisy["next_state_noise"],
+            "delta_clean": delta_clean,
+            "delta_hat": preds["next_state_hat"],
         }
 
     def compute_dsm_loss(
@@ -523,5 +532,5 @@ def build_dsm_model(
         latent_dim=int(latent_dim),
         action_dim=int(action_dim),
         transition_horizon=int(transition_horizon),
-        noise_sigma=float(_cfg_get(cfg_model, "noise_sigma", 0.1)),
+        noise_sigma=float(_cfg_get(cfg_model, "noise_sigma", 0.05)),
     )
