@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED="${SEED:-42}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="${DSM_CKPT:-${ROOT}/checkpoints/multitask_6/lpb_score/lpb_score_dsm.pt}"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_score/analyse/lpb_score_dsm_threshold_20260408_230818.json"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/eval}"
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-96}"

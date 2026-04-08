@@ -16,9 +16,11 @@ from .model import (
     ConditionalManifoldDenoiser,
     DSMModel,
     JointManifoldDenoiser,
+    UnifiedConditionedDSM,
     build_conditional_manifold_denoiser,
     build_dsm_model,
     build_joint_manifold_denoiser,
+    build_unified_conditioned_dsm,
 )
 from .trainer import Trainer, TrainerConfig
 
@@ -36,9 +38,11 @@ __all__ = [
     "prepare_cached_trajectories",
     "ConditionalManifoldDenoiser",
     "JointManifoldDenoiser",
+    "UnifiedConditionedDSM",
     "DSMModel",
     "build_conditional_manifold_denoiser",
     "build_joint_manifold_denoiser",
+    "build_unified_conditioned_dsm",
     "build_dsm_model",
     "TrainerConfig",
     "Trainer",

@@ -59,7 +59,7 @@ class TrajectoryScoreBundle:
 
 
 class DSMTransitionScorer:
-    """Score trajectories with a trained DSM denoiser."""
+    """Score trajectories with a trained unified DSM denoiser."""
 
     def __init__(
         self,
@@ -67,11 +67,9 @@ class DSMTransitionScorer:
         device: str = "cuda",
         batch_size: int = 256,
         action_horizon: int = -1,
-        policy_weight: float = 0.2,
     ) -> None:
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
-        self.policy_weight = float(policy_weight)
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
             checkpoint_path=checkpoint_path,
             override_action_horizon=action_horizon,
@@ -118,15 +116,15 @@ class DSMTransitionScorer:
         if unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a three-headed DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"Expected a unified task-conditioned DSM checkpoint from lpb_score, but got incompatible weights from "
                 f"{checkpoint_path}. "
-                "This often happens when model.dsm_ckpt points to a legacy lpb_new world-model checkpoint. "
+                "This often happens when model.dsm_ckpt points to an old three-head DSM checkpoint or a non-lpb_score checkpoint. "
                 f"Unexpected keys: {sorted(unexpected)}"
             )
         if missing and not missing.issubset(allowed_missing):
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a three-headed DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"Expected a unified task-conditioned DSM checkpoint from lpb_score, but got incompatible weights from "
                 f"{checkpoint_path}. "
                 f"Missing keys: {sorted(missing)}"
             )
@@ -161,6 +159,7 @@ class DSMTransitionScorer:
             chunk = actions[t:end]
             out[t, : chunk.shape[0]] = chunk
             if chunk.shape[0] < horizon:
+                # Repeat the last action when the rollout tail is shorter than H.
                 pad_value = chunk[-1] if chunk.shape[0] > 0 else np.zeros((self.action_dim,), dtype=np.float32)
                 out[t, chunk.shape[0] :] = pad_value
         return out
@@ -206,21 +205,24 @@ class DSMTransitionScorer:
             recon = self.model.reconstruction_components(
                 state_clean=out["state_clean"],
                 state_hat=out["state_hat"],
+                state_logvar=out["state_logvar"],
                 action_clean=out["action_clean"],
                 action_hat=out["action_hat"],
+                action_logvar=out["action_logvar"],
                 next_state_clean=out["next_state_clean"],
                 next_state_hat=out["next_state_hat"],
+                next_state_logvar=out["next_state_logvar"],
             )
             state_energy = recon["state_energy_per_sample"].detach().cpu()
-            raw_policy_energy = recon["action_energy_per_sample"].detach().cpu()
-            policy_energy = raw_policy_energy * float(self.policy_weight)
+            action_energy = recon["action_energy_per_sample"].detach().cpu()
             dynamics_energy = recon["next_state_energy_per_sample"].detach().cpu()
-            step_scores.append((state_energy + policy_energy + dynamics_energy).detach().cpu())
+            # The per-step energy is the sum of the three routed NLL terms.
+            step_scores.append((state_energy + action_energy + dynamics_energy).detach().cpu())
             state_scores.append(state_energy)
-            action_scores.append(policy_energy)
+            action_scores.append(action_energy)
             next_state_scores.append(dynamics_energy)
             state_contrib.append(state_energy)
-            action_contrib.append(policy_energy)
+            action_contrib.append(action_energy)
             next_state_contrib.append(dynamics_energy)
 
         return TrajectoryScoreBundle(
@@ -253,18 +255,13 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         delta_step: float = 0.5,
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
-        policy_weight: float = 0.2,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
-        self.policy_weight = float(policy_weight)
-        if not (0.0 < self.policy_weight <= 1.0):
-            raise ValueError("policy_weight must be in (0, 1].")
         self.extractor = DSMTransitionScorer(
             checkpoint_path=self.checkpoint_path,
             device=str(feature_device),
             batch_size=int(feature_batch_size),
             action_horizon=int(action_horizon),
-            policy_weight=self.policy_weight,
         )
         self.device = _resolve_device(detector_device)
         self.delta = float(delta)
@@ -313,6 +310,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         if n == 0:
             return vals
 
+        # Preserve the original prefix or rolling aggregation semantics.
         window = int(self.lambda_window_size)
         full_prefix = window <= 0
 
@@ -453,11 +451,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "noise_scale": float(self.extractor.model.noise_scale),
                 "noise_sigma": float(self.extractor.model.noise_scale),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
+                "model_architecture": "unified_task_conditioned_dsm",
                 "latent_dim": int(self.extractor.latent_dim),
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),
                 "tau_dim": int(self.extractor.model.tau_dim),
-                "policy_weight": float(self.policy_weight),
                 "delta_init": float(self.delta),
                 "delta_final": float(self.delta),
                 "lambda_mode": str(self.lambda_mode),
@@ -502,6 +500,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             "action_error": np.asarray(bundle.action_contrib_scores, dtype=np.float32),
             "next_state_error": np.asarray(bundle.next_state_contrib_scores, dtype=np.float32),
         }
+        # Attribution uses the same aggregated support as the decision score.
         step_contribution_shares = self._compute_component_shares(component_contrib)
         aggregate_contributions = self._aggregate_component_contributions(
             component_contrib,
@@ -577,14 +576,13 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "task_name": task_name,
                 "threshold_source": "task" if task_threshold is not None else "global",
                 "threshold_init": float(task_threshold if task_threshold is not None else self.threshold),
-                "policy_weight": float(self.policy_weight),
                 "delta_final": float(cur_delta),
                 "threshold_final": float(cur_threshold),
                 "state_error_scores": component_scores["state_error"],
                 "action_error_scores": component_scores["action_error"],
                 "next_state_error_scores": component_scores["next_state_error"],
                 "state_energy_scores": component_scores["state_error"],
-                "policy_energy_scores": component_scores["action_error"],
+                "action_energy_scores": component_scores["action_error"],
                 "dynamics_energy_scores": component_scores["next_state_error"],
                 "weighted_step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
@@ -611,7 +609,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "action_error_mean": float(np.mean(component_scores["action_error"])),
                 "next_state_error_mean": float(np.mean(component_scores["next_state_error"])),
                 "state_energy_mean": float(np.mean(component_scores["state_error"])),
-                "policy_energy_mean": float(np.mean(component_scores["action_error"])),
+                "action_energy_mean": float(np.mean(component_scores["action_error"])),
                 "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
             },
         )

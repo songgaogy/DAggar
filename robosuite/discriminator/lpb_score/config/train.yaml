@@ -70,10 +70,10 @@ data:
       test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
 
 model:
-  backbone_dim: 1024
-  backbone_num_blocks: 4
-  head_hidden_dim: 1024
-  head_num_blocks: 2
+  embed_dim: 512
+  num_layers: 4
+  num_heads: 8
+  ffn_dim: 2048
   dropout: 0.0
   std_clamp_min: 0.05
   noise_scale: 0.08

@@ -77,7 +77,6 @@ detector:
   device: "cuda"
   delta: 10.0
   delta_step: 0.5
-  policy_weight: 0.2
   lambda_mode: "mean"
   lambda_window_size: 12
 

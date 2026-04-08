@@ -135,7 +135,11 @@ class Trainer:
         return {
             "loss": float(stats["loss"].detach().item()),
             "score": float(stats["score"].detach().item()),
+            "tau_nll": float(stats["tau_nll"].detach().item()),
             "tau_mse": float(stats["tau_mse"].detach().item()),
+            "state_nll": float(stats["state_nll"].detach().item()),
+            "action_nll": float(stats["action_nll"].detach().item()),
+            "next_state_nll": float(stats["next_state_nll"].detach().item()),
             "state_mse": float(stats["state_mse"].detach().item()),
             "action_mse": float(stats["action_mse"].detach().item()),
             "next_state_mse": float(stats["next_state_mse"].detach().item()),
@@ -160,7 +164,9 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_nll={out['tau_nll']:.6f} "
+                    f"state_nll={out['state_nll']:.6f} action_nll={out['action_nll']:.6f} "
+                    f"next_state_nll={out['next_state_nll']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
                     f"next_state_mse={out['next_state_mse']:.6f} "
                     f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
@@ -180,7 +186,9 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_nll={out['tau_nll']:.6f} "
+                    f"state_nll={out['state_nll']:.6f} action_nll={out['action_nll']:.6f} "
+                    f"next_state_nll={out['next_state_nll']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
                     f"next_state_mse={out['next_state_mse']:.6f} "
                     f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "

@@ -14,7 +14,7 @@ SAVE_NAME="${RUN_NAME}.pt"
 SAVE_DIR="${BASE_SAVE_DIR}/${RUN_NAME}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 
-BATCH_SIZE=256
+BATCH_SIZE=512
 NUM_WORKERS=16
 EPOCHS=50
 LR="${LR:-2e-4}"

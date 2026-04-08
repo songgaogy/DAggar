@@ -15,142 +15,155 @@ def _cfg_get(cfg: Any, key: str, default=None):
     return getattr(cfg, key, default)
 
 
-class ResidualMLPBlock(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.hidden_dim = int(hidden_dim)
-        self.fc_1 = nn.Linear(dim, 2 * self.hidden_dim)
-        self.fc_2 = nn.Linear(self.hidden_dim, dim)
+class UnifiedConditionedDSM(nn.Module):
+    """Shared task-conditioned denoiser with a transformer backbone."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm(x)
-        gate, value = self.fc_1(h).chunk(2, dim=-1)
-        h = F.silu(gate) * value
-        h = self.fc_2(h)
-        return x + h
-
-
-class MLPHead(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        num_blocks: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        layers: list[nn.Module] = []
-        in_dim = int(input_dim)
-        blocks = max(1, int(num_blocks))
-        for _ in range(blocks - 1):
-            layers.extend(
-                [
-                    nn.Linear(in_dim, hidden_dim),
-                    nn.GELU(),
-                ]
-            )
-            in_dim = int(hidden_dim)
-        layers.append(nn.Linear(in_dim, output_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class ConditionalDenoisingTower(nn.Module):
-    """One conditional denoising tower."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        backbone_dim: int = 1024,
-        backbone_num_blocks: int = 4,
-        head_hidden_dim: int = 1024,
-        head_num_blocks: int = 2,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.output_dim = int(output_dim)
-        self.input_proj = nn.Sequential(
-            nn.Linear(self.input_dim, backbone_dim),
-            nn.LayerNorm(backbone_dim),
-            nn.GELU(),
-        )
-        block_hidden_dim = int(2 * head_hidden_dim)
-        self.backbone = nn.ModuleList(
-            [
-                ResidualMLPBlock(
-                    dim=backbone_dim,
-                    hidden_dim=block_hidden_dim,
-                    dropout=dropout,
-                )
-                for _ in range(int(backbone_num_blocks))
-            ]
-        )
-        self.backbone_norm = nn.LayerNorm(backbone_dim)
-        self.head = MLPHead(
-            input_dim=backbone_dim,
-            hidden_dim=head_hidden_dim,
-            output_dim=self.output_dim,
-            num_blocks=int(head_num_blocks),
-            dropout=dropout,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.input_proj(x)
-        for block in self.backbone:
-            h = block(h)
-        h = self.backbone_norm(h)
-        return self.head(h)
-
-
-class ConditionalManifoldDenoiser(nn.Module):
-    """Three-headed denoiser over state, action, and next state."""
+    TASK_STATE = 0
+    TASK_ACTOR = 1
+    TASK_DYNAMICS = 2
 
     def __init__(
         self,
         latent_dim: int,
         action_flat_dim: int,
-        backbone_dim: int = 1024,
-        backbone_num_blocks: int = 4,
-        head_hidden_dim: int = 1024,
-        head_num_blocks: int = 2,
+        embed_dim: int = 512,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        ffn_dim: int = 2048,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.action_flat_dim = int(action_flat_dim)
-        self.state_tower = ConditionalDenoisingTower(
-            input_dim=self.latent_dim,
-            output_dim=self.latent_dim,
-            backbone_dim=backbone_dim,
-            backbone_num_blocks=backbone_num_blocks,
-            head_hidden_dim=head_hidden_dim,
-            head_num_blocks=head_num_blocks,
-            dropout=dropout,
+        self.embed_dim = int(embed_dim)
+        self.num_layers = int(num_layers)
+        self.num_heads = int(num_heads)
+        self.ffn_dim = int(ffn_dim)
+        self.dropout = float(dropout)
+
+        if self.embed_dim <= 0:
+            raise ValueError("embed_dim must be positive.")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be positive.")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive.")
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads, got embed_dim={self.embed_dim}, "
+                f"num_heads={self.num_heads}"
+            )
+
+        # Shared projections require a common padded width per routed field.
+        self.target_max_dim = max(self.latent_dim, self.action_flat_dim)
+        self.context_max_dim = self.latent_dim + self.action_flat_dim
+
+        self.task_embedding = nn.Embedding(3, self.embed_dim)
+        self.context_proj = nn.Sequential(
+            nn.Linear(self.context_max_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU(),
         )
-        self.actor_tower = ConditionalDenoisingTower(
-            input_dim=int(self.latent_dim + self.action_flat_dim),
-            output_dim=self.action_flat_dim,
-            backbone_dim=backbone_dim,
-            backbone_num_blocks=backbone_num_blocks,
-            head_hidden_dim=head_hidden_dim,
-            head_num_blocks=head_num_blocks,
-            dropout=dropout,
+        self.target_proj = nn.Sequential(
+            nn.Linear(self.target_max_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU(),
         )
-        self.dynamics_tower = ConditionalDenoisingTower(
-            input_dim=int(2 * self.latent_dim + self.action_flat_dim),
-            output_dim=self.latent_dim,
-            backbone_dim=backbone_dim,
-            backbone_num_blocks=backbone_num_blocks,
-            head_hidden_dim=head_hidden_dim,
-            head_num_blocks=head_num_blocks,
-            dropout=dropout,
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim,
+            nhead=self.num_heads,
+            dim_feedforward=self.ffn_dim,
+            dropout=self.dropout,
+            activation="gelu",
+            batch_first=True,
         )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=self.num_layers,
+        )
+        self.output_norm = nn.LayerNorm(self.embed_dim)
+        self.output_mean = nn.Linear(self.embed_dim, self.target_max_dim)
+        self.output_logvar = nn.Linear(self.embed_dim, self.target_max_dim)
+
+    def _task_target_dim(self, task_id: int) -> int:
+        if int(task_id) == self.TASK_STATE:
+            return self.latent_dim
+        if int(task_id) == self.TASK_ACTOR:
+            return self.action_flat_dim
+        if int(task_id) == self.TASK_DYNAMICS:
+            return self.latent_dim
+        raise ValueError(f"Unsupported task_id: {task_id}")
+
+    def _task_context_dim(self, task_id: int) -> int:
+        if int(task_id) == self.TASK_STATE:
+            return 0
+        if int(task_id) == self.TASK_ACTOR:
+            return self.latent_dim
+        if int(task_id) == self.TASK_DYNAMICS:
+            return self.latent_dim + self.action_flat_dim
+        raise ValueError(f"Unsupported task_id: {task_id}")
+
+    @staticmethod
+    def _require_2d(name: str, x: torch.Tensor) -> None:
+        if x.ndim != 2:
+            raise ValueError(f"Expected {name} shape (B,D), got {tuple(x.shape)}")
+
+    def _pad_feature(self, x: torch.Tensor, expected_dim: int, padded_dim: int, name: str) -> torch.Tensor:
+        self._require_2d(name, x)
+        if int(x.shape[1]) != int(expected_dim):
+            raise ValueError(f"{name} dim mismatch: expected {expected_dim}, got {x.shape[1]}")
+        if expected_dim > padded_dim:
+            raise ValueError(f"{name} padded dim must be >= expected dim, got {padded_dim} < {expected_dim}")
+        if expected_dim == padded_dim:
+            return x
+        # Zero padding keeps the shared linear layers task-agnostic.
+        pad = x.new_zeros((x.shape[0], padded_dim - expected_dim))
+        return torch.cat([x, pad], dim=-1)
+
+    def forward_task(
+        self,
+        *,
+        task_id: int,
+        noisy_target: torch.Tensor,
+        context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        target_dim = self._task_target_dim(task_id)
+        context_dim = self._task_context_dim(task_id)
+        target_padded = self._pad_feature(
+            noisy_target,
+            expected_dim=target_dim,
+            padded_dim=self.target_max_dim,
+            name="noisy_target",
+        )
+        context_padded = self._pad_feature(
+            context,
+            expected_dim=context_dim,
+            padded_dim=self.context_max_dim,
+            name="context",
+        )
+
+        batch_size = int(noisy_target.shape[0])
+        task_ids = torch.full(
+            (batch_size,),
+            int(task_id),
+            dtype=torch.long,
+            device=noisy_target.device,
+        )
+        task_token = self.task_embedding(task_ids).unsqueeze(1)
+        context_token = self.context_proj(context_padded).unsqueeze(1)
+        target_token = self.target_proj(target_padded).unsqueeze(1)
+        # Token order is [task, context, target].
+        tokens = torch.cat([task_token, context_token, target_token], dim=1)
+        tokens = self.transformer(tokens)
+        target_feature = self.output_norm(tokens[:, 2, :])
+
+        pred_mean_full = self.output_mean(target_feature)
+        pred_logvar_full = self.output_logvar(target_feature)
+        return {
+            "pred_mean": pred_mean_full[:, :target_dim],
+            "pred_logvar": pred_logvar_full[:, :target_dim],
+            "target_feature": target_feature,
+        }
 
     def forward(
         self,
@@ -161,27 +174,46 @@ class ConditionalManifoldDenoiser(nn.Module):
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        state_hat = self.state_tower(state_input)
-        actor_input = torch.cat([current_latent, action_input], dim=-1)
-        action_hat = self.actor_tower(actor_input)
-        dynamics_input = torch.cat([current_latent, action_clean, next_state_input], dim=-1)
-        next_state_hat = self.dynamics_tower(dynamics_input)
+        batch_size = int(state_input.shape[0])
+        state_context = state_input.new_zeros((batch_size, 0))
+        # The dynamics task conditions on clean [z_t, a].
+        dynamics_context = torch.cat([current_latent, action_clean], dim=-1)
+
+        state_out = self.forward_task(
+            task_id=self.TASK_STATE,
+            noisy_target=state_input,
+            context=state_context,
+        )
+        action_out = self.forward_task(
+            task_id=self.TASK_ACTOR,
+            noisy_target=action_input,
+            context=current_latent,
+        )
+        dynamics_out = self.forward_task(
+            task_id=self.TASK_DYNAMICS,
+            noisy_target=next_state_input,
+            context=dynamics_context,
+        )
         return {
-            "state_hat": state_hat,
-            "action_hat": action_hat,
-            "next_state_hat": next_state_hat,
+            "state_hat": state_out["pred_mean"],
+            "state_logvar": state_out["pred_logvar"],
+            "action_hat": action_out["pred_mean"],
+            "action_logvar": action_out["pred_logvar"],
+            "next_state_hat": dynamics_out["pred_mean"],
+            "next_state_logvar": dynamics_out["pred_logvar"],
         }
 
 
-JointManifoldDenoiser = ConditionalManifoldDenoiser
+ConditionalManifoldDenoiser = UnifiedConditionedDSM
+JointManifoldDenoiser = UnifiedConditionedDSM
 
 
 class DSMModel(nn.Module):
-    """Denoise state, action, and next state with variance scaling."""
+    """Denoise state, action, and dynamics with variance scaling."""
 
     def __init__(
         self,
-        predictor: ConditionalManifoldDenoiser,
+        predictor: UnifiedConditionedDSM,
         latent_dim: int,
         action_dim: int,
         transition_horizon: int,
@@ -357,30 +389,52 @@ class DSMModel(nn.Module):
             "next_state_noise": next_state_noise,
         }
 
+    @staticmethod
+    def _gaussian_nll(pred_mean: torch.Tensor, pred_logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Predicted variance down-weights inherently noisy dimensions.
+        sq_error = torch.square(pred_mean - target)
+        inv_var = torch.exp(-pred_logvar)
+        return 0.5 * (sq_error * inv_var + pred_logvar)
+
     def reconstruction_components(
         self,
         *,
         state_clean: torch.Tensor,
         state_hat: torch.Tensor,
+        state_logvar: torch.Tensor,
         action_clean: torch.Tensor,
         action_hat: torch.Tensor,
+        action_logvar: torch.Tensor,
         next_state_clean: torch.Tensor,
         next_state_hat: torch.Tensor,
+        next_state_logvar: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         state_sq = F.mse_loss(state_hat, state_clean, reduction="none")
         action_sq = F.mse_loss(action_hat, action_clean, reduction="none")
         next_state_sq = F.mse_loss(next_state_hat, next_state_clean, reduction="none")
+
+        state_nll = self._gaussian_nll(state_hat, state_logvar, state_clean)
+        action_nll = self._gaussian_nll(action_hat, action_logvar, action_clean)
+        next_state_nll = self._gaussian_nll(next_state_hat, next_state_logvar, next_state_clean)
+
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
-        state_energy = state_sq.mean(dim=-1)
-        action_energy = action_sq.mean(dim=-1)
-        next_state_energy = next_state_sq.mean(dim=-1)
+        error_nll = torch.cat([state_nll, action_nll, next_state_nll], dim=-1)
+
+        state_energy = state_nll.mean(dim=-1)
+        action_energy = action_nll.mean(dim=-1)
+        next_state_energy = next_state_nll.mean(dim=-1)
         return {
             "error_sq": error_sq,
+            "error_nll": error_nll,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
+            "tau_nll_per_sample": error_nll.mean(dim=-1),
             "tau_sse_per_sample": error_sq.sum(dim=-1),
             "state_mse_per_sample": state_sq.mean(dim=-1),
             "action_mse_per_sample": action_sq.mean(dim=-1),
             "next_state_mse_per_sample": next_state_sq.mean(dim=-1),
+            "state_nll_per_sample": state_nll.mean(dim=-1),
+            "action_nll_per_sample": action_nll.mean(dim=-1),
+            "next_state_nll_per_sample": next_state_nll.mean(dim=-1),
             "state_sse_per_sample": state_sq.sum(dim=-1),
             "action_sse_per_sample": action_sq.sum(dim=-1),
             "next_state_sse_per_sample": next_state_sq.sum(dim=-1),
@@ -401,24 +455,29 @@ class DSMModel(nn.Module):
         state_clean_raw = current_latent
         action_clean_raw = self.flatten_action_sequence(action_sequence)
         next_state_clean_raw = target_latent
+
         state_clean = self.normalize_latent(state_clean_raw)
         action_clean = self.normalize_action_flat(action_clean_raw)
         next_state_norm_clean = self.normalize_latent(next_state_clean_raw)
+        # The dynamics branch reconstructs the normalized residual.
         delta_clean = next_state_norm_clean - state_clean
+
+        # Noise is injected only in normalized space.
         noisy = {
             "state_input": state_clean,
             "state_noise": torch.zeros_like(state_clean),
             "action_input": action_clean,
             "action_noise": torch.zeros_like(action_clean),
-            "next_state_input": next_state_norm_clean,
-            "next_state_noise": torch.zeros_like(next_state_norm_clean),
+            "next_state_input": delta_clean,
+            "next_state_noise": torch.zeros_like(delta_clean),
         }
         if add_noise:
             noisy = self.add_noise(
                 state_clean=state_clean,
                 action_clean=action_clean,
-                next_state_clean=next_state_norm_clean,
+                next_state_clean=delta_clean,
             )
+
         preds = self.predictor(
             state_input=noisy["state_input"],
             current_latent=state_clean,
@@ -431,18 +490,22 @@ class DSMModel(nn.Module):
             "state_clean": state_clean,
             "state_input": noisy["state_input"],
             "state_hat": preds["state_hat"],
+            "state_logvar": preds["state_logvar"],
             "state_noise": noisy["state_noise"],
             "action_clean": action_clean,
             "action_input": noisy["action_input"],
             "action_hat": preds["action_hat"],
+            "action_logvar": preds["action_logvar"],
             "action_noise": noisy["action_noise"],
             "next_state_clean": delta_clean,
             "next_state_norm_clean": next_state_norm_clean,
             "next_state_input": noisy["next_state_input"],
             "next_state_hat": preds["next_state_hat"],
+            "next_state_logvar": preds["next_state_logvar"],
             "next_state_noise": noisy["next_state_noise"],
             "delta_clean": delta_clean,
             "delta_hat": preds["next_state_hat"],
+            "delta_logvar": preds["next_state_logvar"],
         }
 
     def compute_dsm_loss(
@@ -460,19 +523,26 @@ class DSMModel(nn.Module):
         recon = self.reconstruction_components(
             state_clean=out["state_clean"],
             state_hat=out["state_hat"],
+            state_logvar=out["state_logvar"],
             action_clean=out["action_clean"],
             action_hat=out["action_hat"],
+            action_logvar=out["action_logvar"],
             next_state_clean=out["next_state_clean"],
             next_state_hat=out["next_state_hat"],
+            next_state_logvar=out["next_state_logvar"],
         )
         loss = recon["score_per_sample"].mean()
         return {
             "loss": loss,
             "score": recon["score_per_sample"].mean(),
             "tau_mse": recon["tau_mse_per_sample"].mean(),
+            "tau_nll": recon["tau_nll_per_sample"].mean(),
             "state_mse": recon["state_mse_per_sample"].mean(),
             "action_mse": recon["action_mse_per_sample"].mean(),
             "next_state_mse": recon["next_state_mse_per_sample"].mean(),
+            "state_nll": recon["state_nll_per_sample"].mean(),
+            "action_nll": recon["action_nll_per_sample"].mean(),
+            "next_state_nll": recon["next_state_nll_per_sample"].mean(),
             "state_energy": recon["state_energy_per_sample"].mean(),
             "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
@@ -480,13 +550,34 @@ class DSMModel(nn.Module):
             "state_clean": out["state_clean"],
             "state_input": out["state_input"],
             "state_hat": out["state_hat"],
+            "state_logvar": out["state_logvar"],
             "action_clean": out["action_clean"],
             "action_input": out["action_input"],
             "action_hat": out["action_hat"],
+            "action_logvar": out["action_logvar"],
             "next_state_clean": out["next_state_clean"],
             "next_state_input": out["next_state_input"],
             "next_state_hat": out["next_state_hat"],
+            "next_state_logvar": out["next_state_logvar"],
         }
+
+
+def build_unified_conditioned_dsm(
+    *,
+    latent_dim: int,
+    action_flat_dim: int,
+    cfg_model: Any,
+) -> UnifiedConditionedDSM:
+    embed_dim = int(_cfg_get(cfg_model, "embed_dim", _cfg_get(cfg_model, "backbone_dim", 512)))
+    return UnifiedConditionedDSM(
+        latent_dim=int(latent_dim),
+        action_flat_dim=int(action_flat_dim),
+        embed_dim=embed_dim,
+        num_layers=int(_cfg_get(cfg_model, "num_layers", _cfg_get(cfg_model, "backbone_num_blocks", 4))),
+        num_heads=int(_cfg_get(cfg_model, "num_heads", 8)),
+        ffn_dim=int(_cfg_get(cfg_model, "ffn_dim", max(4 * embed_dim, embed_dim))),
+        dropout=float(_cfg_get(cfg_model, "dropout", 0.1)),
+    )
 
 
 def build_conditional_manifold_denoiser(
@@ -494,15 +585,11 @@ def build_conditional_manifold_denoiser(
     latent_dim: int,
     action_flat_dim: int,
     cfg_model: Any,
-) -> ConditionalManifoldDenoiser:
-    return ConditionalManifoldDenoiser(
+) -> UnifiedConditionedDSM:
+    return build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         action_flat_dim=int(action_flat_dim),
-        backbone_dim=int(_cfg_get(cfg_model, "backbone_dim", 1024)),
-        backbone_num_blocks=int(_cfg_get(cfg_model, "backbone_num_blocks", 4)),
-        head_hidden_dim=int(_cfg_get(cfg_model, "head_hidden_dim", 1024)),
-        head_num_blocks=int(_cfg_get(cfg_model, "head_num_blocks", 2)),
-        dropout=float(_cfg_get(cfg_model, "dropout", 0.1)),
+        cfg_model=cfg_model,
     )
 
 
@@ -510,10 +597,10 @@ def build_joint_manifold_denoiser(
     *,
     tau_dim: int,
     cfg_model: Any,
-) -> ConditionalManifoldDenoiser:
+) -> UnifiedConditionedDSM:
     raise ValueError(
         "build_joint_manifold_denoiser requires the old joint interface. "
-        "Use build_conditional_manifold_denoiser with latent_dim and action_flat_dim."
+        "Use build_unified_conditioned_dsm with latent_dim and action_flat_dim."
     )
 
 
@@ -525,7 +612,7 @@ def build_dsm_model(
     transition_horizon: int,
 ) -> DSMModel:
     action_flat_dim = int(action_dim * transition_horizon)
-    predictor = build_conditional_manifold_denoiser(
+    predictor = build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         action_flat_dim=action_flat_dim,
         cfg_model=cfg_model,

@@ -85,6 +85,7 @@ def _build_payload(
         "model": model.state_dict(),
         "history": history,
         "cfg": cfg,
+        "model_architecture": "unified_task_conditioned_dsm",
         "latent_dim": int(latent_dim),
         "action_dim": int(action_dim),
         "horizon": int(cfg.data.transition_horizon),
