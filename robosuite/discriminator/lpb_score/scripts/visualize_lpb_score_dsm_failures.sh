@@ -5,12 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-SEED=3
+SEED=1
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_score/lpb_score_dsm_20260408_224851/lpb_score_dsm_20260408_224851_ep0030.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_score/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_new_cache}"
 NUM_VIDEOS=8
+DELTA_THRESHOLD=20.0
 
 BANK_SIZE=100
 WINDOW_SIZE=6
@@ -114,4 +115,5 @@ echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEE
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
   detector.lambda_window_size=$WINDOW_SIZE \
+  detector.delta="${DELTA_THRESHOLD}" \
   "$@"

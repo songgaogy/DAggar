@@ -1,3 +1,5 @@
+"""Unified task-conditioned DSM model for LPB score transitions."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -16,7 +18,7 @@ def _cfg_get(cfg: Any, key: str, default=None):
 
 
 class UnifiedConditionedDSM(nn.Module):
-    """Shared task-conditioned denoiser with a transformer backbone."""
+    """Route state, actor, and dynamics denoising through one transformer."""
 
     TASK_STATE = 0
     TASK_ACTOR = 1
@@ -57,6 +59,7 @@ class UnifiedConditionedDSM(nn.Module):
         self.target_max_dim = max(self.latent_dim, self.action_flat_dim)
         self.context_max_dim = self.latent_dim + self.action_flat_dim
 
+        # Each task id owns one learned routing token.
         self.task_embedding = nn.Embedding(3, self.embed_dim)
         self.context_proj = nn.Sequential(
             nn.Linear(self.context_max_dim, self.embed_dim),
@@ -127,8 +130,20 @@ class UnifiedConditionedDSM(nn.Module):
         noisy_target: torch.Tensor,
         context: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Run one routed denoising task and slice outputs to its active width.
+        
+        For each task, the model builds a 3-token sequence:
+        1. task token from learnable `nn.Embedding(3, embed_dim)`
+        2. context token from the clean condition vector
+        3. target token from the noisy target variable
+        
+        The target and context vectors are zero-padded to shared maximum dimensions before projection:
+        - `target_max_dim = max(latent_dim, action_flat_dim)`
+        - `context_max_dim = latent_dim + action_flat_dim`
+        """
         target_dim = self._task_target_dim(task_id)
         context_dim = self._task_context_dim(task_id)
+        
         target_padded = self._pad_feature(
             noisy_target,
             expected_dim=target_dim,
@@ -149,12 +164,15 @@ class UnifiedConditionedDSM(nn.Module):
             dtype=torch.long,
             device=noisy_target.device,
         )
+        
         task_token = self.task_embedding(task_ids).unsqueeze(1)
         context_token = self.context_proj(context_padded).unsqueeze(1)
         target_token = self.target_proj(target_padded).unsqueeze(1)
-        # Token order is [task, context, target].
+
+        # Token order fixes the routing layout seen by the encoder.
         tokens = torch.cat([task_token, context_token, target_token], dim=1)
         tokens = self.transformer(tokens)
+        # Only the target token is decoded back to feature space.
         target_feature = self.output_norm(tokens[:, 2, :])
 
         pred_mean_full = self.output_mean(target_feature)
@@ -174,6 +192,10 @@ class UnifiedConditionedDSM(nn.Module):
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Run the three denoising factors with shared backbone parameters.
+        
+        NOTE: you can regard this as a unified world action model, modeling all three factors with shared backbone parameters.
+        """
         batch_size = int(state_input.shape[0])
         state_context = state_input.new_zeros((batch_size, 0))
         # The dynamics task conditions on clean [z_t, a].
@@ -209,7 +231,7 @@ JointManifoldDenoiser = UnifiedConditionedDSM
 
 
 class DSMModel(nn.Module):
-    """Denoise state, action, and dynamics with variance scaling."""
+    """Normalize transitions, inject DSM noise, and compute NLL energies."""
 
     def __init__(
         self,
@@ -259,6 +281,7 @@ class DSMModel(nn.Module):
         action_var: torch.Tensor,
         min_variance: float = 1e-6,
     ) -> None:
+        """Load dataset statistics used for latent and action standardization."""
         latent_mean = torch.as_tensor(latent_mean, dtype=torch.float32, device=self.latent_mean.device).reshape(-1)
         latent_var = torch.as_tensor(latent_var, dtype=torch.float32, device=self.latent_var.device).reshape(-1)
         action_mean = torch.as_tensor(action_mean, dtype=torch.float32, device=self.action_mean.device).reshape(-1)
@@ -299,16 +322,19 @@ class DSMModel(nn.Module):
         return torch.ones(self.tau_dim, dtype=self.latent_var.dtype, device=self.latent_var.device)
 
     def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Standardize latent features with clamped expert statistics."""
         latent_mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype)
         latent_std = self.latent_std.to(device=latent.device, dtype=latent.dtype)
         return (latent - latent_mean.unsqueeze(0)) / latent_std.unsqueeze(0)
 
     def normalize_action_flat(self, action_flat: torch.Tensor) -> torch.Tensor:
+        """Standardize flattened action chunks with repeated action statistics."""
         action_mean = self.action_mean_flat.to(device=action_flat.device, dtype=action_flat.dtype)
         action_std = self.action_std_flat.to(device=action_flat.device, dtype=action_flat.dtype)
         return (action_flat - action_mean.unsqueeze(0)) / action_std.unsqueeze(0)
 
     def flatten_action_sequence(self, action_sequence: torch.Tensor) -> torch.Tensor:
+        """Reshape (B, H, A) actions into the routed flat actor target."""
         if action_sequence.ndim != 3:
             raise ValueError(f"Expected action_sequence shape (B,H,A), got {tuple(action_sequence.shape)}")
         if int(action_sequence.shape[1]) != self.transition_horizon:
@@ -328,6 +354,7 @@ class DSMModel(nn.Module):
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
     ) -> torch.Tensor:
+        """Pack the raw transition tuple into the legacy flat tau layout."""
         if current_latent.ndim != 2:
             raise ValueError(f"Expected current_latent shape (B,D), got {tuple(current_latent.shape)}")
         if action_sequence.ndim != 3:
@@ -361,6 +388,7 @@ class DSMModel(nn.Module):
         )
 
     def split_tau(self, tau: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Split a flat tau vector into state, action, and next-state blocks."""
         if tau.ndim != 2 or int(tau.shape[1]) != self.tau_dim:
             raise ValueError(f"Expected tau shape (B,{self.tau_dim}), got {tuple(tau.shape)}")
         return {
@@ -376,6 +404,7 @@ class DSMModel(nn.Module):
         action_clean: torch.Tensor,
         next_state_clean: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Add isotropic Gaussian noise to normalized task targets."""
         sigma = float(self.noise_scale)
         state_noise = torch.randn_like(state_clean) * sigma
         action_noise = torch.randn_like(action_clean) * sigma
@@ -409,6 +438,7 @@ class DSMModel(nn.Module):
         next_state_hat: torch.Tensor,
         next_state_logvar: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Compute per-task MSE diagnostics and NLL energies."""
         state_sq = F.mse_loss(state_hat, state_clean, reduction="none")
         action_sq = F.mse_loss(action_hat, action_clean, reduction="none")
         next_state_sq = F.mse_loss(next_state_hat, next_state_clean, reduction="none")
@@ -420,6 +450,7 @@ class DSMModel(nn.Module):
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
         error_nll = torch.cat([state_nll, action_nll, next_state_nll], dim=-1)
 
+        # Mean reduction keeps each task on its own feature-normalized scale.
         state_energy = state_nll.mean(dim=-1)
         action_energy = action_nll.mean(dim=-1)
         next_state_energy = next_state_nll.mean(dim=-1)
@@ -452,10 +483,12 @@ class DSMModel(nn.Module):
         *,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
+        """Build normalized task targets and run the unified denoiser."""
         state_clean_raw = current_latent
         action_clean_raw = self.flatten_action_sequence(action_sequence)
         next_state_clean_raw = target_latent
 
+        # Standardization is shared across train and inference.
         state_clean = self.normalize_latent(state_clean_raw)
         action_clean = self.normalize_action_flat(action_clean_raw)
         next_state_norm_clean = self.normalize_latent(next_state_clean_raw)
@@ -514,6 +547,7 @@ class DSMModel(nn.Module):
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Run noisy denoising and return aggregate training statistics."""
         out = self.forward(
             current_latent=current_latent,
             action_sequence=action_sequence,
@@ -568,6 +602,7 @@ def build_unified_conditioned_dsm(
     action_flat_dim: int,
     cfg_model: Any,
 ) -> UnifiedConditionedDSM:
+    """Build the unified transformer predictor from config values."""
     embed_dim = int(_cfg_get(cfg_model, "embed_dim", _cfg_get(cfg_model, "backbone_dim", 512)))
     return UnifiedConditionedDSM(
         latent_dim=int(latent_dim),
@@ -586,6 +621,7 @@ def build_conditional_manifold_denoiser(
     action_flat_dim: int,
     cfg_model: Any,
 ) -> UnifiedConditionedDSM:
+    """Backward-compatible alias for the unified predictor builder."""
     return build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         action_flat_dim=int(action_flat_dim),
@@ -611,6 +647,7 @@ def build_dsm_model(
     cfg_model: Any,
     transition_horizon: int,
 ) -> DSMModel:
+    """Build the full DSM wrapper around the unified predictor."""
     action_flat_dim = int(action_dim * transition_horizon)
     predictor = build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
