@@ -21,13 +21,13 @@ from robosuite.discriminator.lpb_score.core.model import DSMModel, build_dsm_mod
 from robosuite.discriminator.lpb_score.core.trainer import Trainer, TrainerConfig
 
 
-def _compute_expert_normalization_stats(
+def _compute_positive_normalization_stats(
     *,
-    expert_refs,
+    positive_refs,
     min_variance: float = 1e-6,
 ) -> dict[str, np.ndarray]:
-    if not expert_refs:
-        raise RuntimeError("Expected non-empty expert refs to compute normalization stats.")
+    if not positive_refs:
+        raise RuntimeError("Expected non-empty positive refs to compute normalization stats.")
 
     latent_sum = None
     latent_sq_sum = None
@@ -36,7 +36,7 @@ def _compute_expert_normalization_stats(
     latent_count = 0
     action_count = 0
 
-    for ref in expert_refs:
+    for ref in positive_refs:
         traj = load_cached_latent_trajectory(ref)
         latents = np.asarray(traj.latents, dtype=np.float64)
         actions = np.asarray(traj.actions, dtype=np.float64)
@@ -53,7 +53,7 @@ def _compute_expert_normalization_stats(
         action_count += int(actions.shape[0])
 
     if latent_count <= 0 or action_count <= 0:
-        raise RuntimeError("Expert normalization stats require positive latent/action counts.")
+        raise RuntimeError("Positive normalization stats require positive latent/action counts.")
 
     latent_mean = latent_sum / float(latent_count)
     latent_var = np.maximum(latent_sq_sum / float(latent_count) - np.square(latent_mean), float(min_variance))
@@ -85,7 +85,7 @@ def _build_payload(
         "model": model.state_dict(),
         "history": history,
         "cfg": cfg,
-        "model_architecture": "unified_task_conditioned_dsm",
+        "model_architecture": "conditional_fisher_unified_task_dsm",
         "latent_dim": int(latent_dim),
         "action_dim": int(action_dim),
         "horizon": int(cfg.data.transition_horizon),
@@ -115,7 +115,7 @@ def _build_trainer(
         learning_rate=float(cfg.training.lr),
         weight_decay=float(cfg.training.weight_decay),
         epochs=int(cfg.training.epochs),
-        expert_sampling_ratio=float(cfg.training.expert_ratio),
+        positive_sampling_ratio=float(cfg.training.positive_ratio),
         grad_clip_norm=float(cfg.training.grad_clip_norm),
         log_every=int(cfg.training.log_every),
         device=str(cfg.training.device),
@@ -151,20 +151,20 @@ def run_train(cfg: DictConfig) -> None:
         val_dataset = datasets.val_dataset
         train_refs = datasets.train_refs
         val_refs = datasets.val_refs
-        expert_train_refs = [ref for ref in train_refs if ref.data_type == "expert"]
+        positive_train_refs = [ref for ref in train_refs if ref.data_type != "fail_rollout"]
 
         print(
             f"[lpb_score] train_transitions={len(train_dataset)} "
-            f"expert_samples={train_dataset.num_expert_samples} "
-            f"rollout_samples={train_dataset.num_rollout_samples} "
+            f"positive_samples={train_dataset.num_positive_samples} "
+            f"negative_samples={train_dataset.num_negative_samples} "
             f"num_train_trajectories={len(train_refs)} "
             f"latent_dim={train_dataset.latent_dim} action_dim={train_dataset.action_dim}"
         )
         if val_dataset is not None:
             print(
                 f"[lpb_score] val_transitions={len(val_dataset)} "
-                f"expert_samples={val_dataset.num_expert_samples} "
-                f"rollout_samples={val_dataset.num_rollout_samples} "
+                f"positive_samples={val_dataset.num_positive_samples} "
+                f"negative_samples={val_dataset.num_negative_samples} "
                 f"num_val_trajectories={len(val_refs)}"
             )
 
@@ -174,7 +174,7 @@ def run_train(cfg: DictConfig) -> None:
             cfg_model=cfg.model,
             transition_horizon=int(cfg.data.transition_horizon),
         )
-        normalization_stats = _compute_expert_normalization_stats(expert_refs=expert_train_refs)
+        normalization_stats = _compute_positive_normalization_stats(positive_refs=positive_train_refs)
         model.set_normalization_stats(
             latent_mean=normalization_stats["latent_mean"],
             latent_var=normalization_stats["latent_var"],
@@ -182,7 +182,7 @@ def run_train(cfg: DictConfig) -> None:
             action_var=normalization_stats["action_var"],
         )
         print(
-            f"[lpb_score] expert_norm_stats latent_count={int(normalization_stats['latent_count'])} "
+            f"[lpb_score] positive_norm_stats latent_count={int(normalization_stats['latent_count'])} "
             f"action_count={int(normalization_stats['action_count'])}"
         )
 

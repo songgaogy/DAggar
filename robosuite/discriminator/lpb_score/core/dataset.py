@@ -20,16 +20,8 @@ DATA_TYPE_ORDER = ["expert", "success_rollout", "fail_rollout"]
 
 @dataclass(frozen=True)
 class SplitCounts:
-    num_expert_traj: int
-    num_success_traj: int
-    num_fail_traj: int
-
-    def by_data_type(self) -> dict[str, int]:
-        return {
-            "expert": int(self.num_expert_traj),
-            "success_rollout": int(self.num_success_traj),
-            "fail_rollout": int(self.num_fail_traj),
-        }
+    num_pos_traj: int
+    num_neg_traj: int
 
 
 @dataclass(frozen=True)
@@ -78,7 +70,7 @@ class TransitionRef:
     trajectory_index: int
     t: int
     horizon: int
-    is_expert: bool
+    traj_type: int
 
 
 @dataclass(frozen=True)
@@ -102,9 +94,8 @@ def _cfg_get(cfg: Any, key: str, default=None):
 
 def _split_counts_from_cfg(cfg: Any) -> SplitCounts:
     return SplitCounts(
-        num_expert_traj=int(_cfg_get(cfg, "num_expert_traj", 0)),
-        num_success_traj=int(_cfg_get(cfg, "num_success_traj", 0)),
-        num_fail_traj=int(_cfg_get(cfg, "num_fail_traj", 0)),
+        num_pos_traj=int(_cfg_get(cfg, "num_pos_traj", 0)),
+        num_neg_traj=int(_cfg_get(cfg, "num_neg_traj", 0)),
     )
 
 
@@ -167,14 +158,14 @@ def _list_hdf5_demo_refs(task_name: str, data_type: str, data_dir: str) -> list[
 
 
 def _split_refs_with_counts(
-    refs: list[tuple[str, str]],
+    refs: Sequence[DemoRef],
     train_count: int,
     val_count: int,
     test_count: int,
     seed: int,
     task_name: str,
-    data_type: str,
-) -> dict[str, list[tuple[str, str]]]:
+    bucket_name: str,
+) -> dict[str, list[DemoRef]]:
     requested_total = int(train_count) + int(val_count) + int(test_count)
     if requested_total <= 0 or len(refs) <= 0:
         return {"train": [], "val": [], "test": []}
@@ -186,7 +177,7 @@ def _split_refs_with_counts(
 
     if len(selected) < requested_total:
         print(
-            f"[lpb_score] task={task_name} data_type={data_type} requested "
+            f"[lpb_score] task={task_name} bucket={bucket_name} requested "
             f"(train={train_count}, val={val_count}, test={test_count}, total={requested_total}) "
             f"but only found {len(refs)} trajectories. Using all available trajectories for this bucket."
         )
@@ -218,33 +209,78 @@ def build_split_refs(
         spec = task_specs[task_name]
         split_summary[task_name] = {"train": {}, "val": {}, "test": {}}
         split_cfgs = {"train": spec.train, "val": spec.val, "test": spec.test}
-        for data_type_idx, data_type in enumerate(DATA_TYPE_ORDER):
+        positive_refs: list[DemoRef] = []
+        for data_type in ["expert", "success_rollout"]:
             refs = _list_hdf5_demo_refs(
                 task_name=task_name,
                 data_type=data_type,
                 data_dir=spec.dir_for(data_type),
             )
-            chosen = _split_refs_with_counts(
-                refs=refs,
-                train_count=split_cfgs["train"].by_data_type()[data_type],
-                val_count=split_cfgs["val"].by_data_type()[data_type],
-                test_count=split_cfgs["test"].by_data_type()[data_type],
-                seed=int(seed + task_offset * 97 + data_type_idx * 17),
-                task_name=task_name,
-                data_type=data_type,
+            positive_refs.extend(
+                DemoRef(
+                    task_name=task_name,
+                    data_type=data_type,
+                    split="",
+                    file_path=file_path,
+                    demo_key=demo_key,
+                )
+                for file_path, demo_key in refs
             )
-            for split_name in ["train", "val", "test"]:
-                split_summary[task_name][split_name][data_type] = int(len(chosen[split_name]))
-                for file_path, demo_key in chosen[split_name]:
-                    split_refs[split_name].append(
-                        DemoRef(
-                            task_name=task_name,
-                            data_type=data_type,
-                            split=split_name,
-                            file_path=file_path,
-                            demo_key=demo_key,
-                        )
+
+        negative_refs = [
+            DemoRef(
+                task_name=task_name,
+                data_type="fail_rollout",
+                split="",
+                file_path=file_path,
+                demo_key=demo_key,
+            )
+            for file_path, demo_key in _list_hdf5_demo_refs(
+                task_name=task_name,
+                data_type="fail_rollout",
+                data_dir=spec.dir_for("fail_rollout"),
+            )
+        ]
+
+        chosen_pos = _split_refs_with_counts(
+            refs=positive_refs,
+            train_count=split_cfgs["train"].num_pos_traj,
+            val_count=split_cfgs["val"].num_pos_traj,
+            test_count=split_cfgs["test"].num_pos_traj,
+            seed=int(seed + task_offset * 97),
+            task_name=task_name,
+            bucket_name="positive",
+        )
+        chosen_neg = _split_refs_with_counts(
+            refs=negative_refs,
+            train_count=split_cfgs["train"].num_neg_traj,
+            val_count=split_cfgs["val"].num_neg_traj,
+            test_count=split_cfgs["test"].num_neg_traj,
+            seed=int(seed + task_offset * 97 + 17),
+            task_name=task_name,
+            bucket_name="negative",
+        )
+
+        for split_name in ["train", "val", "test"]:
+            split_pos = list(chosen_pos[split_name])
+            split_neg = list(chosen_neg[split_name])
+            split_summary[task_name][split_name] = {
+                "num_pos_traj": int(len(split_pos)),
+                "num_neg_traj": int(len(split_neg)),
+                "expert": int(sum(ref.data_type == "expert" for ref in split_pos)),
+                "success_rollout": int(sum(ref.data_type == "success_rollout" for ref in split_pos)),
+                "fail_rollout": int(len(split_neg)),
+            }
+            for ref in split_pos + split_neg:
+                split_refs[split_name].append(
+                    DemoRef(
+                        task_name=ref.task_name,
+                        data_type=ref.data_type,
+                        split=split_name,
+                        file_path=ref.file_path,
+                        demo_key=ref.demo_key,
                     )
+                )
 
     return split_refs, split_summary, task_to_index
 
@@ -253,7 +289,13 @@ def _print_split_summary(split_summary: dict[str, dict[str, dict[str, int]]]) ->
     for task_name, task_summary in split_summary.items():
         for split_name, split_counts in task_summary.items():
             msg = ", ".join(
-                [f"{data_type}={int(split_counts.get(data_type, 0))}" for data_type in DATA_TYPE_ORDER]
+                [
+                    f"num_pos_traj={int(split_counts.get('num_pos_traj', 0))}",
+                    f"num_neg_traj={int(split_counts.get('num_neg_traj', 0))}",
+                    f"expert={int(split_counts.get('expert', 0))}",
+                    f"success_rollout={int(split_counts.get('success_rollout', 0))}",
+                    f"fail_rollout={int(split_counts.get('fail_rollout', 0))}",
+                ]
             )
             print(f"[lpb_score] task={task_name} split={split_name} {msg}")
 
@@ -420,7 +462,7 @@ class LatentTransitionDataset(Dataset):
         self._action_dim: Optional[int] = None
         self._latent_dim: Optional[int] = None
         self._transition_refs: list[TransitionRef] = []
-        self._sample_is_expert: list[bool] = []
+        self._sample_is_positive: list[bool] = []
 
         for traj_idx, ref in enumerate(self.trajectory_refs):
             traj = load_cached_latent_trajectory(ref)
@@ -443,17 +485,17 @@ class LatentTransitionDataset(Dataset):
                         f"expected={self._latent_dim}, got={traj.latents.shape[-1]}"
                     )
             for t in range(usable):
-                is_expert = ref.data_type == "expert"
+                traj_type = 1 if ref.data_type == "fail_rollout" else 0
                 # Each prefix becomes one transition prediction example.
                 self._transition_refs.append(
                     TransitionRef(
                         trajectory_index=traj_idx,
                         t=t,
                         horizon=self.horizon,
-                        is_expert=is_expert,
+                        traj_type=traj_type,
                     )
                 )
-                self._sample_is_expert.append(is_expert)
+                self._sample_is_positive.append(traj_type == 0)
             if self.preload_to_memory:
                 self._trajectory_cache[traj_idx] = traj
 
@@ -471,16 +513,16 @@ class LatentTransitionDataset(Dataset):
         return self._latent_dim
 
     @property
-    def sample_is_expert(self) -> list[bool]:
-        return self._sample_is_expert
+    def sample_is_positive(self) -> list[bool]:
+        return self._sample_is_positive
 
     @property
-    def num_expert_samples(self) -> int:
-        return int(sum(self._sample_is_expert))
+    def num_positive_samples(self) -> int:
+        return int(sum(self._sample_is_positive))
 
     @property
-    def num_rollout_samples(self) -> int:
-        return len(self._sample_is_expert) - self.num_expert_samples
+    def num_negative_samples(self) -> int:
+        return len(self._sample_is_positive) - self.num_positive_samples
 
     def __len__(self) -> int:
         return len(self._transition_refs)
@@ -505,7 +547,7 @@ class LatentTransitionDataset(Dataset):
             "target_latent": torch.from_numpy(np.asarray(traj.latents[th], dtype=np.float32)),
             "task_index": torch.tensor(int(traj.task_index), dtype=torch.int64),
             "data_type_index": torch.tensor(int(traj.data_type_index), dtype=torch.int64),
-            "is_expert": torch.tensor(1 if ref.is_expert else 0, dtype=torch.int64),
+            "traj_type": torch.tensor(int(ref.traj_type), dtype=torch.int64),
         }
 
 
@@ -517,7 +559,7 @@ def build_cached_splits(
 ) -> tuple[dict[str, list[EncodedTrajectoryRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
     """
     Build split refs, then ensure every selected demo has a latent cache on disk.  
-    Build splits for expert / success_rollout / fail_rollout.
+    Build splits for pooled positive / fail_rollout trajectories.
     """
     split_refs, split_summary, task_to_index = build_split_refs(cfg_data=cfg_data, seed=seed)
     _print_split_summary(split_summary)

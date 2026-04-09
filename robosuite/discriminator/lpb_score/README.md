@@ -1,200 +1,145 @@
-# LPB Score Unified Task-Conditioned DSM
+# LPB Score Conditional Fisher DSM
 
-This module implements an offline failure detector based on a **Unified Task-Conditioned Diffusion Transformer (DiT)** over latent transitions.
+This module implements an offline failure detector over latent transitions from the frozen flow policy encoder.
 
-## Goal
+## What Changed
 
-Given a transition
+The refactored `lpb_score` no longer uses heteroscedastic NLL reconstruction. It now:
 
-`(z_t, a_{t:t+H-1}, z_{t+H})`
+- trains a unified conditional DSM with a binary trajectory-type condition
+- uses `traj_type = 0` for positive data from `expert + success_rollout`
+- uses `traj_type = 1` for negative data from `fail_rollout`
+- scores each step with Fisher-style L2 distances between the positive and negative conditional predictions
 
-the detector estimates how far the transition is from the expert manifold. The latent `z_t` comes from the frozen flow policy encoder and is not changed by this module.
+Only `train + visualize` remain in this module. The old standalone `analyse` and `eval` entrypoints were removed.
 
-The detector still evaluates three conditional factors at each step:
+## Data Layout
 
-1. Is the current latent state itself unusual?
-2. Is the action chunk unusual given the current state?
-3. Is the realized transition unusual given the current state and action?
+Each task still uses the same on-disk folders:
 
-## Unified Routing
+- `./data/<task_name>/expert`
+- `./data/<task_name>/success_rollout`
+- `./data/<task_name>/fail_rollout`
 
-The model keeps the same causal factorization
+Training positives are sampled from the merged `expert + success_rollout` pool for each task. Negatives are sampled from `fail_rollout`.
 
-`p(z_t, a, z_{t+H}) = p(z_t) p(a | z_t) p(z_{t+H} | z_t, a)`
+The split config now uses:
 
-but routes the three targets through one shared backbone with task IDs:
+- `num_pos_traj`
+- `num_neg_traj`
 
-- `0`: state validation
-- `1`: actor validation
-- `2`: dynamics validation
+instead of separate expert / success / fail counts.
 
-For each task, the model builds a 3-token sequence:
-
-1. task token from `nn.Embedding(3, embed_dim)`
-2. context token from the clean condition vector
-3. target token from the noisy target variable
-
-The target and context vectors are zero-padded to shared maximum dimensions before projection:
-
-- `target_max_dim = max(latent_dim, action_flat_dim)`
-- `context_max_dim = latent_dim + action_flat_dim`
-
-Task routing uses:
-
-- state task: target=`z_t_norm`, context=`0`
-- actor task: target=`a_norm`, context=`z_t_norm`
-- dynamics task: target=`delta_z_norm`, context=`[z_t_norm, a_norm]`
-
-The backbone is a shared `nn.TransformerEncoder` and only the output feature of the target token is decoded.
-
-## Normalization
-
-Before denoising, latent and action features are standardized with statistics computed from expert trajectories:
-
-- `latent_mean`
-- `latent_var`
-- `action_mean`
-- `action_var`
-
-Standard deviations are clamped:
-
-`std = clamp(sqrt(var), min=std_clamp_min)`
-
-with default
-
-`std_clamp_min = 0.05`
-
-This keeps near-constant features stable during normalization.
-
-## Training Objective
+## Model
 
 File: `core/model.py`
 
-Training happens in normalized space.
+The unified transformer still routes three denoising factors through one shared backbone:
 
-Let
+- state branch
+- action branch
+- dynamics branch
 
-- `z_t_norm` be the normalized current latent
-- `a_norm` be the normalized flattened action chunk
-- `z_next_norm` be the normalized future latent
-- `delta_z_norm = z_next_norm - z_t_norm`
+Task routing still uses a learned task token. The refactor adds:
 
-Gaussian noise is injected after normalization:
+- `type_embedding = nn.Embedding(2, embed_dim)`
 
-- `z_noisy = z_t_norm + eps_z`
-- `a_noisy = a_norm + eps_a`
-- `delta_noisy = delta_z_norm + eps_delta`
+The route token becomes:
 
-with default
+- `task_embedding(task_id) + type_embedding(traj_type)`
 
-`noise_scale = 0.08`
-
-Each task predicts:
+The model output head is now deterministic:
 
 - `pred_mean`
-- `pred_logvar`
 
-The per-dimension training objective is the heteroscedastic Gaussian NLL:
+There is no `pred_logvar`.
 
-`0.5 * ((pred_mean - target)^2 * exp(-pred_logvar) + pred_logvar)`
+## Training Objective
 
-Per-task energies use `mean(dim=-1)` over active feature dimensions. The final score is:
+Training still happens in normalized latent / action space with Gaussian noise injection.
 
-`u_t = state_energy + action_energy + dynamics_energy`
+For each sampled transition:
 
-The optimization loss is the batch mean of `u_t`.
+1. normalize `z_t`, `a_{t:t+H-1}`, and `z_{t+H}`
+2. build the routed clean targets
+3. add Gaussian noise to the routed targets
+4. predict the clean routed targets conditioned on `traj_type`
+5. optimize plain MSE
 
-Diagnostic MSE metrics are still logged, but they no longer drive training.
+The batch loss is the mean of:
+
+- state MSE
+- action MSE
+- dynamics MSE
+
+Normalization statistics are computed from the sampled positive training refs, not expert-only refs.
 
 ## Inference Score
 
 File: `core/dsm_discriminator.py`
 
-At test time, the model runs with
+At inference time the detector runs the same transition twice:
 
-`add_noise = False`
+1. once with `traj_type = 0`
+2. once with `traj_type = 1`
 
-so inference uses the clean normalized state, clean normalized action chunk, and clean normalized dynamics residual.
+For each branch, the detector computes a Fisher-style squared L2 distance:
 
-For each timestep, the detector computes:
+- `state_error = ||state_pos - state_neg||^2`
+- `action_error = ||action_pos - action_neg||^2`
+- `next_state_error = ||dynamics_pos - dynamics_neg||^2`
 
-- `state_energy`
-- `action_energy`
-- `dynamics_energy`
+The final per-step score is:
 
-Each term is the model NLL for that routed task. There is no manual `policy_weight` anymore. Action stochasticity is handled by the predicted `logvar`.
+- `u_t = state_error + action_error + next_state_error`
 
-The final step score is:
-
-`u_t = state_energy + action_energy + dynamics_energy`
-
-## Temporal Aggregation
-
-The per-step score `u_t` is aggregated into `lambda_t` using the existing temporal logic:
+The existing temporal aggregation logic remains unchanged:
 
 - `lambda_mode = mean` or `max`
 - `lambda_window_size` controls prefix or rolling aggregation
 
-Thresholds are calibrated from clean validation trajectories with the configured `delta` percentile rule.
+Thresholds are still calibrated inside `visualize` from positive bank trajectories.
 
-## Visualization Semantics
+## Entrypoints
 
-Files:
+### Train
 
-- `core/dsm_discriminator.py`
-- `visualize_failures.py`
-- `app/visualize.py`
+Python entry:
 
-Visualization uses the detector component energies directly:
+- `robosuite/discriminator/lpb_score/train.py`
 
-- `state_error -> state_energy`
-- `action_error -> action_energy`
-- `next_state_error -> dynamics_energy`
+Bash entry:
 
-The stacked attribution plots therefore match the actual detection score:
+- `robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh`
 
-`u_t = state_energy + action_energy + dynamics_energy`
+Important environment overrides:
 
-## Main Hyperparameters
+- `NUM_POS`
+- `NUM_NEG`
+- `POSITIVE_RATIO`
+- `CKPT`
+- `GPU`
 
-- `embed_dim`
-  Transformer token width
+Example:
 
-- `num_layers`
-  Number of transformer encoder layers
+```bash
+NUM_POS=240 NUM_NEG=120 GPU=0 \
+bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
+```
 
-- `num_heads`
-  Number of attention heads
+### Visualize
 
-- `ffn_dim`
-  Transformer feed-forward width
+Python entry:
 
-- `std_clamp_min`
-  Lower bound for normalization standard deviation
+- `robosuite/discriminator/lpb_score/visualize_failures.py`
 
-- `noise_scale`
-  Gaussian noise scale used during training after normalization
+Bash entry:
 
-- `lambda_mode`
-  Temporal aggregation mode for `u_t`
+- `robosuite/discriminator/lpb_score/scripts/visualize_lpb_score_dsm_failures.sh`
 
-- `lambda_window_size`
-  Window size for rolling aggregation
+The script accepts `DSM_CKPT` explicitly, otherwise it auto-discovers the latest final checkpoint under `checkpoints/multitask_6/lpb_score`.
 
-- `delta`
-  Quantile parameter for threshold calibration
+## Notes
 
-## Practical Interpretation
-
-- `state_energy` rises when the latent state itself becomes unfamiliar
-- `action_energy` rises when the chosen action chunk is atypical for the current latent
-- `dynamics_energy` rises when the realized transition violates learned transition structure
-
-For failures like object drops or severe scene deviations, `state_energy` and `dynamics_energy` are often the sharpest indicators, while `action_energy` is automatically softened when the model predicts large uncertainty.
-
-## Implementation Notes
-
-- the frozen flow policy encoder is unchanged
-- the dynamics task predicts `delta_z_norm`, not absolute next latent
-- old three-head DSM checkpoints are intentionally incompatible with the unified model
-- evaluation, analysis, and visualization all consume the same NLL-based component energies
+- `state_error_scores`, `action_error_scores`, and `next_state_error_scores` are kept for compatibility in summaries and visualization code, but they now mean Fisher L2 energies.
+- Old `lpb_score` checkpoints are intentionally incompatible with this refactor because the variance head was removed and `type_embedding` was added.

@@ -28,17 +28,6 @@ class TrainingDatasets:
     val_refs: list[EncodedTrajectoryRef]
 
 
-@dataclass(frozen=True)
-class EvalTrajectorySplits:
-    """Grouped trajectory buckets used by offline evaluation."""
-
-    bank: list[LatentTrajectory]
-    calibration: list[LatentTrajectory]
-    expert_eval: list[LatentTrajectory]
-    success_eval: list[LatentTrajectory]
-    fail_eval: list[LatentTrajectory]
-
-
 def now_tag() -> str:
     """Return a compact timestamp for output folders and artifacts."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -101,16 +90,8 @@ def build_training_datasets(
     cached_splits: dict[str, Sequence[EncodedTrajectoryRef]],
 ) -> TrainingDatasets:
     """Create train/val transition datasets from cached latent trajectories."""
-    train_refs = select_split_refs(
-        cached_splits=cached_splits,
-        split_name="train",
-        data_types=list(getattr(cfg.data, "train_data_types", ["expert", "success_rollout"])),
-    )
-    val_refs = select_split_refs(
-        cached_splits=cached_splits,
-        split_name="val",
-        data_types=list(getattr(cfg.data, "val_data_types", ["expert", "success_rollout"])),
-    )
+    train_refs = list(cached_splits["train"])
+    val_refs = list(cached_splits["val"])
 
     train_dataset = LatentTransitionDataset(
         trajectory_refs=train_refs,
@@ -131,38 +112,4 @@ def build_training_datasets(
         val_dataset=val_dataset,
         train_refs=train_refs,
         val_refs=val_refs,
-    )
-
-
-def load_eval_trajectory_splits(
-    cfg: Any,
-    cached_splits: dict[str, Sequence[EncodedTrajectoryRef]],
-) -> EvalTrajectorySplits:
-    """Load the standard bank/calibration/eval buckets used by offline evaluation."""
-    return EvalTrajectorySplits(
-        bank=load_split_trajectories(
-            cached_splits,
-            split_name=str(cfg.eval.bank_split),
-            data_types=list(cfg.eval.bank_data_types),
-        ),
-        calibration=load_split_trajectories(
-            cached_splits,
-            split_name=str(cfg.eval.calibration_split),
-            data_types=list(cfg.eval.calibration_data_types),
-        ),
-        expert_eval=load_split_trajectories(
-            cached_splits,
-            split_name=str(cfg.eval.expert_eval_split),
-            data_types=list(cfg.eval.expert_eval_data_types),
-        ),
-        success_eval=load_split_trajectories(
-            cached_splits,
-            split_name=str(cfg.eval.success_eval_split),
-            data_types=list(cfg.eval.success_eval_data_types),
-        ),
-        fail_eval=load_split_trajectories(
-            cached_splits,
-            split_name=str(cfg.eval.fail_eval_split),
-            data_types=list(cfg.eval.fail_eval_data_types),
-        ),
     )

@@ -15,9 +15,9 @@ TERM_ORDER: tuple[str, ...] = (
 )
 
 TERM_LABELS: dict[str, str] = {
-    "state_error": "State Error",
-    "action_error": "Policy Energy",
-    "next_state_error": "Dynamics Energy",
+    "state_error": "State Fisher",
+    "action_error": "Action Fisher",
+    "next_state_error": "Dynamics Fisher",
 }
 
 TERM_SHORT_LABELS: dict[str, str] = {

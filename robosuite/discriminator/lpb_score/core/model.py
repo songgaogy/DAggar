@@ -6,7 +6,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _cfg_get(cfg: Any, key: str, default=None):
@@ -61,6 +60,7 @@ class UnifiedConditionedDSM(nn.Module):
 
         # Each task id owns one learned routing token.
         self.task_embedding = nn.Embedding(3, self.embed_dim)
+        self.type_embedding = nn.Embedding(2, self.embed_dim)
         self.context_proj = nn.Sequential(
             nn.Linear(self.context_max_dim, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
@@ -86,7 +86,6 @@ class UnifiedConditionedDSM(nn.Module):
         )
         self.output_norm = nn.LayerNorm(self.embed_dim)
         self.output_mean = nn.Linear(self.embed_dim, self.target_max_dim)
-        self.output_logvar = nn.Linear(self.embed_dim, self.target_max_dim)
 
     def _task_target_dim(self, task_id: int) -> int:
         if int(task_id) == self.TASK_STATE:
@@ -129,6 +128,7 @@ class UnifiedConditionedDSM(nn.Module):
         task_id: int,
         noisy_target: torch.Tensor,
         context: torch.Tensor,
+        traj_type: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run one routed denoising task and slice outputs to its active width.
         
@@ -158,14 +158,16 @@ class UnifiedConditionedDSM(nn.Module):
         )
 
         batch_size = int(noisy_target.shape[0])
+        if traj_type.ndim != 1 or int(traj_type.shape[0]) != batch_size:
+            raise ValueError(f"Expected traj_type shape ({batch_size},), got {tuple(traj_type.shape)}")
         task_ids = torch.full(
             (batch_size,),
             int(task_id),
             dtype=torch.long,
             device=noisy_target.device,
         )
-        
-        task_token = self.task_embedding(task_ids).unsqueeze(1)
+
+        task_token = (self.task_embedding(task_ids) + self.type_embedding(traj_type)).unsqueeze(1)
         context_token = self.context_proj(context_padded).unsqueeze(1)
         target_token = self.target_proj(target_padded).unsqueeze(1)
 
@@ -176,10 +178,8 @@ class UnifiedConditionedDSM(nn.Module):
         target_feature = self.output_norm(tokens[:, 2, :])
 
         pred_mean_full = self.output_mean(target_feature)
-        pred_logvar_full = self.output_logvar(target_feature)
         return {
             "pred_mean": pred_mean_full[:, :target_dim],
-            "pred_logvar": pred_logvar_full[:, :target_dim],
             "target_feature": target_feature,
         }
 
@@ -191,6 +191,7 @@ class UnifiedConditionedDSM(nn.Module):
         action_input: torch.Tensor,
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
+        traj_type: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run the three denoising factors with shared backbone parameters.
         
@@ -205,24 +206,24 @@ class UnifiedConditionedDSM(nn.Module):
             task_id=self.TASK_STATE,
             noisy_target=state_input,
             context=state_context,
+            traj_type=traj_type,
         )
         action_out = self.forward_task(
             task_id=self.TASK_ACTOR,
             noisy_target=action_input,
             context=current_latent,
+            traj_type=traj_type,
         )
         dynamics_out = self.forward_task(
             task_id=self.TASK_DYNAMICS,
             noisy_target=next_state_input,
             context=dynamics_context,
+            traj_type=traj_type,
         )
         return {
             "state_hat": state_out["pred_mean"],
-            "state_logvar": state_out["pred_logvar"],
             "action_hat": action_out["pred_mean"],
-            "action_logvar": action_out["pred_logvar"],
             "next_state_hat": dynamics_out["pred_mean"],
-            "next_state_logvar": dynamics_out["pred_logvar"],
         }
 
 
@@ -231,7 +232,7 @@ JointManifoldDenoiser = UnifiedConditionedDSM
 
 
 class DSMModel(nn.Module):
-    """Normalize transitions, inject DSM noise, and compute NLL energies."""
+    """Normalize transitions, inject DSM noise, and compute reconstruction energies."""
 
     def __init__(
         self,
@@ -322,7 +323,7 @@ class DSMModel(nn.Module):
         return torch.ones(self.tau_dim, dtype=self.latent_var.dtype, device=self.latent_var.device)
 
     def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        """Standardize latent features with clamped expert statistics."""
+        """Standardize latent features with clamped positive-pool statistics."""
         latent_mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype)
         latent_std = self.latent_std.to(device=latent.device, dtype=latent.dtype)
         return (latent - latent_mean.unsqueeze(0)) / latent_std.unsqueeze(0)
@@ -419,53 +420,42 @@ class DSMModel(nn.Module):
         }
 
     @staticmethod
-    def _gaussian_nll(pred_mean: torch.Tensor, pred_logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Predicted variance down-weights inherently noisy dimensions.
-        sq_error = torch.square(pred_mean - target)
-        inv_var = torch.exp(-pred_logvar)
-        return 0.5 * (sq_error * inv_var + pred_logvar)
+    def _require_traj_type(batch_size: int, traj_type: torch.Tensor | int, device: torch.device) -> torch.Tensor:
+        if isinstance(traj_type, int):
+            return torch.full((batch_size,), int(traj_type), dtype=torch.long, device=device)
+        traj_type_tensor = torch.as_tensor(traj_type, dtype=torch.long, device=device).reshape(-1)
+        if int(traj_type_tensor.shape[0]) != int(batch_size):
+            raise ValueError(f"Expected traj_type length {batch_size}, got {traj_type_tensor.shape[0]}")
+        if torch.any((traj_type_tensor < 0) | (traj_type_tensor > 1)):
+            raise ValueError("traj_type must contain only 0 (positive) or 1 (negative).")
+        return traj_type_tensor
 
     def reconstruction_components(
         self,
         *,
         state_clean: torch.Tensor,
         state_hat: torch.Tensor,
-        state_logvar: torch.Tensor,
         action_clean: torch.Tensor,
         action_hat: torch.Tensor,
-        action_logvar: torch.Tensor,
         next_state_clean: torch.Tensor,
         next_state_hat: torch.Tensor,
-        next_state_logvar: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute per-task MSE diagnostics and NLL energies."""
-        state_sq = F.mse_loss(state_hat, state_clean, reduction="none")
-        action_sq = F.mse_loss(action_hat, action_clean, reduction="none")
-        next_state_sq = F.mse_loss(next_state_hat, next_state_clean, reduction="none")
-
-        state_nll = self._gaussian_nll(state_hat, state_logvar, state_clean)
-        action_nll = self._gaussian_nll(action_hat, action_logvar, action_clean)
-        next_state_nll = self._gaussian_nll(next_state_hat, next_state_logvar, next_state_clean)
+        """Compute per-task MSE diagnostics."""
+        state_sq = torch.square(state_hat - state_clean)
+        action_sq = torch.square(action_hat - action_clean)
+        next_state_sq = torch.square(next_state_hat - next_state_clean)
 
         error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
-        error_nll = torch.cat([state_nll, action_nll, next_state_nll], dim=-1)
-
-        # Mean reduction keeps each task on its own feature-normalized scale.
-        state_energy = state_nll.mean(dim=-1)
-        action_energy = action_nll.mean(dim=-1)
-        next_state_energy = next_state_nll.mean(dim=-1)
+        state_energy = state_sq.mean(dim=-1)
+        action_energy = action_sq.mean(dim=-1)
+        next_state_energy = next_state_sq.mean(dim=-1)
         return {
             "error_sq": error_sq,
-            "error_nll": error_nll,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
-            "tau_nll_per_sample": error_nll.mean(dim=-1),
             "tau_sse_per_sample": error_sq.sum(dim=-1),
             "state_mse_per_sample": state_sq.mean(dim=-1),
             "action_mse_per_sample": action_sq.mean(dim=-1),
             "next_state_mse_per_sample": next_state_sq.mean(dim=-1),
-            "state_nll_per_sample": state_nll.mean(dim=-1),
-            "action_nll_per_sample": action_nll.mean(dim=-1),
-            "next_state_nll_per_sample": next_state_nll.mean(dim=-1),
             "state_sse_per_sample": state_sq.sum(dim=-1),
             "action_sse_per_sample": action_sq.sum(dim=-1),
             "next_state_sse_per_sample": next_state_sq.sum(dim=-1),
@@ -475,12 +465,38 @@ class DSMModel(nn.Module):
             "score_per_sample": state_energy + action_energy + next_state_energy,
         }
 
+    def fisher_components(
+        self,
+        *,
+        state_pos: torch.Tensor,
+        state_neg: torch.Tensor,
+        action_pos: torch.Tensor,
+        action_neg: torch.Tensor,
+        next_state_pos: torch.Tensor,
+        next_state_neg: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute Fisher-style L2 energies from dual conditional predictions."""
+        state_sq = torch.square(state_pos - state_neg)
+        action_sq = torch.square(action_pos - action_neg)
+        next_state_sq = torch.square(next_state_pos - next_state_neg)
+
+        state_energy = state_sq.sum(dim=-1)
+        action_energy = action_sq.sum(dim=-1)
+        next_state_energy = next_state_sq.sum(dim=-1)
+        return {
+            "state_error_per_sample": state_energy,
+            "action_error_per_sample": action_energy,
+            "next_state_error_per_sample": next_state_energy,
+            "score_per_sample": state_energy + action_energy + next_state_energy,
+        }
+
     def forward(
         self,
         current_latent: torch.Tensor,
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
         *,
+        traj_type: torch.Tensor | int,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Build normalized task targets and run the unified denoiser."""
@@ -511,34 +527,38 @@ class DSMModel(nn.Module):
                 next_state_clean=delta_clean,
             )
 
+        traj_type_tensor = self._require_traj_type(
+            batch_size=int(current_latent.shape[0]),
+            traj_type=traj_type,
+            device=current_latent.device,
+        )
+
         preds = self.predictor(
             state_input=noisy["state_input"],
             current_latent=state_clean,
             action_input=noisy["action_input"],
             action_clean=action_clean,
             next_state_input=noisy["next_state_input"],
+            traj_type=traj_type_tensor,
         )
         return {
             "current_latent": current_latent,
+            "traj_type": traj_type_tensor,
             "state_clean": state_clean,
             "state_input": noisy["state_input"],
             "state_hat": preds["state_hat"],
-            "state_logvar": preds["state_logvar"],
             "state_noise": noisy["state_noise"],
             "action_clean": action_clean,
             "action_input": noisy["action_input"],
             "action_hat": preds["action_hat"],
-            "action_logvar": preds["action_logvar"],
             "action_noise": noisy["action_noise"],
             "next_state_clean": delta_clean,
             "next_state_norm_clean": next_state_norm_clean,
             "next_state_input": noisy["next_state_input"],
             "next_state_hat": preds["next_state_hat"],
-            "next_state_logvar": preds["next_state_logvar"],
             "next_state_noise": noisy["next_state_noise"],
             "delta_clean": delta_clean,
             "delta_hat": preds["next_state_hat"],
-            "delta_logvar": preds["next_state_logvar"],
         }
 
     def compute_dsm_loss(
@@ -546,53 +566,89 @@ class DSMModel(nn.Module):
         current_latent: torch.Tensor,
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
+        traj_type: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run noisy denoising and return aggregate training statistics."""
         out = self.forward(
             current_latent=current_latent,
             action_sequence=action_sequence,
             target_latent=target_latent,
+            traj_type=traj_type,
             add_noise=True,
         )
         recon = self.reconstruction_components(
             state_clean=out["state_clean"],
             state_hat=out["state_hat"],
-            state_logvar=out["state_logvar"],
             action_clean=out["action_clean"],
             action_hat=out["action_hat"],
-            action_logvar=out["action_logvar"],
             next_state_clean=out["next_state_clean"],
             next_state_hat=out["next_state_hat"],
-            next_state_logvar=out["next_state_logvar"],
         )
         loss = recon["score_per_sample"].mean()
         return {
             "loss": loss,
             "score": recon["score_per_sample"].mean(),
             "tau_mse": recon["tau_mse_per_sample"].mean(),
-            "tau_nll": recon["tau_nll_per_sample"].mean(),
             "state_mse": recon["state_mse_per_sample"].mean(),
             "action_mse": recon["action_mse_per_sample"].mean(),
             "next_state_mse": recon["next_state_mse_per_sample"].mean(),
-            "state_nll": recon["state_nll_per_sample"].mean(),
-            "action_nll": recon["action_nll_per_sample"].mean(),
-            "next_state_nll": recon["next_state_nll_per_sample"].mean(),
             "state_energy": recon["state_energy_per_sample"].mean(),
             "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
             "current_latent": out["current_latent"],
+            "traj_type": out["traj_type"],
             "state_clean": out["state_clean"],
             "state_input": out["state_input"],
             "state_hat": out["state_hat"],
-            "state_logvar": out["state_logvar"],
             "action_clean": out["action_clean"],
             "action_input": out["action_input"],
             "action_hat": out["action_hat"],
-            "action_logvar": out["action_logvar"],
             "next_state_clean": out["next_state_clean"],
             "next_state_input": out["next_state_input"],
             "next_state_hat": out["next_state_hat"],
-            "next_state_logvar": out["next_state_logvar"],
+        }
+
+    def compute_fisher_score(
+        self,
+        *,
+        current_latent: torch.Tensor,
+        action_sequence: torch.Tensor,
+        target_latent: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Run dual conditional inference and return Fisher L2 energies."""
+        pos_out = self.forward(
+            current_latent=current_latent,
+            action_sequence=action_sequence,
+            target_latent=target_latent,
+            traj_type=0,
+            add_noise=False,
+        )
+        neg_out = self.forward(
+            current_latent=current_latent,
+            action_sequence=action_sequence,
+            target_latent=target_latent,
+            traj_type=1,
+            add_noise=False,
+        )
+        fisher = self.fisher_components(
+            state_pos=pos_out["state_hat"],
+            state_neg=neg_out["state_hat"],
+            action_pos=pos_out["action_hat"],
+            action_neg=neg_out["action_hat"],
+            next_state_pos=pos_out["next_state_hat"],
+            next_state_neg=neg_out["next_state_hat"],
+        )
+        return {
+            "score_per_sample": fisher["score_per_sample"],
+            "state_error_per_sample": fisher["state_error_per_sample"],
+            "action_error_per_sample": fisher["action_error_per_sample"],
+            "next_state_error_per_sample": fisher["next_state_error_per_sample"],
+            "state_pos_hat": pos_out["state_hat"],
+            "state_neg_hat": neg_out["state_hat"],
+            "action_pos_hat": pos_out["action_hat"],
+            "action_neg_hat": neg_out["action_hat"],
+            "next_state_pos_hat": pos_out["next_state_hat"],
+            "next_state_neg_hat": neg_out["next_state_hat"],
         }
 
 

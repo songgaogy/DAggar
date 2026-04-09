@@ -137,7 +137,7 @@ def _save_failure_plot_pdf(
     first_crossing_dominant_term: str | None,
     gt_fail_mask: np.ndarray | None = None,
 ) -> None:
-    """Save a PDF page with score traces and DSM term attributions."""
+    """Save a PDF page with score traces and Fisher term attributions."""
     num_frames = int(np.asarray(frame_scores).shape[0])
     if num_frames <= 0:
         return

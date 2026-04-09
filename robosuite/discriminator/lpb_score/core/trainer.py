@@ -17,7 +17,7 @@ class TrainerConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     epochs: int = 50
-    expert_sampling_ratio: float = 0.5
+    positive_sampling_ratio: float = 0.5
     grad_clip_norm: float = 1.0
     log_every: int = 50
     device: str = "cuda"
@@ -62,30 +62,30 @@ class Trainer:
             else None
         )
 
-    def _resolve_expert_labels(self, dataset: Dataset) -> Optional[list[bool]]:
+    def _resolve_positive_labels(self, dataset: Dataset) -> Optional[list[bool]]:
         if isinstance(dataset, LatentTransitionDataset):
-            return dataset.sample_is_expert
+            return dataset.sample_is_positive
         if isinstance(dataset, Subset) and isinstance(dataset.dataset, LatentTransitionDataset):
-            base = dataset.dataset.sample_is_expert
+            base = dataset.dataset.sample_is_positive
             return [base[i] for i in dataset.indices]
         return None
 
     def _build_train_loader(self) -> DataLoader:
-        labels = self._resolve_expert_labels(self.train_dataset)
+        labels = self._resolve_positive_labels(self.train_dataset)
         use_balanced = labels is not None
         if labels is None:
-            n_exp, n_roll = 0, 0
+            n_pos, n_neg = 0, 0
         else:
-            n_exp = int(sum(labels))
-            n_roll = int(len(labels) - n_exp)
-            use_balanced = (n_exp > 0) and (n_roll > 0)
+            n_pos = int(sum(labels))
+            n_neg = int(len(labels) - n_pos)
+            use_balanced = (n_pos > 0) and (n_neg > 0)
 
         if use_balanced:
-            ratio = float(self.cfg.expert_sampling_ratio)
+            ratio = float(self.cfg.positive_sampling_ratio)
             ratio = min(max(ratio, 0.0), 1.0)
-            w_exp = ratio / float(n_exp)
-            w_roll = (1.0 - ratio) / float(n_roll)
-            weights = torch.tensor([w_exp if x else w_roll for x in labels], dtype=torch.double)
+            w_pos = ratio / float(n_pos)
+            w_neg = (1.0 - ratio) / float(n_neg)
+            weights = torch.tensor([w_pos if x else w_neg for x in labels], dtype=torch.double)
             sampler = WeightedRandomSampler(
                 weights=weights,
                 num_samples=len(weights),
@@ -124,6 +124,7 @@ class Trainer:
                 current_latent=data["current_latent"],
                 action_sequence=data["action_sequence"],
                 target_latent=data["target_latent"],
+                traj_type=data["traj_type"],
             )
             loss = stats["loss"]
             if train:
@@ -135,11 +136,7 @@ class Trainer:
         return {
             "loss": float(stats["loss"].detach().item()),
             "score": float(stats["score"].detach().item()),
-            "tau_nll": float(stats["tau_nll"].detach().item()),
             "tau_mse": float(stats["tau_mse"].detach().item()),
-            "state_nll": float(stats["state_nll"].detach().item()),
-            "action_nll": float(stats["action_nll"].detach().item()),
-            "next_state_nll": float(stats["next_state_nll"].detach().item()),
             "state_mse": float(stats["state_mse"].detach().item()),
             "action_mse": float(stats["action_mse"].detach().item()),
             "next_state_mse": float(stats["next_state_mse"].detach().item()),
@@ -164,9 +161,7 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_nll={out['tau_nll']:.6f} "
-                    f"state_nll={out['state_nll']:.6f} action_nll={out['action_nll']:.6f} "
-                    f"next_state_nll={out['next_state_nll']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
                     f"next_state_mse={out['next_state_mse']:.6f} "
                     f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
@@ -186,9 +181,7 @@ class Trainer:
             if self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_nll={out['tau_nll']:.6f} "
-                    f"state_nll={out['state_nll']:.6f} action_nll={out['action_nll']:.6f} "
-                    f"next_state_nll={out['next_state_nll']:.6f} tau_mse={out['tau_mse']:.6f} "
+                    f"loss={out['loss']:.6f} score={out['score']:.6f} tau_mse={out['tau_mse']:.6f} "
                     f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
                     f"next_state_mse={out['next_state_mse']:.6f} "
                     f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "

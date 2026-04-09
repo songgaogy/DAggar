@@ -59,7 +59,7 @@ class TrajectoryScoreBundle:
 
 
 class DSMTransitionScorer:
-    """Score trajectories with a trained unified DSM denoiser."""
+    """Score trajectories with a trained unified conditional DSM."""
 
     def __init__(
         self,
@@ -196,27 +196,15 @@ class DSMTransitionScorer:
             current_b = current_t[start:end].to(self.device)
             action_b = action_chunk_t[start:end].to(self.device)
             target_b = target_t[start:end].to(self.device)
-            out = self.model.forward(
+            fisher = self.model.compute_fisher_score(
                 current_latent=current_b,
                 action_sequence=action_b,
                 target_latent=target_b,
-                add_noise=False,
             )
-            recon = self.model.reconstruction_components(
-                state_clean=out["state_clean"],
-                state_hat=out["state_hat"],
-                state_logvar=out["state_logvar"],
-                action_clean=out["action_clean"],
-                action_hat=out["action_hat"],
-                action_logvar=out["action_logvar"],
-                next_state_clean=out["next_state_clean"],
-                next_state_hat=out["next_state_hat"],
-                next_state_logvar=out["next_state_logvar"],
-            )
-            state_energy = recon["state_energy_per_sample"].detach().cpu()
-            action_energy = recon["action_energy_per_sample"].detach().cpu()
-            dynamics_energy = recon["next_state_energy_per_sample"].detach().cpu()
-            # The per-step energy is the sum of the three routed NLL terms.
+            state_energy = fisher["state_error_per_sample"].detach().cpu()
+            action_energy = fisher["action_error_per_sample"].detach().cpu()
+            dynamics_energy = fisher["next_state_error_per_sample"].detach().cpu()
+            # The per-step score is the sum of the three Fisher component energies.
             step_scores.append((state_energy + action_energy + dynamics_energy).detach().cpu())
             state_scores.append(state_energy)
             action_scores.append(action_energy)
@@ -451,7 +439,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "noise_scale": float(self.extractor.model.noise_scale),
                 "noise_sigma": float(self.extractor.model.noise_scale),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
-                "model_architecture": "unified_task_conditioned_dsm",
+                "model_architecture": "conditional_fisher_unified_task_dsm",
+                "score_semantics": "fisher_l2",
                 "latent_dim": int(self.extractor.latent_dim),
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),
@@ -584,6 +573,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_energy_scores": component_scores["state_error"],
                 "action_energy_scores": component_scores["action_error"],
                 "dynamics_energy_scores": component_scores["next_state_error"],
+                "state_fisher_scores": component_scores["state_error"],
+                "action_fisher_scores": component_scores["action_error"],
+                "dynamics_fisher_scores": component_scores["next_state_error"],
                 "weighted_step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in component_contrib.items()
@@ -611,6 +603,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_energy_mean": float(np.mean(component_scores["state_error"])),
                 "action_energy_mean": float(np.mean(component_scores["action_error"])),
                 "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
+                "state_fisher_mean": float(np.mean(component_scores["state_error"])),
+                "action_fisher_mean": float(np.mean(component_scores["action_error"])),
+                "dynamics_fisher_mean": float(np.mean(component_scores["next_state_error"])),
             },
         )
 

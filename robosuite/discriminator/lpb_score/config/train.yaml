@@ -19,55 +19,35 @@ data:
   encode_demo_batch_size: 8
   preload_train_to_memory: false
   preload_eval_to_memory: false
-  train_data_types: ["expert", "success_rollout"]
-  val_data_types: ["expert", "success_rollout"]
   splits:
-    train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-    val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-    test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    train: {num_pos_traj: 360, num_neg_traj: 180}
+    val: {num_pos_traj: 30, num_neg_traj: 15}
+    test: {num_pos_traj: 10, num_neg_traj: 5}
   tasks:
     PandaLift:
       expert_dir: "./data/PandaLift/expert"
       success_rollout_dir: "./data/PandaLift/success_rollout"
       fail_rollout_dir: "./data/PandaLift/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 0}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 0}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 0}
     PandaPickPlaceCan:
       expert_dir: "./data/PandaPickPlaceCan/expert"
       success_rollout_dir: "./data/PandaPickPlaceCan/success_rollout"
       fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
     PandaStack:
       expert_dir: "./data/PandaStack/expert"
       success_rollout_dir: "./data/PandaStack/success_rollout"
       fail_rollout_dir: "./data/PandaStack/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
     PickPlaceBread:
       expert_dir: "./data/PickPlaceBread/expert"
       success_rollout_dir: "./data/PickPlaceBread/success_rollout"
       fail_rollout_dir: "./data/PickPlaceBread/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
     PickPlaceCereal:
       expert_dir: "./data/PickPlaceCereal/expert"
       success_rollout_dir: "./data/PickPlaceCereal/success_rollout"
       fail_rollout_dir: "./data/PickPlaceCereal/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
     PickPlaceMilk:
       expert_dir: "./data/PickPlaceMilk/expert"
       success_rollout_dir: "./data/PickPlaceMilk/success_rollout"
       fail_rollout_dir: "./data/PickPlaceMilk/fail_rollout"
-      train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
 
 model:
   embed_dim: 512
@@ -86,6 +66,6 @@ training:
   save_freq: 10
   lr: 2e-4
   weight_decay: 1e-4
-  expert_ratio: 0.5
+  positive_ratio: 0.5
   grad_clip_norm: 1.0
   log_every: 100
