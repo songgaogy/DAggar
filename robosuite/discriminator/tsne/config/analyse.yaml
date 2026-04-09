@@ -1,0 +1,72 @@
+hydra:
+  run:
+    dir: outputs/tsne/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 42
+
+save_dir: "./output/tsne"
+
+policy:
+  ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  device: "cuda"
+  encoder_batch_size: 96
+
+data:
+  root_dir: "./data"
+  cache_dir: "./data/.lpb_score_cache"
+  image_size: 128
+  encode_demo_batch_size: 8
+  build_missing_cache: true
+  tasks:
+    - "PandaLift"
+    - "PandaPickPlaceCan"
+    - "PandaStack"
+    - "PickPlaceBread"
+    - "PickPlaceCereal"
+    - "PickPlaceMilk"
+  source_data_types:
+    - "expert"
+  max_rollouts_per_task_source: 20
+  sample_seed: 42
+  timestep_stride: 1
+
+suboptimal:
+  enabled: true
+  root_dir: "./data/suboptimal_dataset"
+  tasks:
+    - "PandaLift"
+    - "PandaPickPlaceCan"
+    - "PandaStack"
+    - "PickPlaceBread"
+    - "PickPlaceCereal"
+    - "PickPlaceMilk"
+  max_rollouts_per_task: 8
+  sample_seed: 42
+
+analysis:
+  max_total_points: 30000
+  plot_dpi: 220
+  point_size: 10
+  point_alpha: 0.72
+  task_legend_fontsize: 8.5
+  task_legend_title_fontsize: 9.5
+  expert_point_size: 7
+  expert_alpha: 0.24
+  suboptimal_point_size: 13
+  suboptimal_alpha: 0.88
+  ood_onset_marker_size: 46
+  failure_legend_fontsize: 9.0
+  failure_legend_title_fontsize: 10.0
+  annotation_fontsize: 8.8
+
+tsne:
+  perplexity: 30.0
+  early_exaggeration: 12.0
+  learning_rate: "auto"
+  max_iter: 1000
+  init: "pca"
+  metric: "euclidean"
+  method: "barnes_hut"
+  angle: 0.5
+  n_jobs: -1
+  verbose: 1
