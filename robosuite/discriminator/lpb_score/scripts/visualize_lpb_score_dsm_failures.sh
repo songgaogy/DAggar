@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=1
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole/lpb_dipole_dsm_20260410_013711/lpb_dipole_dsm_20260410_013711_ep0040.pt"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole/lpb_dipole_dsm_20260410_024108/lpb_dipole_dsm_20260410_024108_ep0030.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
 NUM_VIDEOS=20
@@ -89,7 +89,7 @@ PY
 validate_policy_ckpt "${CKPT}"
 validate_dsm_ckpt "${DSM_CKPT}"
 
-export CUDA_VISIBLE_DEVICES="${GPU:-0}"
+export CUDA_VISIBLE_DEVICES=1
 
 echo "[visualize_lpb_score_dsm] ROOT=${ROOT}"
 echo "[visualize_lpb_score_dsm] policy.ckpt=${CKPT}"
