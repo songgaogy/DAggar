@@ -677,7 +677,7 @@ class DSMModel(nn.Module):
         target_latent: torch.Tensor,
         task_index: torch.Tensor | int,
     ) -> dict[str, torch.Tensor]:
-        """Run dual conditional inference and return Fisher L2 energies."""
+        """Run dual conditional inference and return Fisher plus conditional energy terms."""
         pos_out = self.forward(
             current_latent=current_latent,
             action_sequence=action_sequence,
@@ -702,11 +702,42 @@ class DSMModel(nn.Module):
             next_state_pos=pos_out["next_state_hat"],
             next_state_neg=neg_out["next_state_hat"],
         )
+        pos_recon = self.reconstruction_components(
+            state_clean=pos_out["state_clean"],
+            state_hat=pos_out["state_hat"],
+            action_clean=pos_out["action_clean"],
+            action_hat=pos_out["action_hat"],
+            next_state_clean=pos_out["next_state_clean"],
+            next_state_hat=pos_out["next_state_hat"],
+        )
+        neg_recon = self.reconstruction_components(
+            state_clean=pos_out["state_clean"],
+            state_hat=neg_out["state_hat"],
+            action_clean=pos_out["action_clean"],
+            action_hat=neg_out["action_hat"],
+            next_state_clean=pos_out["next_state_clean"],
+            next_state_hat=neg_out["next_state_hat"],
+        )
+        state_margin = neg_recon["state_energy_per_sample"] - pos_recon["state_energy_per_sample"]
+        action_margin = neg_recon["action_energy_per_sample"] - pos_recon["action_energy_per_sample"]
+        next_state_margin = neg_recon["next_state_energy_per_sample"] - pos_recon["next_state_energy_per_sample"]
         return {
             "score_per_sample": fisher["score_per_sample"],
             "state_error_per_sample": fisher["state_error_per_sample"],
             "action_error_per_sample": fisher["action_error_per_sample"],
             "next_state_error_per_sample": fisher["next_state_error_per_sample"],
+            "state_positive_energy_per_sample": pos_recon["state_energy_per_sample"],
+            "action_positive_energy_per_sample": pos_recon["action_energy_per_sample"],
+            "next_state_positive_energy_per_sample": pos_recon["next_state_energy_per_sample"],
+            "positive_score_per_sample": pos_recon["score_per_sample"],
+            "state_negative_energy_per_sample": neg_recon["state_energy_per_sample"],
+            "action_negative_energy_per_sample": neg_recon["action_energy_per_sample"],
+            "next_state_negative_energy_per_sample": neg_recon["next_state_energy_per_sample"],
+            "negative_score_per_sample": neg_recon["score_per_sample"],
+            "state_margin_per_sample": state_margin,
+            "action_margin_per_sample": action_margin,
+            "next_state_margin_per_sample": next_state_margin,
+            "margin_score_per_sample": state_margin + action_margin + next_state_margin,
             "state_pos_hat": pos_out["state_hat"],
             "state_neg_hat": neg_out["state_hat"],
             "action_pos_hat": pos_out["action_hat"],

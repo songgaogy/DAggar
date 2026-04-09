@@ -64,6 +64,23 @@ class LabeledLatentTrajectory:
     split: str
 
 
+SCORE_MODE_ORDER = (
+    "t1_positive_energy",
+    "t2_negative_margin",
+    "t3_weighted_combo",
+)
+SCORE_MODE_SHORT_LABELS = {
+    "t1_positive_energy": "T1",
+    "t2_negative_margin": "T2",
+    "t3_weighted_combo": "T3",
+}
+SCORE_MODE_COLORS = {
+    "t1_positive_energy": "#1f77b4",
+    "t2_negative_margin": "#2ca02c",
+    "t3_weighted_combo": "#9467bd",
+}
+
+
 def _sample_refs(
     refs,
     num_samples: int,
@@ -128,6 +145,9 @@ def _save_failure_plot_pdf(
     fps: int,
     frame_scores: np.ndarray,
     frame_thresholds: np.ndarray,
+    frame_scores_by_mode: dict[str, np.ndarray],
+    frame_thresholds_by_mode: dict[str, np.ndarray],
+    active_score_mode: str,
     thumbnail_frames: list[np.ndarray],
     thumbnail_indices: list[int],
     delta_final: float,
@@ -137,7 +157,7 @@ def _save_failure_plot_pdf(
     first_crossing_dominant_term: str | None,
     gt_fail_mask: np.ndarray | None = None,
 ) -> None:
-    """Save a PDF page with score traces and Fisher term attributions."""
+    """Save a PDF page with active score, T1/T2/T3 traces, and term attributions."""
     num_frames = int(np.asarray(frame_scores).shape[0])
     if num_frames <= 0:
         return
@@ -146,11 +166,12 @@ def _save_failure_plot_pdf(
     times = np.arange(num_frames, dtype=np.float32) / float(fps_value)
     num_cols = max(1, len(thumbnail_frames))
 
-    fig = plt.figure(figsize=(4.2 * num_cols, 9.6), constrained_layout=True)
-    grid = fig.add_gridspec(3, num_cols, height_ratios=[1.0, 1.6, 1.7])
+    fig = plt.figure(figsize=(4.2 * num_cols, 11.4), constrained_layout=True)
+    grid = fig.add_gridspec(4, num_cols, height_ratios=[1.0, 1.5, 1.5, 1.7])
     top_axes = [fig.add_subplot(grid[0, idx]) for idx in range(num_cols)]
     score_ax = fig.add_subplot(grid[1, :])
-    contrib_ax = fig.add_subplot(grid[2, :])
+    mode_ax = fig.add_subplot(grid[2, :])
+    contrib_ax = fig.add_subplot(grid[3, :])
 
     for idx, (thumb_ax, image_rgb, frame_id) in enumerate(zip(top_axes, thumbnail_frames, thumbnail_indices)):
         thumb_ax.imshow(image_rgb)
@@ -167,6 +188,7 @@ def _save_failure_plot_pdf(
         )
         if idx < len(top_axes):
             score_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
+            mode_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
             contrib_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
 
     score_ax.plot(times, np.asarray(frame_scores, dtype=np.float32), color="#1f77b4", linewidth=2.2, label="lambda")
@@ -195,6 +217,12 @@ def _save_failure_plot_pdf(
                         color="#d62728",
                         alpha=0.12,
                     )
+                    mode_ax.axvspan(
+                        times[start_idx],
+                        times[min(end_idx - 1, num_frames - 1)],
+                        color="#d62728",
+                        alpha=0.10,
+                    )
                     contrib_ax.axvspan(
                         times[start_idx],
                         times[min(end_idx - 1, num_frames - 1)],
@@ -210,6 +238,13 @@ def _save_failure_plot_pdf(
             linestyle="-.",
             alpha=0.95,
             label="first crossing",
+        )
+        mode_ax.axvline(
+            times[int(first_crossing_index)],
+            color="#d62728",
+            linewidth=1.4,
+            linestyle="-.",
+            alpha=0.95,
         )
 
     score_ax.set_title(
@@ -231,6 +266,41 @@ def _save_failure_plot_pdf(
         fontsize=10,
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
     )
+
+    for score_mode in SCORE_MODE_ORDER:
+        score_values = np.asarray(frame_scores_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
+        if score_values.size != num_frames:
+            continue
+        threshold_values = np.asarray(frame_thresholds_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
+        color = SCORE_MODE_COLORS.get(score_mode, "#555555")
+        short_label = SCORE_MODE_SHORT_LABELS.get(score_mode, score_mode)
+        mode_ax.plot(
+            times,
+            score_values,
+            color=color,
+            linewidth=2.0,
+            alpha=0.95,
+            label=f"{short_label} score",
+        )
+        if threshold_values.size == num_frames:
+            mode_ax.plot(
+                times,
+                threshold_values,
+                color=color,
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.85,
+                label=f"{short_label} th",
+            )
+    mode_ax.set_title(
+        f"T1/T2/T3 Aggregate Scores | active={SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)}",
+        fontsize=12,
+        pad=8,
+    )
+    mode_ax.set_xlabel("Time (s)")
+    mode_ax.set_ylabel("Aggregate Score")
+    mode_ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.8)
+    mode_ax.legend(loc="upper left", ncol=3)
 
     term_keys = ordered_term_keys(aggregate_contribution_shares)
     if term_keys:
@@ -609,7 +679,7 @@ def _load_visualization_targets(
     num_videos: int,
     horizon: int,
 ) -> tuple[list[object], list[LatentTrajectory], list[np.ndarray | None], dict[str, object]]:
-    data_source = str(getattr(cfg.visualization, "data_source", "fail_rollout"))
+    data_source = str(getattr(cfg.visualization, "data_source", "suboptimal"))
     if data_source != "suboptimal":
         fail_refs = select_split_refs(
             cached_splits=cached_splits,
@@ -810,23 +880,35 @@ def run_visualize(cfg: DictConfig) -> None:
                     aggregate_contribution_shares,
                     num_frames=num_frames,
                 )
-                component_keys = (
-                    "state_error_scores",
-                    "action_error_scores",
-                    "next_state_error_scores",
-                )
-                frame_component_scores = {
-                    key: (
-                        map_step_values_to_frames(
-                            np.asarray(result.metadata[key], dtype=np.float32),
-                            num_frames=num_frames,
-                            tail_fill=float(np.asarray(result.metadata[key], dtype=np.float32)[-1]),
-                        )
-                        if result.metadata.get(key, None) is not None
-                        else None
+                aggregate_scores_by_mode = result.metadata.get("aggregate_scores_by_mode", {}) or {}
+                threshold_by_score = result.metadata.get("threshold_by_score", {}) or {}
+                active_score_mode = str(result.metadata.get("score_mode", detector.score_mode))
+                frame_scores_by_mode = {
+                    score_mode: map_step_values_to_frames(
+                        np.asarray(values, dtype=np.float32),
+                        num_frames=num_frames,
+                        tail_fill=float(np.asarray(values, dtype=np.float32)[-1]),
                     )
-                    for key in component_keys
+                    for score_mode, values in aggregate_scores_by_mode.items()
+                    if np.asarray(values).size > 0
                 }
+                frame_thresholds_by_mode: dict[str, np.ndarray] = {}
+                for score_mode in SCORE_MODE_ORDER:
+                    if score_mode == active_score_mode:
+                        threshold_steps = np.asarray(result.thresholds, dtype=np.float32)
+                    else:
+                        scalar_threshold = float(threshold_by_score.get(score_mode, np.nan))
+                        ref_steps = np.asarray(aggregate_scores_by_mode.get(score_mode, []), dtype=np.float32)
+                        if ref_steps.size == 0:
+                            continue
+                        threshold_steps = np.full(ref_steps.shape, scalar_threshold, dtype=np.float32)
+                    if threshold_steps.size == 0:
+                        continue
+                    frame_thresholds_by_mode[score_mode] = map_step_values_to_frames(
+                        threshold_steps,
+                        num_frames=num_frames,
+                        tail_fill=float(threshold_steps[-1]),
+                    )
                 term_summary = summarize_trajectory_term_attribution(result)
 
                 stem = (
@@ -848,27 +930,21 @@ def run_visualize(cfg: DictConfig) -> None:
                             flip_vertical=bool(cfg.visualization.flip_vertical),
                         )
                         footer_lines = [
-                            f"det={detector.name} dl={float(result.metadata.get('delta_final', np.nan)):.1f}",
-                            f"lam={float(frame_scores[frame_id]):.3f} th={float(frame_thresholds[frame_id]):.3f}",
-                        ]
-                        if frame_aggregate_share_by_term:
-                            dominant_term = max(
-                                frame_aggregate_share_by_term,
-                                key=lambda key: float(frame_aggregate_share_by_term[key][frame_id]),
-                            )
-                            dominant_share = float(frame_aggregate_share_by_term[dominant_term][frame_id])
-                            footer_lines.append(
-                                f"dom={TERM_SHORT_LABELS.get(dominant_term, dominant_term)} {100.0 * dominant_share:.0f}%"
-                            )
-                        footer_lines.append(
                             " ".join(
                                 [
-                                    f"st={float(frame_component_scores['state_error_scores'][frame_id]):.3f}",
-                                    f"pi={float(frame_component_scores['action_error_scores'][frame_id]):.3f}",
-                                    f"dy={float(frame_component_scores['next_state_error_scores'][frame_id]):.3f}",
+                                    (
+                                        f"{SCORE_MODE_SHORT_LABELS.get(score_mode, score_mode)} "
+                                        f"{float(frame_scores_by_mode[score_mode][frame_id]):.2f}"
+                                    )
+                                    for score_mode in SCORE_MODE_ORDER
+                                    if score_mode in frame_scores_by_mode
                                 ]
-                            )
-                        )
+                            ),
+                            (
+                                f"{SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)} "
+                                f"{float(frame_scores[frame_id]):.2f}|{float(frame_thresholds[frame_id]):.2f}"
+                            ),
+                        ]
                         frame = draw_detection_overlay(
                             frame_rgb,
                             frame_id=frame_id,
@@ -914,6 +990,15 @@ def run_visualize(cfg: DictConfig) -> None:
                         thumbnail_indices=thumbnail_indices,
                         delta_final=float(result.metadata.get("delta_final", np.nan)),
                         threshold_final=float(result.metadata.get("threshold_final", np.nan)),
+                        frame_scores_by_mode={
+                            key: np.asarray(values, dtype=np.float32)
+                            for key, values in frame_scores_by_mode.items()
+                        },
+                        frame_thresholds_by_mode={
+                            key: np.asarray(values, dtype=np.float32)
+                            for key, values in frame_thresholds_by_mode.items()
+                        },
+                        active_score_mode=active_score_mode,
                         aggregate_contribution_shares={
                             key: np.asarray(values, dtype=np.float32)
                             for key, values in frame_aggregate_share_by_term.items()

@@ -60,6 +60,13 @@ detector:
   delta_step: 0.5
   lambda_mode: "mean"
   lambda_window_size: 12
+  score_mode: "t1_positive_energy"
+  alpha_state: 1.0
+  alpha_action: 1.0
+  alpha_dynamics: 1.0
+  beta_state: 1.0
+  beta_action: 1.0
+  beta_dynamics: 1.0
 
 eval:
   bank_split: "train"
@@ -79,7 +86,7 @@ online:
 visualization:
   bank_size: 100
   calibration_seed: 42
-  data_source: "fail_rollout"
+  data_source: "suboptimal"
   num_videos: 3
   fps: 20
   camera_name: "agentview"

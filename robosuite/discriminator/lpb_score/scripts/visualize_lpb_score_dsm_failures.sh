@@ -15,6 +15,15 @@ DELTA_THRESHOLD=10.0
 
 BANK_SIZE=100
 WINDOW_SIZE=6
+VIS_DATA_SOURCE="${VIS_DATA_SOURCE:-suboptimal}"
+SUBOPTIMAL_SOURCE_SPLIT="${SUBOPTIMAL_SOURCE_SPLIT:-eval}"
+SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_weighted_combo
+ALPHA_STATE="${ALPHA_STATE:-1.0}"
+ALPHA_ACTION="${ALPHA_ACTION:-1.0}"
+ALPHA_DYNAMICS="${ALPHA_DYNAMICS:-1.0}"
+BETA_STATE="${BETA_STATE:-1.0}"
+BETA_ACTION="${BETA_ACTION:-1.0}"
+BETA_DYNAMICS="${BETA_DYNAMICS:-1.0}"
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-96}"
@@ -95,8 +104,13 @@ echo "[visualize_lpb_score_dsm] ROOT=${ROOT}"
 echo "[visualize_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[visualize_lpb_score_dsm] model.dsm_ckpt=${DSM_CKPT}"
 echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
+echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
+echo "[visualize_lpb_score_dsm] suboptimal.source_split=${SUBOPTIMAL_SOURCE_SPLIT}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
+echo "[visualize_lpb_score_dsm] detector.score_mode=${SCORE_MODE}"
+echo "[visualize_lpb_score_dsm] detector.alpha=(state=${ALPHA_STATE}, action=${ALPHA_ACTION}, dynamics=${ALPHA_DYNAMICS})"
+echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BETA_ACTION}, dynamics=${BETA_DYNAMICS})"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/visualize_failures.py" \
   seed="${SEED}" \
@@ -107,6 +121,7 @@ echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEE
   data.image_size="${IMAGE_SIZE}" \
   model.dsm_ckpt="${DSM_CKPT}" \
   feature.action_horizon="${ACTION_HORIZON}" \
+  visualization.data_source="${VIS_DATA_SOURCE}" \
   visualization.bank_size="${BANK_SIZE}" \
   visualization.calibration_seed="${CALIBRATION_SEED}" \
   visualization.num_videos="${NUM_VIDEOS}" \
@@ -114,6 +129,14 @@ echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEE
   visualization.camera_name="${CAMERA_NAME}" \
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
+  suboptimal.source_split="${SUBOPTIMAL_SOURCE_SPLIT}" \
   detector.lambda_window_size=$WINDOW_SIZE \
   detector.delta="${DELTA_THRESHOLD}" \
+  detector.score_mode="${SCORE_MODE}" \
+  detector.alpha_state="${ALPHA_STATE}" \
+  detector.alpha_action="${ALPHA_ACTION}" \
+  detector.alpha_dynamics="${ALPHA_DYNAMICS}" \
+  detector.beta_state="${BETA_STATE}" \
+  detector.beta_action="${BETA_ACTION}" \
+  detector.beta_dynamics="${BETA_DYNAMICS}" \
   "$@"

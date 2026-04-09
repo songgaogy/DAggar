@@ -56,6 +56,17 @@ class TrajectoryScoreBundle:
     state_contrib_scores: np.ndarray
     action_contrib_scores: np.ndarray
     next_state_contrib_scores: np.ndarray
+    t1_step_scores: np.ndarray
+    t2_step_scores: np.ndarray
+    state_positive_scores: np.ndarray
+    action_positive_scores: np.ndarray
+    next_state_positive_scores: np.ndarray
+    state_negative_scores: np.ndarray
+    action_negative_scores: np.ndarray
+    next_state_negative_scores: np.ndarray
+    state_margin_scores: np.ndarray
+    action_margin_scores: np.ndarray
+    next_state_margin_scores: np.ndarray
 
 
 class DSMTransitionScorer:
@@ -202,12 +213,23 @@ class DSMTransitionScorer:
         target_t = latents_t[horizon : horizon + valid_len]
 
         step_scores: list[torch.Tensor] = []
+        t1_step_scores: list[torch.Tensor] = []
+        t2_step_scores: list[torch.Tensor] = []
         state_scores: list[torch.Tensor] = []
         action_scores: list[torch.Tensor] = []
         next_state_scores: list[torch.Tensor] = []
         state_contrib: list[torch.Tensor] = []
         action_contrib: list[torch.Tensor] = []
         next_state_contrib: list[torch.Tensor] = []
+        state_positive_scores: list[torch.Tensor] = []
+        action_positive_scores: list[torch.Tensor] = []
+        next_state_positive_scores: list[torch.Tensor] = []
+        state_negative_scores: list[torch.Tensor] = []
+        action_negative_scores: list[torch.Tensor] = []
+        next_state_negative_scores: list[torch.Tensor] = []
+        state_margin_scores: list[torch.Tensor] = []
+        action_margin_scores: list[torch.Tensor] = []
+        next_state_margin_scores: list[torch.Tensor] = []
 
         for start in range(0, valid_len, self.batch_size):
             end = min(start + self.batch_size, valid_len)
@@ -220,17 +242,37 @@ class DSMTransitionScorer:
                 target_latent=target_b,
                 task_index=int(traj.task_index),
             )
-            state_energy = fisher["state_error_per_sample"].detach().cpu()
-            action_energy = fisher["action_error_per_sample"].detach().cpu()
-            dynamics_energy = fisher["next_state_error_per_sample"].detach().cpu()
-            # The per-step score is the sum of the three Fisher component energies.
-            step_scores.append((state_energy + action_energy + dynamics_energy).detach().cpu())
-            state_scores.append(state_energy)
-            action_scores.append(action_energy)
-            next_state_scores.append(dynamics_energy)
-            state_contrib.append(state_energy)
-            action_contrib.append(action_energy)
-            next_state_contrib.append(dynamics_energy)
+            state_positive = fisher["state_positive_energy_per_sample"].detach().cpu()
+            action_positive = fisher["action_positive_energy_per_sample"].detach().cpu()
+            dynamics_positive = fisher["next_state_positive_energy_per_sample"].detach().cpu()
+            state_negative = fisher["state_negative_energy_per_sample"].detach().cpu()
+            action_negative = fisher["action_negative_energy_per_sample"].detach().cpu()
+            dynamics_negative = fisher["next_state_negative_energy_per_sample"].detach().cpu()
+            state_margin = fisher["state_margin_per_sample"].detach().cpu()
+            action_margin = fisher["action_margin_per_sample"].detach().cpu()
+            dynamics_margin = fisher["next_state_margin_per_sample"].detach().cpu()
+            t1_step = state_positive + action_positive + dynamics_positive
+            t2_step = -(state_margin + action_margin + dynamics_margin)
+
+            # Default bundle compatibility stays on T1 = sum_b s^(b) = sum_b e_+^(b).
+            step_scores.append(t1_step.detach().cpu())
+            t1_step_scores.append(t1_step.detach().cpu())
+            t2_step_scores.append(t2_step.detach().cpu())
+            state_scores.append(state_positive)
+            action_scores.append(action_positive)
+            next_state_scores.append(dynamics_positive)
+            state_contrib.append(state_positive)
+            action_contrib.append(action_positive)
+            next_state_contrib.append(dynamics_positive)
+            state_positive_scores.append(state_positive)
+            action_positive_scores.append(action_positive)
+            next_state_positive_scores.append(dynamics_positive)
+            state_negative_scores.append(state_negative)
+            action_negative_scores.append(action_negative)
+            next_state_negative_scores.append(dynamics_negative)
+            state_margin_scores.append(state_margin)
+            action_margin_scores.append(action_margin)
+            next_state_margin_scores.append(dynamics_margin)
 
         return TrajectoryScoreBundle(
             step_scores=torch.cat(step_scores, dim=0).numpy().astype(np.float32),
@@ -240,10 +282,24 @@ class DSMTransitionScorer:
             state_contrib_scores=torch.cat(state_contrib, dim=0).numpy().astype(np.float32),
             action_contrib_scores=torch.cat(action_contrib, dim=0).numpy().astype(np.float32),
             next_state_contrib_scores=torch.cat(next_state_contrib, dim=0).numpy().astype(np.float32),
+            t1_step_scores=torch.cat(t1_step_scores, dim=0).numpy().astype(np.float32),
+            t2_step_scores=torch.cat(t2_step_scores, dim=0).numpy().astype(np.float32),
+            state_positive_scores=torch.cat(state_positive_scores, dim=0).numpy().astype(np.float32),
+            action_positive_scores=torch.cat(action_positive_scores, dim=0).numpy().astype(np.float32),
+            next_state_positive_scores=torch.cat(next_state_positive_scores, dim=0).numpy().astype(np.float32),
+            state_negative_scores=torch.cat(state_negative_scores, dim=0).numpy().astype(np.float32),
+            action_negative_scores=torch.cat(action_negative_scores, dim=0).numpy().astype(np.float32),
+            next_state_negative_scores=torch.cat(next_state_negative_scores, dim=0).numpy().astype(np.float32),
+            state_margin_scores=torch.cat(state_margin_scores, dim=0).numpy().astype(np.float32),
+            action_margin_scores=torch.cat(action_margin_scores, dim=0).numpy().astype(np.float32),
+            next_state_margin_scores=torch.cat(next_state_margin_scores, dim=0).numpy().astype(np.float32),
         )
 
 
 class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
+    SCORE_T1 = "t1_positive_energy"
+    SCORE_T2 = "t2_negative_margin"
+    SCORE_T3 = "t3_weighted_combo"
     COMPONENT_ORDER: tuple[str, ...] = (
         "state_error",
         "action_error",
@@ -262,6 +318,13 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         delta_step: float = 0.5,
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
+        score_mode: str = SCORE_T1,
+        alpha_state: float = 1.0,
+        alpha_action: float = 1.0,
+        alpha_dynamics: float = 1.0,
+        beta_state: float = 1.0,
+        beta_action: float = 1.0,
+        beta_dynamics: float = 1.0,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
         self.extractor = DSMTransitionScorer(
@@ -275,15 +338,38 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self.delta_step = float(delta_step)
         self.lambda_mode = str(lambda_mode)
         self.lambda_window_size = int(lambda_window_size)
+        self.score_mode = str(score_mode)
         if self.lambda_mode not in {"mean", "max"}:
             raise ValueError("lambda_mode must be 'mean' or 'max'")
         if self.lambda_window_size == 0:
             raise ValueError("lambda_window_size must be -1 or >=1")
+        if self.score_mode not in {self.SCORE_T1, self.SCORE_T2, self.SCORE_T3}:
+            raise ValueError(
+                f"score_mode must be one of {[self.SCORE_T1, self.SCORE_T2, self.SCORE_T3]}, "
+                f"got {self.score_mode}"
+            )
+
+        self.t3_alpha = {
+            "state_error": float(alpha_state),
+            "action_error": float(alpha_action),
+            "next_state_error": float(alpha_dynamics),
+        }
+        self.t3_beta = {
+            "state_error": float(beta_state),
+            "action_error": float(beta_action),
+            "next_state_error": float(beta_dynamics),
+        }
 
         self._calib_lambdas: Optional[np.ndarray] = None
         self._calib_lambdas_by_task: dict[str, np.ndarray] = {}
         self.threshold: Optional[float] = None
         self.thresholds_by_task: dict[str, float] = {}
+        self._calib_lambdas_by_score: dict[str, np.ndarray] = {}
+        self._calib_lambdas_by_task_and_score: dict[str, dict[str, np.ndarray]] = {}
+        self.threshold_by_score: dict[str, float] = {}
+        self.thresholds_by_task_and_score: dict[str, dict[str, float]] = {}
+        self._t3_norm_stats_global: dict[str, float] = {}
+        self._t3_norm_stats_by_task: dict[str, dict[str, float]] = {}
 
     @property
     def name(self) -> str:
@@ -301,19 +387,160 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             for task_name, threshold in self.thresholds_by_task.items()
         }
 
+    def get_thresholds_by_score(self) -> dict[str, float]:
+        return {
+            str(score_name): float(threshold)
+            for score_name, threshold in self.threshold_by_score.items()
+        }
+
     def collect_lambdas_by_task(
         self,
         trajectories: Sequence[LatentTrajectory],
     ) -> dict[str, np.ndarray]:
         lambdas_by_task: dict[str, list[np.ndarray]] = {}
         for traj in trajectories:
-            step_scores = np.asarray(self.extractor.score_trajectory(traj).step_scores, dtype=np.float32)
+            bundle = self.extractor.score_trajectory(traj)
+            step_scores = self._bundle_score_families(bundle, task_name=str(traj.task_name))[self.score_mode]["step_scores"]
             lambdas = self._aggregate_lambda(step_scores)
             lambdas_by_task.setdefault(str(traj.task_name), []).append(lambdas.astype(np.float32, copy=False))
         return {
             str(task_name): np.concatenate(values, axis=0).astype(np.float32)
             for task_name, values in lambdas_by_task.items()
             if values
+        }
+
+    @staticmethod
+    def _safe_standardize(values: np.ndarray, mean: float, std: float) -> np.ndarray:
+        denom = max(float(std), 1e-6)
+        return ((np.asarray(values, dtype=np.float32) - float(mean)) / denom).astype(np.float32)
+
+    @staticmethod
+    def _bundle_raw_terms(bundle: TrajectoryScoreBundle) -> dict[str, np.ndarray]:
+        return {
+            "state_positive": np.asarray(bundle.state_positive_scores, dtype=np.float32),
+            "action_positive": np.asarray(bundle.action_positive_scores, dtype=np.float32),
+            "next_state_positive": np.asarray(bundle.next_state_positive_scores, dtype=np.float32),
+            "state_negative": np.asarray(bundle.state_negative_scores, dtype=np.float32),
+            "action_negative": np.asarray(bundle.action_negative_scores, dtype=np.float32),
+            "next_state_negative": np.asarray(bundle.next_state_negative_scores, dtype=np.float32),
+            "state_margin": np.asarray(bundle.state_margin_scores, dtype=np.float32),
+            "action_margin": np.asarray(bundle.action_margin_scores, dtype=np.float32),
+            "next_state_margin": np.asarray(bundle.next_state_margin_scores, dtype=np.float32),
+        }
+
+    def _compute_t3_norm_stats(
+        self,
+        scored_bundles: Sequence[tuple[str, TrajectoryScoreBundle]],
+    ) -> None:
+        global_terms: dict[str, list[np.ndarray]] = {}
+        task_terms: dict[str, dict[str, list[np.ndarray]]] = {}
+
+        for task_name, bundle in scored_bundles:
+            raw_terms = self._bundle_raw_terms(bundle)
+            bucket = task_terms.setdefault(str(task_name), {})
+            for key, values in raw_terms.items():
+                global_terms.setdefault(key, []).append(values)
+                bucket.setdefault(key, []).append(values)
+
+        def _reduce(term_map: dict[str, list[np.ndarray]]) -> dict[str, float]:
+            stats: dict[str, float] = {}
+            for key, values in term_map.items():
+                arr = np.concatenate(values, axis=0).astype(np.float32) if values else np.zeros((0,), dtype=np.float32)
+                if arr.size == 0:
+                    stats[f"{key}_mean"] = 0.0
+                    stats[f"{key}_std"] = 1.0
+                else:
+                    stats[f"{key}_mean"] = float(np.mean(arr))
+                    stats[f"{key}_std"] = float(max(float(np.std(arr)), 1e-6))
+            return stats
+
+        self._t3_norm_stats_global = _reduce(global_terms)
+        self._t3_norm_stats_by_task = {
+            str(task_name): _reduce(term_map)
+            for task_name, term_map in task_terms.items()
+        }
+
+    def _resolve_t3_norm_stats(self, task_name: str) -> dict[str, float]:
+        task_stats = self._t3_norm_stats_by_task.get(str(task_name), None)
+        if task_stats is not None:
+            return task_stats
+        return self._t3_norm_stats_global
+
+    def _bundle_score_families(
+        self,
+        bundle: TrajectoryScoreBundle,
+        *,
+        task_name: str,
+    ) -> dict[str, dict[str, np.ndarray]]:
+        t1_components = {
+            "state_error": np.asarray(bundle.state_positive_scores, dtype=np.float32),
+            "action_error": np.asarray(bundle.action_positive_scores, dtype=np.float32),
+            "next_state_error": np.asarray(bundle.next_state_positive_scores, dtype=np.float32),
+        }
+        t2_components = {
+            "state_error": (-np.asarray(bundle.state_margin_scores, dtype=np.float32)).astype(np.float32),
+            "action_error": (-np.asarray(bundle.action_margin_scores, dtype=np.float32)).astype(np.float32),
+            "next_state_error": (-np.asarray(bundle.next_state_margin_scores, dtype=np.float32)).astype(np.float32),
+        }
+
+        t3_stats = self._resolve_t3_norm_stats(task_name)
+        t3_components = {
+            "state_error": (
+                self.t3_alpha["state_error"]
+                * self._safe_standardize(
+                    bundle.state_positive_scores,
+                    t3_stats.get("state_positive_mean", 0.0),
+                    t3_stats.get("state_positive_std", 1.0),
+                )
+                - self.t3_beta["state_error"]
+                * self._safe_standardize(
+                    bundle.state_margin_scores,
+                    t3_stats.get("state_margin_mean", 0.0),
+                    t3_stats.get("state_margin_std", 1.0),
+                )
+            ).astype(np.float32),
+            "action_error": (
+                self.t3_alpha["action_error"]
+                * self._safe_standardize(
+                    bundle.action_positive_scores,
+                    t3_stats.get("action_positive_mean", 0.0),
+                    t3_stats.get("action_positive_std", 1.0),
+                )
+                - self.t3_beta["action_error"]
+                * self._safe_standardize(
+                    bundle.action_margin_scores,
+                    t3_stats.get("action_margin_mean", 0.0),
+                    t3_stats.get("action_margin_std", 1.0),
+                )
+            ).astype(np.float32),
+            "next_state_error": (
+                self.t3_alpha["next_state_error"]
+                * self._safe_standardize(
+                    bundle.next_state_positive_scores,
+                    t3_stats.get("next_state_positive_mean", 0.0),
+                    t3_stats.get("next_state_positive_std", 1.0),
+                )
+                - self.t3_beta["next_state_error"]
+                * self._safe_standardize(
+                    bundle.next_state_margin_scores,
+                    t3_stats.get("next_state_margin_mean", 0.0),
+                    t3_stats.get("next_state_margin_std", 1.0),
+                )
+            ).astype(np.float32),
+        }
+
+        def _family(components: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+            step_scores = (
+                np.asarray(components["state_error"], dtype=np.float32)
+                + np.asarray(components["action_error"], dtype=np.float32)
+                + np.asarray(components["next_state_error"], dtype=np.float32)
+            ).astype(np.float32)
+            return {"step_scores": step_scores, "components": components}
+
+        return {
+            self.SCORE_T1: _family(t1_components),
+            self.SCORE_T2: _family(t2_components),
+            self.SCORE_T3: _family(t3_components),
         }
 
     @staticmethod
@@ -459,24 +686,57 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         if len(calibration_set) == 0:
             raise ValueError("Calibration requires at least one trajectory.")
 
-        calib_lambdas: list[np.ndarray] = []
-        calib_lambdas_by_task: dict[str, list[np.ndarray]] = {}
+        scored_bundles: list[tuple[str, TrajectoryScoreBundle]] = []
         for traj in calibration_set:
-            lambdas = self._aggregate_lambda(self.extractor.score_trajectory(traj).step_scores)
-            calib_lambdas.append(lambdas)
-            calib_lambdas_by_task.setdefault(str(traj.task_name), []).append(lambdas)
+            scored_bundles.append((str(traj.task_name), self.extractor.score_trajectory(traj)))
 
-        self._calib_lambdas = np.concatenate(calib_lambdas, axis=0).astype(np.float32)
-        self._calib_lambdas_by_task = {
-            task_name: np.concatenate(task_values, axis=0).astype(np.float32)
-            for task_name, task_values in calib_lambdas_by_task.items()
-            if len(task_values) > 0
+        self._compute_t3_norm_stats(scored_bundles)
+        calib_lambdas_by_score: dict[str, list[np.ndarray]] = {
+            self.SCORE_T1: [],
+            self.SCORE_T2: [],
+            self.SCORE_T3: [],
         }
-        self.threshold = self._compute_threshold(self._calib_lambdas, self.delta)
-        self.thresholds_by_task = {
-            task_name: self._compute_threshold(task_values, self.delta)
-            for task_name, task_values in self._calib_lambdas_by_task.items()
+        calib_lambdas_by_task_and_score: dict[str, dict[str, list[np.ndarray]]] = {
+            self.SCORE_T1: {},
+            self.SCORE_T2: {},
+            self.SCORE_T3: {},
         }
+        for task_name, bundle in scored_bundles:
+            families = self._bundle_score_families(bundle, task_name=task_name)
+            for score_name, family in families.items():
+                lambdas = self._aggregate_lambda(family["step_scores"])
+                calib_lambdas_by_score[score_name].append(lambdas)
+                calib_lambdas_by_task_and_score[score_name].setdefault(str(task_name), []).append(lambdas)
+
+        self._calib_lambdas_by_score = {
+            score_name: np.concatenate(score_values, axis=0).astype(np.float32)
+            for score_name, score_values in calib_lambdas_by_score.items()
+            if score_values
+        }
+        self._calib_lambdas_by_task_and_score = {
+            score_name: {
+                task_name: np.concatenate(task_values, axis=0).astype(np.float32)
+                for task_name, task_values in task_map.items()
+                if task_values
+            }
+            for score_name, task_map in calib_lambdas_by_task_and_score.items()
+        }
+        self.threshold_by_score = {
+            score_name: self._compute_threshold(values, self.delta)
+            for score_name, values in self._calib_lambdas_by_score.items()
+        }
+        self.thresholds_by_task_and_score = {
+            score_name: {
+                task_name: self._compute_threshold(task_values, self.delta)
+                for task_name, task_values in task_map.items()
+            }
+            for score_name, task_map in self._calib_lambdas_by_task_and_score.items()
+        }
+
+        self._calib_lambdas = self._calib_lambdas_by_score[self.score_mode]
+        self._calib_lambdas_by_task = self._calib_lambdas_by_task_and_score.get(self.score_mode, {})
+        self.threshold = self.threshold_by_score[self.score_mode]
+        self.thresholds_by_task = self.thresholds_by_task_and_score.get(self.score_mode, {})
         return DetectorCalibrationSummary(
             detector_name=self.name,
             threshold=float(self.threshold),
@@ -486,19 +746,34 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "noise_sigma": float(self.extractor.model.noise_scale),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
                 "model_architecture": "conditional_fisher_unified_task_dsm",
-                "score_semantics": "fisher_l2",
+                "score_semantics": str(self.score_mode),
                 "latent_dim": int(self.extractor.latent_dim),
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),
                 "tau_dim": int(self.extractor.model.tau_dim),
                 "delta_init": float(self.delta),
                 "delta_final": float(self.delta),
+                "score_mode": str(self.score_mode),
+                "supported_score_modes": [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3],
+                "threshold_by_score": {
+                    score_name: float(threshold)
+                    for score_name, threshold in self.threshold_by_score.items()
+                },
+                "thresholds_by_task_and_score": {
+                    score_name: {
+                        task_name: float(threshold)
+                        for task_name, threshold in task_thresholds.items()
+                    }
+                    for score_name, task_thresholds in self.thresholds_by_task_and_score.items()
+                },
+                "t3_alpha": {key: float(value) for key, value in self.t3_alpha.items()},
+                "t3_beta": {key: float(value) for key, value in self.t3_beta.items()},
                 "lambda_mode": str(self.lambda_mode),
                 "lambda_window_size": int(self.lambda_window_size),
                 "num_calibration_trajectories": int(len(calibration_set)),
                 "num_calibration_trajectories_by_task": {
-                    task_name: int(len(task_values))
-                    for task_name, task_values in calib_lambdas_by_task.items()
+                    task_name: int(sum(1 for bundle_task_name, _ in scored_bundles if bundle_task_name == task_name))
+                    for task_name in sorted({task_name for task_name, _ in scored_bundles})
                 },
                 "thresholds_by_task": {
                     task_name: float(threshold)
@@ -522,18 +797,19 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
         bundle = self.extractor.score_trajectory(trajectory)
-        step_scores = np.asarray(bundle.step_scores, dtype=np.float32)
+        task_name = str(trajectory.task_name)
+        score_families = self._bundle_score_families(bundle, task_name=task_name)
+        active_family = score_families[self.score_mode]
+        step_scores = np.asarray(active_family["step_scores"], dtype=np.float32)
         lamb = self._aggregate_lambda(step_scores)
 
         component_scores = {
-            "state_error": np.asarray(bundle.state_error_scores, dtype=np.float32),
-            "action_error": np.asarray(bundle.action_error_scores, dtype=np.float32),
-            "next_state_error": np.asarray(bundle.next_state_error_scores, dtype=np.float32),
+            key: np.asarray(values, dtype=np.float32)
+            for key, values in active_family["components"].items()
         }
         component_contrib = {
-            "state_error": np.asarray(bundle.state_contrib_scores, dtype=np.float32),
-            "action_error": np.asarray(bundle.action_contrib_scores, dtype=np.float32),
-            "next_state_error": np.asarray(bundle.next_state_contrib_scores, dtype=np.float32),
+            key: np.asarray(values, dtype=np.float32)
+            for key, values in component_scores.items()
         }
         # Attribution uses the same aggregated support as the decision score.
         step_contribution_shares = self._compute_component_shares(component_contrib)
@@ -548,7 +824,10 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         preds = np.zeros_like(lamb, dtype=np.int64)
         ths = np.zeros_like(lamb, dtype=np.float32)
 
-        task_name = str(trajectory.task_name)
+        aggregate_scores_by_mode = {
+            score_name: self._aggregate_lambda(np.asarray(family["step_scores"], dtype=np.float32))
+            for score_name, family in score_families.items()
+        }
         task_calib_lambdas = self._calib_lambdas_by_task.get(task_name, None)
         task_threshold = self.thresholds_by_task.get(task_name, None)
         cur_delta = float(self.delta)
@@ -613,6 +892,36 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "threshold_init": float(task_threshold if task_threshold is not None else self.threshold),
                 "delta_final": float(cur_delta),
                 "threshold_final": float(cur_threshold),
+                "score_mode": str(self.score_mode),
+                "supported_score_modes": [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3],
+                "score_steps_by_mode": {
+                    score_name: np.asarray(family["step_scores"], dtype=np.float32)
+                    for score_name, family in score_families.items()
+                },
+                "aggregate_scores_by_mode": {
+                    score_name: np.asarray(values, dtype=np.float32)
+                    for score_name, values in aggregate_scores_by_mode.items()
+                },
+                "threshold_by_score": {
+                    score_name: float(
+                        self.thresholds_by_task_and_score.get(score_name, {}).get(
+                            task_name,
+                            self.threshold_by_score.get(score_name, np.nan),
+                        )
+                    )
+                    for score_name in [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3]
+                },
+                "state_positive_scores": np.asarray(bundle.state_positive_scores, dtype=np.float32),
+                "action_positive_scores": np.asarray(bundle.action_positive_scores, dtype=np.float32),
+                "next_state_positive_scores": np.asarray(bundle.next_state_positive_scores, dtype=np.float32),
+                "state_negative_scores": np.asarray(bundle.state_negative_scores, dtype=np.float32),
+                "action_negative_scores": np.asarray(bundle.action_negative_scores, dtype=np.float32),
+                "next_state_negative_scores": np.asarray(bundle.next_state_negative_scores, dtype=np.float32),
+                "state_margin_scores": np.asarray(bundle.state_margin_scores, dtype=np.float32),
+                "action_margin_scores": np.asarray(bundle.action_margin_scores, dtype=np.float32),
+                "next_state_margin_scores": np.asarray(bundle.next_state_margin_scores, dtype=np.float32),
+                "t1_step_scores": np.asarray(bundle.t1_step_scores, dtype=np.float32),
+                "t2_step_scores": np.asarray(bundle.t2_step_scores, dtype=np.float32),
                 "state_error_scores": component_scores["state_error"],
                 "action_error_scores": component_scores["action_error"],
                 "next_state_error_scores": component_scores["next_state_error"],
@@ -622,6 +931,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_fisher_scores": component_scores["state_error"],
                 "action_fisher_scores": component_scores["action_error"],
                 "dynamics_fisher_scores": component_scores["next_state_error"],
+                "t3_alpha": {key: float(value) for key, value in self.t3_alpha.items()},
+                "t3_beta": {key: float(value) for key, value in self.t3_beta.items()},
                 "weighted_step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in component_contrib.items()
@@ -646,6 +957,15 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_error_mean": float(np.mean(component_scores["state_error"])),
                 "action_error_mean": float(np.mean(component_scores["action_error"])),
                 "next_state_error_mean": float(np.mean(component_scores["next_state_error"])),
+                "state_positive_mean": float(np.mean(bundle.state_positive_scores)),
+                "action_positive_mean": float(np.mean(bundle.action_positive_scores)),
+                "next_state_positive_mean": float(np.mean(bundle.next_state_positive_scores)),
+                "state_negative_mean": float(np.mean(bundle.state_negative_scores)),
+                "action_negative_mean": float(np.mean(bundle.action_negative_scores)),
+                "next_state_negative_mean": float(np.mean(bundle.next_state_negative_scores)),
+                "state_margin_mean": float(np.mean(bundle.state_margin_scores)),
+                "action_margin_mean": float(np.mean(bundle.action_margin_scores)),
+                "next_state_margin_mean": float(np.mean(bundle.next_state_margin_scores)),
                 "state_energy_mean": float(np.mean(component_scores["state_error"])),
                 "action_energy_mean": float(np.mean(component_scores["action_error"])),
                 "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
