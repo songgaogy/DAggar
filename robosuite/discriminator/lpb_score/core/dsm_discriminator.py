@@ -87,6 +87,23 @@ class DSMTransitionScorer:
         cfg = payload.get("cfg", None)
         latent_dim = int(payload.get("latent_dim"))
         action_dim = int(payload.get("action_dim"))
+        num_tasks = int(payload.get("num_tasks", 0))
+        if num_tasks <= 0:
+            task_to_index = payload.get("task_to_index", None)
+            if isinstance(task_to_index, dict) and task_to_index:
+                num_tasks = int(len(task_to_index))
+        if num_tasks <= 0:
+            cfg_tasks = _cfg_get(cfg, "data.tasks", None)
+            if cfg_tasks is not None:
+                try:
+                    num_tasks = int(len(cfg_tasks))
+                except Exception:
+                    num_tasks = 0
+        if num_tasks <= 0:
+            raise ValueError(
+                "Checkpoint is missing task vocabulary metadata. "
+                f"Expected `num_tasks` or `task_to_index` in {checkpoint_path}."
+            )
         horizon_ckpt = int(payload.get("horizon", 1))
         if int(override_action_horizon) > 0 and int(override_action_horizon) != horizon_ckpt:
             raise ValueError(
@@ -98,6 +115,7 @@ class DSMTransitionScorer:
         model = build_dsm_model(
             latent_dim=latent_dim,
             action_dim=action_dim,
+            num_tasks=num_tasks,
             cfg_model=_cfg_get(cfg, "model", {}),
             transition_horizon=action_horizon,
         )
@@ -200,6 +218,7 @@ class DSMTransitionScorer:
                 current_latent=current_b,
                 action_sequence=action_b,
                 target_latent=target_b,
+                task_index=int(traj.task_index),
             )
             state_energy = fisher["state_error_per_sample"].detach().cpu()
             action_energy = fisher["action_error_per_sample"].detach().cpu()
@@ -269,6 +288,33 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
     @property
     def name(self) -> str:
         return "lpb_score_dsm"
+
+    def get_calibration_lambdas_by_task(self) -> dict[str, np.ndarray]:
+        return {
+            str(task_name): np.asarray(values, dtype=np.float32).copy()
+            for task_name, values in self._calib_lambdas_by_task.items()
+        }
+
+    def get_thresholds_by_task(self) -> dict[str, float]:
+        return {
+            str(task_name): float(threshold)
+            for task_name, threshold in self.thresholds_by_task.items()
+        }
+
+    def collect_lambdas_by_task(
+        self,
+        trajectories: Sequence[LatentTrajectory],
+    ) -> dict[str, np.ndarray]:
+        lambdas_by_task: dict[str, list[np.ndarray]] = {}
+        for traj in trajectories:
+            step_scores = np.asarray(self.extractor.score_trajectory(traj).step_scores, dtype=np.float32)
+            lambdas = self._aggregate_lambda(step_scores)
+            lambdas_by_task.setdefault(str(traj.task_name), []).append(lambdas.astype(np.float32, copy=False))
+        return {
+            str(task_name): np.concatenate(values, axis=0).astype(np.float32)
+            for task_name, values in lambdas_by_task.items()
+            if values
+        }
 
     @staticmethod
     def _compute_threshold(values: np.ndarray, delta: float) -> float:

@@ -88,6 +88,7 @@ def _build_payload(
         "model_architecture": "conditional_fisher_unified_task_dsm",
         "latent_dim": int(latent_dim),
         "action_dim": int(action_dim),
+        "num_tasks": int(len(task_to_index)),
         "horizon": int(cfg.data.transition_horizon),
         "tau_dim": int(model.tau_dim),
         "task_to_index": dict(task_to_index),
@@ -171,6 +172,7 @@ def run_train(cfg: DictConfig) -> None:
         model = build_dsm_model(
             latent_dim=int(train_dataset.latent_dim),
             action_dim=int(train_dataset.action_dim),
+            num_tasks=int(len(task_to_index)),
             cfg_model=cfg.model,
             transition_horizon=int(cfg.data.transition_horizon),
         )

@@ -27,6 +27,7 @@ class UnifiedConditionedDSM(nn.Module):
         self,
         latent_dim: int,
         action_flat_dim: int,
+        num_tasks: int,
         embed_dim: int = 512,
         num_layers: int = 4,
         num_heads: int = 8,
@@ -36,6 +37,7 @@ class UnifiedConditionedDSM(nn.Module):
         super().__init__()
         self.latent_dim = int(latent_dim)
         self.action_flat_dim = int(action_flat_dim)
+        self.num_tasks = int(num_tasks)
         self.embed_dim = int(embed_dim)
         self.num_layers = int(num_layers)
         self.num_heads = int(num_heads)
@@ -53,14 +55,17 @@ class UnifiedConditionedDSM(nn.Module):
                 f"embed_dim must be divisible by num_heads, got embed_dim={self.embed_dim}, "
                 f"num_heads={self.num_heads}"
             )
+        if self.num_tasks <= 0:
+            raise ValueError("num_tasks must be positive.")
 
         # Shared projections require a common padded width per routed field.
         self.target_max_dim = max(self.latent_dim, self.action_flat_dim)
         self.context_max_dim = self.latent_dim + self.action_flat_dim
 
-        # Each task id owns one learned routing token.
+        # Branch routing, trajectory type, and task identity each own a learned token.
         self.task_embedding = nn.Embedding(3, self.embed_dim)
         self.type_embedding = nn.Embedding(2, self.embed_dim)
+        self.task_name_embedding = nn.Embedding(self.num_tasks, self.embed_dim)
         self.context_proj = nn.Sequential(
             nn.Linear(self.context_max_dim, self.embed_dim),
             nn.LayerNorm(self.embed_dim),
@@ -110,6 +115,24 @@ class UnifiedConditionedDSM(nn.Module):
         if x.ndim != 2:
             raise ValueError(f"Expected {name} shape (B,D), got {tuple(x.shape)}")
 
+    def _require_task_index(
+        self,
+        batch_size: int,
+        task_index: torch.Tensor | int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(task_index, int):
+            task_index_tensor = torch.full((batch_size,), int(task_index), dtype=torch.long, device=device)
+        else:
+            task_index_tensor = torch.as_tensor(task_index, dtype=torch.long, device=device).reshape(-1)
+        if int(task_index_tensor.shape[0]) != int(batch_size):
+            raise ValueError(f"Expected task_index shape ({batch_size},), got {tuple(task_index_tensor.shape)}")
+        if torch.any((task_index_tensor < 0) | (task_index_tensor >= self.num_tasks)):
+            raise ValueError(
+                f"task_index must be in [0, {self.num_tasks - 1}] for this checkpoint's task vocabulary."
+            )
+        return task_index_tensor
+
     def _pad_feature(self, x: torch.Tensor, expected_dim: int, padded_dim: int, name: str) -> torch.Tensor:
         self._require_2d(name, x)
         if int(x.shape[1]) != int(expected_dim):
@@ -129,14 +152,17 @@ class UnifiedConditionedDSM(nn.Module):
         noisy_target: torch.Tensor,
         context: torch.Tensor,
         traj_type: torch.Tensor,
+        task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run one routed denoising task and slice outputs to its active width.
-        
-        For each task, the model builds a 3-token sequence:
-        1. task token from learnable `nn.Embedding(3, embed_dim)`
-        2. context token from the clean condition vector
-        3. target token from the noisy target variable
-        
+
+        For each routed factor, the model builds a 5-token sequence:
+        1. route token from learnable `nn.Embedding(3, embed_dim)`
+        2. type token from learnable `nn.Embedding(2, embed_dim)`
+        3. task token from learnable `nn.Embedding(num_tasks, embed_dim)`
+        4. context token from the clean condition vector
+        5. target token from the noisy target variable
+
         The target and context vectors are zero-padded to shared maximum dimensions before projection:
         - `target_max_dim = max(latent_dim, action_flat_dim)`
         - `context_max_dim = latent_dim + action_flat_dim`
@@ -167,15 +193,17 @@ class UnifiedConditionedDSM(nn.Module):
             device=noisy_target.device,
         )
 
-        task_token = (self.task_embedding(task_ids) + self.type_embedding(traj_type)).unsqueeze(1)
+        task_token = self.task_embedding(task_ids).unsqueeze(1)
+        type_token = self.type_embedding(traj_type).unsqueeze(1)
+        task_name_token = self.task_name_embedding(task_index).unsqueeze(1)
         context_token = self.context_proj(context_padded).unsqueeze(1)
         target_token = self.target_proj(target_padded).unsqueeze(1)
 
-        # Token order fixes the routing layout seen by the encoder.
-        tokens = torch.cat([task_token, context_token, target_token], dim=1)
+        # Route/type/task tokens participate in attention without changing routed context construction.
+        tokens = torch.cat([task_token, type_token, task_name_token, context_token, target_token], dim=1)
         tokens = self.transformer(tokens)
         # Only the target token is decoded back to feature space.
-        target_feature = self.output_norm(tokens[:, 2, :])
+        target_feature = self.output_norm(tokens[:, 4, :])
 
         pred_mean_full = self.output_mean(target_feature)
         return {
@@ -192,6 +220,7 @@ class UnifiedConditionedDSM(nn.Module):
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
         traj_type: torch.Tensor,
+        task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run the three denoising factors with shared backbone parameters.
         
@@ -199,6 +228,11 @@ class UnifiedConditionedDSM(nn.Module):
         """
         batch_size = int(state_input.shape[0])
         state_context = state_input.new_zeros((batch_size, 0))
+        task_index_tensor = self._require_task_index(
+            batch_size=batch_size,
+            task_index=task_index,
+            device=state_input.device,
+        )
         # The dynamics task conditions on clean [z_t, a].
         dynamics_context = torch.cat([current_latent, action_clean], dim=-1)
 
@@ -207,18 +241,21 @@ class UnifiedConditionedDSM(nn.Module):
             noisy_target=state_input,
             context=state_context,
             traj_type=traj_type,
+            task_index=task_index_tensor,
         )
         action_out = self.forward_task(
             task_id=self.TASK_ACTOR,
             noisy_target=action_input,
             context=current_latent,
             traj_type=traj_type,
+            task_index=task_index_tensor,
         )
         dynamics_out = self.forward_task(
             task_id=self.TASK_DYNAMICS,
             noisy_target=next_state_input,
             context=dynamics_context,
             traj_type=traj_type,
+            task_index=task_index_tensor,
         )
         return {
             "state_hat": state_out["pred_mean"],
@@ -251,6 +288,7 @@ class DSMModel(nn.Module):
         self.noise_scale = float(noise_scale)
         self.noise_sigma = self.noise_scale
         self.std_clamp_min = float(std_clamp_min)
+        self.num_tasks = int(self.predictor.num_tasks)
         self.action_flat_dim = int(self.action_dim * self.transition_horizon)
         self.tau_dim = int(2 * self.latent_dim + self.action_flat_dim)
 
@@ -430,6 +468,18 @@ class DSMModel(nn.Module):
             raise ValueError("traj_type must contain only 0 (positive) or 1 (negative).")
         return traj_type_tensor
 
+    def _require_task_index(
+        self,
+        batch_size: int,
+        task_index: torch.Tensor | int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return self.predictor._require_task_index(
+            batch_size=batch_size,
+            task_index=task_index,
+            device=device,
+        )
+
     def reconstruction_components(
         self,
         *,
@@ -497,6 +547,7 @@ class DSMModel(nn.Module):
         target_latent: torch.Tensor,
         *,
         traj_type: torch.Tensor | int,
+        task_index: torch.Tensor | int,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Build normalized task targets and run the unified denoiser."""
@@ -532,6 +583,11 @@ class DSMModel(nn.Module):
             traj_type=traj_type,
             device=current_latent.device,
         )
+        task_index_tensor = self._require_task_index(
+            batch_size=int(current_latent.shape[0]),
+            task_index=task_index,
+            device=current_latent.device,
+        )
 
         preds = self.predictor(
             state_input=noisy["state_input"],
@@ -540,10 +596,12 @@ class DSMModel(nn.Module):
             action_clean=action_clean,
             next_state_input=noisy["next_state_input"],
             traj_type=traj_type_tensor,
+            task_index=task_index_tensor,
         )
         return {
             "current_latent": current_latent,
             "traj_type": traj_type_tensor,
+            "task_index": task_index_tensor,
             "state_clean": state_clean,
             "state_input": noisy["state_input"],
             "state_hat": preds["state_hat"],
@@ -567,6 +625,7 @@ class DSMModel(nn.Module):
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
         traj_type: torch.Tensor,
+        task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Run noisy denoising and return aggregate training statistics."""
         out = self.forward(
@@ -574,6 +633,7 @@ class DSMModel(nn.Module):
             action_sequence=action_sequence,
             target_latent=target_latent,
             traj_type=traj_type,
+            task_index=task_index,
             add_noise=True,
         )
         recon = self.reconstruction_components(
@@ -597,6 +657,7 @@ class DSMModel(nn.Module):
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
             "current_latent": out["current_latent"],
             "traj_type": out["traj_type"],
+            "task_index": out["task_index"],
             "state_clean": out["state_clean"],
             "state_input": out["state_input"],
             "state_hat": out["state_hat"],
@@ -614,6 +675,7 @@ class DSMModel(nn.Module):
         current_latent: torch.Tensor,
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
+        task_index: torch.Tensor | int,
     ) -> dict[str, torch.Tensor]:
         """Run dual conditional inference and return Fisher L2 energies."""
         pos_out = self.forward(
@@ -621,6 +683,7 @@ class DSMModel(nn.Module):
             action_sequence=action_sequence,
             target_latent=target_latent,
             traj_type=0,
+            task_index=task_index,
             add_noise=False,
         )
         neg_out = self.forward(
@@ -628,6 +691,7 @@ class DSMModel(nn.Module):
             action_sequence=action_sequence,
             target_latent=target_latent,
             traj_type=1,
+            task_index=task_index,
             add_noise=False,
         )
         fisher = self.fisher_components(
@@ -656,6 +720,7 @@ def build_unified_conditioned_dsm(
     *,
     latent_dim: int,
     action_flat_dim: int,
+    num_tasks: int,
     cfg_model: Any,
 ) -> UnifiedConditionedDSM:
     """Build the unified transformer predictor from config values."""
@@ -663,6 +728,7 @@ def build_unified_conditioned_dsm(
     return UnifiedConditionedDSM(
         latent_dim=int(latent_dim),
         action_flat_dim=int(action_flat_dim),
+        num_tasks=int(num_tasks),
         embed_dim=embed_dim,
         num_layers=int(_cfg_get(cfg_model, "num_layers", _cfg_get(cfg_model, "backbone_num_blocks", 4))),
         num_heads=int(_cfg_get(cfg_model, "num_heads", 8)),
@@ -675,12 +741,14 @@ def build_conditional_manifold_denoiser(
     *,
     latent_dim: int,
     action_flat_dim: int,
+    num_tasks: int,
     cfg_model: Any,
 ) -> UnifiedConditionedDSM:
     """Backward-compatible alias for the unified predictor builder."""
     return build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         action_flat_dim=int(action_flat_dim),
+        num_tasks=int(num_tasks),
         cfg_model=cfg_model,
     )
 
@@ -700,6 +768,7 @@ def build_dsm_model(
     *,
     latent_dim: int,
     action_dim: int,
+    num_tasks: int,
     cfg_model: Any,
     transition_horizon: int,
 ) -> DSMModel:
@@ -708,6 +777,7 @@ def build_dsm_model(
     predictor = build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         action_flat_dim=action_flat_dim,
+        num_tasks=int(num_tasks),
         cfg_model=cfg_model,
     )
     return DSMModel(

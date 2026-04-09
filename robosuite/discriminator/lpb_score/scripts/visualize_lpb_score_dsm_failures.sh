@@ -7,10 +7,10 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=1
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole/lpb_dipole_dsm_20260410_000622/lpb_dipole_dsm_20260410_000622_ep0030.pt"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole/lpb_dipole_dsm_20260410_013711/lpb_dipole_dsm_20260410_013711_ep0040.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
-NUM_VIDEOS=8
+NUM_VIDEOS=20
 DELTA_THRESHOLD=10.0
 
 BANK_SIZE=100

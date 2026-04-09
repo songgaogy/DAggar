@@ -125,6 +125,7 @@ class Trainer:
                 action_sequence=data["action_sequence"],
                 target_latent=data["target_latent"],
                 traj_type=data["traj_type"],
+                task_index=data["task_index"],
             )
             loss = stats["loss"]
             if train:

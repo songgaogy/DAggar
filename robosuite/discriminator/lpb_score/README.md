@@ -43,10 +43,15 @@ The unified transformer still routes three denoising factors through one shared 
 Task routing still uses a learned task token. The refactor adds:
 
 - `type_embedding = nn.Embedding(2, embed_dim)`
+- `task_name_embedding = nn.Embedding(num_tasks, embed_dim)`
 
-The route token becomes:
+The shared backbone now sees five tokens:
 
-- `task_embedding(task_id) + type_embedding(traj_type)`
+- `task_embedding(task_id)`
+- `type_embedding(traj_type)`
+- `task_name_embedding(task_index)`
+- projected context token
+- projected noisy target token
 
 The model output head is now deterministic:
 
@@ -63,7 +68,7 @@ For each sampled transition:
 1. normalize `z_t`, `a_{t:t+H-1}`, and `z_{t+H}`
 2. build the routed clean targets
 3. add Gaussian noise to the routed targets
-4. predict the clean routed targets conditioned on `traj_type`
+4. predict the clean routed targets conditioned on `traj_type` and `task_index`
 5. optimize plain MSE
 
 The batch loss is the mean of:

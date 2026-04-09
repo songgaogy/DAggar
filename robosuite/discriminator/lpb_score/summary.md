@@ -56,8 +56,9 @@ The refactor adds trajectory-type conditioning:
 
 - `task_embedding(task_id)`
 - `type_embedding(traj_type)`
+- `task_name_embedding(task_index)`
 
-These are summed before entering the shared backbone.
+These enter the shared backbone as separate attention tokens alongside the context and target tokens.
 
 The output head is deterministic:
 
@@ -72,7 +73,7 @@ Training remains denoising-style in normalized space:
 1. standardize latent and action features
 2. build clean routed targets
 3. add Gaussian noise to the routed targets
-4. predict clean routed targets conditioned on `traj_type`
+4. predict clean routed targets conditioned on `traj_type` and `task_index`
 5. optimize plain MSE
 
 Normalization stats are computed from the sampled positive training refs.

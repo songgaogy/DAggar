@@ -289,6 +289,150 @@ def _save_failure_plot_pdf(
     plt.close(fig)
 
 
+def _save_threshold_distribution_plots(
+    *,
+    threshold_dir: str,
+    calibration_lambdas_by_task: dict[str, np.ndarray],
+    fail_lambdas_by_task: dict[str, np.ndarray],
+    thresholds_by_task: dict[str, float],
+) -> dict[str, str]:
+    """Save one calibration-threshold distribution plot per task."""
+    os.makedirs(threshold_dir, exist_ok=True)
+    saved_paths: dict[str, str] = {}
+
+    task_names = sorted(set(calibration_lambdas_by_task.keys()) | set(fail_lambdas_by_task.keys()))
+    for task_name in task_names:
+        calibration_values = np.asarray(
+            calibration_lambdas_by_task.get(task_name, []),
+            dtype=np.float32,
+        ).reshape(-1)
+        fail_values = np.asarray(
+            fail_lambdas_by_task.get(task_name, []),
+            dtype=np.float32,
+        ).reshape(-1)
+        if calibration_values.size == 0 and fail_values.size == 0:
+            continue
+
+        threshold = float(thresholds_by_task.get(task_name, np.nan))
+        combined_values = np.concatenate(
+            [
+                values
+                for values in [calibration_values, fail_values]
+                if values.size > 0
+            ],
+            axis=0,
+        ).astype(np.float32)
+        num_bins = max(10, min(60, int(np.sqrt(combined_values.size))))
+
+        fig = plt.figure(figsize=(8.4, 6.2), constrained_layout=True)
+        grid = fig.add_gridspec(2, 1, height_ratios=[2.2, 1.3])
+        hist_ax = fig.add_subplot(grid[0, 0])
+        cdf_ax = fig.add_subplot(grid[1, 0])
+
+        if calibration_values.size > 0:
+            hist_ax.hist(
+                calibration_values,
+                bins=num_bins,
+                color="#4c78a8",
+                edgecolor="white",
+                linewidth=0.8,
+                alpha=0.62,
+                label="calibration",
+            )
+        if fail_values.size > 0:
+            hist_ax.hist(
+                fail_values,
+                bins=num_bins,
+                color="#f58518",
+                edgecolor="white",
+                linewidth=0.8,
+                alpha=0.48,
+                label="fail_rollout",
+            )
+        if np.isfinite(threshold):
+            hist_ax.axvline(
+                threshold,
+                color="#d62728",
+                linewidth=2.0,
+                linestyle="--",
+                label=f"threshold={threshold:.3f}",
+            )
+        if calibration_values.size > 0 or fail_values.size > 0 or np.isfinite(threshold):
+            hist_ax.legend(loc="upper right")
+        hist_ax.set_title(f"{task_name} Lambda Distribution Comparison", fontsize=13, pad=10)
+        hist_ax.set_ylabel("Count")
+        hist_ax.grid(True, alpha=0.20, linestyle="--", linewidth=0.8)
+        calibration_mean = float(np.mean(calibration_values)) if calibration_values.size > 0 else float("nan")
+        fail_mean = float(np.mean(fail_values)) if fail_values.size > 0 else float("nan")
+        hist_ax.text(
+            0.995,
+            0.98,
+            (
+                f"cal_n={int(calibration_values.size)}  "
+                f"cal_mean={calibration_mean:.3f}  "
+                f"fail_n={int(fail_values.size)}"
+                + (
+                    f"  fail_mean={fail_mean:.3f}"
+                    if fail_values.size > 0
+                    else ""
+                )
+            ),
+            transform=hist_ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=10,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
+        )
+
+        if calibration_values.size > 0:
+            sorted_calibration = np.sort(calibration_values.astype(np.float64))
+            calibration_cdf = np.arange(1, sorted_calibration.size + 1, dtype=np.float64) / float(sorted_calibration.size)
+            cdf_ax.plot(sorted_calibration, calibration_cdf, color="#1f77b4", linewidth=2.0, label="calibration")
+        if fail_values.size > 0:
+            sorted_fail = np.sort(fail_values.astype(np.float64))
+            fail_cdf = np.arange(1, sorted_fail.size + 1, dtype=np.float64) / float(sorted_fail.size)
+            cdf_ax.plot(sorted_fail, fail_cdf, color="#f58518", linewidth=2.0, label="fail_rollout")
+        if np.isfinite(threshold):
+            cdf_ax.axvline(threshold, color="#d62728", linewidth=1.8, linestyle="--")
+            calibration_quantile = (
+                float(np.mean(calibration_values.astype(np.float64) <= threshold))
+                if calibration_values.size > 0
+                else float("nan")
+            )
+            fail_quantile = (
+                float(np.mean(fail_values.astype(np.float64) <= threshold))
+                if fail_values.size > 0
+                else float("nan")
+            )
+            cdf_ax.text(
+                0.995,
+                0.08,
+                (
+                    f"cal_q={calibration_quantile:.3f}"
+                    + (f"  fail_q={fail_quantile:.3f}" if np.isfinite(fail_quantile) else "")
+                ),
+                transform=cdf_ax.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=10,
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
+            )
+        cdf_ax.set_xlabel("Lambda")
+        cdf_ax.set_ylabel("ECDF")
+        cdf_ax.set_ylim(0.0, 1.02)
+        cdf_ax.grid(True, alpha=0.20, linestyle="--", linewidth=0.8)
+        if calibration_values.size > 0 or fail_values.size > 0:
+            cdf_ax.legend(loc="lower right")
+
+        safe_task_name = str(task_name).replace(os.sep, "_")
+        plot_path = os.path.join(threshold_dir, f"{safe_task_name}_threshold_distribution.png")
+        fig.savefig(plot_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths[str(task_name)] = plot_path
+
+    return saved_paths
+
+
 def _list_suboptimal_demo_refs(cfg: DictConfig) -> tuple[list[SuboptimalDemoRef], dict[str, dict[str, int]]]:
     root_dir = to_absolute_path(str(cfg.suboptimal.root_dir))
     train_count = int(cfg.suboptimal.train_count_per_task)
@@ -580,6 +724,12 @@ def run_visualize(cfg: DictConfig) -> None:
         calibration_trajectories = list(bank_trajectories)
         if not sampled_bank_refs:
             raise RuntimeError("No bank trajectories found for visualization.")
+        fail_distribution_refs = select_split_refs(
+            cached_splits=cached_splits,
+            split_name=str(cfg.eval.fail_eval_split),
+            data_types=list(cfg.eval.fail_eval_data_types),
+        )
+        fail_distribution_trajectories = load_latent_trajectories(fail_distribution_refs)
 
         detector = build_dsm_discriminator(cfg)
         selected_refs, target_trajectories, gt_label_sequences, target_summary = _load_visualization_targets(
@@ -598,6 +748,13 @@ def run_visualize(cfg: DictConfig) -> None:
 
         run_dir = os.path.join(to_absolute_path(str(cfg.save_dir)), f"run_{now_tag()}")
         os.makedirs(run_dir, exist_ok=True)
+        threshold_dir = os.path.join(run_dir, "threshold")
+        threshold_plot_paths = _save_threshold_distribution_plots(
+            threshold_dir=threshold_dir,
+            calibration_lambdas_by_task=detector.get_calibration_lambdas_by_task(),
+            fail_lambdas_by_task=detector.collect_lambdas_by_task(fail_distribution_trajectories),
+            thresholds_by_task=detector.get_thresholds_by_task(),
+        )
         report_pdf_path = os.path.join(run_dir, "failure_report.pdf")
         report_pdf = PdfPages(report_pdf_path) if bool(cfg.visualization.save_pdf) else None
 
@@ -839,6 +996,11 @@ def run_visualize(cfg: DictConfig) -> None:
                 "num_selected": int(len(sampled_bank_refs)),
                 "bank_size": int(bank_size),
                 "calibration_seed": int(calibration_seed),
+                "fail_distribution_split": str(cfg.eval.fail_eval_split),
+                "fail_distribution_data_types": list(cfg.eval.fail_eval_data_types),
+                "num_fail_distribution_trajectories": int(len(fail_distribution_trajectories)),
+                "threshold_plot_dir": threshold_dir,
+                "threshold_plots_by_task": threshold_plot_paths,
             },
             "videos": [asdict(record) for record in records],
         }
