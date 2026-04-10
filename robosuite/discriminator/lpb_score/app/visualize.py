@@ -1054,6 +1054,15 @@ def run_visualize(cfg: DictConfig) -> None:
                     if calibration_summary.threshold is not None
                     else float("nan")
                 ),
+                "detector_hparams": {
+                    "score_mode": str(getattr(cfg.detector, "score_mode", detector.score_mode)),
+                    "alpha_state": float(getattr(cfg.detector, "alpha_state", 1.0)),
+                    "alpha_action": float(getattr(cfg.detector, "alpha_action", 1.0)),
+                    "alpha_dynamics": float(getattr(cfg.detector, "alpha_dynamics", 1.0)),
+                    "beta_state": float(getattr(cfg.detector, "beta_state", 1.0)),
+                    "beta_action": float(getattr(cfg.detector, "beta_action", 1.0)),
+                    "beta_dynamics": float(getattr(cfg.detector, "beta_dynamics", 1.0)),
+                },
                 **dict(calibration_summary.metadata),
             },
             "visualization": {

@@ -678,19 +678,27 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         normal_bank_trajectories: Sequence[LatentTrajectory],
         calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
+        normal_bank_set = list(normal_bank_trajectories)
         calibration_set = (
             list(calibration_trajectories)
             if calibration_trajectories is not None
-            else list(normal_bank_trajectories)
+            else list(normal_bank_set)
         )
         if len(calibration_set) == 0:
             raise ValueError("Calibration requires at least one trajectory.")
+        if len(normal_bank_set) == 0:
+            raise ValueError("T3 normalization requires at least one success-bank trajectory.")
+
+        bank_scored_bundles: list[tuple[str, TrajectoryScoreBundle]] = []
+        for traj in normal_bank_set:
+            bank_scored_bundles.append((str(traj.task_name), self.extractor.score_trajectory(traj)))
 
         scored_bundles: list[tuple[str, TrajectoryScoreBundle]] = []
         for traj in calibration_set:
             scored_bundles.append((str(traj.task_name), self.extractor.score_trajectory(traj)))
 
-        self._compute_t3_norm_stats(scored_bundles)
+        # T3 always standardizes branch-wise s/m terms with statistics estimated from the success bank.
+        self._compute_t3_norm_stats(bank_scored_bundles)
         calib_lambdas_by_score: dict[str, list[np.ndarray]] = {
             self.SCORE_T1: [],
             self.SCORE_T2: [],
@@ -768,6 +776,23 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 },
                 "t3_alpha": {key: float(value) for key, value in self.t3_alpha.items()},
                 "t3_beta": {key: float(value) for key, value in self.t3_beta.items()},
+                "t3_norm_source": "success_bank",
+                "num_t3_norm_bank_trajectories": int(len(normal_bank_set)),
+                "num_t3_norm_bank_trajectories_by_task": {
+                    task_name: int(sum(1 for bundle_task_name, _ in bank_scored_bundles if bundle_task_name == task_name))
+                    for task_name in sorted({task_name for task_name, _ in bank_scored_bundles})
+                },
+                "t3_norm_stats_global": {
+                    key: float(value)
+                    for key, value in self._t3_norm_stats_global.items()
+                },
+                "t3_norm_stats_by_task": {
+                    task_name: {
+                        key: float(value)
+                        for key, value in stats.items()
+                    }
+                    for task_name, stats in self._t3_norm_stats_by_task.items()
+                },
                 "lambda_mode": str(self.lambda_mode),
                 "lambda_window_size": int(self.lambda_window_size),
                 "num_calibration_trajectories": int(len(calibration_set)),

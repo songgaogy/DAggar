@@ -18,12 +18,17 @@ WINDOW_SIZE=6
 VIS_DATA_SOURCE="${VIS_DATA_SOURCE:-suboptimal}"
 SUBOPTIMAL_SOURCE_SPLIT="${SUBOPTIMAL_SOURCE_SPLIT:-eval}"
 SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_weighted_combo
-ALPHA_STATE="${ALPHA_STATE:-1.0}"
-ALPHA_ACTION="${ALPHA_ACTION:-1.0}"
-ALPHA_DYNAMICS="${ALPHA_DYNAMICS:-1.0}"
-BETA_STATE="${BETA_STATE:-1.0}"
-BETA_ACTION="${BETA_ACTION:-1.0}"
-BETA_DYNAMICS="${BETA_DYNAMICS:-1.0}"
+
+# ---------------------------------------
+# positive energy
+ALPHA_STATE=0
+ALPHA_ACTION=0
+ALPHA_DYNAMICS=0
+# energy margin gap
+BETA_STATE=1
+BETA_ACTION=0
+BETA_DYNAMICS=1
+# ---------------------------------------
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-96}"
