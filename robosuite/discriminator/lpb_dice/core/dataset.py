@@ -16,6 +16,24 @@ from robosuite.discriminator.dyn_bce.task_registry import ordered_task_names
 
 
 DATA_TYPE_ORDER = ["expert", "success_rollout", "fail_rollout"]
+POSITIVE_DATA_TYPES = ("expert", "success_rollout")
+BACKGROUND_DATA_TYPES = ("fail_rollout",)
+
+
+def is_positive_data_type(data_type: str) -> bool:
+    return str(data_type) in POSITIVE_DATA_TYPES
+
+
+def is_background_data_type(data_type: str) -> bool:
+    return str(data_type) in BACKGROUND_DATA_TYPES
+
+
+def role_for_data_type(data_type: str) -> str:
+    if is_positive_data_type(data_type):
+        return "positive"
+    if is_background_data_type(data_type):
+        return "background"
+    raise KeyError(f"Unsupported data_type role mapping: {data_type}")
 
 
 @dataclass(frozen=True)
@@ -39,8 +57,7 @@ class TaskDataSpec:
     success_rollout_dir: str
     fail_rollout_dir: str
     train: SplitCounts
-    val: SplitCounts
-    test: SplitCounts
+    eval: SplitCounts
 
     def dir_for(self, data_type: str) -> str:
         if data_type == "expert":
@@ -127,8 +144,6 @@ def parse_task_specs(cfg_data: Any) -> dict[str, TaskDataSpec]:
 
     global_train = _split_counts_from_cfg(_cfg_get(global_splits, "train"))
     global_eval = _split_counts_from_cfg(_get_eval_split_cfg(global_splits))
-    global_test = _split_counts_from_cfg(_cfg_get(global_splits, "test"))
-
     for task_name in ordered_task_names(list(tasks_cfg.keys())):
         task_cfg = tasks_cfg[task_name]
         specs[task_name] = TaskDataSpec(
@@ -137,21 +152,20 @@ def parse_task_specs(cfg_data: Any) -> dict[str, TaskDataSpec]:
             success_rollout_dir=to_absolute_path(str(_cfg_get(task_cfg, "success_rollout_dir"))),
             fail_rollout_dir=to_absolute_path(str(_cfg_get(task_cfg, "fail_rollout_dir"))),
             train=_split_counts_from_cfg(_cfg_get(task_cfg, "train", global_train)),
-            val=_split_counts_from_cfg(_get_eval_split_cfg(task_cfg, global_eval)),
-            test=_split_counts_from_cfg(_cfg_get(task_cfg, "test", global_test)),
+            eval=_split_counts_from_cfg(_get_eval_split_cfg(task_cfg, global_eval)),
         )
     return specs
 
 
 def _list_hdf5_demo_refs(task_name: str, data_type: str, data_dir: str) -> list[tuple[str, str]]:
     if not os.path.isdir(data_dir):
-        print(f"[lpb_new] Missing directory for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
+        print(f"[lpb_dice] Missing directory for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
         return []
 
     refs: list[tuple[str, str]] = []
     hdf5_files = sorted(glob.glob(os.path.join(data_dir, "*.hdf5")))
     if not hdf5_files:
-        print(f"[lpb_new] No .hdf5 files for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
+        print(f"[lpb_dice] No .hdf5 files for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
         return []
 
     for file_path in hdf5_files:
@@ -162,22 +176,21 @@ def _list_hdf5_demo_refs(task_name: str, data_type: str, data_dir: str) -> list[
                 refs.append((file_path, demo_key))
 
     if not refs:
-        print(f"[lpb_new] No demos found for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
+        print(f"[lpb_dice] No demos found for {task_name}/{data_type}: {data_dir}. Using 0 trajectories.")
     return refs
 
 
 def _split_refs_with_counts(
     refs: list[tuple[str, str]],
     train_count: int,
-    val_count: int,
-    test_count: int,
+    eval_count: int,
     seed: int,
     task_name: str,
     data_type: str,
 ) -> dict[str, list[tuple[str, str]]]:
-    requested_total = int(train_count) + int(val_count) + int(test_count)
+    requested_total = int(train_count) + int(eval_count)
     if requested_total <= 0 or len(refs) <= 0:
-        return {"train": [], "val": [], "test": []}
+        return {"train": [], "eval": []}
 
     rng = np.random.default_rng(int(seed))
     indices = np.arange(len(refs))
@@ -186,18 +199,16 @@ def _split_refs_with_counts(
 
     if len(selected) < requested_total:
         print(
-            f"[lpb_new] task={task_name} data_type={data_type} requested "
-            f"(train={train_count}, val={val_count}, test={test_count}, total={requested_total}) "
+            f"[lpb_dice] task={task_name} data_type={data_type} requested "
+            f"(train={train_count}, eval={eval_count}, total={requested_total}) "
             f"but only found {len(refs)} trajectories. Using all available trajectories for this bucket."
         )
 
     train_end = min(int(train_count), len(selected))
-    val_end = min(train_end + int(val_count), len(selected))
-    test_end = min(val_end + int(test_count), len(selected))
+    eval_end = min(train_end + int(eval_count), len(selected))
     return {
         "train": selected[:train_end],
-        "val": selected[train_end:val_end],
-        "test": selected[val_end:test_end],
+        "eval": selected[train_end:eval_end],
     }
 
 
@@ -205,9 +216,9 @@ def build_split_refs(
     cfg_data: Any,
     seed: int,
 ) -> tuple[dict[str, list[DemoRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
-    """Sample demo references for train/val/test across all tasks and buckets."""
+    """Sample demo references for train/eval across all tasks and buckets."""
     task_specs = parse_task_specs(cfg_data)
-    split_refs = {"train": [], "val": [], "test": []}
+    split_refs = {"train": [], "eval": []}
     split_summary: dict[str, dict[str, dict[str, int]]] = {}
     task_to_index = {
         task_name: idx
@@ -216,8 +227,8 @@ def build_split_refs(
 
     for task_offset, task_name in enumerate(ordered_task_names(list(task_specs.keys()))):
         spec = task_specs[task_name]
-        split_summary[task_name] = {"train": {}, "val": {}, "test": {}}
-        split_cfgs = {"train": spec.train, "val": spec.val, "test": spec.test}
+        split_summary[task_name] = {"train": {}, "eval": {}}
+        split_cfgs = {"train": spec.train, "eval": spec.eval}
         for data_type_idx, data_type in enumerate(DATA_TYPE_ORDER):
             refs = _list_hdf5_demo_refs(
                 task_name=task_name,
@@ -227,13 +238,12 @@ def build_split_refs(
             chosen = _split_refs_with_counts(
                 refs=refs,
                 train_count=split_cfgs["train"].by_data_type()[data_type],
-                val_count=split_cfgs["val"].by_data_type()[data_type],
-                test_count=split_cfgs["test"].by_data_type()[data_type],
+                eval_count=split_cfgs["eval"].by_data_type()[data_type],
                 seed=int(seed + task_offset * 97 + data_type_idx * 17),
                 task_name=task_name,
                 data_type=data_type,
             )
-            for split_name in ["train", "val", "test"]:
+            for split_name in ["train", "eval"]:
                 split_summary[task_name][split_name][data_type] = int(len(chosen[split_name]))
                 for file_path, demo_key in chosen[split_name]:
                     split_refs[split_name].append(
@@ -249,13 +259,49 @@ def build_split_refs(
     return split_refs, split_summary, task_to_index
 
 
+def list_raw_demo_refs(
+    cfg_data: Any,
+    *,
+    data_types: Sequence[str] | None = None,
+) -> tuple[list[DemoRef], dict[str, dict[str, int]]]:
+    """Enumerate raw demos without applying train/eval split sampling."""
+    task_specs = parse_task_specs(cfg_data)
+    allowed = None if data_types is None else {str(name) for name in data_types}
+
+    refs: list[DemoRef] = []
+    summary: dict[str, dict[str, int]] = {}
+    for task_name in ordered_task_names(list(task_specs.keys())):
+        spec = task_specs[task_name]
+        summary[task_name] = {}
+        for data_type in DATA_TYPE_ORDER:
+            if allowed is not None and data_type not in allowed:
+                continue
+            task_refs = _list_hdf5_demo_refs(
+                task_name=task_name,
+                data_type=data_type,
+                data_dir=spec.dir_for(data_type),
+            )
+            summary[task_name][data_type] = int(len(task_refs))
+            for file_path, demo_key in task_refs:
+                refs.append(
+                    DemoRef(
+                        task_name=task_name,
+                        data_type=data_type,
+                        split="raw",
+                        file_path=file_path,
+                        demo_key=demo_key,
+                    )
+                )
+    return refs, summary
+
+
 def _print_split_summary(split_summary: dict[str, dict[str, dict[str, int]]]) -> None:
     for task_name, task_summary in split_summary.items():
         for split_name, split_counts in task_summary.items():
             msg = ", ".join(
                 [f"{data_type}={int(split_counts.get(data_type, 0))}" for data_type in DATA_TYPE_ORDER]
             )
-            print(f"[lpb_new] task={task_name} split={split_name} {msg}")
+            print(f"[lpb_dice] task={task_name} split={split_name} {msg}")
 
 
 def prepare_cached_trajectories(
@@ -338,7 +384,7 @@ def prepare_cached_trajectories(
                 flush_batch()
 
         if (idx + 1) % 1000 == 0 or (idx + 1) == len(refs):
-            print(f"[lpb_new] prepared_cached_trajectories {idx + 1}/{len(refs)}")
+            print(f"[lpb_dice] prepared_cached_trajectories {idx + 1}/{len(refs)}")
 
     flush_batch()
     return encoded_refs
@@ -374,6 +420,16 @@ def filter_refs_by_data_types(
         return list(refs)
     allowed = {str(name) for name in data_types}
     return [ref for ref in refs if ref.data_type in allowed]
+
+
+def filter_refs_by_roles(
+    refs: Sequence[EncodedTrajectoryRef],
+    roles: Sequence[str] | None,
+) -> list[EncodedTrajectoryRef]:
+    if roles is None:
+        return list(refs)
+    allowed = {str(role) for role in roles}
+    return [ref for ref in refs if role_for_data_type(ref.data_type) in allowed]
 
 
 class LatentTransitionDataset(Dataset):
@@ -504,7 +560,7 @@ def build_cached_splits(
     batch_size = int(_cfg_get(cfg_data, "encode_demo_batch_size", 8))
 
     for split_name, refs in split_refs.items():
-        print(f"[lpb_new] building latent cache for split={split_name} num_trajectories={len(refs)}")
+        print(f"[lpb_dice] building latent cache for split={split_name} num_trajectories={len(refs)}")
         cached_splits[split_name] = prepare_cached_trajectories(
             refs=refs,
             encoder=encoder,

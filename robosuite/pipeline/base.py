@@ -7,21 +7,10 @@ import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 
-from robosuite.discriminator.bce.dataset import (
-    build_cached_splits as build_bce_cached_splits,
-    filter_refs_by_data_types as filter_bce_refs_by_data_types,
-    load_latent_trajectories as load_bce_latent_trajectories,
-)
-from robosuite.discriminator.bce.tpud_discriminator import TPUDDiscriminator
 from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
 from robosuite.discriminator.dyn_bce.task_registry import normalize_task_name, resolve_checkpoint_task_name
-from robosuite.discriminator.lpb_new.core.dataset import (
-    LatentTrajectory,
-    build_cached_splits as build_lpb_cached_splits,
-    filter_refs_by_data_types as filter_lpb_refs_by_data_types,
-    load_latent_trajectories as load_lpb_latent_trajectories,
-)
-from robosuite.discriminator.lpb_new.core.knn_discriminator import LPBKNNDiscriminator
+from robosuite.discriminator.lpb_dice.core.dataset import LatentTrajectory
+from robosuite.discriminator.lpb_dice.core.pu_detector import LPBDiceDiscriminator
 from robosuite.policy.flow_multi.eval_flow import (
     center_crop_resize,
     resolve_language_instruction,
@@ -352,6 +341,8 @@ class OfflinePrefixOnlineDiscriminator(BaseOnlineDiscriminator):
         horizon = getattr(self.detector, "action_horizon", None)
         if horizon is None and hasattr(self.detector, "extractor"):
             horizon = getattr(self.detector.extractor, "action_horizon", None)
+        if horizon is None and hasattr(self.detector, "representation"):
+            horizon = getattr(self.detector.representation, "action_horizon", None)
         if horizon is None:
             return 1
         return int(horizon) + 1
@@ -478,68 +469,46 @@ class OfflinePrefixOnlineDiscriminator(BaseOnlineDiscriminator):
         self.encoder.close()
 
 
-class LPBNewOnlineDiscriminator(OfflinePrefixOnlineDiscriminator):
+class LPBDiceOnlineDiscriminator(OfflinePrefixOnlineDiscriminator):
     def __init__(self, cfg: Any) -> None:
-        self.name = "lpb_new"
+        self.name = "lpb_dice"
         self._task_to_index_map: dict[str, int] = {}
         super().__init__(cfg)
 
     def _build_and_fit_detector(self):
-        cached_splits, _, task_to_index = build_lpb_cached_splits(
-            cfg_data=self.cfg.data,
-            encoder=self.encoder,
-            seed=self.seed,
+        checkpoint_path = to_absolute_path(str(self.cfg.model.dice_ckpt))
+        payload = _torch_load_checkpoint(checkpoint_path)
+        task_to_index = payload.get("task_to_index", None)
+        if isinstance(task_to_index, dict) and task_to_index:
+            self._task_to_index_map = {
+                str(task_name): int(idx)
+                for task_name, idx in task_to_index.items()
+            }
+        else:
+            task_names = sorted(list(getattr(self.cfg.data, "tasks", {}).keys()))
+            self._task_to_index_map = {
+                str(normalize_task_name(task_name)): int(idx)
+                for idx, task_name in enumerate(task_names)
+            }
+        return LPBDiceDiscriminator.from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            device=str(self.cfg.detector.device),
         )
-        self._task_to_index_map = {str(task_name): int(idx) for task_name, idx in task_to_index.items()}
-        bank_refs = filter_lpb_refs_by_data_types(
-            cached_splits[str(self.cfg.eval.bank_split)],
-            list(self.cfg.eval.bank_data_types),
-        )
-        calibration_refs = filter_lpb_refs_by_data_types(
-            cached_splits[str(self.cfg.eval.calibration_split)],
-            list(self.cfg.eval.calibration_data_types),
-        )
-        bank_trajectories = load_lpb_latent_trajectories(bank_refs)
-        calibration_trajectories = load_lpb_latent_trajectories(calibration_refs)
-        if not bank_trajectories:
-            raise RuntimeError("No bank trajectories found for online LPB discriminator.")
-        if not calibration_trajectories:
-            raise RuntimeError("No calibration trajectories found for online LPB discriminator.")
-
-        detector = LPBKNNDiscriminator(
-            checkpoint_path=to_absolute_path(str(self.cfg.model.lpb_ckpt)),
-            feature_device=str(self.cfg.feature.device),
-            feature_batch_size=int(self.cfg.feature.batch_size),
-            action_horizon=int(self.cfg.feature.action_horizon),
-            normalize_feature=bool(self.cfg.feature.normalize_feature),
-            normalize_policy_chunk=bool(self.cfg.feature.normalize_policy_chunk),
-            use_transition_error=bool(self.cfg.feature.use_transition_error),
-            detector_device=str(self.cfg.detector.device),
-            delta=float(self.cfg.detector.delta),
-            delta_step=float(self.cfg.detector.delta_step),
-            knn_chunk_size=int(self.cfg.detector.knn_chunk_size),
-            lambda_mode=str(self.cfg.detector.lambda_mode),
-            lambda_window_size=int(self.cfg.detector.lambda_window_size),
-            feature_knn_weight=float(self.cfg.detector.feature_knn_weight),
-            transition_aux_weight=float(self.cfg.detector.transition_aux_weight),
-            policy_chunk_weight=float(self.cfg.detector.policy_chunk_weight),
-            dynamics_weight=float(self.cfg.detector.dynamics_weight),
-            neighbor_topk=int(self.cfg.detector.neighbor_topk),
-            dynamics_temperature=float(self.cfg.detector.dynamics_temperature),
-        )
-        detector.fit(
-            normal_bank_trajectories=bank_trajectories,
-            calibration_trajectories=calibration_trajectories,
-        )
-        return detector
 
     def _task_to_index(self, task_name: str) -> int:
         if task_name not in self._task_to_index_map:
             raise KeyError(
-                f"Task '{task_name}' was not part of the online LPB build. "
+                f"Task '{task_name}' was not part of the online LPB Dice build. "
                 f"Available tasks: {sorted(self._task_to_index_map.keys())}"
             )
         return int(self._task_to_index_map[task_name])
+
+    def _detect_prefix(self, trajectory: LatentTrajectory):
+        support_cfg = _cfg_get(self.cfg, "support_penalty", None)
+        return self.detector.detect_trajectory(
+            trajectory,
+            support_penalty_weight=float(_cfg_get(support_cfg, "weight", 0.0)),
+        )
 
 
 class TPUDOnlineDiscriminator(OfflinePrefixOnlineDiscriminator):
@@ -549,6 +518,13 @@ class TPUDOnlineDiscriminator(OfflinePrefixOnlineDiscriminator):
         super().__init__(cfg)
 
     def _build_and_fit_detector(self):
+        from robosuite.discriminator.bce.dataset import (
+            build_cached_splits as build_bce_cached_splits,
+            filter_refs_by_data_types as filter_bce_refs_by_data_types,
+            load_latent_trajectories as load_bce_latent_trajectories,
+        )
+        from robosuite.discriminator.bce.tpud_discriminator import TPUDDiscriminator
+
         cached_splits, _, task_to_index = build_bce_cached_splits(
             cfg_data=self.cfg.data,
             encoder=self.encoder,

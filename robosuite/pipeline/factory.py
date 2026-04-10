@@ -8,7 +8,7 @@ from .algorithms.hil_serl import HILSERLAgent
 from .base import (
     DummyPolicyRuntime,
     FlowMultiPolicyRuntime,
-    LPBNewOnlineDiscriminator,
+    LPBDiceOnlineDiscriminator,
     NullOnlineDiscriminator,
     TPUDOnlineDiscriminator,
 )
@@ -62,9 +62,9 @@ def _build_null_discriminator(cfg: Any) -> NullOnlineDiscriminator:
     return NullOnlineDiscriminator()
 
 
-@register_discriminator("lpb_new")
-def _build_lpb_new_discriminator(cfg: Any) -> LPBNewOnlineDiscriminator:
-    return LPBNewOnlineDiscriminator(cfg=cfg)
+@register_discriminator("lpb_dice")
+def _build_lpb_dice_discriminator(cfg: Any) -> LPBDiceOnlineDiscriminator:
+    return LPBDiceOnlineDiscriminator(cfg=cfg)
 
 
 @register_discriminator("bce")

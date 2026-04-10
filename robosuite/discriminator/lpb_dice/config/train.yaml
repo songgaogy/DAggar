@@ -1,10 +1,11 @@
 hydra:
   run:
-    dir: outputs/lpb_new_knn_eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/lpb_dice_train/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 seed: 42
 
-save_dir: "./checkpoints/multitask_6/lpb_new_eval"
+save_dir: "./checkpoints/multitask_6/lpb_dice"
+save_name: "lpb_dice.pt"
 
 policy:
   ckpt: "./checkpoints/multitask_6/flow-20/flow_multi_ep0100_20260320_114720.pt"
@@ -16,100 +17,113 @@ data:
   transition_horizon: 1
   cache_dir: "./data/.lpb_new_cache"
   encode_demo_batch_size: 8
+  preload_train_to_memory: false
+  preload_eval_to_memory: false
+  train_data_types: ["expert", "success_rollout"]
+  eval_data_types: ["expert", "success_rollout"]
+  pu_train_data_types: ["expert", "success_rollout", "fail_rollout"]
+  pu_eval_data_types: ["expert", "success_rollout", "fail_rollout"]
   splits:
     train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-    val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-    test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+    eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
   tasks:
     PandaLift:
       expert_dir: "./data/PandaLift/expert"
       success_rollout_dir: "./data/PandaLift/success_rollout"
       fail_rollout_dir: "./data/PandaLift/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 0}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 0}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 0}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 0}
     PandaPickPlaceCan:
       expert_dir: "./data/PandaPickPlaceCan/expert"
       success_rollout_dir: "./data/PandaPickPlaceCan/success_rollout"
       fail_rollout_dir: "./data/PandaPickPlaceCan/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
     PandaStack:
       expert_dir: "./data/PandaStack/expert"
       success_rollout_dir: "./data/PandaStack/success_rollout"
       fail_rollout_dir: "./data/PandaStack/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
     PickPlaceBread:
       expert_dir: "./data/PickPlaceBread/expert"
       success_rollout_dir: "./data/PickPlaceBread/success_rollout"
       fail_rollout_dir: "./data/PickPlaceBread/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
     PickPlaceCereal:
       expert_dir: "./data/PickPlaceCereal/expert"
       success_rollout_dir: "./data/PickPlaceCereal/success_rollout"
       fail_rollout_dir: "./data/PickPlaceCereal/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
     PickPlaceMilk:
       expert_dir: "./data/PickPlaceMilk/expert"
       success_rollout_dir: "./data/PickPlaceMilk/success_rollout"
       fail_rollout_dir: "./data/PickPlaceMilk/fail_rollout"
       train: {num_expert_traj: 180, num_success_traj: 180, num_fail_traj: 180}
-      val: {num_expert_traj: 15, num_success_traj: 15, num_fail_traj: 15}
-      test: {num_expert_traj: 5, num_success_traj: 5, num_fail_traj: 5}
+      eval: {num_expert_traj: 20, num_success_traj: 20, num_fail_traj: 20}
 
 model:
-  lpb_ckpt: "./checkpoints/multitask_6/lpb_new/lpb_new.pt"
+  backbone_ckpt: null
+  predictor_type: "world_model"
+  d_model: 512
+  action_encoder_layers: 3
+  action_encoder_heads: 8
+  action_encoder_dropout: 0.1
+  backbone_dim: 1024
+  backbone_num_blocks: 4
+  head_hidden_dim: 1024
+  head_num_blocks: 2
+  dropout: 0.1
+  max_action_horizon: 8
+  delta_scale: 1.0
+  use_uncertainty: true
+  min_logvar: -6.0
+  max_logvar: 2.0
 
-feature:
+representation:
   device: "cuda"
   batch_size: 256
-  action_horizon: -1
-  normalize_feature: true
-  normalize_policy_chunk: true
-  policy_history_steps: 4
-  use_transition_error: true
 
-# default choice
+training:
+  device: "cuda"
+  batch_size: 256
+  num_workers: 8
+  epochs: 50
+  save_freq: 0
+  lr: 2e-4
+  weight_decay: 1e-4
+  expert_ratio: 0.5
+  grad_clip_norm: 1.0
+  log_every: 100
+
+detector_training:
+  device: "cuda"
+  batch_size: 1024
+  num_workers: 8
+  epochs: 20
+  lr: 2e-4
+  weight_decay: 1e-4
+  positive_ratio: 0.5
+  grad_clip_norm: 1.0
+  log_every: 100
+  hidden_dim: 512
+  num_layers: 2
+  dropout: 0.1
+
 detector:
   device: "cuda"
   delta: 10.0
-  delta_step: 0.5
-  knn_chunk_size: 8192
   lambda_mode: "mean"
   lambda_window_size: 12
-  feature_knn_weight: 0.35469082
-  transition_aux_weight: 0.0
-  policy_chunk_weight: 0.64530921
-  dynamics_weight: 0.0
-  neighbor_topk: 8
-  dynamics_temperature: 1.0
-  weight_json_path: null
+  c_min: 1e-3
+  corrected_prob_eps: 1e-5
 
-labels:
-  fail_tail_ratio: 0.2
+support_penalty:
+  weight: 0.0
 
 eval:
-  bank_split: "train"
-  bank_data_types: ["expert", "success_rollout"]
-  calibration_split: "val"
-  calibration_data_types: ["expert", "success_rollout"]
-  expert_eval_split: "test"
-  expert_eval_data_types: ["expert"]
-  success_eval_split: "test"
-  success_eval_data_types: ["success_rollout"]
-  fail_eval_split: "test"
-  fail_eval_data_types: ["fail_rollout"]
-
-online:
-  adaptive_delta: true
-  delta_min: 2.0
-  delta_max: 40.0
-  warmup_steps: 20
-  update_interval: 5
+  calibration_split: "eval"
+  calibration_positive_data_types: ["expert", "success_rollout"]
+  calibration_background_data_types: ["fail_rollout"]

@@ -567,7 +567,7 @@ def build_cached_splits(
     cached_splits: dict[str, list[EncodedTrajectoryRef]] = {}
     cache_root = to_absolute_path(str(_cfg_get(cfg_data, "cache_dir")))
     batch_size = int(_cfg_get(cfg_data, "encode_demo_batch_size", 8))
-    legacy_cache_root = to_absolute_path("./data/.lpb_new_cache")
+    legacy_cache_root = to_absolute_path("./data/.lpb_dice_cache")
     fallback_cache_roots: list[str] = []
     if os.path.abspath(cache_root) != os.path.abspath(legacy_cache_root) and os.path.isdir(legacy_cache_root):
         fallback_cache_roots.append(legacy_cache_root)
