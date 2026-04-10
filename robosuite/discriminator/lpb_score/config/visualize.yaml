@@ -70,7 +70,7 @@ eval:
   fail_eval_data_types: ["fail_rollout"]
 
 online:
-  adaptive_delta: true
+  adaptive_delta: false
   delta_min: 2.0
   delta_max: 40.0
   warmup_steps: 20
