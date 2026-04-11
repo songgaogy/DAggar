@@ -1,8 +1,8 @@
-"""Multitask latent DSM: shared transformer with factor routing, traj-type, and task-ID tokens.
+"""Multitask latent DSM with late-fusion conditioning and AdaLN-Zero DiT blocks.
 
-``UnifiedConditionedDSM`` stacks route (3 heads), success/fail, and ``num_tasks`` embeddings with
-context/target tokens; ``DSMModel`` wraps it with normalization, noise, DSM loss, and Fisher scores
-for the offline detector.
+``UnifiedConditionedDSM`` encodes each routed target/context independently, aggregates route/type/task
+conditions into one global vector, and denoises with a lightweight shared MLP backbone.
+``DSMModel`` wraps it with normalization, noise, DSM loss, and Fisher scores for the offline detector.
 """
 
 from __future__ import annotations
@@ -22,8 +22,65 @@ def _cfg_get(cfg: Any, key: str, default=None):
     return getattr(cfg, key, default)
 
 
+class AdaLNModulation(nn.Module):
+    """AdaLN-Zero modulation for one residual branch."""
+
+    def __init__(self, cond_dim: int, embed_dim: int) -> None:
+        super().__init__()
+        self.linear = nn.Linear(cond_dim, 3 * embed_dim)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        shift, scale, gate = self.linear(cond).chunk(3, dim=-1)
+        return shift, scale, gate
+
+
+class DiTFeedForward(nn.Module):
+    """Feedforward block used by the shared DiT-style denoiser."""
+
+    def __init__(self, embed_dim: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DiTBlock(nn.Module):
+    """Two-branch AdaLN-Zero residual MLP block."""
+
+    def __init__(self, embed_dim: int, cond_dim: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.mod1 = AdaLNModulation(cond_dim=cond_dim, embed_dim=embed_dim)
+        self.mod2 = AdaLNModulation(cond_dim=cond_dim, embed_dim=embed_dim)
+        self.ffn1 = DiTFeedForward(embed_dim=embed_dim, ffn_dim=ffn_dim, dropout=dropout)
+        self.ffn2 = DiTFeedForward(embed_dim=embed_dim, ffn_dim=ffn_dim, dropout=dropout)
+
+    @staticmethod
+    def _apply_adaln(normed_x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return normed_x * (1.0 + scale) + shift
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        shift1, scale1, gate1 = self.mod1(cond)
+        y = self._apply_adaln(self.norm1(x), shift1, scale1)
+        x = x + gate1 * self.ffn1(y)
+
+        shift2, scale2, gate2 = self.mod2(cond)
+        y = self._apply_adaln(self.norm2(x), shift2, scale2)
+        x = x + gate2 * self.ffn2(y)
+        return x
+
+
 class UnifiedConditionedDSM(nn.Module):
-    """Single transformer for three denoising factors, conditioned on traj type and task index."""
+    """Late-fusion multitask DSM with routed encoders and a shared AdaLN-Zero denoiser."""
 
     TASK_STATE = 0
     TASK_ACTOR = 1
@@ -57,47 +114,42 @@ class UnifiedConditionedDSM(nn.Module):
             raise ValueError("num_layers must be positive.")
         if self.num_heads <= 0:
             raise ValueError("num_heads must be positive.")
-        if self.embed_dim % self.num_heads != 0:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads, got embed_dim={self.embed_dim}, "
-                f"num_heads={self.num_heads}"
-            )
+        if self.ffn_dim <= 0:
+            raise ValueError("ffn_dim must be positive.")
         if self.num_tasks <= 0:
             raise ValueError("num_tasks must be positive.")
-
-        # Shared projections require a common padded width per routed field.
-        self.target_max_dim = max(self.latent_dim, self.action_flat_dim)
-        self.context_max_dim = self.latent_dim + self.action_flat_dim
+        if self.dropout < 0.0:
+            raise ValueError("dropout must be non-negative.")
 
         # route ∈ {state, actor, dynamics}; type ∈ {non-fail, fail}; task_name ∈ {0..num_tasks-1}.
-        self.task_embedding = nn.Embedding(3, self.embed_dim)
+        self.route_embedding = nn.Embedding(3, self.embed_dim)
         self.type_embedding = nn.Embedding(2, self.embed_dim)
         self.task_name_embedding = nn.Embedding(self.num_tasks, self.embed_dim)
-        self.context_proj = nn.Sequential(
-            nn.Linear(self.context_max_dim, self.embed_dim),
-            nn.LayerNorm(self.embed_dim),
-            nn.GELU(),
-        )
-        self.target_proj = nn.Sequential(
-            nn.Linear(self.target_max_dim, self.embed_dim),
-            nn.LayerNorm(self.embed_dim),
-            nn.GELU(),
-        )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=self.num_heads,
-            dim_feedforward=self.ffn_dim,
-            dropout=self.dropout,
-            activation="gelu",
-            batch_first=True,
+        self.state_target_encoder = self._build_feature_encoder(self.latent_dim)
+        self.action_target_encoder = self._build_feature_encoder(self.action_flat_dim)
+        self.dynamics_target_encoder = self._build_feature_encoder(self.latent_dim)
+
+        self.state_context_encoder = self._build_feature_encoder(self.latent_dim)
+        self.action_context_encoder = self._build_feature_encoder(self.action_flat_dim)
+        self.dynamics_context_encoder = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
+        self.condition_mlp = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
+
+        self.shared_blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    embed_dim=self.embed_dim,
+                    cond_dim=self.embed_dim,
+                    ffn_dim=self.ffn_dim,
+                    dropout=self.dropout,
+                )
+                for _ in range(self.num_layers)
+            ]
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer=encoder_layer,
-            num_layers=self.num_layers,
-        )
-        self.output_norm = nn.LayerNorm(self.embed_dim)
-        self.output_mean = nn.Linear(self.embed_dim, self.target_max_dim)
+        self.final_norm = nn.LayerNorm(self.embed_dim)
+        self.state_head = nn.Linear(self.embed_dim, self.latent_dim)
+        self.action_head = nn.Linear(self.embed_dim, self.action_flat_dim)
+        self.dynamics_head = nn.Linear(self.embed_dim, self.latent_dim)
 
     def _task_target_dim(self, task_id: int) -> int:
         if int(task_id) == self.TASK_STATE:
@@ -108,19 +160,55 @@ class UnifiedConditionedDSM(nn.Module):
             return self.latent_dim
         raise ValueError(f"Unsupported task_id: {task_id}")
 
-    def _task_context_dim(self, task_id: int) -> int:
+    def _task_head(self, task_id: int) -> nn.Module:
         if int(task_id) == self.TASK_STATE:
-            return 0
+            return self.state_head
         if int(task_id) == self.TASK_ACTOR:
-            return self.latent_dim
+            return self.action_head
         if int(task_id) == self.TASK_DYNAMICS:
-            return self.latent_dim + self.action_flat_dim
+            return self.dynamics_head
         raise ValueError(f"Unsupported task_id: {task_id}")
+
+    def _task_target_encoder(self, task_id: int) -> nn.Module:
+        if int(task_id) == self.TASK_STATE:
+            return self.state_target_encoder
+        if int(task_id) == self.TASK_ACTOR:
+            return self.action_target_encoder
+        if int(task_id) == self.TASK_DYNAMICS:
+            return self.dynamics_target_encoder
+        raise ValueError(f"Unsupported task_id: {task_id}")
+
+    def _build_feature_encoder(self, input_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(input_dim, self.embed_dim),
+            nn.LayerNorm(self.embed_dim),
+            nn.GELU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+    def _build_condition_mlp(self, input_dim: int, output_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(input_dim, self.embed_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.embed_dim, output_dim),
+        )
 
     @staticmethod
     def _require_2d(name: str, x: torch.Tensor) -> None:
         if x.ndim != 2:
             raise ValueError(f"Expected {name} shape (B,D), got {tuple(x.shape)}")
+
+    @staticmethod
+    def _require_feature_dim(name: str, x: torch.Tensor, expected_dim: int) -> None:
+        if int(x.shape[1]) != int(expected_dim):
+            raise ValueError(f"{name} dim mismatch: expected {expected_dim}, got {x.shape[1]}")
+
+    @staticmethod
+    def _require_batch_size(name: str, x: torch.Tensor, expected_batch_size: int) -> None:
+        if int(x.shape[0]) != int(expected_batch_size):
+            raise ValueError(f"Expected {name} batch size {expected_batch_size}, got {x.shape[0]}")
 
     def _require_task_index(
         self,
@@ -141,82 +229,108 @@ class UnifiedConditionedDSM(nn.Module):
             )
         return task_index_tensor
 
-    def _pad_feature(self, x: torch.Tensor, expected_dim: int, padded_dim: int, name: str) -> torch.Tensor:
-        self._require_2d(name, x)
-        if int(x.shape[1]) != int(expected_dim):
-            raise ValueError(f"{name} dim mismatch: expected {expected_dim}, got {x.shape[1]}")
-        if expected_dim > padded_dim:
-            raise ValueError(f"{name} padded dim must be >= expected dim, got {padded_dim} < {expected_dim}")
-        if expected_dim == padded_dim:
-            return x
-        # Zero padding keeps the shared linear layers task-agnostic.
-        pad = x.new_zeros((x.shape[0], padded_dim - expected_dim))
-        return torch.cat([x, pad], dim=-1)
+    @staticmethod
+    def _require_traj_type(
+        batch_size: int,
+        traj_type: torch.Tensor | int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if isinstance(traj_type, int):
+            traj_type_tensor = torch.full((batch_size,), int(traj_type), dtype=torch.long, device=device)
+        else:
+            traj_type_tensor = torch.as_tensor(traj_type, dtype=torch.long, device=device).reshape(-1)
+        if int(traj_type_tensor.shape[0]) != int(batch_size):
+            raise ValueError(f"Expected traj_type shape ({batch_size},), got {tuple(traj_type_tensor.shape)}")
+        if torch.any((traj_type_tensor < 0) | (traj_type_tensor > 1)):
+            raise ValueError("traj_type must contain only 0 (positive) or 1 (negative).")
+        return traj_type_tensor
+
+    def _build_condition(
+        self,
+        *,
+        task_id: int,
+        context_feature: torch.Tensor,
+        traj_type: torch.Tensor,
+        task_index: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = int(context_feature.shape[0])
+        task_ids = torch.full((batch_size,), int(task_id), dtype=torch.long, device=context_feature.device)
+        discrete_feature = (
+            self.route_embedding(task_ids)
+            + self.type_embedding(traj_type)
+            + self.task_name_embedding(task_index)
+        )
+        return self.condition_mlp(torch.cat([context_feature, discrete_feature], dim=-1))
+
+    def _run_shared_backbone(self, target_feature: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        hidden = target_feature
+        for block in self.shared_blocks:
+            hidden = block(hidden, condition)
+        return self.final_norm(hidden)
+
+    @staticmethod
+    def _module_parameters(*modules: nn.Module) -> list[nn.Parameter]:
+        params: list[nn.Parameter] = []
+        for module in modules:
+            params.extend(list(module.parameters()))
+        return params
+
+    def optimizer_parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        """Return branch-aware parameter groups for optimizer LR scaling."""
+        return {
+            "shared": self._module_parameters(
+                self.route_embedding,
+                self.type_embedding,
+                self.task_name_embedding,
+                self.state_context_encoder,
+                self.condition_mlp,
+                self.shared_blocks,
+                self.final_norm,
+            ),
+            "state_branch": self._module_parameters(
+                self.state_target_encoder,
+                self.state_head,
+            ),
+            "action_branch": self._module_parameters(
+                self.action_target_encoder,
+                self.action_head,
+            ),
+            "dynamics_branch": self._module_parameters(
+                self.action_context_encoder,
+                self.dynamics_context_encoder,
+                self.dynamics_target_encoder,
+                self.dynamics_head,
+            ),
+        }
 
     def forward_task(
         self,
         *,
         task_id: int,
         noisy_target: torch.Tensor,
-        context: torch.Tensor,
+        context_feature: torch.Tensor,
         traj_type: torch.Tensor,
         task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run one routed denoising task and slice outputs to its active width.
-
-        For each routed factor, the model builds a 5-token sequence:
-        1. route token from learnable `nn.Embedding(3, embed_dim)`
-        2. type token from learnable `nn.Embedding(2, embed_dim)`
-        3. task token from learnable `nn.Embedding(num_tasks, embed_dim)`
-        4. context token from the clean condition vector
-        5. target token from the noisy target variable
-
-        The target and context vectors are zero-padded to shared maximum dimensions before projection:
-        - `target_max_dim = max(latent_dim, action_flat_dim)`
-        - `context_max_dim = latent_dim + action_flat_dim`
-        """
+        """Run one routed denoising task with one target token and one global condition."""
         target_dim = self._task_target_dim(task_id)
-        context_dim = self._task_context_dim(task_id)
-        
-        target_padded = self._pad_feature(
-            noisy_target,
-            expected_dim=target_dim,
-            padded_dim=self.target_max_dim,
-            name="noisy_target",
+        self._require_2d("noisy_target", noisy_target)
+        self._require_feature_dim("noisy_target", noisy_target, target_dim)
+        self._require_2d("context_feature", context_feature)
+        self._require_feature_dim("context_feature", context_feature, self.embed_dim)
+
+        target_feature = self._task_target_encoder(task_id)(noisy_target)
+        c_global = self._build_condition(
+            task_id=task_id,
+            context_feature=context_feature,
+            traj_type=traj_type,
+            task_index=task_index,
         )
-        context_padded = self._pad_feature(
-            context,
-            expected_dim=context_dim,
-            padded_dim=self.context_max_dim,
-            name="context",
-        )
-
-        batch_size = int(noisy_target.shape[0])
-        if traj_type.ndim != 1 or int(traj_type.shape[0]) != batch_size:
-            raise ValueError(f"Expected traj_type shape ({batch_size},), got {tuple(traj_type.shape)}")
-        task_ids = torch.full(
-            (batch_size,),
-            int(task_id),
-            dtype=torch.long,
-            device=noisy_target.device,
-        )
-
-        task_token = self.task_embedding(task_ids).unsqueeze(1)
-        type_token = self.type_embedding(traj_type).unsqueeze(1)
-        task_name_token = self.task_name_embedding(task_index).unsqueeze(1)
-        context_token = self.context_proj(context_padded).unsqueeze(1)
-        target_token = self.target_proj(target_padded).unsqueeze(1)
-
-        # Route/type/task tokens participate in attention without changing routed context construction.
-        tokens = torch.cat([task_token, type_token, task_name_token, context_token, target_token], dim=1)
-        tokens = self.transformer(tokens)
-        # Only the target token is decoded back to feature space.
-        target_feature = self.output_norm(tokens[:, 4, :])
-
-        pred_mean_full = self.output_mean(target_feature)
+        hidden = self._run_shared_backbone(target_feature=target_feature, condition=c_global)
+        pred_mean = self._task_head(task_id)(hidden)
         return {
-            "pred_mean": pred_mean_full[:, :target_dim],
-            "target_feature": target_feature,
+            "pred_mean": pred_mean,
+            "target_feature": hidden,
         }
 
     def forward(
@@ -232,34 +346,64 @@ class UnifiedConditionedDSM(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Run state, action-chunk, and residual dynamics heads; ``task_index`` selects multitask embeddings."""
         batch_size = int(state_input.shape[0])
-        state_context = state_input.new_zeros((batch_size, 0))
+        self._require_2d("state_input", state_input)
+        self._require_feature_dim("state_input", state_input, self.latent_dim)
+        self._require_2d("current_latent", current_latent)
+        self._require_batch_size("current_latent", current_latent, batch_size)
+        self._require_feature_dim("current_latent", current_latent, self.latent_dim)
+        self._require_2d("action_input", action_input)
+        self._require_batch_size("action_input", action_input, batch_size)
+        self._require_feature_dim("action_input", action_input, self.action_flat_dim)
+        self._require_2d("action_clean", action_clean)
+        self._require_batch_size("action_clean", action_clean, batch_size)
+        self._require_feature_dim("action_clean", action_clean, self.action_flat_dim)
+        self._require_2d("next_state_input", next_state_input)
+        self._require_batch_size("next_state_input", next_state_input, batch_size)
+        self._require_feature_dim("next_state_input", next_state_input, self.latent_dim)
+
+        traj_type_tensor = self._require_traj_type(
+            batch_size=batch_size,
+            traj_type=traj_type,
+            device=state_input.device,
+        )
         task_index_tensor = self._require_task_index(
             batch_size=batch_size,
             task_index=task_index,
             device=state_input.device,
         )
-        # The dynamics task conditions on clean [z_t, a].
-        dynamics_context = torch.cat([current_latent, action_clean], dim=-1)
+
+        state_context_feature = state_input.new_zeros((batch_size, self.embed_dim))
+        encoded_current_latent = self.state_context_encoder(current_latent)
+        actor_context_feature = encoded_current_latent
+        dynamics_context_feature = self.dynamics_context_encoder(
+            torch.cat(
+                [
+                    encoded_current_latent,
+                    self.action_context_encoder(action_clean),
+                ],
+                dim=-1,
+            )
+        )
 
         state_out = self.forward_task(
             task_id=self.TASK_STATE,
             noisy_target=state_input,
-            context=state_context,
-            traj_type=traj_type,
+            context_feature=state_context_feature,
+            traj_type=traj_type_tensor,
             task_index=task_index_tensor,
         )
         action_out = self.forward_task(
             task_id=self.TASK_ACTOR,
             noisy_target=action_input,
-            context=current_latent,
-            traj_type=traj_type,
+            context_feature=actor_context_feature,
+            traj_type=traj_type_tensor,
             task_index=task_index_tensor,
         )
         dynamics_out = self.forward_task(
             task_id=self.TASK_DYNAMICS,
             noisy_target=next_state_input,
-            context=dynamics_context,
-            traj_type=traj_type,
+            context_feature=dynamics_context_feature,
+            traj_type=traj_type_tensor,
             task_index=task_index_tensor,
         )
         return {
@@ -284,6 +428,9 @@ class DSMModel(nn.Module):
         transition_horizon: int,
         noise_scale: float,
         std_clamp_min: float,
+        state_loss_weight: float = 1.0,
+        action_loss_weight: float = 0.5,
+        dynamics_loss_weight: float = 1.0,
     ) -> None:
         """``predictor.num_tasks`` must match the checkpoint and dataset ``task_index`` range."""
         super().__init__()
@@ -294,6 +441,9 @@ class DSMModel(nn.Module):
         self.noise_scale = float(noise_scale)
         self.noise_sigma = self.noise_scale
         self.std_clamp_min = float(std_clamp_min)
+        self.state_loss_weight = float(state_loss_weight)
+        self.action_loss_weight = float(action_loss_weight)
+        self.dynamics_loss_weight = float(dynamics_loss_weight)
         self.num_tasks = int(self.predictor.num_tasks)
         self.action_flat_dim = int(self.action_dim * self.transition_horizon)
         self.tau_dim = int(2 * self.latent_dim + self.action_flat_dim)
@@ -306,6 +456,13 @@ class DSMModel(nn.Module):
         self.register_buffer("latent_var", torch.ones(self.latent_dim, dtype=torch.float32))
         self.register_buffer("action_mean", torch.zeros(self.action_dim, dtype=torch.float32))
         self.register_buffer("action_var", torch.ones(self.action_dim, dtype=torch.float32))
+
+        if self.state_loss_weight < 0.0:
+            raise ValueError(f"state_loss_weight must be non-negative, got {self.state_loss_weight}")
+        if self.action_loss_weight < 0.0:
+            raise ValueError(f"action_loss_weight must be non-negative, got {self.action_loss_weight}")
+        if self.dynamics_loss_weight < 0.0:
+            raise ValueError(f"dynamics_loss_weight must be non-negative, got {self.dynamics_loss_weight}")
 
         if int(self.predictor.latent_dim) != self.latent_dim:
             raise ValueError(
@@ -522,6 +679,14 @@ class DSMModel(nn.Module):
             "score_per_sample": state_energy + action_energy + next_state_energy,
         }
 
+    def weighted_reconstruction_score(self, recon: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Weighted reconstruction objective used for DSM training."""
+        return (
+            self.state_loss_weight * recon["state_energy_per_sample"]
+            + self.action_loss_weight * recon["action_energy_per_sample"]
+            + self.dynamics_loss_weight * recon["next_state_energy_per_sample"]
+        )
+
     def fisher_components(
         self,
         *,
@@ -651,10 +816,13 @@ class DSMModel(nn.Module):
             next_state_clean=out["next_state_clean"],
             next_state_hat=out["next_state_hat"],
         )
-        loss = recon["score_per_sample"].mean()
+        weighted_score_per_sample = self.weighted_reconstruction_score(recon)
+        loss = weighted_score_per_sample.mean()
         return {
             "loss": loss,
-            "score": recon["score_per_sample"].mean(),
+            "score": loss,
+            "unweighted_score": recon["score_per_sample"].mean(),
+            "weighted_score": loss,
             "tau_mse": recon["tau_mse_per_sample"].mean(),
             "state_mse": recon["state_mse_per_sample"].mean(),
             "action_mse": recon["action_mse_per_sample"].mean(),
@@ -662,6 +830,9 @@ class DSMModel(nn.Module):
             "state_energy": recon["state_energy_per_sample"].mean(),
             "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
+            "state_loss_weight": out["state_clean"].new_tensor(self.state_loss_weight),
+            "action_loss_weight": out["state_clean"].new_tensor(self.action_loss_weight),
+            "dynamics_loss_weight": out["state_clean"].new_tensor(self.dynamics_loss_weight),
             "current_latent": out["current_latent"],
             "traj_type": out["traj_type"],
             "task_index": out["task_index"],
@@ -761,7 +932,7 @@ def build_unified_conditioned_dsm(
     num_tasks: int,
     cfg_model: Any,
 ) -> UnifiedConditionedDSM:
-    """Build the unified transformer predictor from config values."""
+    """Build the unified late-fusion predictor from config values."""
     embed_dim = int(_cfg_get(cfg_model, "embed_dim", _cfg_get(cfg_model, "backbone_dim", 512)))
     return UnifiedConditionedDSM(
         latent_dim=int(latent_dim),
@@ -825,4 +996,7 @@ def build_dsm_model(
         transition_horizon=int(transition_horizon),
         noise_scale=float(_cfg_get(cfg_model, "noise_scale", _cfg_get(cfg_model, "noise_sigma", 0.08))),
         std_clamp_min=float(_cfg_get(cfg_model, "std_clamp_min", 0.05)),
+        state_loss_weight=float(_cfg_get(cfg_model, "state_loss_weight", 1.0)),
+        action_loss_weight=float(_cfg_get(cfg_model, "action_loss_weight", 0.5)),
+        dynamics_loss_weight=float(_cfg_get(cfg_model, "dynamics_loss_weight", 1.0)),
     )

@@ -108,7 +108,3 @@ suboptimal:
     - "PickPlaceBread"
     - "PickPlaceCereal"
     - "PickPlaceMilk"
-  train_count_per_task: 8
-  eval_count_per_task: 2
-  source_split: "eval"
-  seed: 42

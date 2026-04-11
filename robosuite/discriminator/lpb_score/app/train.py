@@ -73,19 +73,21 @@ def _compute_positive_normalization_stats(
 
 
 def _build_payload(
-    model: DSMModel,
+    model_state: dict,
     history: dict[str, dict[str, dict[str, float]]],
     cfg: DictConfig,
     latent_dim: int,
     action_dim: int,
+    tau_dim: int,
     task_to_index: dict[str, int],
     split_summary: dict[str, dict[str, dict[str, int]]],
     epoch: int,
     normalization_stats: dict[str, np.ndarray],
+    model_online_state: dict | None = None,
 ) -> dict:
     """Serialize weights, Hydra config, ``task_to_index``, and normalization stats for inference."""
-    return {
-        "model": model.state_dict(),
+    payload: dict = {
+        "model": model_state,
         "history": history,
         "cfg": cfg,
         "model_architecture": "conditional_fisher_unified_task_dsm",
@@ -93,7 +95,7 @@ def _build_payload(
         "action_dim": int(action_dim),
         "num_tasks": int(len(task_to_index)),
         "horizon": int(cfg.data.transition_horizon),
-        "tau_dim": int(model.tau_dim),
+        "tau_dim": int(tau_dim),
         "task_to_index": dict(task_to_index),
         "split_summary": split_summary,
         "policy_ckpt": to_absolute_path(str(cfg.policy.ckpt)),
@@ -104,6 +106,9 @@ def _build_payload(
             for key, value in normalization_stats.items()
         },
     }
+    if model_online_state is not None:
+        payload["model_online"] = model_online_state
+    return payload
 
 
 def _build_trainer(
@@ -123,6 +128,14 @@ def _build_trainer(
         grad_clip_norm=float(cfg.training.grad_clip_norm),
         log_every=int(cfg.training.log_every),
         device=str(cfg.training.device),
+        use_ema=bool(getattr(cfg.training, "use_ema", False)),
+        ema_decay=float(getattr(cfg.training, "ema_decay", 0.999)),
+        val_use_ema=bool(getattr(cfg.training, "val_use_ema", True)),
+        save_ema_in_checkpoint=bool(getattr(cfg.training, "save_ema_in_checkpoint", True)),
+        shared_lr_multiplier=float(getattr(cfg.training, "shared_lr_multiplier", 1.0)),
+        state_branch_lr_multiplier=float(getattr(cfg.training, "state_branch_lr_multiplier", 1.0)),
+        action_branch_lr_multiplier=float(getattr(cfg.training, "action_branch_lr_multiplier", 0.5)),
+        dynamics_branch_lr_multiplier=float(getattr(cfg.training, "dynamics_branch_lr_multiplier", 1.0)),
     )
     return Trainer(
         model=model,
@@ -198,6 +211,12 @@ def run_train(cfg: DictConfig) -> None:
             train_dataset=train_dataset,
             val_dataset=val_dataset,
         )
+        if bool(getattr(cfg.training, "use_ema", False)):
+            print(
+                f"[lpb_score] EMA enabled decay={float(getattr(cfg.training, 'ema_decay', 0.999))} "
+                f"val_use_ema={bool(getattr(cfg.training, 'val_use_ema', True))} "
+                f"save_ema_in_checkpoint={bool(getattr(cfg.training, 'save_ema_in_checkpoint', True))}"
+            )
 
         save_dir = to_absolute_path(str(cfg.save_dir))
         os.makedirs(save_dir, exist_ok=True)
@@ -214,16 +233,19 @@ def run_train(cfg: DictConfig) -> None:
             """Write intermediate checkpoint when ``training.save_freq`` divides ``epoch``."""
             periodic_name = f"{stem}_ep{epoch:04d}{ext}"
             periodic_path = os.path.join(save_dir, periodic_name)
+            primary_sd, online_sd = trainer.checkpoint_state_dicts()
             payload = _build_payload(
-                model=model,
+                model_state=primary_sd,
                 history=history,
                 cfg=cfg,
                 latent_dim=train_dataset.latent_dim,
                 action_dim=train_dataset.action_dim,
+                tau_dim=model.tau_dim,
                 task_to_index=task_to_index,
                 split_summary=split_summary,
                 epoch=epoch,
                 normalization_stats=normalization_stats,
+                model_online_state=online_sd,
             )
             torch.save(payload, periodic_path)
             print(f"[lpb_score] Saved checkpoint to: {periodic_path}")
@@ -233,16 +255,19 @@ def run_train(cfg: DictConfig) -> None:
             save_callback=_save_periodic,
         )
 
+        primary_sd, online_sd = trainer.checkpoint_state_dicts()
         final_payload = _build_payload(
-            model=model,
+            model_state=primary_sd,
             history=history,
             cfg=cfg,
             latent_dim=train_dataset.latent_dim,
             action_dim=train_dataset.action_dim,
+            tau_dim=model.tau_dim,
             task_to_index=task_to_index,
             split_summary=split_summary,
             epoch=int(cfg.training.epochs),
             normalization_stats=normalization_stats,
+            model_online_state=online_sd,
         )
         torch.save(final_payload, save_path_final)
         print(f"[lpb_score] Saved final checkpoint to: {save_path_final}")

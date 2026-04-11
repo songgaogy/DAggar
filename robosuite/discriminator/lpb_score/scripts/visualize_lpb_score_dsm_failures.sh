@@ -5,17 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-SEED=1
+SEED=2
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole/lpb_dipole_dsm_20260410_024108/lpb_dipole_dsm_20260410_024108_ep0030.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole/visualize}"
+DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031/lpb_dipole_dsm_20260412_002031_ep0050.pt"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
-NUM_VIDEOS=20
+NUM_VIDEOS=12
 
 BANK_SIZE=100
-WINDOW_SIZE=6
-VIS_DATA_SOURCE="${VIS_DATA_SOURCE:-suboptimal}"
-SUBOPTIMAL_SOURCE_SPLIT="${SUBOPTIMAL_SOURCE_SPLIT:-eval}"
+VIS_DATA_SOURCE="suboptimal"  # suboptimal | expert | success_rollout | fail_rollout
 SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_weighted_combo
 
 # ---------------------------------------
@@ -30,8 +28,11 @@ BETA_ACTION=0
 BETA_DYNAMICS=1
 
 # threshold
-# NOTE: for PandaLift, 5% is too small; nomally 3-10% is fine
-DELTA_THRESHOLD=8.0
+# NOTE: 3-5% should be better
+DELTA_THRESHOLD=5
+
+LAMBDA_MODE="ema"  # mean | ema | max
+WINDOW_SIZE=6
 # ---------------------------------------
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
@@ -114,7 +115,6 @@ echo "[visualize_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[visualize_lpb_score_dsm] model.dsm_ckpt=${DSM_CKPT}"
 echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
 echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
-echo "[visualize_lpb_score_dsm] suboptimal.source_split=${SUBOPTIMAL_SOURCE_SPLIT}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
 echo "[visualize_lpb_score_dsm] detector.score_mode=${SCORE_MODE}"
@@ -138,7 +138,6 @@ echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BET
   visualization.camera_name="${CAMERA_NAME}" \
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
-  suboptimal.source_split="${SUBOPTIMAL_SOURCE_SPLIT}" \
   detector.lambda_window_size=$WINDOW_SIZE \
   detector.delta="${DELTA_THRESHOLD}" \
   detector.score_mode="${SCORE_MODE}" \

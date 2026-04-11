@@ -505,17 +505,14 @@ def _save_threshold_distribution_plots(
     return saved_paths
 
 
-def _list_suboptimal_demo_refs(cfg: DictConfig) -> tuple[list[SuboptimalDemoRef], dict[str, dict[str, int]]]:
+def _list_suboptimal_demo_refs(cfg: DictConfig) -> tuple[list[SuboptimalDemoRef], dict[str, int]]:
+    """Scan suboptimal HDF5 trees: one pool per task, no train/eval partition."""
     root_dir = to_absolute_path(str(cfg.suboptimal.root_dir))
-    train_count = int(cfg.suboptimal.train_count_per_task)
-    eval_count = int(cfg.suboptimal.eval_count_per_task)
-    total_required = train_count + eval_count
-    seed = int(cfg.suboptimal.seed)
 
     refs: list[SuboptimalDemoRef] = []
-    split_summary: dict[str, dict[str, int]] = {}
+    counts_by_task: dict[str, int] = {}
 
-    for task_offset, task_name_raw in enumerate(list(cfg.suboptimal.tasks)):
+    for task_name_raw in list(cfg.suboptimal.tasks):
         task_name = normalize_task_name(str(task_name_raw))
         sub_dir = os.path.join(root_dir, f"{resolve_checkpoint_task_name(task_name)}_allview")
         if not os.path.isdir(sub_dir):
@@ -531,7 +528,7 @@ def _list_suboptimal_demo_refs(cfg: DictConfig) -> tuple[list[SuboptimalDemoRef]
                     task_refs.append(
                         SuboptimalDemoRef(
                             task_name=task_name,
-                            split="",
+                            split="suboptimal",
                             file_path=file_path,
                             demo_key=demo_key,
                             sub_start=int(np.asarray(demo["sub_start"])[()]),
@@ -539,32 +536,12 @@ def _list_suboptimal_demo_refs(cfg: DictConfig) -> tuple[list[SuboptimalDemoRef]
                         )
                     )
 
-        if len(task_refs) < total_required:
-            raise ValueError(
-                f"Task {task_name} requires at least {total_required} suboptimal demos, found {len(task_refs)}."
-            )
+        if not task_refs:
+            raise ValueError(f"Task {task_name} has no suboptimal demos under {sub_dir}.")
+        counts_by_task[task_name] = len(task_refs)
+        refs.extend(task_refs)
 
-        rng = np.random.default_rng(seed + task_offset * 97)
-        indices = np.arange(len(task_refs))
-        rng.shuffle(indices)
-        selected_refs = [task_refs[int(idx)] for idx in indices[:total_required]]
-
-        split_summary[task_name] = {"train": 0, "eval": 0}
-        for local_idx, ref in enumerate(selected_refs):
-            split_name = "train" if local_idx < train_count else "eval"
-            refs.append(
-                SuboptimalDemoRef(
-                    task_name=ref.task_name,
-                    split=split_name,
-                    file_path=ref.file_path,
-                    demo_key=ref.demo_key,
-                    sub_start=int(ref.sub_start),
-                    sub_stop=int(ref.sub_stop),
-                )
-            )
-            split_summary[task_name][split_name] += 1
-
-    return refs, split_summary
+    return refs, counts_by_task
 
 
 def _encode_suboptimal_refs(
@@ -708,16 +685,14 @@ def _load_visualization_targets(
             },
         )
 
-    requested_split = str(cfg.suboptimal.source_split)
-    suboptimal_refs, suboptimal_split_summary = _list_suboptimal_demo_refs(cfg)
-    source_refs = [ref for ref in suboptimal_refs if str(ref.split) == requested_split]
+    suboptimal_refs, suboptimal_counts_by_task = _list_suboptimal_demo_refs(cfg)
     selected_refs = _sample_refs(
-        refs=source_refs,
+        refs=suboptimal_refs,
         num_samples=int(num_videos),
         seed=int(seed),
     )
     if not selected_refs:
-        raise RuntimeError(f"No suboptimal trajectories selected for visualization from split={requested_split}.")
+        raise RuntimeError("No suboptimal trajectories selected for visualization (empty pool).")
 
     labeled_trajectories, encode_summary = _encode_suboptimal_refs(
         refs=selected_refs,
@@ -756,10 +731,10 @@ def _load_visualization_targets(
         ordered_labels,
         {
             "data_source": data_source,
-            "split_name": requested_split,
-            "num_available": int(len(source_refs)),
+            "split_name": "suboptimal",
+            "num_available": int(len(suboptimal_refs)),
             "num_selected": int(len(selected_refs)),
-            "suboptimal_split_summary": suboptimal_split_summary,
+            "suboptimal_counts_by_task": suboptimal_counts_by_task,
             "suboptimal_encode_summary": encode_summary,
         },
     )
