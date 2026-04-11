@@ -11,7 +11,6 @@ DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipo
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
 NUM_VIDEOS=20
-DELTA_THRESHOLD=10.0
 
 BANK_SIZE=100
 WINDOW_SIZE=6
@@ -21,13 +20,18 @@ SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_
 
 # ---------------------------------------
 # positive energy
-ALPHA_STATE=0
+ALPHA_STATE=1
 ALPHA_ACTION=0
-ALPHA_DYNAMICS=0
+ALPHA_DYNAMICS=1
+
 # energy margin gap
 BETA_STATE=1
 BETA_ACTION=0
 BETA_DYNAMICS=1
+
+# threshold
+# NOTE: for PandaLift, 5% is too small; nomally 3-10% is fine
+DELTA_THRESHOLD=8.0
 # ---------------------------------------
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"

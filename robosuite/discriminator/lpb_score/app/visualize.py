@@ -1,3 +1,5 @@
+"""Calibrate the DSM detector on a success bank and render failure videos or PDF reports."""
+
 from __future__ import annotations
 
 import glob

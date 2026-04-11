@@ -1,3 +1,5 @@
+"""LPB score package: multitask latent DSM training and trajectory failure detection (public exports)."""
+
 from .analysis import (
     TERM_COLORS,
     TERM_LABELS,

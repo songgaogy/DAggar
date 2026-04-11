@@ -1,3 +1,5 @@
+"""Hydra training entry: latent caches, positive-pool normalization, DSM optimization, checkpoints."""
+
 from __future__ import annotations
 
 import os
@@ -26,6 +28,7 @@ def _compute_positive_normalization_stats(
     positive_refs,
     min_variance: float = 1e-6,
 ) -> dict[str, np.ndarray]:
+    """Per-dimension mean and variance over all timesteps from non-failure train trajectories only."""
     if not positive_refs:
         raise RuntimeError("Expected non-empty positive refs to compute normalization stats.")
 
@@ -80,7 +83,7 @@ def _build_payload(
     epoch: int,
     normalization_stats: dict[str, np.ndarray],
 ) -> dict:
-    """Package model state and run metadata into a checkpoint payload."""
+    """Serialize weights, Hydra config, ``task_to_index``, and normalization stats for inference."""
     return {
         "model": model.state_dict(),
         "history": history,
@@ -131,6 +134,7 @@ def _build_trainer(
 
 
 def run_train(cfg: DictConfig) -> None:
+    """Run cached splits, build ``DSMModel`` with ``num_tasks=len(task_to_index)``, train, and save."""
     seed = int(cfg.seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -207,6 +211,7 @@ def run_train(cfg: DictConfig) -> None:
             ext = ".pt"
 
         def _save_periodic(epoch: int, history: dict[str, dict[str, dict[str, float]]]) -> None:
+            """Write intermediate checkpoint when ``training.save_freq`` divides ``epoch``."""
             periodic_name = f"{stem}_ep{epoch:04d}{ext}"
             periodic_path = os.path.join(save_dir, periodic_name)
             payload = _build_payload(

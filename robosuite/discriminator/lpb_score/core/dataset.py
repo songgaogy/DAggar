@@ -1,3 +1,5 @@
+"""Latent data pipeline: HDF5 splits, ``.npz`` caches from the frozen encoder, transition indexing."""
+
 from __future__ import annotations
 
 import glob
@@ -15,6 +17,7 @@ from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMulti
 from robosuite.discriminator.dyn_bce.task_registry import ordered_task_names
 
 
+# Stable indices for ``EncodedTrajectoryRef.data_type_index`` (metadata and batch tensors).
 DATA_TYPE_ORDER = ["expert", "success_rollout", "fail_rollout"]
 
 
@@ -441,7 +444,7 @@ def filter_refs_by_data_types(
 
 
 class LatentTransitionDataset(Dataset):
-    """World-model training dataset over cached latent transitions."""
+    """Sliding-window ``(z_t, a_{t:t+H}, z_{t+H})`` samples with ``traj_type`` and ``task_index``."""
 
     def __init__(
         self,
@@ -536,6 +539,7 @@ class LatentTransitionDataset(Dataset):
         return traj
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Return tensors for one transition; ``task_index`` matches ``UnifiedConditionedDSM`` embeddings."""
         ref = self._transition_refs[index]
         traj = self._get_trajectory(ref.trajectory_index)
         t0 = ref.t
@@ -557,10 +561,7 @@ def build_cached_splits(
     seed: int,
     build_missing_cache: bool = True,
 ) -> tuple[dict[str, list[EncodedTrajectoryRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
-    """
-    Build split refs, then ensure every selected demo has a latent cache on disk.  
-    Build splits for pooled positive / fail_rollout trajectories.
-    """
+    """Split demos by config, then resolve or create per-demo ``.npz`` caches under ``cache_dir``."""
     split_refs, split_summary, task_to_index = build_split_refs(cfg_data=cfg_data, seed=seed)
     _print_split_summary(split_summary)
 

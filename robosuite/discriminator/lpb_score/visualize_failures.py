@@ -8,7 +8,7 @@ from robosuite.discriminator.lpb_score.app.visualize import run_visualize
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="visualize")
 def main(cfg: DictConfig) -> None:
-    """Hydra entrypoint for DSM failure visualization."""
+    """CLI: ``config/visualize.yaml``; delegates to ``run_visualize``."""
     run_visualize(cfg)
 
 

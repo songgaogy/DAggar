@@ -1,3 +1,5 @@
+"""Train and visualize entrypoints plus shared encoder/discriminator builders."""
+
 from .pipeline import (
     TrainingDatasets,
     build_dsm_discriminator,

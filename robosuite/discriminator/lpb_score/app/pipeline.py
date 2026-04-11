@@ -1,3 +1,5 @@
+"""Hydra helpers: frozen flow encoder, DSM discriminator wiring, and train/val transition datasets."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ from ..core.dsm_discriminator import DSMDiscriminator
 
 @dataclass(frozen=True)
 class TrainingDatasets:
-    """Grouped training inputs built from cached latent splits."""
+    """Train/val ``LatentTransitionDataset`` instances plus the underlying encoded trajectory refs."""
 
     train_dataset: LatentTransitionDataset
     val_dataset: LatentTransitionDataset | None
@@ -44,7 +46,7 @@ def build_flow_encoder(cfg: Any) -> FrozenFlowMultitaskEncoder:
 
 
 def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
-    """Construct the DSM discriminator from Hydra config."""
+    """Load checkpoint into ``DSMTransitionScorer`` and configure detector thresholds and T3 weights."""
     return DSMDiscriminator(
         checkpoint_path=to_absolute_path(str(cfg.model.dsm_ckpt)),
         feature_device=str(cfg.feature.device),

@@ -1,3 +1,5 @@
+"""Offline DSM-based trajectory discriminator: scoring, calibration, and detection API."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -15,6 +17,7 @@ from .model import DSMModel, build_dsm_model
 
 
 def _cfg_get(cfg: Any, path: str, default: Any) -> Any:
+    """Dot-path lookup for nested checkpoint or Hydra config blobs."""
     if cfg is None:
         return default
     cur = cfg
@@ -49,6 +52,8 @@ def _torch_load_checkpoint(path: str, map_location: str = "cpu") -> Any:
 
 @dataclass
 class TrajectoryScoreBundle:
+    """Per-step Fisher and margin arrays for one trajectory (feeds ``DSMDiscriminator`` aggregation)."""
+
     step_scores: np.ndarray
     state_error_scores: np.ndarray
     action_error_scores: np.ndarray
@@ -70,7 +75,7 @@ class TrajectoryScoreBundle:
 
 
 class DSMTransitionScorer:
-    """Score trajectories with a trained unified conditional DSM."""
+    """Loads a trained ``DSMModel`` checkpoint and runs ``compute_fisher_score`` along sliding windows."""
 
     def __init__(
         self,
@@ -79,6 +84,7 @@ class DSMTransitionScorer:
         batch_size: int = 256,
         action_horizon: int = -1,
     ) -> None:
+        """Restore weights from ``checkpoint_path``; horizon must match the checkpoint when overridden."""
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
@@ -91,6 +97,7 @@ class DSMTransitionScorer:
         checkpoint_path: str,
         override_action_horizon: int,
     ) -> tuple[DSMModel, int, int, int]:
+        """Rebuild ``build_dsm_model`` from checkpoint metadata, load state dict, eval mode on device."""
         payload = _torch_load_checkpoint(checkpoint_path, map_location="cpu")
         if "model" not in payload:
             raise ValueError(f"Checkpoint missing key `model`: {checkpoint_path}")
@@ -195,6 +202,7 @@ class DSMTransitionScorer:
 
     @torch.no_grad()
     def score_trajectory(self, traj: LatentTrajectory) -> TrajectoryScoreBundle:
+        """Batch-infer Fisher energies and margins for each valid ``(z_t, a, z')`` window along ``traj``."""
         t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
         if t_len <= 0:
             raise ValueError("Trajectory has zero valid timesteps")
@@ -297,6 +305,8 @@ class DSMTransitionScorer:
 
 
 class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
+    """Thresholded detector on top of ``DSMTransitionScorer`` (T1/T2/T3 families, λ aggregation)."""
+
     SCORE_T1 = "t1_positive_energy"
     SCORE_T2 = "t2_negative_margin"
     SCORE_T3 = "t3_weighted_combo"

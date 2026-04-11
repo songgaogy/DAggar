@@ -1,3 +1,5 @@
+"""AdamW training loop for ``DSMModel`` with optional positive vs failure balanced sampling."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +14,8 @@ from .model import DSMModel
 
 @dataclass
 class TrainerConfig:
+    """Hyperparameters for ``Trainer`` (batching, optimization, logging, class balance)."""
+
     batch_size: int = 64
     num_workers: int = 4
     learning_rate: float = 3e-4
@@ -24,6 +28,8 @@ class TrainerConfig:
 
 
 class Trainer:
+    """Trains ``DSMModel`` via ``compute_dsm_loss``; uses ``WeightedRandomSampler`` when both traj classes exist."""
+
     def __init__(
         self,
         model: DSMModel,
@@ -32,6 +38,7 @@ class Trainer:
         config: Optional[TrainerConfig] = None,
         device: Optional[str] = None,
     ) -> None:
+        """Attach model, build optimizers and loaders, move parameters to ``device``."""
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -115,6 +122,7 @@ class Trainer:
         }
 
     def _run_step(self, batch: dict[str, torch.Tensor], train: bool) -> dict[str, float]:
+        """Single forward/backward on ``task_index`` and ``traj_type`` batches from ``LatentTransitionDataset``."""
         data = self._move_batch(batch)
         if train:
             self.optimizer.zero_grad(set_to_none=True)
@@ -154,6 +162,7 @@ class Trainer:
         return {key: float(sum(item[key] for item in metrics) / len(metrics)) for key in keys}
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
+        """One full pass over the training loader; returns mean logged scalars."""
         self.model.train()
         logs: list[dict[str, float]] = []
         for step, batch in enumerate(self.train_loader):
@@ -172,6 +181,7 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch: int) -> dict[str, float]:
+        """Validation pass; returns ``{}`` if no validation loader."""
         if self.val_loader is None:
             return {}
         self.model.eval()
@@ -195,6 +205,7 @@ class Trainer:
         save_freq: int = 0,
         save_callback: Optional[Callable[[int, dict[str, dict[str, float]]], None]] = None,
     ) -> dict[str, dict[str, float]]:
+        """Train for ``epochs``; optional ``save_callback(epoch, history)`` every ``save_freq`` epochs."""
         history: dict[str, dict[str, float]] = {}
         freq = int(save_freq)
         for epoch in range(1, self.cfg.epochs + 1):

@@ -1,3 +1,5 @@
+"""Core LPB score: datasets, multitask DSM, trainer, and offline discriminator."""
+
 from .dataset import (
     DATA_TYPE_ORDER,
     EncodedTrajectoryRef,

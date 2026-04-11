@@ -1,3 +1,5 @@
+"""Stable ordering and summaries for state/action/dynamics Fisher attribution in plots and JSON."""
+
 from __future__ import annotations
 
 from typing import Mapping, Sequence
