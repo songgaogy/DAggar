@@ -61,6 +61,8 @@ detector:
   lambda_mode: "mean"
   lambda_window_size: 12
   score_mode: "t1_positive_energy"
+  lambda_a: 0.1
+  lambda_trans: 1.0
   alpha_state: 1.0
   alpha_action: 1.0
   alpha_dynamics: 1.0

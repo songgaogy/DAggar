@@ -7,29 +7,29 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031/lpb_dipole_dsm_20260412_002031_ep0050.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new/visualize}"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v2/lpb_dipole_dsm_20260415_182434/lpb_dipole_dsm_20260415_182434.pt"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v2/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
 NUM_VIDEOS=12
 
 BANK_SIZE=100
-VIS_DATA_SOURCE="suboptimal"  # suboptimal | expert | success_rollout | fail_rollout
+VIS_DATA_SOURCE="fail_rollout"  # suboptimal | expert | success_rollout | fail_rollout
 SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_weighted_combo
 
 # ---------------------------------------
 # positive energy
 ALPHA_STATE=1
 ALPHA_ACTION=0
-ALPHA_DYNAMICS=1
+ALPHA_DYNAMICS=0.5
 
 # energy margin gap
 BETA_STATE=1
 BETA_ACTION=0
-BETA_DYNAMICS=1
+BETA_DYNAMICS=0.5
 
 # threshold
-# NOTE: 3-5% should be better
-DELTA_THRESHOLD=5
+# NOTE: 5-8% should be better
+DELTA_THRESHOLD=8
 
 LAMBDA_MODE="ema"  # mean | ema | max
 WINDOW_SIZE=6

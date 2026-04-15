@@ -58,6 +58,8 @@ def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
         lambda_mode=str(cfg.detector.lambda_mode),
         lambda_window_size=int(cfg.detector.lambda_window_size),
         score_mode=str(getattr(cfg.detector, "score_mode", "t1_positive_energy")),
+        lambda_a=float(getattr(cfg.detector, "lambda_a", 0.1)),
+        lambda_trans=float(getattr(cfg.detector, "lambda_trans", 1.0)),
         alpha_state=float(getattr(cfg.detector, "alpha_state", 1.0)),
         alpha_action=float(getattr(cfg.detector, "alpha_action", 1.0)),
         alpha_dynamics=float(getattr(cfg.detector, "alpha_dynamics", 1.0)),

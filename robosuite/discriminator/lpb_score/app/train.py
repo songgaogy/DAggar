@@ -19,7 +19,7 @@ from robosuite.discriminator.lpb_score.core.dataset import (
     build_cached_splits,
     load_cached_latent_trajectory,
 )
-from robosuite.discriminator.lpb_score.core.model import DSMModel, build_dsm_model
+from robosuite.discriminator.lpb_score.core.model import MODEL_ARCHITECTURE, DSMModel, build_dsm_model
 from robosuite.discriminator.lpb_score.core.trainer import Trainer, TrainerConfig
 
 
@@ -90,7 +90,7 @@ def _build_payload(
         "model": model_state,
         "history": history,
         "cfg": cfg,
-        "model_architecture": "conditional_fisher_unified_task_dsm",
+        "model_architecture": MODEL_ARCHITECTURE,
         "latent_dim": int(latent_dim),
         "action_dim": int(action_dim),
         "num_tasks": int(len(task_to_index)),

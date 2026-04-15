@@ -13,7 +13,7 @@ from robosuite.discriminator.utils.base import OfflineTrajectoryDiscriminator
 from robosuite.discriminator.utils.types import DetectorCalibrationSummary, TrajectoryDetectionResult
 
 from .dataset import LatentTrajectory
-from .model import DSMModel, build_dsm_model
+from .model import MODEL_ARCHITECTURE, DSMModel, build_dsm_model
 
 
 def _cfg_get(cfg: Any, path: str, default: Any) -> Any:
@@ -83,10 +83,18 @@ class DSMTransitionScorer:
         device: str = "cuda",
         batch_size: int = 256,
         action_horizon: int = -1,
+        lambda_a: float = 0.1,
+        lambda_trans: float = 1.0,
     ) -> None:
         """Restore weights from ``checkpoint_path``; horizon must match the checkpoint when overridden."""
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
+        self.lambda_a = float(lambda_a)
+        self.lambda_trans = float(lambda_trans)
+        if self.lambda_a < 0.0:
+            raise ValueError(f"lambda_a must be non-negative, got {self.lambda_a}")
+        if self.lambda_trans < 0.0:
+            raise ValueError(f"lambda_trans must be non-negative, got {self.lambda_trans}")
         self.model, self.action_horizon, self.action_dim, self.latent_dim = self._load_model(
             checkpoint_path=checkpoint_path,
             override_action_horizon=action_horizon,
@@ -101,6 +109,13 @@ class DSMTransitionScorer:
         payload = _torch_load_checkpoint(checkpoint_path, map_location="cpu")
         if "model" not in payload:
             raise ValueError(f"Checkpoint missing key `model`: {checkpoint_path}")
+        checkpoint_architecture = str(payload.get("model_architecture", "") or "")
+        if checkpoint_architecture and checkpoint_architecture != MODEL_ARCHITECTURE:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch. "
+                f"Expected `{MODEL_ARCHITECTURE}` but got `{checkpoint_architecture}` from {checkpoint_path}. "
+                "Old unified DSM checkpoints are not load-compatible with the decoupled two-head model."
+            )
 
         cfg = payload.get("cfg", None)
         latent_dim = int(payload.get("latent_dim"))
@@ -152,15 +167,15 @@ class DSMTransitionScorer:
         if unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a unified task-conditioned DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"Expected a `{MODEL_ARCHITECTURE}` checkpoint from lpb_score, but got incompatible weights from "
                 f"{checkpoint_path}. "
-                "This often happens when model.dsm_ckpt points to an old three-head DSM checkpoint or a non-lpb_score checkpoint. "
+                "This often happens when model.dsm_ckpt points to an older unified DSM checkpoint. "
                 f"Unexpected keys: {sorted(unexpected)}"
             )
         if missing and not missing.issubset(allowed_missing):
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a unified task-conditioned DSM checkpoint from lpb_score, but got incompatible weights from "
+                f"Expected a `{MODEL_ARCHITECTURE}` checkpoint from lpb_score, but got incompatible weights from "
                 f"{checkpoint_path}. "
                 f"Missing keys: {sorted(missing)}"
             )
@@ -169,6 +184,7 @@ class DSMTransitionScorer:
         return model, action_horizon, action_dim, latent_dim
 
     def _prepare_latents(self, latents: np.ndarray, t_len: int) -> np.ndarray:
+        """Trim/pad latent features to checkpoint latent_dim."""
         latents = np.asarray(latents[:t_len], dtype=np.float32)
         if latents.shape[1] < self.latent_dim:
             pad = np.zeros((latents.shape[0], self.latent_dim - latents.shape[1]), dtype=np.float32)
@@ -178,6 +194,7 @@ class DSMTransitionScorer:
         return latents
 
     def _prepare_actions(self, actions: Optional[np.ndarray], t_len: int) -> np.ndarray:
+        """Build fixed-horizon action chunks ``a_{t:t+H-1}`` with tail padding."""
         if actions is None:
             actions = np.zeros((t_len, self.action_dim), dtype=np.float32)
         else:
@@ -249,7 +266,15 @@ class DSMTransitionScorer:
                 action_sequence=action_b,
                 target_latent=target_b,
                 task_index=int(traj.task_index),
+                lambda_a=self.lambda_a,
+                lambda_trans=self.lambda_trans,
             )
+            state_error = fisher["state_error_per_sample"].detach().cpu()
+            action_error = fisher["action_error_per_sample"].detach().cpu()
+            dynamics_error = fisher["next_state_error_per_sample"].detach().cpu()
+            state_weighted = fisher["state_contrib_per_sample"].detach().cpu()
+            action_weighted = fisher["action_contrib_per_sample"].detach().cpu()
+            dynamics_weighted = fisher["next_state_contrib_per_sample"].detach().cpu()
             state_positive = fisher["state_positive_energy_per_sample"].detach().cpu()
             action_positive = fisher["action_positive_energy_per_sample"].detach().cpu()
             dynamics_positive = fisher["next_state_positive_energy_per_sample"].detach().cpu()
@@ -259,19 +284,18 @@ class DSMTransitionScorer:
             state_margin = fisher["state_margin_per_sample"].detach().cpu()
             action_margin = fisher["action_margin_per_sample"].detach().cpu()
             dynamics_margin = fisher["next_state_margin_per_sample"].detach().cpu()
-            t1_step = state_positive + action_positive + dynamics_positive
+            t1_step = fisher["score_per_sample"].detach().cpu()
             t2_step = -(state_margin + action_margin + dynamics_margin)
 
-            # Default bundle compatibility stays on T1 = sum_b s^(b) = sum_b e_+^(b).
             step_scores.append(t1_step.detach().cpu())
             t1_step_scores.append(t1_step.detach().cpu())
             t2_step_scores.append(t2_step.detach().cpu())
-            state_scores.append(state_positive)
-            action_scores.append(action_positive)
-            next_state_scores.append(dynamics_positive)
-            state_contrib.append(state_positive)
-            action_contrib.append(action_positive)
-            next_state_contrib.append(dynamics_positive)
+            state_scores.append(state_error)
+            action_scores.append(action_error)
+            next_state_scores.append(dynamics_error)
+            state_contrib.append(state_weighted)
+            action_contrib.append(action_weighted)
+            next_state_contrib.append(dynamics_weighted)
             state_positive_scores.append(state_positive)
             action_positive_scores.append(action_positive)
             next_state_positive_scores.append(dynamics_positive)
@@ -329,6 +353,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         lambda_mode: str = "mean",
         lambda_window_size: int = -1,
         score_mode: str = SCORE_T1,
+        lambda_a: float = 0.1,
+        lambda_trans: float = 1.0,
         alpha_state: float = 1.0,
         alpha_action: float = 1.0,
         alpha_dynamics: float = 1.0,
@@ -342,6 +368,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             device=str(feature_device),
             batch_size=int(feature_batch_size),
             action_horizon=int(action_horizon),
+            lambda_a=float(lambda_a),
+            lambda_trans=float(lambda_trans),
         )
         self.device = _resolve_device(detector_device)
         self.delta = float(delta)
@@ -349,10 +377,16 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self.lambda_mode = str(lambda_mode)
         self.lambda_window_size = int(lambda_window_size)
         self.score_mode = str(score_mode)
+        self.lambda_a = float(lambda_a)
+        self.lambda_trans = float(lambda_trans)
         if self.lambda_mode not in {"mean", "max"}:
             raise ValueError("lambda_mode must be 'mean' or 'max'")
         if self.lambda_window_size == 0:
             raise ValueError("lambda_window_size must be -1 or >=1")
+        if self.lambda_a < 0.0:
+            raise ValueError(f"lambda_a must be non-negative, got {self.lambda_a}")
+        if self.lambda_trans < 0.0:
+            raise ValueError(f"lambda_trans must be non-negative, got {self.lambda_trans}")
         if self.score_mode not in {self.SCORE_T1, self.SCORE_T2, self.SCORE_T3}:
             raise ValueError(
                 f"score_mode must be one of {[self.SCORE_T1, self.SCORE_T2, self.SCORE_T3]}, "
@@ -482,10 +516,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         *,
         task_name: str,
     ) -> dict[str, dict[str, np.ndarray]]:
+        """Convert one scored trajectory into T1/T2/T3 step-score families."""
         t1_components = {
-            "state_error": np.asarray(bundle.state_positive_scores, dtype=np.float32),
-            "action_error": np.asarray(bundle.action_positive_scores, dtype=np.float32),
-            "next_state_error": np.asarray(bundle.next_state_positive_scores, dtype=np.float32),
+            "state_error": np.asarray(bundle.state_contrib_scores, dtype=np.float32),
+            "action_error": np.asarray(bundle.action_contrib_scores, dtype=np.float32),
+            "next_state_error": np.asarray(bundle.next_state_contrib_scores, dtype=np.float32),
         }
         t2_components = {
             "state_error": (-np.asarray(bundle.state_margin_scores, dtype=np.float32)).astype(np.float32),
@@ -576,6 +611,11 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         return out
 
     def _aggregate_lambda(self, step_scores: np.ndarray) -> np.ndarray:
+        """Aggregate per-step scores into detector ``lambda_t`` sequence.
+
+        - ``mean`` mode computes prefix/sliding averages.
+        - ``max`` mode computes prefix/sliding maxima.
+        """
         vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
         n = vals.shape[0]
         if n == 0:
@@ -608,6 +648,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self,
         step_scores: np.ndarray,
     ) -> np.ndarray:
+        """Return argmax support indices used by max-based lambda aggregation."""
         vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
         n = int(vals.shape[0])
         support = np.zeros((n,), dtype=np.int64)
@@ -659,6 +700,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         contributions: dict[str, np.ndarray],
         step_scores: np.ndarray,
     ) -> dict[str, np.ndarray]:
+        """Aggregate component terms with the same temporal rule used for lambda."""
         if self.lambda_mode == "mean":
             return {
                 key: self._aggregate_lambda(values)
@@ -688,6 +730,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         normal_bank_trajectories: Sequence[LatentTrajectory],
         calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
+        """Calibrate global/task thresholds from lambda distributions on normal trajectories."""
         normal_bank_set = list(normal_bank_trajectories)
         calibration_set = (
             list(calibration_trajectories)
@@ -763,14 +806,18 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "noise_scale": float(self.extractor.model.noise_scale),
                 "noise_sigma": float(self.extractor.model.noise_scale),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
-                "model_architecture": "conditional_fisher_unified_task_dsm",
+                "model_architecture": MODEL_ARCHITECTURE,
                 "score_semantics": str(self.score_mode),
+                "t1_semantics": "weighted_fisher",
+                "t1_formula": "state + lambda_a * action + lambda_trans * transition",
                 "latent_dim": int(self.extractor.latent_dim),
                 "action_dim": int(self.extractor.action_dim),
                 "horizon": int(self.extractor.action_horizon),
                 "tau_dim": int(self.extractor.model.tau_dim),
                 "delta_init": float(self.delta),
                 "delta_final": float(self.delta),
+                "lambda_a": float(self.lambda_a),
+                "lambda_trans": float(self.lambda_trans),
                 "score_mode": str(self.score_mode),
                 "supported_score_modes": [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3],
                 "threshold_by_score": {
@@ -828,6 +875,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         warmup_steps: int = 0,
         update_interval: int = 1,
     ) -> TrajectoryDetectionResult:
+        """Score one trajectory over time and emit thresholded anomaly predictions."""
         if self.threshold is None or self._calib_lambdas is None:
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
@@ -923,10 +971,13 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             labels=labels_np,
             metadata={
                 "task_name": task_name,
+                "model_architecture": MODEL_ARCHITECTURE,
                 "threshold_source": "task" if task_threshold is not None else "global",
                 "threshold_init": float(task_threshold if task_threshold is not None else self.threshold),
                 "delta_final": float(cur_delta),
                 "threshold_final": float(cur_threshold),
+                "lambda_a": float(self.lambda_a),
+                "lambda_trans": float(self.lambda_trans),
                 "score_mode": str(self.score_mode),
                 "supported_score_modes": [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3],
                 "score_steps_by_mode": {
@@ -957,15 +1008,18 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "next_state_margin_scores": np.asarray(bundle.next_state_margin_scores, dtype=np.float32),
                 "t1_step_scores": np.asarray(bundle.t1_step_scores, dtype=np.float32),
                 "t2_step_scores": np.asarray(bundle.t2_step_scores, dtype=np.float32),
-                "state_error_scores": component_scores["state_error"],
-                "action_error_scores": component_scores["action_error"],
-                "next_state_error_scores": component_scores["next_state_error"],
+                "state_error_scores": np.asarray(bundle.state_error_scores, dtype=np.float32),
+                "action_error_scores": np.asarray(bundle.action_error_scores, dtype=np.float32),
+                "next_state_error_scores": np.asarray(bundle.next_state_error_scores, dtype=np.float32),
+                "state_contrib_scores": np.asarray(bundle.state_contrib_scores, dtype=np.float32),
+                "action_contrib_scores": np.asarray(bundle.action_contrib_scores, dtype=np.float32),
+                "next_state_contrib_scores": np.asarray(bundle.next_state_contrib_scores, dtype=np.float32),
                 "state_energy_scores": component_scores["state_error"],
                 "action_energy_scores": component_scores["action_error"],
                 "dynamics_energy_scores": component_scores["next_state_error"],
-                "state_fisher_scores": component_scores["state_error"],
-                "action_fisher_scores": component_scores["action_error"],
-                "dynamics_fisher_scores": component_scores["next_state_error"],
+                "state_fisher_scores": np.asarray(bundle.state_error_scores, dtype=np.float32),
+                "action_fisher_scores": np.asarray(bundle.action_error_scores, dtype=np.float32),
+                "dynamics_fisher_scores": np.asarray(bundle.next_state_error_scores, dtype=np.float32),
                 "t3_alpha": {key: float(value) for key, value in self.t3_alpha.items()},
                 "t3_beta": {key: float(value) for key, value in self.t3_beta.items()},
                 "weighted_step_contributions": {
@@ -989,9 +1043,12 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "first_crossing_index": first_crossing_index,
                 "first_crossing_dominant_term": first_crossing_dominant_term,
                 "first_crossing_term_shares": dict(first_crossing_term_shares),
-                "state_error_mean": float(np.mean(component_scores["state_error"])),
-                "action_error_mean": float(np.mean(component_scores["action_error"])),
-                "next_state_error_mean": float(np.mean(component_scores["next_state_error"])),
+                "state_error_mean": float(np.mean(bundle.state_error_scores)),
+                "action_error_mean": float(np.mean(bundle.action_error_scores)),
+                "next_state_error_mean": float(np.mean(bundle.next_state_error_scores)),
+                "state_contrib_mean": float(np.mean(bundle.state_contrib_scores)),
+                "action_contrib_mean": float(np.mean(bundle.action_contrib_scores)),
+                "next_state_contrib_mean": float(np.mean(bundle.next_state_contrib_scores)),
                 "state_positive_mean": float(np.mean(bundle.state_positive_scores)),
                 "action_positive_mean": float(np.mean(bundle.action_positive_scores)),
                 "next_state_positive_mean": float(np.mean(bundle.next_state_positive_scores)),
@@ -1004,9 +1061,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "state_energy_mean": float(np.mean(component_scores["state_error"])),
                 "action_energy_mean": float(np.mean(component_scores["action_error"])),
                 "dynamics_energy_mean": float(np.mean(component_scores["next_state_error"])),
-                "state_fisher_mean": float(np.mean(component_scores["state_error"])),
-                "action_fisher_mean": float(np.mean(component_scores["action_error"])),
-                "dynamics_fisher_mean": float(np.mean(component_scores["next_state_error"])),
+                "state_fisher_mean": float(np.mean(bundle.state_error_scores)),
+                "action_fisher_mean": float(np.mean(bundle.action_error_scores)),
+                "dynamics_fisher_mean": float(np.mean(bundle.next_state_error_scores)),
             },
         )
 

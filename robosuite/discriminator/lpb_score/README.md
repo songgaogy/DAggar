@@ -1,6 +1,6 @@
-# LPB Score: Multitask Conditional Fisher DSM
+# LPB Score: Two-Head Conditional Fisher DSM
 
-Offline failure detection on **latent transitions** produced by a **frozen multitask flow policy encoder**. The pipeline trains a **conditional denoising score model (DSM)** shared across manipulation tasks, then scores trajectories by **contrasting** two trajectory-type conditionals—informally a **Fisher-type** gap between predictions under success-like vs failure-like conditioning.
+Offline failure detection on **latent transitions** produced by a **frozen multitask flow policy encoder**. The pipeline trains a **two-head conditional denoising score model (DSM)** shared across manipulation tasks, then scores trajectories by **contrasting** two trajectory-type conditionals with a **weighted Fisher-type** gap between success-like and failure-like predictions.
 
 This document merges the former user guide and design summary and records the **mathematical formulation** implemented in `core/model.py` and `core/dsm_discriminator.py`.
 
@@ -33,7 +33,7 @@ $$
 \delta_t = \bar{z}_{t+H} - \bar{z}_t \in \mathbb{R}^{d_z}.
 $$
 
-The three **clean routed targets** used inside the model are:
+The three **clean normalized targets** used inside the model are:
 
 - **State factor:** \(\bar{z}_t\)
 - **Actor factor:** \(\bar{a}\) (flattened dimension \(H d_a\))
@@ -41,79 +41,81 @@ The three **clean routed targets** used inside the model are:
 
 ---
 
-## 2. Unified conditional DSM (training)
+## 2. Two-head conditional DSM (training)
 
 ### 2.1 Denoising targets and noise
 
-For each factor \(b \in \{\mathrm{state},\,\pi,\,\mathrm{dyn}\}\), let \(x_b\) denote the corresponding clean target vector (as above). Training uses **isotropic Gaussian noise** in **normalized** space:
+The model uses two denoisers:
+
+- **Occupancy head:** joint state-action target \(x_{sa} = [\bar{z}_t, \bar{a}]\)
+- **Transition head:** residual target \(x_{\mathrm{dyn}} = \delta_t\)
+
+Training uses **isotropic Gaussian noise** in **normalized** space:
 
 $$
-\tilde{x}_b = x_b + \sigma \,\varepsilon_b, \qquad \varepsilon_b \sim \mathcal{N}(0, I),
+\tilde{x}_{sa} = x_{sa} + \sigma \,\varepsilon_{sa}, \qquad
+\tilde{x}_{\mathrm{dyn}} = x_{\mathrm{dyn}} + \sigma \,\varepsilon_{\mathrm{dyn}},
 $$
 
 with fixed \(\sigma = \texttt{noise\_scale}\) (see config).
 
 ### 2.2 Predictor and conditioning
 
-Let \(g_\theta\) denote the **late-fusion** denoiser (`UnifiedConditionedDSM`). The current model removes the old 5-token transformer and replaces it with four stages:
+Let \(g_\theta\) denote the current denoiser (`UnifiedConditionedDSM`, name kept for compatibility). The implementation is now a **two-head decoupled conditional DSM** with **AdaLN-conditioned ResNet-MLP** backbones:
 
-1. **Independent target/context encoders**
-
-   - state target: encode noisy \(\tilde{z}_t\),
-   - actor target: encode noisy \(\tilde{a}\),
-   - dynamics target: encode noisy \(\tilde{\delta}_t\),
-   - actor context: encode clean \(\bar{z}_t\),
-   - dynamics context: encode clean \(\bar{z}_t\) and clean \(\bar{a}\), then fuse them with an MLP.
-
-   The state branch uses **no continuous context**. The actor branch conditions on clean \(\bar{z}_t\). The dynamics branch conditions on clean \((\bar{z}_t, \bar{a})\).
-
-2. **Global condition aggregation**
+1. **Condition embeddings**
 
    Learnable embeddings for:
 
-   - **route** \(r \in \{0,1,2\}\) (state / actor / dynamics),
-   - **type** \(c \in \{0,1\}\),
-   - **task** \(k\),
+   - trajectory type \(c \in \{0,1\}\),
+   - task \(k \in \{0,\ldots,K-1\}\),
 
-   are summed and concatenated with the branch-specific context feature, then passed through a 2-layer MLP to produce one global conditioning vector \(c_{\mathrm{global}}\).
+   are summed and passed through a small MLP to form a dense condition vector \(e_{\mathrm{cond}}\).
 
-3. **Shared DiT-style backbone**
+2. **Occupancy denoiser**
 
-   A small stack of AdaLN-Zero `DiTBlock`s processes exactly **one target feature** per branch. There is **no self-attention**, **no token padding**, and **no token sequence**. Each block uses
+   The occupancy head denoises the joint noisy vector
 
    $$
-   x \leftarrow x + \alpha_1 \odot \mathrm{FFN}_1(\mathrm{AdaLN}_1(x, c_{\mathrm{global}})),
-   $$
-   $$
-   x \leftarrow x + \alpha_2 \odot \mathrm{FFN}_2(\mathrm{AdaLN}_2(x, c_{\mathrm{global}})),
+   \tilde{x}_{sa} = [\tilde{s}, \tilde{a}],
    $$
 
-   where the AdaLN modulation linear layers are initialized to **zero**, so the shared stack starts as an identity map.
+   and outputs one hidden feature that is decoded into:
 
-   The config still accepts `model.num_heads` for backward compatibility with older YAMLs, but it is now a **compatibility no-op** because the backbone no longer uses attention.
+   - state prediction \(\hat{s}\),
+   - action prediction \(\hat{a}\).
 
-4. **Task-specific decoders**
+3. **Transition denoiser**
 
-   Independent linear heads map the shared hidden feature back to:
+   The transition head denoises noisy residual \(\tilde{\delta}_t\), but conditions on **clean** normalized state-action context. Concretely, clean \([\bar{z}_t, \bar{a}]\) is projected to a context feature, concatenated with \(\tilde{\delta}_t\), and then passed into the transition backbone.
 
-   - state: \(\mathbb{R}^{d_z}\),
-   - actor: \(\mathbb{R}^{H d_a}\),
-   - dynamics: \(\mathbb{R}^{d_z}\).
+4. **AdaLN residual blocks**
 
-Conceptually,
+   Each backbone applies condition-dependent scale and shift at every hidden block:
+
+   $$
+   h_{l+1} = h_l + \mathrm{MLP}\bigl(\gamma_l(e_{\mathrm{cond}}) \odot \mathrm{LN}(h_l) + \beta_l(e_{\mathrm{cond}})\bigr).
+   $$
+
+The config still accepts `model.num_heads` for backward compatibility with older YAMLs, but it is a **compatibility no-op** because the backbone is MLP-only.
 
 $$
-\hat{x}_b = g_{\theta,b}\bigl(\tilde{x}_b,\, \text{ctx}_b,\, r,\, c,\, k\bigr),
+\hat{x}_{sa}^{(c)} = g_{\theta,sa}\bigl(\tilde{x}_{sa}, c, k\bigr), \qquad
+\hat{\delta}_t^{(c)} = g_{\theta,\mathrm{dyn}}\bigl(\tilde{\delta}_t, \bar{z}_t, \bar{a}, c, k\bigr).
 $$
-
-but the conditioning is now **late-fused through one global vector** instead of early-fused through attention tokens.
 
 ### 2.3 DSM training loss
 
-For each factor, define the per-branch reconstruction energy
+Define the reconstruction energies
 
 $$
-E_b = \frac{1}{\dim(x_b)}\left\lVert \hat{x}_b - x_b \right\rVert_2^2.
+E_{\mathrm{state}} = \frac{1}{d_z}\left\lVert \hat{s} - \bar{z}_t \right\rVert_2^2,
+$$
+$$
+E_{\pi} = \frac{1}{H d_a}\left\lVert \hat{a} - \bar{a} \right\rVert_2^2,
+$$
+$$
+E_{\mathrm{dyn}} = \frac{1}{d_z}\left\lVert \hat{\delta}_t - \delta_t \right\rVert_2^2.
 $$
 
 Training minimizes a **weighted** sum of branch energies:
@@ -121,7 +123,9 @@ Training minimizes a **weighted** sum of branch energies:
 $$
 \mathcal{L}_{\mathrm{DSM}}
 = \mathbb{E}_{\tau,\,\varepsilon}\left[
-\sum_b w_b E_b
+w_{\mathrm{state}} E_{\mathrm{state}}
++ w_{\pi} E_{\pi}
++ w_{\mathrm{dyn}} E_{\mathrm{dyn}}
 \right],
 $$
 
@@ -143,10 +147,10 @@ Optional **balanced sampling** over \(c=0\) vs \(c=1\) transitions still enforce
 
 The optimizer uses separate AdamW parameter groups for:
 
-- shared backbone and conditioning modules,
+- shared occupancy backbone and occupancy conditioning modules,
 - state branch,
 - action branch,
-- dynamics branch.
+- full transition network.
 
 Given base learning rate `training.lr`, the effective per-group learning rates are:
 
@@ -170,30 +174,47 @@ relative to the state and dynamics branches.
 
 ---
 
-## 3. Inference: Fisher contrast and energies
+## 3. Inference: weighted Fisher contrast and energies
 
-At inference, **no noise** is added. The same \(\tau\) and task \(k\) are evaluated under **two** type conditionals, \(c=0\) and \(c=1\), producing \((\hat{x}_b^{(0)}, \hat{x}_b^{(1)})\) for each factor \(b\).
+At inference, **no noise** is added. The same \(\tau\) and task \(k\) are evaluated under **two** type conditionals, \(c=0\) and \(c=1\), producing:
+
+- occupancy outputs \((\hat{s}^{(0)}, \hat{a}^{(0)})\) and \((\hat{s}^{(1)}, \hat{a}^{(1)})\),
+- transition outputs \(\hat{\delta}^{(0)}\) and \(\hat{\delta}^{(1)}\).
 
 ### 3.1 Fisher-type divergence per factor
 
-Define the **squared \(\ell_2\) divergence** between the two conditional predictions:
+Define
 
 $$
-D_b = \left\lVert \hat{x}_b^{(0)} - \hat{x}_b^{(1)} \right\rVert_2^2
-= \sum_{j} \bigl(\hat{x}_{b,j}^{(0)} - \hat{x}_{b,j}^{(1)}\bigr)^2.
+\Delta_s = \hat{s}^{(0)} - \hat{s}^{(1)}, \qquad
+\Delta_a = \hat{a}^{(0)} - \hat{a}^{(1)}, \qquad
+\Delta_{\mathrm{dyn}} = \hat{\delta}^{(0)} - \hat{\delta}^{(1)}.
 $$
 
-The **total Fisher score** (per transition step) is
+The raw per-factor Fisher terms are
 
 $$
-S^{\mathrm{Fisher}} = D_{\mathrm{state}} + D_{\pi} + D_{\mathrm{dyn}}.
+D_{\mathrm{state}} = \left\lVert \Delta_s \right\rVert_2^2, \qquad
+D_{\pi} = \left\lVert \Delta_a \right\rVert_2^2, \qquad
+D_{\mathrm{dyn}} = \left\lVert \Delta_{\mathrm{dyn}} \right\rVert_2^2.
 $$
 
-Large \(S^{\mathrm{Fisher}}\) indicates the two conditionals disagree strongly on the same transition—useful for separating **ambiguous** or **off-manifold** behavior.
+The **default step score** is the weighted Fisher score
+
+$$
+S^{\mathrm{Fisher}} = D_{\mathrm{state}} + \lambda_a D_{\pi} + \lambda_{\mathrm{trans}} D_{\mathrm{dyn}},
+$$
+
+with default detector settings:
+
+- `detector.lambda_a = 0.1`
+- `detector.lambda_trans = 1.0`
+
+Large \(S^{\mathrm{Fisher}}\) indicates the two conditionals disagree strongly on the same transition, with the **action occupancy term explicitly suppressed**.
 
 ### 3.2 Branch reconstruction energies and margins
 
-Independently, each branch \(c \in \{0,1\}\) yields a **reconstruction energy** per factor (mean coordinate MSE vs. clean target \(x_b\)):
+Independently, each branch \(c \in \{0,1\}\) yields a **reconstruction energy** per factor (mean coordinate MSE vs. clean target):
 
 $$
 E_b^{(c)} = \frac{1}{\dim(x_b)} \left\lVert \hat{x}_b^{(c)} - x_b \right\rVert_2^2 .
@@ -205,7 +226,7 @@ $$
 M_b = E_b^{(1)} - E_b^{(0)} .
 $$
 
-Implementation details and additional scalars are returned by `compute_fisher_score` and packaged into a `TrajectoryScoreBundle`.
+Implementation details, weighted contributions, and auxiliary reconstruction terms are returned by `compute_fisher_score` and packaged into a `TrajectoryScoreBundle`.
 
 ---
 
@@ -214,25 +235,30 @@ Implementation details and additional scalars are returned by `compute_fisher_sc
 Let \(u_t\) denote a **scalar step score** at time \(t\) chosen from a **score family** (below). The detector maps \(\{u_t\}\) to an aggregate **\(\lambda\)** sequence:
 
 - **Mean mode:** if \(\texttt{lambda\_window\_size} \le 0\), prefix average \(\lambda_t = \frac{1}{t+1}\sum_{i=0}^{t} u_i\). If \(W = \texttt{lambda\_window\_size} > 0\), **sliding arithmetic mean** over the last \(W\) steps.
-- **EMA mode:** exponential weighted moving average with span \(W = \texttt{lambda\_window\_size}\) when \(W>0\) (\(\alpha = \frac{2}{W+1}\), same as `pandas` `ewm(span=W, adjust=False)`). If \(\texttt{lambda\_window\_size} \le 0\), span is set to the trajectory length \(T\).
 - **Max mode:** prefix maximum if \(\texttt{lambda\_window\_size} \le 0\), else rolling maximum over a window of size \(W\).
 
 A **threshold** \(\tau\) is calibrated from **normal** trajectories (e.g. success bank) as a high quantile of \(\lambda\) values, controlled by **`delta`** (percentile-style budget). Alarms occur when \(\lambda_t \ge \tau\) (per-task thresholds optional).
 
 ### 4.1 Score families (T1 / T2 / T3)
 
-Let \(e_b^{+} = E_b^{(0)}\) denote positive-branch energies and \(M_b\) margin-like terms as implemented.
+Let \(M_b\) denote the margin terms above. For T1, the implementation uses the **weighted Fisher contributions**:
 
-- **T1 — positive energy:**  
+$$
+C_{\mathrm{state}} = D_{\mathrm{state}}, \qquad
+C_{\pi} = \lambda_a D_{\pi}, \qquad
+C_{\mathrm{dyn}} = \lambda_{\mathrm{trans}} D_{\mathrm{dyn}}.
+$$
+
+- **T1 — weighted Fisher:**  
   $$
-  u_t^{\mathrm{(T1)}} = e_{\mathrm{state}}^{+} + e_{\pi}^{+} + e_{\mathrm{dyn}}^{+}.
+  u_t^{\mathrm{(T1)}} = C_{\mathrm{state}} + C_{\pi} + C_{\mathrm{dyn}}.
   $$
 
-- **T2 — negative margin:** uses **negative** linear combinations of margin terms (implementation maps bundle margins so that larger values indicate stronger failure signal—see `SCORE_T2` in code).
+- **T2 — negative margin:** uses **negative** linear combinations of margin terms. This path is kept for compatibility.
 
 - **T3 — weighted standardized combo:** blends **z-scored** positive energies and margins with weights \(\alpha_b, \beta_b\) (config `alpha_*`, `beta_*`). Normalization statistics for z-scoring are estimated from a **success bank** of trajectories.
 
-The active mode is `detector.score_mode` in `config/visualize.yaml`.
+The active mode is `detector.score_mode` in `config/visualize.yaml`. The default detector config still points to T1, which now means the **weighted Fisher** score above.
 
 ---
 
@@ -261,7 +287,7 @@ Per-task directories are set in `config/train.yaml`. Cached latents live under `
 
 | Component | Path |
 |-----------|------|
-| Unified DSM + `DSMModel` | `core/model.py` |
+| Two-head DSM + `DSMModel` | `core/model.py` |
 | Training loop | `core/trainer.py` |
 | Data + caches | `core/dataset.py` |
 | Scorer + detector | `core/dsm_discriminator.py` |
@@ -271,9 +297,9 @@ Per-task directories are set in `config/train.yaml`. Cached latents live under `
 
 ## 6. Training and inference workflows
 
-**Training:** `train.py` + `config/train.yaml` — builds caches, sets `num_tasks = \|task_to_index\|`, fits \(\mu,\sigma\) from positives, builds the late-fusion DSM, applies branch-weighted loss and branch-wise optimizer LRs, runs `Trainer.fit`, and saves checkpoints.
+**Training:** `train.py` + `config/train.yaml` — builds caches, sets `num_tasks = \|task_to_index\|`, fits \(\mu,\sigma\) from positives, builds the two-head DSM, applies branch-weighted loss and branch-wise optimizer LRs, runs `Trainer.fit`, and saves checkpoints.
 
-**Visualization:** `visualize_failures.py` + `config/visualize.yaml` — loads `model.dsm_ckpt`, calibrates detector from `eval.bank_*`, renders failures from `eval.fail_*` or **suboptimal** HDF5 (`visualization.data_source`).
+**Visualization:** `visualize_failures.py` + `config/visualize.yaml` — loads `model.dsm_ckpt`, calibrates detector from `eval.bank_*`, applies `detector.lambda_a` / `detector.lambda_trans` inside the default Fisher score, and renders failures from `eval.fail_*` or **suboptimal** HDF5 (`visualization.data_source`).
 
 **Shell helpers:** `scripts/train_lpb_score_dsm.sh`, `scripts/visualize_lpb_score_dsm_failures.sh`.
 
@@ -297,9 +323,9 @@ GPU=0 \
 
 ## 7. Checkpoints and compatibility
 
-Saved payloads include `model`, `cfg`, `latent_dim`, `action_dim`, `horizon`, `num_tasks`, `task_to_index`, `normalization_stats`, and `model_architecture: conditional_fisher_unified_task_dsm`.
+Saved payloads include `model`, `cfg`, `latent_dim`, `action_dim`, `horizon`, `num_tasks`, `task_to_index`, `normalization_stats`, and `model_architecture: two_head_decoupled_conditional_dsm`.
 
-Checkpoints must contain the current late-fusion multitask architecture. Older checkpoints from the former transformer/token-stack predictor are **not** weight-compatible with the current `UnifiedConditionedDSM`, even if they used multitask conditioning.
+Checkpoints must contain the current two-head architecture. Older checkpoints from the former unified multitask DSM are **not** weight-compatible with the current `UnifiedConditionedDSM`, even though the class name was kept for API compatibility.
 
 ---
 

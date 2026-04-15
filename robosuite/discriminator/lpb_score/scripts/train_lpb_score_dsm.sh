@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 GPU="${GPU:-0}"
 SEED="${SEED:-42}"
-BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new}"
+BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v2}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="lpb_dipole_dsm_${TIMESTAMP}"
 SAVE_NAME="${RUN_NAME}.pt"
