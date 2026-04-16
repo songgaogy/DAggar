@@ -31,9 +31,7 @@ class TrainerConfig:
     val_use_ema: bool = True
     save_ema_in_checkpoint: bool = True
     shared_lr_multiplier: float = 1.0
-    state_branch_lr_multiplier: float = 1.0
-    action_branch_lr_multiplier: float = 0.5
-    dynamics_branch_lr_multiplier: float = 1.0
+    chunk_branch_lr_multiplier: float = 1.0
 
 
 class Trainer:
@@ -87,9 +85,7 @@ class Trainer:
     def _build_optimizer_param_groups(self) -> list[dict[str, object]]:
         multipliers = {
             "shared": float(self.cfg.shared_lr_multiplier),
-            "state_branch": float(self.cfg.state_branch_lr_multiplier),
-            "action_branch": float(self.cfg.action_branch_lr_multiplier),
-            "dynamics_branch": float(self.cfg.dynamics_branch_lr_multiplier),
+            "chunk_branch": float(self.cfg.chunk_branch_lr_multiplier),
         }
         for name, multiplier in multipliers.items():
             if multiplier < 0.0:
@@ -97,7 +93,7 @@ class Trainer:
 
         groups = self.model.predictor.optimizer_parameter_groups()
         param_groups: list[dict[str, object]] = []
-        for name in ("shared", "state_branch", "action_branch", "dynamics_branch"):
+        for name in ("shared", "chunk_branch"):
             params = groups.get(name, [])
             if not params:
                 continue
@@ -188,9 +184,7 @@ class Trainer:
 
         with torch.set_grad_enabled(train):
             stats = active.compute_dsm_loss(
-                current_latent=data["current_latent"],
-                action_sequence=data["action_sequence"],
-                target_latent=data["target_latent"],
+                latent_window=data["latent_window"],
                 traj_type=data["traj_type"],
                 task_index=data["task_index"],
             )
@@ -207,13 +201,8 @@ class Trainer:
             "loss": float(stats["loss"].detach().item()),
             "score": float(stats["score"].detach().item()),
             "unweighted_score": float(stats["unweighted_score"].detach().item()),
-            "tau_mse": float(stats["tau_mse"].detach().item()),
-            "state_mse": float(stats["state_mse"].detach().item()),
-            "action_mse": float(stats["action_mse"].detach().item()),
-            "next_state_mse": float(stats["next_state_mse"].detach().item()),
-            "state_energy": float(stats["state_energy"].detach().item()),
-            "action_energy": float(stats["action_energy"].detach().item()),
-            "next_state_energy": float(stats["next_state_energy"].detach().item()),
+            "chunk_mse": float(stats["chunk_mse"].detach().item()),
+            "chunk_energy": float(stats["chunk_energy"].detach().item()),
         }
 
     @staticmethod
@@ -257,11 +246,9 @@ class Trainer:
                 print(
                     f"[train] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} score={out['score']:.6f} "
-                    f"unweighted_score={out['unweighted_score']:.6f} tau_mse={out['tau_mse']:.6f} "
-                    f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f} "
-                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
-                    f"next_state_energy={out['next_state_energy']:.6f}"
+                    f"unweighted_score={out['unweighted_score']:.6f} "
+                    f"chunk_mse={out['chunk_mse']:.6f} "
+                    f"chunk_energy={out['chunk_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
 
@@ -281,11 +268,9 @@ class Trainer:
                 print(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} score={out['score']:.6f} "
-                    f"unweighted_score={out['unweighted_score']:.6f} tau_mse={out['tau_mse']:.6f} "
-                    f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f} "
-                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
-                    f"next_state_energy={out['next_state_energy']:.6f}"
+                    f"unweighted_score={out['unweighted_score']:.6f} "
+                    f"chunk_mse={out['chunk_mse']:.6f} "
+                    f"chunk_energy={out['chunk_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
 

@@ -1,4 +1,4 @@
-"""Latent data pipeline: HDF5 splits, ``.npz`` caches from the frozen encoder, transition indexing."""
+"""Latent data pipeline: HDF5 splits, ``.npz`` caches, and temporal window indexing."""
 
 from __future__ import annotations
 
@@ -72,7 +72,6 @@ class EncodedTrajectoryRef:
 class TransitionRef:
     trajectory_index: int
     t: int
-    horizon: int
     traj_type: int
 
 
@@ -93,6 +92,21 @@ def _cfg_get(cfg: Any, key: str, default=None):
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
+
+
+def resolve_window_size(cfg: Any, default: int = 8) -> int:
+    """Resolve the canonical window size with a legacy fallback."""
+    dataset_cfg = _cfg_get(cfg, "dataset", None)
+    value = _cfg_get(dataset_cfg, "window_size", None)
+    if value is None:
+        data_cfg = _cfg_get(cfg, "data", None)
+        value = _cfg_get(data_cfg, "window_size", None)
+    if value is None:
+        value = default
+    window_size = int(value)
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive, got {window_size}")
+    return window_size
 
 
 def _split_counts_from_cfg(cfg: Any) -> SplitCounts:
@@ -430,7 +444,7 @@ def load_cached_latent_trajectory(ref: EncodedTrajectoryRef) -> LatentTrajectory
 
 def load_latent_trajectories(refs: Sequence[EncodedTrajectoryRef]) -> list[LatentTrajectory]:
     trajectories = [load_cached_latent_trajectory(ref) for ref in refs]
-    return [traj for traj in trajectories if min(int(traj.latents.shape[0]), int(traj.actions.shape[0])) > 1]
+    return [traj for traj in trajectories if int(traj.latents.shape[0]) > 0]
 
 
 def filter_refs_by_data_types(
@@ -444,57 +458,46 @@ def filter_refs_by_data_types(
 
 
 class LatentTransitionDataset(Dataset):
-    """Sliding-window ``(z_t, a_{t:t+H}, z_{t+H})`` samples with ``traj_type`` and ``task_index``."""
+    """Temporal latent-window samples with ``traj_type`` and ``task_index``."""
 
     def __init__(
         self,
         trajectory_refs: Sequence[EncodedTrajectoryRef],
-        horizon: int = 1,
+        window_size: int = 8,
         preload_to_memory: bool = False,
     ) -> None:
         super().__init__()
         self.trajectory_refs = list(trajectory_refs)
-        self.horizon = int(horizon)
-        if self.horizon <= 0:
-            raise ValueError(f"horizon must be positive, got {self.horizon}")
+        self.window_size = int(window_size)
+        if self.window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {self.window_size}")
         if not self.trajectory_refs:
             raise ValueError("trajectory_refs cannot be empty")
 
         self.preload_to_memory = bool(preload_to_memory)
         self._trajectory_cache: dict[int, LatentTrajectory] = {}
-        self._action_dim: Optional[int] = None
         self._latent_dim: Optional[int] = None
         self._transition_refs: list[TransitionRef] = []
         self._sample_is_positive: list[bool] = []
 
         for traj_idx, ref in enumerate(self.trajectory_refs):
             traj = load_cached_latent_trajectory(ref)
-            length = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
-            usable = length - self.horizon
-            if usable <= 0:
+            length = int(traj.latents.shape[0])
+            if length <= 0:
                 continue
-            if self._action_dim is None:
-                self._action_dim = int(traj.actions.shape[-1])
+            if self._latent_dim is None:
                 self._latent_dim = int(traj.latents.shape[-1])
-            else:
-                if int(traj.actions.shape[-1]) != self._action_dim:
-                    raise ValueError(
-                        f"Action dim mismatch in {traj.file_path}:{traj.demo_key}. "
-                        f"expected={self._action_dim}, got={traj.actions.shape[-1]}"
-                    )
-                if int(traj.latents.shape[-1]) != self._latent_dim:
-                    raise ValueError(
-                        f"Latent dim mismatch in {traj.file_path}:{traj.demo_key}. "
-                        f"expected={self._latent_dim}, got={traj.latents.shape[-1]}"
-                    )
-            for t in range(usable):
+            elif int(traj.latents.shape[-1]) != self._latent_dim:
+                raise ValueError(
+                    f"Latent dim mismatch in {traj.file_path}:{traj.demo_key}. "
+                    f"expected={self._latent_dim}, got={traj.latents.shape[-1]}"
+                )
+            for t in range(length):
                 traj_type = 1 if ref.data_type == "fail_rollout" else 0
-                # Each prefix becomes one transition prediction example.
                 self._transition_refs.append(
                     TransitionRef(
                         trajectory_index=traj_idx,
                         t=t,
-                        horizon=self.horizon,
                         traj_type=traj_type,
                     )
                 )
@@ -503,12 +506,7 @@ class LatentTransitionDataset(Dataset):
                 self._trajectory_cache[traj_idx] = traj
 
         if not self._transition_refs:
-            raise RuntimeError("No valid transitions found for the provided trajectory refs.")
-
-    @property
-    def action_dim(self) -> int:
-        assert self._action_dim is not None
-        return self._action_dim
+            raise RuntimeError("No valid latent windows found for the provided trajectory refs.")
 
     @property
     def latent_dim(self) -> int:
@@ -538,17 +536,21 @@ class LatentTransitionDataset(Dataset):
         self._trajectory_cache[trajectory_index] = traj
         return traj
 
+    def _build_latent_window(self, traj: LatentTrajectory, t: int) -> np.ndarray:
+        latents = np.asarray(traj.latents, dtype=np.float32)
+        start = int(t) - self.window_size + 1
+        if start >= 0:
+            return latents[start : int(t) + 1]
+        pad = np.repeat(latents[:1], -start, axis=0)
+        return np.concatenate([pad, latents[: int(t) + 1]], axis=0)
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Return tensors for one transition; ``task_index`` matches ``UnifiedConditionedDSM`` embeddings."""
+        """Return tensors for one latent window."""
         ref = self._transition_refs[index]
         traj = self._get_trajectory(ref.trajectory_index)
-        t0 = ref.t
-        th = t0 + ref.horizon
-        action_sequence = traj.actions[t0:th]
+        latent_window = self._build_latent_window(traj, t=int(ref.t))
         return {
-            "current_latent": torch.from_numpy(np.asarray(traj.latents[t0], dtype=np.float32)),
-            "action_sequence": torch.from_numpy(np.asarray(action_sequence, dtype=np.float32)),
-            "target_latent": torch.from_numpy(np.asarray(traj.latents[th], dtype=np.float32)),
+            "latent_window": torch.from_numpy(np.asarray(latent_window, dtype=np.float32)),
             "task_index": torch.tensor(int(traj.task_index), dtype=torch.int64),
             "data_type_index": torch.tensor(int(traj.data_type_index), dtype=torch.int64),
             "traj_type": torch.tensor(int(ref.traj_type), dtype=torch.int64),

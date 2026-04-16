@@ -67,18 +67,12 @@ class LabeledLatentTrajectory:
 
 
 SCORE_MODE_ORDER = (
-    "t1_positive_energy",
-    "t2_negative_margin",
     "t3_weighted_combo",
 )
 SCORE_MODE_SHORT_LABELS = {
-    "t1_positive_energy": "T1",
-    "t2_negative_margin": "T2",
     "t3_weighted_combo": "T3",
 }
 SCORE_MODE_COLORS = {
-    "t1_positive_energy": "#1f77b4",
-    "t2_negative_margin": "#2ca02c",
     "t3_weighted_combo": "#9467bd",
 }
 
@@ -163,7 +157,7 @@ def _save_failure_plot_pdf(
     first_crossing_dominant_term: str | None,
     gt_fail_mask: np.ndarray | None = None,
 ) -> None:
-    """Save a PDF page with active score, T1/T2/T3 traces, and term attributions."""
+    """Save a PDF page with the active score and chunk term attributions."""
     num_frames = int(np.asarray(frame_scores).shape[0])
     if num_frames <= 0:
         return
@@ -273,7 +267,7 @@ def _save_failure_plot_pdf(
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
     )
 
-    t3_term_keys = ["state_error", "action_error", "next_state_error"]
+    t3_term_keys = ["chunk_energy", "chunk_margin"]
     if any(
         np.asarray(frame_t3_alpha_terms.get(key, []), dtype=np.float32).reshape(-1).size == num_frames
         or np.asarray(frame_t3_beta_terms.get(key, []), dtype=np.float32).reshape(-1).size == num_frames
@@ -317,12 +311,8 @@ def _save_failure_plot_pdf(
             0.995,
             0.02,
             (
-                f"alpha_state={float(t3_alpha.get('state_error', 0.0)):.3f}\n"
-                f"alpha_action={float(t3_alpha.get('action_error', 0.0)):.3f}\n"
-                f"alpha_dynamic={float(t3_alpha.get('next_state_error', 0.0)):.3f}\n"
-                f"beta_state={float(t3_beta.get('state_error', 0.0)):.3f}\n"
-                f"beta_action={float(t3_beta.get('action_error', 0.0)):.3f}\n"
-                f"beta_dynamic={float(t3_beta.get('next_state_error', 0.0)):.3f}"
+                f"alpha_energy={float(t3_alpha.get('chunk_energy', 0.0)):.3f}\n"
+                f"beta_margin={float(t3_beta.get('chunk_margin', 0.0)):.3f}"
             ),
             transform=t3_term_ax.transAxes,
             ha="right",
@@ -588,7 +578,6 @@ def _encode_suboptimal_refs(
     *,
     encoder,
     task_to_index: dict[str, int],
-    horizon: int,
     batch_size: int,
 ) -> tuple[list[LabeledLatentTrajectory], dict[str, object]]:
     encoded: list[LabeledLatentTrajectory] = []
@@ -610,8 +599,7 @@ def _encode_suboptimal_refs(
             item = encoded_lookup.get(key)
             if item is None:
                 raise KeyError(f"Missing encoded suboptimal demo for {key}")
-            length = min(int(item.latents.shape[0]), int(item.actions.shape[0]))
-            valid_len = length - int(horizon)
+            valid_len = int(item.latents.shape[0])
             if valid_len <= 0:
                 dropped.append(
                     {
@@ -619,7 +607,7 @@ def _encode_suboptimal_refs(
                         "split": ref.split,
                         "file_path": ref.file_path,
                         "demo_key": ref.demo_key,
-                        "reason": "too_short_for_horizon",
+                        "reason": "empty_latent_sequence",
                     }
                 )
                 continue
@@ -695,7 +683,6 @@ def _load_visualization_targets(
     task_to_index: dict[str, int],
     seed: int,
     num_videos: int,
-    horizon: int,
 ) -> tuple[list[object], list[LatentTrajectory], list[np.ndarray | None], dict[str, object]]:
     data_source = str(getattr(cfg.visualization, "data_source", "suboptimal"))
     if data_source != "suboptimal":
@@ -737,7 +724,6 @@ def _load_visualization_targets(
         refs=selected_refs,
         encoder=encoder,
         task_to_index=task_to_index,
-        horizon=int(horizon),
         batch_size=int(cfg.data.encode_demo_batch_size),
     )
     selected_lookup = {
@@ -825,7 +811,6 @@ def run_visualize(cfg: DictConfig) -> None:
             task_to_index=task_to_index,
             seed=int(cfg.seed),
             num_videos=int(cfg.visualization.num_videos),
-            horizon=int(detector.extractor.action_horizon),
         )
         calibration_summary = detector.fit(
             normal_bank_trajectories=bank_trajectories,
@@ -1105,13 +1090,9 @@ def run_visualize(cfg: DictConfig) -> None:
                     else float("nan")
                 ),
                 "detector_hparams": {
-                    "score_mode": str(getattr(cfg.detector, "score_mode", detector.score_mode)),
-                    "alpha_state": float(getattr(cfg.detector, "alpha_state", 1.0)),
-                    "alpha_action": float(getattr(cfg.detector, "alpha_action", 1.0)),
-                    "alpha_dynamics": float(getattr(cfg.detector, "alpha_dynamics", 1.0)),
-                    "beta_state": float(getattr(cfg.detector, "beta_state", 1.0)),
-                    "beta_action": float(getattr(cfg.detector, "beta_action", 1.0)),
-                    "beta_dynamics": float(getattr(cfg.detector, "beta_dynamics", 1.0)),
+                    "score_mode": detector.score_mode,
+                    "alpha": float(getattr(cfg.detector, "alpha", 1.0)),
+                    "beta": float(getattr(cfg.detector, "beta", 1.0)),
                 },
                 **dict(calibration_summary.metadata),
             },

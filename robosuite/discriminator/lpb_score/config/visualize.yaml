@@ -6,6 +6,9 @@ seed: 42
 
 save_dir: "./checkpoints/multitask_6/lpb_score/visualize"
 
+dataset:
+  window_size: 8
+
 policy:
   ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
   device: "cuda"
@@ -13,7 +16,7 @@ policy:
 
 data:
   image_size: 128
-  transition_horizon: 1
+  window_size: 8
   cache_dir: "./data/.lpb_score_cache"
   encode_demo_batch_size: 8
   splits:
@@ -52,7 +55,6 @@ model:
 feature:
   device: "cuda"
   batch_size: 256
-  action_horizon: -1
 
 detector:
   device: "cuda"
@@ -60,15 +62,8 @@ detector:
   delta_step: 0.5
   lambda_mode: "mean"
   lambda_window_size: 12
-  score_mode: "t1_positive_energy"
-  lambda_a: 0.1
-  lambda_trans: 1.0
-  alpha_state: 1.0
-  alpha_action: 1.0
-  alpha_dynamics: 1.0
-  beta_state: 1.0
-  beta_action: 1.0
-  beta_dynamics: 1.0
+  alpha: 1.0
+  beta: 1.0
 
 eval:
   bank_split: "train"

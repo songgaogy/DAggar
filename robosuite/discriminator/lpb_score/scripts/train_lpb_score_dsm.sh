@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 GPU="${GPU:-0}"
 SEED="${SEED:-42}"
-BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v2}"
+BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v3}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="lpb_dipole_dsm_${TIMESTAMP}"
 SAVE_NAME="${RUN_NAME}.pt"
@@ -23,7 +23,8 @@ EPOCHS=50
 
 LR="${LR:-2e-4}"
 IMAGE_SIZE=128
-HORIZON=2
+HORIZON=10
+DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE:-${HORIZON}}"
 ENCODER_BATCH_SIZE=128
 STD_CLAMP_MIN="${STD_CLAMP_MIN:-0.05}"
 NOISE_SCALE="${NOISE_SCALE:-0.08}"
@@ -41,6 +42,7 @@ echo "[train_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[train_lpb_score_dsm] save_dir=${SAVE_DIR}"
 echo "[train_lpb_score_dsm] train.num_pos_traj=${NUM_POS}"
 echo "[train_lpb_score_dsm] train.num_neg_traj=${NUM_NEG}"
+echo "[train_lpb_score_dsm] dataset.window_size=${DSM_WINDOW_SIZE}"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/train.py" \
   seed="${SEED}" \
@@ -50,7 +52,7 @@ echo "[train_lpb_score_dsm] train.num_neg_traj=${NUM_NEG}"
   policy.ckpt="${CKPT}" \
   policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
   data.image_size="${IMAGE_SIZE}" \
-  data.transition_horizon="${HORIZON}" \
+  dataset.window_size="${DSM_WINDOW_SIZE}" \
   model.std_clamp_min="${STD_CLAMP_MIN}" \
   model.noise_scale="${NOISE_SCALE}" \
   data.splits.train.num_pos_traj="${NUM_POS}" \

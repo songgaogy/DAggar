@@ -1,4 +1,4 @@
-"""Stable ordering and summaries for state/action/dynamics Fisher attribution in plots and JSON."""
+"""Stable ordering and summaries for chunk attribution in plots and JSON."""
 
 from __future__ import annotations
 
@@ -11,27 +11,23 @@ from robosuite.discriminator.utils.visualization import map_step_values_to_frame
 
 
 TERM_ORDER: tuple[str, ...] = (
-    "state_error",
-    "action_error",
-    "next_state_error",
+    "chunk_energy",
+    "chunk_margin",
 )
 
 TERM_LABELS: dict[str, str] = {
-    "state_error": "State Fisher",
-    "action_error": "Action Fisher",
-    "next_state_error": "Dynamics Fisher",
+    "chunk_energy": "Chunk Energy",
+    "chunk_margin": "Chunk Margin",
 }
 
 TERM_SHORT_LABELS: dict[str, str] = {
-    "state_error": "ST",
-    "action_error": "PI",
-    "next_state_error": "DY",
+    "chunk_energy": "EN",
+    "chunk_margin": "MG",
 }
 
 TERM_COLORS: dict[str, str] = {
-    "state_error": "#1f77b4",
-    "action_error": "#ff7f0e",
-    "next_state_error": "#2ca02c",
+    "chunk_energy": "#1f77b4",
+    "chunk_margin": "#ff7f0e",
 }
 
 

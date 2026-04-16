@@ -7,8 +7,8 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v2/lpb_dipole_dsm_20260415_222402/lpb_dipole_dsm_20260415_222402.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v2/visualize}"
+DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new-v3/lpb_dipole_dsm_20260417_005436/lpb_dipole_dsm_20260417_005436.pt"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v3/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
 NUM_VIDEOS=12
 
@@ -17,22 +17,21 @@ VIS_DATA_SOURCE="fail_rollout"  # suboptimal | expert | success_rollout | fail_r
 SCORE_MODE="t3_weighted_combo"   # only supported score
 
 # ---------------------------------------
-# positive energy
+# chunk energy
 ALPHA_STATE=1
-ALPHA_ACTION=0
-ALPHA_DYNAMICS=0
+ALPHA="${ALPHA:-${ALPHA_STATE}}"
 
-# energy margin gap
+# chunk margin
 BETA_STATE=1
-BETA_ACTION=0
-BETA_DYNAMICS=0
+BETA="${BETA:-${BETA_STATE}}"
 
 # threshold
 # NOTE: 5-8% should be better
-DELTA_THRESHOLD=4
+DELTA_THRESHOLD=8
 
 LAMBDA_MODE="mean"  # mean | max
-WINDOW_SIZE=6
+WINDOW_SIZE=10
+DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE:-10}"
 # ---------------------------------------
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
@@ -41,7 +40,6 @@ FPS="${FPS:-20}"
 CAMERA_NAME="${CAMERA_NAME:-agentview}"
 SAVE_PDF="${SAVE_PDF:-true}"
 NUM_PLOT_FRAMES="${NUM_PLOT_FRAMES:-8}"
-ACTION_HORIZON="${ACTION_HORIZON:--1}"
 CALIBRATION_SEED="${CALIBRATION_SEED:-${SEED}}"
 
 if [[ -z "${DSM_CKPT}" ]]; then
@@ -97,10 +95,10 @@ try:
 except TypeError:
     payload = torch.load(path, map_location="cpu")
 
-if "model" not in payload or "latent_dim" not in payload or "action_dim" not in payload:
+if "model" not in payload or "latent_dim" not in payload or "window_size" not in payload:
     raise SystemExit(
         f"[visualize_lpb_score_dsm] Invalid DSM checkpoint: {path}\n"
-        "Expected an lpb_score DSM checkpoint with keys like `model`, `latent_dim`, and `action_dim`."
+        "Expected an lpb_score DSM checkpoint with keys like `model`, `latent_dim`, and `window_size`."
     )
 PY
 }
@@ -117,9 +115,10 @@ echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
 echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
+echo "[visualize_lpb_score_dsm] dataset.window_size=${DSM_WINDOW_SIZE}"
 echo "[visualize_lpb_score_dsm] detector.score_mode=${SCORE_MODE}"
-echo "[visualize_lpb_score_dsm] detector.alpha=(state=${ALPHA_STATE}, action=${ALPHA_ACTION}, dynamics=${ALPHA_DYNAMICS})"
-echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BETA_ACTION}, dynamics=${BETA_DYNAMICS})"
+echo "[visualize_lpb_score_dsm] detector.alpha=${ALPHA}"
+echo "[visualize_lpb_score_dsm] detector.beta=${BETA}"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/visualize_failures.py" \
   seed="${SEED}" \
@@ -129,7 +128,7 @@ echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BET
   policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
   data.image_size="${IMAGE_SIZE}" \
   model.dsm_ckpt="${DSM_CKPT}" \
-  feature.action_horizon="${ACTION_HORIZON}" \
+  dataset.window_size="${DSM_WINDOW_SIZE}" \
   visualization.data_source="${VIS_DATA_SOURCE}" \
   visualization.bank_size="${BANK_SIZE}" \
   visualization.calibration_seed="${CALIBRATION_SEED}" \
@@ -140,11 +139,6 @@ echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BET
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
   detector.lambda_window_size=$WINDOW_SIZE \
   detector.delta="${DELTA_THRESHOLD}" \
-  detector.score_mode="${SCORE_MODE}" \
-  detector.alpha_state="${ALPHA_STATE}" \
-  detector.alpha_action="${ALPHA_ACTION}" \
-  detector.alpha_dynamics="${ALPHA_DYNAMICS}" \
-  detector.beta_state="${BETA_STATE}" \
-  detector.beta_action="${BETA_ACTION}" \
-  detector.beta_dynamics="${BETA_DYNAMICS}" \
+  detector.alpha="${ALPHA}" \
+  detector.beta="${BETA}" \
   "$@"
