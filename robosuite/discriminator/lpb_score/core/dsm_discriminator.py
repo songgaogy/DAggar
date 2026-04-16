@@ -529,19 +529,13 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         }
 
         t3_stats = self._resolve_t3_norm_stats(task_name)
-        t3_components = {
+        alpha_terms = {
             "state_error": (
                 self.t3_alpha["state_error"]
                 * self._safe_standardize(
                     bundle.state_positive_scores,
                     t3_stats.get("state_positive_mean", 0.0),
                     t3_stats.get("state_positive_std", 1.0),
-                )
-                - self.t3_beta["state_error"]
-                * self._safe_standardize(
-                    bundle.state_margin_scores,
-                    t3_stats.get("state_margin_mean", 0.0),
-                    t3_stats.get("state_margin_std", 1.0),
                 )
             ).astype(np.float32),
             "action_error": (
@@ -551,12 +545,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                     t3_stats.get("action_positive_mean", 0.0),
                     t3_stats.get("action_positive_std", 1.0),
                 )
-                - self.t3_beta["action_error"]
-                * self._safe_standardize(
-                    bundle.action_margin_scores,
-                    t3_stats.get("action_margin_mean", 0.0),
-                    t3_stats.get("action_margin_std", 1.0),
-                )
             ).astype(np.float32),
             "next_state_error": (
                 self.t3_alpha["next_state_error"]
@@ -565,13 +553,39 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                     t3_stats.get("next_state_positive_mean", 0.0),
                     t3_stats.get("next_state_positive_std", 1.0),
                 )
-                - self.t3_beta["next_state_error"]
+            ).astype(np.float32),
+        }
+        beta_terms = {
+            "state_error": (
+                self.t3_beta["state_error"]
+                * self._safe_standardize(
+                    bundle.state_margin_scores,
+                    t3_stats.get("state_margin_mean", 0.0),
+                    t3_stats.get("state_margin_std", 1.0),
+                )
+            ).astype(np.float32),
+            "action_error": (
+                self.t3_beta["action_error"]
+                * self._safe_standardize(
+                    bundle.action_margin_scores,
+                    t3_stats.get("action_margin_mean", 0.0),
+                    t3_stats.get("action_margin_std", 1.0),
+                )
+            ).astype(np.float32),
+            "next_state_error": (
+                self.t3_beta["next_state_error"]
                 * self._safe_standardize(
                     bundle.next_state_margin_scores,
                     t3_stats.get("next_state_margin_mean", 0.0),
                     t3_stats.get("next_state_margin_std", 1.0),
                 )
             ).astype(np.float32),
+        }
+        t3_components = {
+            key: (np.asarray(alpha_terms[key], dtype=np.float32) - np.asarray(beta_terms[key], dtype=np.float32)).astype(
+                np.float32
+            )
+            for key in ["state_error", "action_error", "next_state_error"]
         }
 
         def _family(components: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -585,7 +599,16 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         return {
             self.SCORE_T1: _family(t1_components),
             self.SCORE_T2: _family(t2_components),
-            self.SCORE_T3: _family(t3_components),
+            self.SCORE_T3: {
+                "step_scores": (
+                    np.asarray(t3_components["state_error"], dtype=np.float32)
+                    + np.asarray(t3_components["action_error"], dtype=np.float32)
+                    + np.asarray(t3_components["next_state_error"], dtype=np.float32)
+                ).astype(np.float32),
+                "components": t3_components,
+                "alpha_terms": alpha_terms,
+                "beta_terms": beta_terms,
+            },
         }
 
     @staticmethod
@@ -688,10 +711,10 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         keys = list(contributions.keys())
         total = np.zeros_like(np.asarray(contributions[keys[0]], dtype=np.float32), dtype=np.float32)
         for values in contributions.values():
-            total = total + np.asarray(values, dtype=np.float32)
+            total = total + np.abs(np.asarray(values, dtype=np.float32))
         safe_total = np.where(np.abs(total) > 1e-8, total, 1.0).astype(np.float32)
         return {
-            key: (np.asarray(values, dtype=np.float32) / safe_total).astype(np.float32, copy=False)
+            key: (np.abs(np.asarray(values, dtype=np.float32)) / safe_total).astype(np.float32, copy=False)
             for key, values in contributions.items()
         }
 
@@ -721,7 +744,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         keys = [key for key in self.COMPONENT_ORDER if key in contributions]
         if not keys:
             keys = list(contributions.keys())
-        stacked = np.stack([np.asarray(contributions[key], dtype=np.float32) for key in keys], axis=0)
+        stacked = np.stack([np.abs(np.asarray(contributions[key], dtype=np.float32)) for key in keys], axis=0)
         dominant_idx = np.argmax(stacked, axis=0)
         return [str(keys[int(idx)]) for idx in dominant_idx.tolist()]
 
@@ -996,6 +1019,14 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                         )
                     )
                     for score_name in [self.SCORE_T1, self.SCORE_T2, self.SCORE_T3]
+                },
+                "t3_alpha_terms": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in active_family.get("alpha_terms", {}).items()
+                },
+                "t3_beta_terms": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in active_family.get("beta_terms", {}).items()
                 },
                 "state_positive_scores": np.asarray(bundle.state_positive_scores, dtype=np.float32),
                 "action_positive_scores": np.asarray(bundle.action_positive_scores, dtype=np.float32),

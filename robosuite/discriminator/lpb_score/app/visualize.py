@@ -150,6 +150,10 @@ def _save_failure_plot_pdf(
     frame_scores_by_mode: dict[str, np.ndarray],
     frame_thresholds_by_mode: dict[str, np.ndarray],
     active_score_mode: str,
+    t3_alpha: dict[str, float],
+    t3_beta: dict[str, float],
+    frame_t3_alpha_terms: dict[str, np.ndarray],
+    frame_t3_beta_terms: dict[str, np.ndarray],
     thumbnail_frames: list[np.ndarray],
     thumbnail_indices: list[int],
     delta_final: float,
@@ -172,7 +176,7 @@ def _save_failure_plot_pdf(
     grid = fig.add_gridspec(4, num_cols, height_ratios=[1.0, 1.5, 1.5, 1.7])
     top_axes = [fig.add_subplot(grid[0, idx]) for idx in range(num_cols)]
     score_ax = fig.add_subplot(grid[1, :])
-    mode_ax = fig.add_subplot(grid[2, :])
+    t3_term_ax = fig.add_subplot(grid[2, :])
     contrib_ax = fig.add_subplot(grid[3, :])
 
     for idx, (thumb_ax, image_rgb, frame_id) in enumerate(zip(top_axes, thumbnail_frames, thumbnail_indices)):
@@ -190,7 +194,7 @@ def _save_failure_plot_pdf(
         )
         if idx < len(top_axes):
             score_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
-            mode_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
+            t3_term_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
             contrib_ax.axvline(times[int(frame_id)], color="#999999", linewidth=1.0, linestyle=":", alpha=0.9)
 
     score_ax.plot(times, np.asarray(frame_scores, dtype=np.float32), color="#1f77b4", linewidth=2.2, label="lambda")
@@ -219,7 +223,7 @@ def _save_failure_plot_pdf(
                         color="#d62728",
                         alpha=0.12,
                     )
-                    mode_ax.axvspan(
+                    t3_term_ax.axvspan(
                         times[start_idx],
                         times[min(end_idx - 1, num_frames - 1)],
                         color="#d62728",
@@ -241,7 +245,7 @@ def _save_failure_plot_pdf(
             alpha=0.95,
             label="first crossing",
         )
-        mode_ax.axvline(
+        t3_term_ax.axvline(
             times[int(first_crossing_index)],
             color="#d62728",
             linewidth=1.4,
@@ -269,40 +273,75 @@ def _save_failure_plot_pdf(
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
     )
 
-    for score_mode in SCORE_MODE_ORDER:
-        score_values = np.asarray(frame_scores_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
-        if score_values.size != num_frames:
-            continue
-        threshold_values = np.asarray(frame_thresholds_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
-        color = SCORE_MODE_COLORS.get(score_mode, "#555555")
-        short_label = SCORE_MODE_SHORT_LABELS.get(score_mode, score_mode)
-        mode_ax.plot(
-            times,
-            score_values,
-            color=color,
-            linewidth=2.0,
-            alpha=0.95,
-            label=f"{short_label} score",
+    t3_term_keys = ["state_error", "action_error", "next_state_error"]
+    if any(
+        np.asarray(frame_t3_alpha_terms.get(key, []), dtype=np.float32).reshape(-1).size == num_frames
+        or np.asarray(frame_t3_beta_terms.get(key, []), dtype=np.float32).reshape(-1).size == num_frames
+        for key in t3_term_keys
+    ):
+        for key in t3_term_keys:
+            color = TERM_COLORS.get(key, "#777777")
+            short_label = TERM_SHORT_LABELS.get(key, key)
+            alpha_values = np.asarray(frame_t3_alpha_terms.get(key, []), dtype=np.float32).reshape(-1)
+            beta_values = -np.asarray(frame_t3_beta_terms.get(key, []), dtype=np.float32).reshape(-1)
+            if alpha_values.size == num_frames:
+                t3_term_ax.plot(
+                    times,
+                    alpha_values,
+                    color=color,
+                    linewidth=1.8,
+                    linestyle="-",
+                    alpha=0.95,
+                    label=f"alpha {short_label}",
+                )
+            if beta_values.size == num_frames:
+                t3_term_ax.plot(
+                    times,
+                    beta_values,
+                    color=color,
+                    linewidth=1.8,
+                    linestyle="--",
+                    alpha=0.90,
+                    label=f"beta {short_label}",
+                )
+        t3_term_ax.set_title(
+            f"T3 Additive Terms | active={SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)}",
+            fontsize=12,
+            pad=8,
         )
-        if threshold_values.size == num_frames:
-            mode_ax.plot(
-                times,
-                threshold_values,
-                color=color,
-                linewidth=1.2,
-                linestyle="--",
-                alpha=0.85,
-                label=f"{short_label} th",
-            )
-    mode_ax.set_title(
-        f"T1/T2/T3 Aggregate Scores | active={SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)}",
-        fontsize=12,
-        pad=8,
-    )
-    mode_ax.set_xlabel("Time (s)")
-    mode_ax.set_ylabel("Aggregate Score")
-    mode_ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.8)
-    mode_ax.legend(loc="upper left", ncol=3)
+        t3_term_ax.set_xlabel("Time (s)")
+        t3_term_ax.set_ylabel("Term Value")
+        t3_term_ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.8)
+        t3_term_ax.legend(loc="upper left", ncol=3)
+        t3_term_ax.text(
+            0.995,
+            0.02,
+            (
+                f"alpha_state={float(t3_alpha.get('state_error', 0.0)):.3f}\n"
+                f"alpha_action={float(t3_alpha.get('action_error', 0.0)):.3f}\n"
+                f"alpha_dynamic={float(t3_alpha.get('next_state_error', 0.0)):.3f}\n"
+                f"beta_state={float(t3_beta.get('state_error', 0.0)):.3f}\n"
+                f"beta_action={float(t3_beta.get('action_error', 0.0)):.3f}\n"
+                f"beta_dynamic={float(t3_beta.get('next_state_error', 0.0)):.3f}"
+            ),
+            transform=t3_term_ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=10,
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
+        )
+    else:
+        t3_term_ax.text(
+            0.5,
+            0.5,
+            "No T3 alpha/beta decomposition available",
+            transform=t3_term_ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=12,
+            color="#666666",
+        )
+        t3_term_ax.set_axis_off()
 
     term_keys = ordered_term_keys(aggregate_contribution_shares)
     if term_keys:
@@ -326,7 +365,7 @@ def _save_failure_plot_pdf(
                 alpha=0.95,
             )
         contrib_ax.set_ylim(0.0, 100.0)
-        contrib_ax.set_ylabel("Contribution Share (%)")
+        contrib_ax.set_ylabel("Abs Contribution Share (%)")
         contrib_ax.set_xlabel("Time (s)")
         contrib_ax.grid(True, alpha=0.18, linestyle="--", linewidth=0.8)
         contrib_ax.legend(loc="upper left", ncol=max(1, min(2, len(term_keys))))
@@ -857,9 +896,27 @@ def run_visualize(cfg: DictConfig) -> None:
                     aggregate_contribution_shares,
                     num_frames=num_frames,
                 )
+                t3_alpha_terms = result.metadata.get("t3_alpha_terms", {}) or {}
+                t3_beta_terms = result.metadata.get("t3_beta_terms", {}) or {}
+                frame_t3_alpha_terms = map_term_values_to_frames(
+                    {
+                        key: np.asarray(values, dtype=np.float32)
+                        for key, values in t3_alpha_terms.items()
+                    },
+                    num_frames=num_frames,
+                )
+                frame_t3_beta_terms = map_term_values_to_frames(
+                    {
+                        key: np.asarray(values, dtype=np.float32)
+                        for key, values in t3_beta_terms.items()
+                    },
+                    num_frames=num_frames,
+                )
                 aggregate_scores_by_mode = result.metadata.get("aggregate_scores_by_mode", {}) or {}
                 threshold_by_score = result.metadata.get("threshold_by_score", {}) or {}
                 active_score_mode = str(result.metadata.get("score_mode", detector.score_mode))
+                t3_alpha = result.metadata.get("t3_alpha", {}) or {}
+                t3_beta = result.metadata.get("t3_beta", {}) or {}
                 frame_scores_by_mode = {
                     score_mode: map_step_values_to_frames(
                         np.asarray(values, dtype=np.float32),
@@ -976,6 +1033,22 @@ def run_visualize(cfg: DictConfig) -> None:
                             for key, values in frame_thresholds_by_mode.items()
                         },
                         active_score_mode=active_score_mode,
+                        t3_alpha={
+                            key: float(value)
+                            for key, value in t3_alpha.items()
+                        },
+                        t3_beta={
+                            key: float(value)
+                            for key, value in t3_beta.items()
+                        },
+                        frame_t3_alpha_terms={
+                            key: np.asarray(values, dtype=np.float32)
+                            for key, values in frame_t3_alpha_terms.items()
+                        },
+                        frame_t3_beta_terms={
+                            key: np.asarray(values, dtype=np.float32)
+                            for key, values in frame_t3_beta_terms.items()
+                        },
                         aggregate_contribution_shares={
                             key: np.asarray(values, dtype=np.float32)
                             for key, values in frame_aggregate_share_by_term.items()

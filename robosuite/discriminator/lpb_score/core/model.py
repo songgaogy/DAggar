@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 
-MODEL_ARCHITECTURE = "two_head_decoupled_conditional_dsm"
+MODEL_ARCHITECTURE = "two_head_state_only_conditional_dsm"
 
 
 def _cfg_get(cfg: Any, key: str, default=None):
@@ -83,7 +83,7 @@ class UnifiedConditionedDSM(nn.Module):
         self.num_heads = int(num_heads)
         self.ffn_dim = int(ffn_dim)
         self.dropout = float(dropout)
-        self.occupancy_dim = int(self.latent_dim + self.action_flat_dim)
+        self.occupancy_dim = int(self.latent_dim)
 
         if self.latent_dim <= 0:
             raise ValueError("latent_dim must be positive.")
@@ -111,7 +111,7 @@ class UnifiedConditionedDSM(nn.Module):
         self.transition_condition_mlp = self._build_condition_mlp(self.embed_dim, self.embed_dim)
 
         self.occupancy_input_proj = self._build_input_proj(self.occupancy_dim)
-        self.transition_context_proj = self._build_input_proj(self.occupancy_dim)
+        self.transition_context_proj = self._build_input_proj(self.latent_dim + self.action_flat_dim)
         self.transition_input_proj = self._build_input_proj(self.latent_dim + self.embed_dim)
 
         self.occupancy_blocks = nn.ModuleList(
@@ -140,7 +140,6 @@ class UnifiedConditionedDSM(nn.Module):
         self.transition_final_norm = nn.LayerNorm(self.embed_dim)
 
         self.state_head = nn.Linear(self.embed_dim, self.latent_dim)
-        self.action_head = nn.Linear(self.embed_dim, self.action_flat_dim)
         self.dynamics_head = nn.Linear(self.embed_dim, self.latent_dim)
 
     def _build_input_proj(self, input_dim: int) -> nn.Sequential:
@@ -252,7 +251,7 @@ class UnifiedConditionedDSM(nn.Module):
                 self.occupancy_final_norm,
             ),
             "state_branch": self._module_parameters(self.state_head),
-            "action_branch": self._module_parameters(self.action_head),
+            "action_branch": [],
             "dynamics_branch": self._module_parameters(
                 self.transition_type_embedding,
                 self.transition_task_embedding,
@@ -311,7 +310,7 @@ class UnifiedConditionedDSM(nn.Module):
             task_embedding=self.occupancy_task_embedding,
             condition_mlp=self.occupancy_condition_mlp,
         )
-        occupancy_hidden = self.occupancy_input_proj(torch.cat([state_input, action_input], dim=-1))
+        occupancy_hidden = self.occupancy_input_proj(state_input)
         occupancy_hidden = self._run_backbone(
             hidden=occupancy_hidden,
             cond=occupancy_cond,
@@ -336,7 +335,7 @@ class UnifiedConditionedDSM(nn.Module):
         )
         return {
             "state_hat": self.state_head(occupancy_hidden),
-            "action_hat": self.action_head(occupancy_hidden),
+            "action_hat": torch.zeros_like(action_input),
             "next_state_hat": self.dynamics_head(transition_hidden),
         }
 
