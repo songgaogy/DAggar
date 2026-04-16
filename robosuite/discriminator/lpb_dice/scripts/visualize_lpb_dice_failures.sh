@@ -9,7 +9,7 @@ GPU=1
 SEED=1
 POLICY_CKPT="${POLICY_CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 DICE_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dice/lpb_dice_20260410_132822/lpb_dice_20260410_132822.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dice/visualize_suboptimal}"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dice/visualize}"
 NUM_VIDEOS=12
 SUPPORT_PENALTY_WEIGHT=0  # transition error
 
@@ -20,7 +20,7 @@ FPS="${FPS:-20}"
 CAMERA_NAME="${CAMERA_NAME:-agentview}"
 SAVE_PDF="${SAVE_PDF:-true}"
 NUM_PLOT_FRAMES="${NUM_PLOT_FRAMES:-8}"
-DATA_SOURCE="${DATA_SOURCE:-suboptimal}"
+DATA_SOURCE="fail_rollout"
 SOURCE_SPLIT="${SOURCE_SPLIT:-all}"
 
 if [[ ! -f "${POLICY_CKPT}" ]]; then
