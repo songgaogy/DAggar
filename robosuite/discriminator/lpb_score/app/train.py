@@ -1,4 +1,4 @@
-"""Hydra training entry: latent caches, positive-pool normalization, DSM optimization, checkpoints."""
+"""Hydra training entry for the joint encoder + chunk DSM pipeline."""
 
 from __future__ import annotations
 
@@ -16,81 +16,71 @@ from robosuite.discriminator.lpb_score.app.pipeline import (
 )
 from robosuite.discriminator.lpb_score.core.dataset import (
     LatentTransitionDataset,
-    build_cached_splits,
-    load_cached_latent_trajectory,
+    build_split_refs,
+    print_split_summary,
     resolve_window_size,
 )
 from robosuite.discriminator.lpb_score.core.model import MODEL_ARCHITECTURE, DSMModel, build_dsm_model
 from robosuite.discriminator.lpb_score.core.trainer import Trainer, TrainerConfig
 
 
-def _compute_positive_normalization_stats(
-    *,
-    positive_refs,
-    min_variance: float = 1e-6,
-) -> dict[str, np.ndarray]:
-    """Per-dimension mean and variance over all timesteps from non-failure train trajectories only."""
-    if not positive_refs:
-        raise RuntimeError("Expected non-empty positive refs to compute normalization stats.")
+def _task_names_from_index(task_to_index: dict[str, int]) -> list[str]:
+    return [name for name, _ in sorted(task_to_index.items(), key=lambda item: int(item[1]))]
 
-    latent_sum = None
-    latent_sq_sum = None
-    latent_count = 0
 
-    for ref in positive_refs:
-        traj = load_cached_latent_trajectory(ref)
-        latents = np.asarray(traj.latents, dtype=np.float64)
-        if latent_sum is None:
-            latent_sum = np.zeros((latents.shape[1],), dtype=np.float64)
-            latent_sq_sum = np.zeros((latents.shape[1],), dtype=np.float64)
-        latent_sum += latents.sum(axis=0)
-        latent_sq_sum += np.square(latents).sum(axis=0)
-        latent_count += int(latents.shape[0])
+def _normalize_stats_to_numpy(normalization_stats: dict[str, torch.Tensor | np.ndarray]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for key, value in normalization_stats.items():
+        if torch.is_tensor(value):
+            out[key] = value.detach().cpu().numpy()
+        else:
+            out[key] = np.asarray(value)
+    return out
 
-    if latent_count <= 0:
-        raise RuntimeError("Positive normalization stats require positive latent counts.")
 
-    latent_mean = latent_sum / float(latent_count)
-    latent_var = np.maximum(latent_sq_sum / float(latent_count) - np.square(latent_mean), float(min_variance))
-    return {
-        "latent_mean": latent_mean.astype(np.float32),
-        "latent_var": latent_var.astype(np.float32),
-        "latent_count": np.asarray(latent_count, dtype=np.int64),
-    }
+def _cfg_value(cfg: object, key: str, default):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _parameter_counts(module: torch.nn.Module) -> tuple[int, int]:
+    total = int(sum(param.numel() for param in module.parameters()))
+    trainable = int(sum(param.numel() for param in module.parameters() if param.requires_grad))
+    return total, trainable
 
 
 def _build_payload(
+    *,
     model_state: dict,
     history: dict[str, dict[str, dict[str, float]]],
     cfg: DictConfig,
-    latent_dim: int,
-    window_size: int,
-    chunk_dim: int,
+    model: DSMModel,
     task_to_index: dict[str, int],
     split_summary: dict[str, dict[str, dict[str, int]]],
     epoch: int,
-    normalization_stats: dict[str, np.ndarray],
+    normalization_stats: dict[str, torch.Tensor | np.ndarray],
+    policy_checkpoint_payload: dict,
     model_online_state: dict | None = None,
 ) -> dict:
-    """Serialize weights, Hydra config, ``task_to_index``, and normalization stats for inference."""
     payload: dict = {
         "model": model_state,
         "history": history,
         "cfg": cfg,
         "model_architecture": MODEL_ARCHITECTURE,
-        "latent_dim": int(latent_dim),
-        "window_size": int(window_size),
-        "chunk_dim": int(chunk_dim),
+        "latent_dim": int(model.latent_dim),
+        "window_size": int(model.window_size),
+        "chunk_dim": int(model.chunk_dim),
         "num_tasks": int(len(task_to_index)),
         "task_to_index": dict(task_to_index),
+        "task_names": _task_names_from_index(task_to_index),
         "split_summary": split_summary,
-        "policy_ckpt": to_absolute_path(str(cfg.policy.ckpt)),
-        "image_size": int(cfg.data.image_size),
+        "image_size": int(model.policy_encoder.image_size),
         "epoch": int(epoch),
-        "normalization_stats": {
-            key: np.asarray(value)
-            for key, value in normalization_stats.items()
-        },
+        "normalization_stats": _normalize_stats_to_numpy(normalization_stats),
+        "policy_checkpoint_payload": policy_checkpoint_payload,
     }
     if model_online_state is not None:
         payload["model_online"] = model_online_state
@@ -103,7 +93,6 @@ def _build_trainer(
     train_dataset: LatentTransitionDataset,
     val_dataset: LatentTransitionDataset | None,
 ) -> Trainer:
-    """Build the trainer so Hydra config stays out of the main loop."""
     trainer_cfg = TrainerConfig(
         batch_size=int(cfg.training.batch_size),
         num_workers=int(cfg.training.num_workers),
@@ -120,6 +109,11 @@ def _build_trainer(
         save_ema_in_checkpoint=bool(getattr(cfg.training, "save_ema_in_checkpoint", True)),
         shared_lr_multiplier=float(getattr(cfg.training, "shared_lr_multiplier", 1.0)),
         chunk_branch_lr_multiplier=float(getattr(cfg.training, "chunk_branch_lr_multiplier", 1.0)),
+        encoder_branch_lr_multiplier=float(getattr(cfg.training, "encoder_branch_lr_multiplier", 1.0)),
+        normalization_batch_size=int(getattr(cfg.training, "normalization_batch_size", 256)),
+        pin_memory=bool(getattr(cfg.training, "pin_memory", True)),
+        persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
+        prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
     )
     return Trainer(
         model=model,
@@ -131,37 +125,47 @@ def _build_trainer(
 
 
 def run_train(cfg: DictConfig) -> None:
-    """Run cached splits, build ``DSMModel`` with ``num_tasks=len(task_to_index)``, train, and save."""
     seed = int(cfg.seed)
     torch.manual_seed(seed)
+    if bool(getattr(cfg.training, "cudnn_benchmark", True)) and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
     encoder = build_flow_encoder(cfg)
 
     try:
-        cached_splits, split_summary, task_to_index = build_cached_splits(
+        split_refs, split_summary, task_to_index = build_split_refs(
             cfg_data=cfg.data,
-            encoder=encoder,
             seed=seed,
         )
+        print_split_summary(split_summary)
         datasets = build_training_datasets(
             cfg=cfg,
-            cached_splits=cached_splits,
+            split_refs=split_refs,
+            encoder=encoder,
+            task_to_index=task_to_index,
         )
         train_dataset = datasets.train_dataset
         val_dataset = datasets.val_dataset
         train_refs = datasets.train_refs
         val_refs = datasets.val_refs
-        positive_train_refs = [ref for ref in train_refs if ref.data_type != "fail_rollout"]
         window_size = resolve_window_size(cfg)
+        task_names = _task_names_from_index(task_to_index)
+        lora_cfg = getattr(cfg.policy, "lora", None)
+        lora_rank = int(_cfg_value(lora_cfg, "rank", 8))
+        lora_enabled = bool(_cfg_value(lora_cfg, "enabled", False))
+        kernel_size = int(_cfg_value(cfg.model, "kernel_size", 3))
 
         print(
             f"[lpb_score] train_windows={len(train_dataset)} "
             f"positive_samples={train_dataset.num_positive_samples} "
             f"negative_samples={train_dataset.num_negative_samples} "
             f"num_train_trajectories={len(train_refs)} "
-            f"latent_dim={train_dataset.latent_dim} window_size={window_size}"
+            f"latent_dim={encoder.latent_dim} window_size={window_size} "
+            f"trainable_encoder={bool(getattr(cfg.policy, 'trainable_encoder', False))} "
+            f"lora_enabled={lora_enabled} lora_rank={lora_rank} "
+            f"kernel_size={kernel_size}"
         )
         if val_dataset is not None:
             print(
@@ -172,18 +176,22 @@ def run_train(cfg: DictConfig) -> None:
             )
 
         model = build_dsm_model(
-            latent_dim=int(train_dataset.latent_dim),
+            latent_dim=int(encoder.latent_dim),
             num_tasks=int(len(task_to_index)),
             cfg_model=cfg.model,
             window_size=window_size,
+            policy_encoder=encoder,
+            task_names=task_names,
         )
-        normalization_stats = _compute_positive_normalization_stats(positive_refs=positive_train_refs)
-        model.set_normalization_stats(
-            latent_mean=normalization_stats["latent_mean"],
-            latent_var=normalization_stats["latent_var"],
+        model_total, model_trainable = _parameter_counts(model)
+        encoder_total, encoder_trainable = _parameter_counts(model.policy_encoder)
+        model_ratio = 0.0 if model_total <= 0 else float(model_trainable) / float(model_total)
+        encoder_ratio = 0.0 if encoder_total <= 0 else float(encoder_trainable) / float(encoder_total)
+        print(
+            f"[lpb_score] trainable_params model={model_trainable}/{model_total} "
+            f"({100.0 * model_ratio:.4f}%) encoder={encoder_trainable}/{encoder_total} "
+            f"({100.0 * encoder_ratio:.4f}%)"
         )
-        print(f"[lpb_score] positive_norm_stats latent_count={int(normalization_stats['latent_count'])}")
-
         trainer = _build_trainer(
             cfg=cfg,
             model=model,
@@ -208,8 +216,9 @@ def run_train(cfg: DictConfig) -> None:
         if ext == "":
             ext = ".pt"
 
+        policy_checkpoint_payload = model.policy_encoder.export_policy_checkpoint_payload()
+
         def _save_periodic(epoch: int, history: dict[str, dict[str, dict[str, float]]]) -> None:
-            """Write intermediate checkpoint when ``training.save_freq`` divides ``epoch``."""
             periodic_name = f"{stem}_ep{epoch:04d}{ext}"
             periodic_path = os.path.join(save_dir, periodic_name)
             primary_sd, online_sd = trainer.checkpoint_state_dicts()
@@ -217,13 +226,12 @@ def run_train(cfg: DictConfig) -> None:
                 model_state=primary_sd,
                 history=history,
                 cfg=cfg,
-                latent_dim=train_dataset.latent_dim,
-                window_size=window_size,
-                chunk_dim=model.chunk_dim,
+                model=model,
                 task_to_index=task_to_index,
                 split_summary=split_summary,
                 epoch=epoch,
-                normalization_stats=normalization_stats,
+                normalization_stats=trainer.checkpoint_normalization_stats(),
+                policy_checkpoint_payload=policy_checkpoint_payload,
                 model_online_state=online_sd,
             )
             torch.save(payload, periodic_path)
@@ -239,13 +247,12 @@ def run_train(cfg: DictConfig) -> None:
             model_state=primary_sd,
             history=history,
             cfg=cfg,
-            latent_dim=train_dataset.latent_dim,
-            window_size=window_size,
-            chunk_dim=model.chunk_dim,
+            model=model,
             task_to_index=task_to_index,
             split_summary=split_summary,
             epoch=int(cfg.training.epochs),
-            normalization_stats=normalization_stats,
+            normalization_stats=trainer.checkpoint_normalization_stats(),
+            policy_checkpoint_payload=policy_checkpoint_payload,
             model_online_state=online_sd,
         )
         torch.save(final_payload, save_path_final)

@@ -29,15 +29,16 @@ from robosuite.discriminator.lpb_score.analysis.attribution import (
 )
 from robosuite.discriminator.lpb_score.app.pipeline import (
     build_dsm_discriminator,
-    build_flow_encoder,
     now_tag,
     select_split_refs,
 )
 from robosuite.discriminator.lpb_score.core.dataset import (
-    EncodedTrajectoryRef,
-    LatentTrajectory,
-    build_cached_splits,
-    load_latent_trajectories,
+    DemoRef,
+    PreparedTrajectory,
+    build_split_refs,
+    prepare_trajectories,
+    print_split_summary,
+    resolve_preprocessed_cache_root,
 )
 from robosuite.discriminator.utils.types import VideoRenderRecord
 from robosuite.discriminator.utils.video_io import create_vscode_mp4_writer
@@ -60,8 +61,8 @@ class SuboptimalDemoRef:
 
 
 @dataclass(frozen=True)
-class LabeledLatentTrajectory:
-    trajectory: LatentTrajectory
+class LabeledPreparedTrajectory:
+    trajectory: PreparedTrajectory
     labels: np.ndarray
     split: str
 
@@ -75,6 +76,15 @@ SCORE_MODE_SHORT_LABELS = {
 SCORE_MODE_COLORS = {
     "t3_weighted_combo": "#9467bd",
 }
+
+
+def _resolve_preprocessed_cache_settings(cfg: DictConfig) -> tuple[str | None, bool, bool]:
+    cache_root = getattr(cfg.data, "preprocessed_cache_dir", None)
+    use_cache = bool(getattr(cfg.data, "use_preprocessed_cache", True))
+    refresh_cache = bool(getattr(cfg.data, "refresh_preprocessed_cache", False))
+    if cache_root is None or str(cache_root) == "":
+        return None, False, refresh_cache
+    return resolve_preprocessed_cache_root(cfg.data, str(cache_root)), use_cache, refresh_cache
 
 
 def _sample_refs(
@@ -579,39 +589,38 @@ def _encode_suboptimal_refs(
     encoder,
     task_to_index: dict[str, int],
     batch_size: int,
-) -> tuple[list[LabeledLatentTrajectory], dict[str, object]]:
-    encoded: list[LabeledLatentTrajectory] = []
+    cache_root: str | None = None,
+    use_preprocessed_cache: bool = False,
+    refresh_preprocessed_cache: bool = False,
+) -> tuple[list[LabeledPreparedTrajectory], dict[str, object]]:
+    encoded: list[LabeledPreparedTrajectory] = []
     dropped: list[dict[str, object]] = []
-    prepared_batch = []
-    ref_batch: list[SuboptimalDemoRef] = []
 
-    def flush_batch() -> None:
-        nonlocal prepared_batch, ref_batch
-        if not prepared_batch:
-            return
-        encoded_batch = encoder.encode_prepared_demos(prepared_batch)
-        encoded_lookup = {
-            (item.file_path, item.demo_key): item
-            for item in encoded_batch
-        }
-        for ref in ref_batch:
-            key = (ref.file_path, ref.demo_key)
-            item = encoded_lookup.get(key)
-            if item is None:
-                raise KeyError(f"Missing encoded suboptimal demo for {key}")
-            valid_len = int(item.latents.shape[0])
-            if valid_len <= 0:
-                dropped.append(
-                    {
-                        "task_name": ref.task_name,
-                        "split": ref.split,
-                        "file_path": ref.file_path,
-                        "demo_key": ref.demo_key,
-                        "reason": "empty_latent_sequence",
-                    }
-                )
-                continue
-
+    for idx, ref in enumerate(refs):
+        prepared = encoder.materialize_demo_inputs(
+            task_name=ref.task_name,
+            file_path=ref.file_path,
+            demo_key=ref.demo_key,
+            cache_root=cache_root,
+            use_cache=bool(use_preprocessed_cache),
+            refresh_cache=bool(refresh_preprocessed_cache),
+        )
+        valid_len = min(
+            int(prepared.images_chw.shape[0]),
+            int(prepared.proprio.shape[0]),
+            int(prepared.actions.shape[0]),
+        )
+        if valid_len <= 0:
+            dropped.append(
+                {
+                    "task_name": ref.task_name,
+                    "split": ref.split,
+                    "file_path": ref.file_path,
+                    "demo_key": ref.demo_key,
+                    "reason": "empty_sequence",
+                }
+            )
+        else:
             start = int(np.clip(ref.sub_start, 0, valid_len))
             stop = int(np.clip(ref.sub_stop, 0, valid_len))
             if stop <= start:
@@ -627,45 +636,30 @@ def _encode_suboptimal_refs(
                         "valid_len": int(valid_len),
                     }
                 )
-                continue
-
-            labels = np.zeros((valid_len,), dtype=np.int64)
-            labels[start:stop] = 1
-            encoded.append(
-                LabeledLatentTrajectory(
-                    trajectory=LatentTrajectory(
-                        latents=np.asarray(item.latents, dtype=np.float32),
-                        actions=np.asarray(item.actions, dtype=np.float32),
-                        task_name=ref.task_name,
-                        task_index=int(task_to_index[ref.task_name]),
-                        data_type="suboptimal",
-                        data_type_index=-1,
+            else:
+                labels = np.zeros((valid_len,), dtype=np.int64)
+                labels[start:stop] = 1
+                encoded.append(
+                    LabeledPreparedTrajectory(
+                        trajectory=PreparedTrajectory(
+                            images=np.asarray(prepared.images_chw[:valid_len], dtype=np.float32),
+                            proprio=np.asarray(prepared.proprio[:valid_len], dtype=np.float32),
+                            actions=np.asarray(prepared.actions[:valid_len], dtype=np.float32),
+                            task_name=ref.task_name,
+                            task_index=int(task_to_index[ref.task_name]),
+                            data_type="suboptimal",
+                            data_type_index=-1,
+                            split=ref.split,
+                            file_path=ref.file_path,
+                            demo_key=ref.demo_key,
+                        ),
+                        labels=labels,
                         split=ref.split,
-                        file_path=ref.file_path,
-                        demo_key=ref.demo_key,
-                    ),
-                    labels=labels,
-                    split=ref.split,
+                    )
                 )
-            )
-        prepared_batch = []
-        ref_batch = []
-
-    for idx, ref in enumerate(refs):
-        prepared_batch.append(
-            encoder.load_demo_raw(
-                task_name=ref.task_name,
-                file_path=ref.file_path,
-                demo_key=ref.demo_key,
-            )
-        )
-        ref_batch.append(ref)
-        if len(prepared_batch) >= batch_size:
-            flush_batch()
-        if (idx + 1) % 20 == 0 or (idx + 1) == len(refs):
+        if (idx + 1) % max(1, int(batch_size)) == 0 or (idx + 1) == len(refs):
             print(f"[lpb_score visualize] encoded_suboptimal {idx + 1}/{len(refs)}")
 
-    flush_batch()
     summary = {
         "num_requested": int(len(refs)),
         "num_encoded": int(len(encoded)),
@@ -679,15 +673,18 @@ def _load_visualization_targets(
     cfg: DictConfig,
     *,
     encoder,
-    cached_splits: dict[str, list[EncodedTrajectoryRef]],
+    split_refs: dict[str, list[DemoRef]],
     task_to_index: dict[str, int],
     seed: int,
     num_videos: int,
-) -> tuple[list[object], list[LatentTrajectory], list[np.ndarray | None], dict[str, object]]:
+    cache_root: str | None = None,
+    use_preprocessed_cache: bool = False,
+    refresh_preprocessed_cache: bool = False,
+) -> tuple[list[object], list[PreparedTrajectory], list[np.ndarray | None], dict[str, object]]:
     data_source = str(getattr(cfg.visualization, "data_source", "suboptimal"))
     if data_source != "suboptimal":
         fail_refs = select_split_refs(
-            cached_splits=cached_splits,
+            split_refs=split_refs,
             split_name=str(cfg.eval.fail_eval_split),
             data_types=list(cfg.eval.fail_eval_data_types),
         )
@@ -698,7 +695,15 @@ def _load_visualization_targets(
         )
         if not selected_fail_refs:
             raise RuntimeError("No fail trajectories selected for visualization.")
-        fail_trajectories = load_latent_trajectories(selected_fail_refs)
+        fail_trajectories = prepare_trajectories(
+            refs=selected_fail_refs,
+            encoder=encoder,
+            task_to_index=task_to_index,
+            progress_label="preload_visualize_targets",
+            cache_root=cache_root,
+            use_preprocessed_cache=use_preprocessed_cache,
+            refresh_preprocessed_cache=refresh_preprocessed_cache,
+        )
         return (
             list(selected_fail_refs),
             list(fail_trajectories),
@@ -724,7 +729,10 @@ def _load_visualization_targets(
         refs=selected_refs,
         encoder=encoder,
         task_to_index=task_to_index,
-        batch_size=int(cfg.data.encode_demo_batch_size),
+        batch_size=int(getattr(cfg.feature, "batch_size", 32)),
+        cache_root=cache_root,
+        use_preprocessed_cache=use_preprocessed_cache,
+        refresh_preprocessed_cache=refresh_preprocessed_cache,
     )
     selected_lookup = {
         (ref.file_path, ref.demo_key): ref
@@ -736,7 +744,7 @@ def _load_visualization_targets(
     }
 
     ordered_refs: list[object] = []
-    ordered_trajectories: list[LatentTrajectory] = []
+    ordered_trajectories: list[PreparedTrajectory] = []
     ordered_labels: list[np.ndarray | None] = []
     for ref in selected_refs:
         key = (ref.file_path, ref.demo_key)
@@ -767,17 +775,20 @@ def _load_visualization_targets(
 
 def run_visualize(cfg: DictConfig) -> None:
     detector = None
-    encoder = build_flow_encoder(cfg)
+    encoder = None
 
     try:
-        cached_splits, split_summary, task_to_index = build_cached_splits(
+        detector = build_dsm_discriminator(cfg)
+        encoder = detector.extractor.encoder
+        cache_root, use_preprocessed_cache, refresh_preprocessed_cache = _resolve_preprocessed_cache_settings(cfg)
+
+        split_refs, split_summary, task_to_index = build_split_refs(
             cfg_data=cfg.data,
-            encoder=encoder,
             seed=int(cfg.seed),
-            build_missing_cache=False,
         )
+        print_split_summary(split_summary)
         bank_refs = select_split_refs(
-            cached_splits=cached_splits,
+            split_refs=split_refs,
             split_name=str(cfg.eval.bank_split),
             data_types=list(cfg.eval.bank_data_types),
         )
@@ -792,25 +803,43 @@ def run_visualize(cfg: DictConfig) -> None:
             if bank_size > 0
             else list(bank_refs)
         )
-        bank_trajectories = load_latent_trajectories(sampled_bank_refs)
+        bank_trajectories = prepare_trajectories(
+            refs=sampled_bank_refs,
+            encoder=encoder,
+            task_to_index=task_to_index,
+            progress_label="preload_bank",
+            cache_root=cache_root,
+            use_preprocessed_cache=use_preprocessed_cache,
+            refresh_preprocessed_cache=refresh_preprocessed_cache,
+        )
         calibration_trajectories = list(bank_trajectories)
         if not sampled_bank_refs:
             raise RuntimeError("No bank trajectories found for visualization.")
         fail_distribution_refs = select_split_refs(
-            cached_splits=cached_splits,
+            split_refs=split_refs,
             split_name=str(cfg.eval.fail_eval_split),
             data_types=list(cfg.eval.fail_eval_data_types),
         )
-        fail_distribution_trajectories = load_latent_trajectories(fail_distribution_refs)
+        fail_distribution_trajectories = prepare_trajectories(
+            refs=fail_distribution_refs,
+            encoder=encoder,
+            task_to_index=task_to_index,
+            progress_label="preload_fail_distribution",
+            cache_root=cache_root,
+            use_preprocessed_cache=use_preprocessed_cache,
+            refresh_preprocessed_cache=refresh_preprocessed_cache,
+        )
 
-        detector = build_dsm_discriminator(cfg)
         selected_refs, target_trajectories, gt_label_sequences, target_summary = _load_visualization_targets(
             cfg,
             encoder=encoder,
-            cached_splits=cached_splits,
+            split_refs=split_refs,
             task_to_index=task_to_index,
             seed=int(cfg.seed),
             num_videos=int(cfg.visualization.num_videos),
+            cache_root=cache_root,
+            use_preprocessed_cache=use_preprocessed_cache,
+            refresh_preprocessed_cache=refresh_preprocessed_cache,
         )
         calibration_summary = detector.fit(
             normal_bank_trajectories=bank_trajectories,
@@ -1082,7 +1111,6 @@ def run_visualize(cfg: DictConfig) -> None:
             "timestamp": now_tag(),
             "split_summary": split_summary,
             "runtime": {
-                "policy_ckpt": to_absolute_path(str(cfg.policy.ckpt)),
                 "dsm_ckpt": to_absolute_path(str(cfg.model.dsm_ckpt)),
                 "threshold_init": (
                     float(calibration_summary.threshold)
@@ -1139,4 +1167,3 @@ def run_visualize(cfg: DictConfig) -> None:
     finally:
         if detector is not None:
             detector.close()
-        encoder.close()

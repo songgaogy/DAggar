@@ -9,16 +9,11 @@ save_dir: "./checkpoints/multitask_6/lpb_score/visualize"
 dataset:
   window_size: 8
 
-policy:
-  ckpt: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
-  device: "cuda"
-  encoder_batch_size: 96
-
 data:
-  image_size: 128
   window_size: 8
-  cache_dir: "./data/.lpb_score_cache"
-  encode_demo_batch_size: 8
+  preprocessed_cache_dir: "./data/.lpb_score_preprocessed_cache"
+  use_preprocessed_cache: true
+  refresh_preprocessed_cache: false
   splits:
     train: {num_pos_traj: 360, num_neg_traj: 180}
     val: {num_pos_traj: 30, num_neg_traj: 15}

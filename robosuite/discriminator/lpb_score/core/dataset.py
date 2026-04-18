@@ -1,11 +1,12 @@
-"""Latent data pipeline: HDF5 splits, ``.npz`` caches, and temporal window indexing."""
+"""Raw-input data pipeline for joint encoder + chunk DSM training."""
 
 from __future__ import annotations
 
 import glob
 import os
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Iterable, Sequence
 
 import h5py
 import numpy as np
@@ -13,11 +14,10 @@ import torch
 from hydra.utils import to_absolute_path
 from torch.utils.data import Dataset
 
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
+from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
 from robosuite.discriminator.dyn_bce.task_registry import ordered_task_names
 
 
-# Stable indices for ``EncodedTrajectoryRef.data_type_index`` (metadata and batch tensors).
 DATA_TYPE_ORDER = ["expert", "success_rollout", "fail_rollout"]
 
 
@@ -57,27 +57,9 @@ class DemoRef:
 
 
 @dataclass(frozen=True)
-class EncodedTrajectoryRef:
-    task_name: str
-    task_index: int
-    data_type: str
-    data_type_index: int
-    split: str
-    file_path: str
-    demo_key: str
-    cache_path: str
-
-
-@dataclass(frozen=True)
-class TransitionRef:
-    trajectory_index: int
-    t: int
-    traj_type: int
-
-
-@dataclass(frozen=True)
-class LatentTrajectory:
-    latents: np.ndarray
+class PreparedTrajectory:
+    images: np.ndarray
+    proprio: np.ndarray
     actions: np.ndarray
     task_name: str
     task_index: int
@@ -88,6 +70,44 @@ class LatentTrajectory:
     demo_key: str
 
 
+@dataclass(frozen=True)
+class TensorTrajectory:
+    images: torch.Tensor
+    proprio: torch.Tensor
+    actions: torch.Tensor
+    task_index_tensor: torch.Tensor
+    data_type_index_tensor: torch.Tensor
+    task_name: str
+    task_index: int
+    data_type: str
+    data_type_index: int
+    split: str
+    file_path: str
+    demo_key: str
+
+
+@dataclass(frozen=True)
+class CachedTrajectoryRef:
+    cache_path: str
+    num_steps: int
+    num_cameras: int
+    proprio_dim: int
+    task_name: str
+    task_index: int
+    data_type: str
+    data_type_index: int
+    split: str
+    file_path: str
+    demo_key: str
+
+
+@dataclass(frozen=True)
+class TransitionRef:
+    trajectory_index: int
+    t: int
+    traj_type: int
+
+
 def _cfg_get(cfg: Any, key: str, default=None):
     if isinstance(cfg, dict):
         return cfg.get(key, default)
@@ -95,7 +115,6 @@ def _cfg_get(cfg: Any, key: str, default=None):
 
 
 def resolve_window_size(cfg: Any, default: int = 8) -> int:
-    """Resolve the canonical window size with a legacy fallback."""
     dataset_cfg = _cfg_get(cfg, "dataset", None)
     value = _cfg_get(dataset_cfg, "window_size", None)
     if value is None:
@@ -107,6 +126,12 @@ def resolve_window_size(cfg: Any, default: int = 8) -> int:
     if window_size <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}")
     return window_size
+
+
+def resolve_preprocessed_cache_root(cfg_data: Any, cache_root: str | None) -> str | None:
+    if cache_root is None or str(cache_root) == "":
+        return None
+    return to_absolute_path(str(cache_root))
 
 
 def _split_counts_from_cfg(cfg: Any) -> SplitCounts:
@@ -124,7 +149,6 @@ def _get_eval_split_cfg(cfg: Any, default: Any = None) -> Any:
 
 
 def parse_task_specs(cfg_data: Any) -> dict[str, TaskDataSpec]:
-    """Normalize per-task config into absolute paths and split counts."""
     specs: dict[str, TaskDataSpec] = {}
     tasks_cfg = _cfg_get(cfg_data, "tasks")
     global_splits = _cfg_get(cfg_data, "splits")
@@ -213,7 +237,6 @@ def build_split_refs(
     cfg_data: Any,
     seed: int,
 ) -> tuple[dict[str, list[DemoRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
-    """Sample demo references for train/val/test across all tasks and buckets."""
     task_specs = parse_task_specs(cfg_data)
     split_refs = {"train": [], "val": [], "test": []}
     split_summary: dict[str, dict[str, dict[str, int]]] = {}
@@ -302,7 +325,7 @@ def build_split_refs(
     return split_refs, split_summary, task_to_index
 
 
-def _print_split_summary(split_summary: dict[str, dict[str, dict[str, int]]]) -> None:
+def print_split_summary(split_summary: dict[str, dict[str, dict[str, int]]]) -> None:
     for task_name, task_summary in split_summary.items():
         for split_name, split_counts in task_summary.items():
             msg = ", ".join(
@@ -317,183 +340,229 @@ def _print_split_summary(split_summary: dict[str, dict[str, dict[str, int]]]) ->
             print(f"[lpb_score] task={task_name} split={split_name} {msg}")
 
 
-def prepare_cached_trajectories(
-    refs: Sequence[DemoRef],
-    encoder: FrozenFlowMultitaskEncoder,
-    cache_root: str,
-    task_to_index: dict[str, int],
-    encode_demo_batch_size: int = 8,
-    fallback_cache_roots: Sequence[str] | None = None,
-    build_missing_cache: bool = True,
-) -> list[EncodedTrajectoryRef]:
-    """Encode raw demos once and persist latent caches for later reuse."""
-    cache_root = to_absolute_path(str(cache_root))
-    os.makedirs(cache_root, exist_ok=True)
-    batch_size = max(1, int(encode_demo_batch_size))
-    fallback_roots = [to_absolute_path(str(root)) for root in (fallback_cache_roots or [])]
-
-    prepared_batch = []
-    prepared_meta: list[DemoRef] = []
-    encoded_refs: list[EncodedTrajectoryRef] = []
-
-    def flush_batch() -> None:
-        nonlocal prepared_batch, prepared_meta
-        if not prepared_batch:
-            return
-        # Batch encoding amortizes the frozen policy forward pass.
-        encoded_batch = encoder.encode_prepared_demos(prepared_batch)
-        encoded_lookup = {
-            (encoded.file_path, encoded.demo_key): encoded
-            for encoded in encoded_batch
-        }
-        for ref in prepared_meta:
-            key = (ref.file_path, ref.demo_key)
-            encoded = encoded_lookup.get(key)
-            if encoded is None:
-                raise KeyError(f"Missing encoded batch result for {key}")
-            cache_path = encoder.save_encoded_demo(cache_root=cache_root, encoded=encoded)
-            encoded_refs.append(
-                EncodedTrajectoryRef(
-                    task_name=ref.task_name,
-                    task_index=int(task_to_index[ref.task_name]),
-                    data_type=ref.data_type,
-                    data_type_index=int(DATA_TYPE_ORDER.index(ref.data_type)),
-                    split=ref.split,
-                    file_path=ref.file_path,
-                    demo_key=ref.demo_key,
-                    cache_path=cache_path,
-                )
-            )
-        prepared_batch = []
-        prepared_meta = []
-
-    for idx, ref in enumerate(refs):
-        cache_path = encoder.cache_path(
-            cache_root=cache_root,
-            task_name=ref.task_name,
-            file_path=ref.file_path,
-            demo_key=ref.demo_key,
-        )
-        resolved_cache_path = cache_path
-        if not os.path.isfile(resolved_cache_path):
-            for legacy_root in fallback_roots:
-                legacy_cache_path = encoder.cache_path(
-                    cache_root=legacy_root,
-                    task_name=ref.task_name,
-                    file_path=ref.file_path,
-                    demo_key=ref.demo_key,
-                )
-                if os.path.isfile(legacy_cache_path):
-                    resolved_cache_path = legacy_cache_path
-                    break
-
-        if os.path.isfile(resolved_cache_path):
-            encoded_refs.append(
-                EncodedTrajectoryRef(
-                    task_name=ref.task_name,
-                    task_index=int(task_to_index[ref.task_name]),
-                    data_type=ref.data_type,
-                    data_type_index=int(DATA_TYPE_ORDER.index(ref.data_type)),
-                    split=ref.split,
-                    file_path=ref.file_path,
-                    demo_key=ref.demo_key,
-                    cache_path=resolved_cache_path,
-                )
-            )
-        else:
-            if not bool(build_missing_cache):
-                raise FileNotFoundError(
-                    "Missing latent cache while build_missing_cache=False: "
-                    f"task={ref.task_name} data_type={ref.data_type} split={ref.split} "
-                    f"file={ref.file_path} demo={ref.demo_key}"
-                )
-            prepared_batch.append(
-                encoder.load_demo_raw(
-                    task_name=ref.task_name,
-                    file_path=ref.file_path,
-                    demo_key=ref.demo_key,
-                )
-            )
-            prepared_meta.append(ref)
-            if len(prepared_batch) >= batch_size:
-                flush_batch()
-
-        if (idx + 1) % 1000 == 0 or (idx + 1) == len(refs):
-            print(f"[lpb_score] prepared_cached_trajectories {idx + 1}/{len(refs)}")
-
-    flush_batch()
-    return encoded_refs
-
-
-def load_cached_latent_trajectory(ref: EncodedTrajectoryRef) -> LatentTrajectory:
-    with np.load(ref.cache_path) as cached:
-        latents = np.asarray(cached["latents"], dtype=np.float32)
-        actions = np.asarray(cached["actions"], dtype=np.float32)
-    return LatentTrajectory(
-        latents=latents,
-        actions=actions,
-        task_name=ref.task_name,
-        task_index=ref.task_index,
-        data_type=ref.data_type,
-        data_type_index=ref.data_type_index,
-        split=ref.split,
-        file_path=ref.file_path,
-        demo_key=ref.demo_key,
-    )
-
-
-def load_latent_trajectories(refs: Sequence[EncodedTrajectoryRef]) -> list[LatentTrajectory]:
-    trajectories = [load_cached_latent_trajectory(ref) for ref in refs]
-    return [traj for traj in trajectories if int(traj.latents.shape[0]) > 0]
-
-
 def filter_refs_by_data_types(
-    refs: Sequence[EncodedTrajectoryRef],
+    refs: Sequence[DemoRef],
     data_types: Sequence[str] | None,
-) -> list[EncodedTrajectoryRef]:
+) -> list[DemoRef]:
     if data_types is None:
         return list(refs)
     allowed = {str(name) for name in data_types}
     return [ref for ref in refs if ref.data_type in allowed]
 
 
+def prepare_trajectories(
+    refs: Sequence[DemoRef],
+    *,
+    encoder: FlowMultitaskEncoder,
+    task_to_index: dict[str, int],
+    progress_label: str,
+    cache_root: str | None = None,
+    use_preprocessed_cache: bool = False,
+    refresh_preprocessed_cache: bool = False,
+) -> list[PreparedTrajectory]:
+    trajectories: list[PreparedTrajectory] = []
+    cache_hits = 0
+    cache_misses = 0
+    for idx, ref in enumerate(refs):
+        cache_path = None
+        if bool(use_preprocessed_cache) and cache_root is not None and str(cache_root) != "":
+            cache_path = encoder.preprocessed_cache_path(
+                cache_root=cache_root,
+                task_name=ref.task_name,
+                file_path=ref.file_path,
+                demo_key=ref.demo_key,
+            )
+            if os.path.isfile(cache_path) and not bool(refresh_preprocessed_cache):
+                cache_hits += 1
+            else:
+                cache_misses += 1
+        prepared = encoder.materialize_demo_inputs(
+            task_name=ref.task_name,
+            file_path=ref.file_path,
+            demo_key=ref.demo_key,
+            cache_root=cache_root,
+            use_cache=bool(use_preprocessed_cache),
+            refresh_cache=bool(refresh_preprocessed_cache),
+        )
+        length = min(
+            int(prepared.images_chw.shape[0]),
+            int(prepared.proprio.shape[0]),
+            int(prepared.actions.shape[0]),
+        )
+        if length <= 0:
+            continue
+        data_type_index = DATA_TYPE_ORDER.index(ref.data_type) if ref.data_type in DATA_TYPE_ORDER else -1
+        trajectories.append(
+            PreparedTrajectory(
+                images=np.asarray(prepared.images_chw[:length], dtype=np.float32),
+                proprio=np.asarray(prepared.proprio[:length], dtype=np.float32),
+                actions=np.asarray(prepared.actions[:length], dtype=np.float32),
+                task_name=ref.task_name,
+                task_index=int(task_to_index[ref.task_name]),
+                data_type=ref.data_type,
+                data_type_index=int(data_type_index),
+                split=ref.split,
+                file_path=ref.file_path,
+                demo_key=ref.demo_key,
+            )
+        )
+        if (idx + 1) % 200 == 0 or (idx + 1) == len(refs):
+            print(f"[lpb_score] {progress_label} {idx + 1}/{len(refs)}")
+    if bool(use_preprocessed_cache) and cache_root is not None and str(cache_root) != "":
+        print(
+            f"[lpb_score] {progress_label} cache_root={to_absolute_path(str(cache_root))} "
+            f"cache_hits={cache_hits} cache_misses={cache_misses}"
+        )
+    return trajectories
+
+
+def build_cached_trajectory_refs(
+    refs: Sequence[DemoRef],
+    *,
+    encoder: FlowMultitaskEncoder,
+    task_to_index: dict[str, int],
+    progress_label: str,
+    cache_root: str | None = None,
+    use_preprocessed_cache: bool = False,
+    refresh_preprocessed_cache: bool = False,
+) -> list[CachedTrajectoryRef]:
+    if not bool(use_preprocessed_cache):
+        raise ValueError("build_cached_trajectory_refs requires use_preprocessed_cache=True.")
+    if cache_root is None or str(cache_root) == "":
+        raise ValueError("build_cached_trajectory_refs requires a non-empty cache_root.")
+
+    cached_refs: list[CachedTrajectoryRef] = []
+    cache_hits = 0
+    cache_misses = 0
+    for idx, ref in enumerate(refs):
+        cache_path = encoder.preprocessed_cache_path(
+            cache_root=cache_root,
+            task_name=ref.task_name,
+            file_path=ref.file_path,
+            demo_key=ref.demo_key,
+        )
+        prepared = None
+        if os.path.isfile(cache_path) and not bool(refresh_preprocessed_cache):
+            cache_hits += 1
+        else:
+            cache_misses += 1
+            prepared = encoder.materialize_demo_inputs(
+                task_name=ref.task_name,
+                file_path=ref.file_path,
+                demo_key=ref.demo_key,
+                cache_root=cache_root,
+                use_cache=True,
+                refresh_cache=bool(refresh_preprocessed_cache),
+            )
+
+        if prepared is None:
+            with np.load(cache_path) as cached:
+                num_steps = int(cached["images_chw"].shape[0])
+                num_cameras = int(cached["images_chw"].shape[1])
+                proprio_dim = int(cached["proprio"].shape[1])
+        else:
+            num_steps = int(prepared.images_chw.shape[0])
+            num_cameras = int(prepared.images_chw.shape[1])
+            proprio_dim = int(prepared.proprio.shape[1])
+
+        if num_steps <= 0:
+            continue
+        data_type_index = DATA_TYPE_ORDER.index(ref.data_type) if ref.data_type in DATA_TYPE_ORDER else -1
+        cached_refs.append(
+            CachedTrajectoryRef(
+                cache_path=cache_path,
+                num_steps=num_steps,
+                num_cameras=num_cameras,
+                proprio_dim=proprio_dim,
+                task_name=ref.task_name,
+                task_index=int(task_to_index[ref.task_name]),
+                data_type=ref.data_type,
+                data_type_index=int(data_type_index),
+                split=ref.split,
+                file_path=ref.file_path,
+                demo_key=ref.demo_key,
+            )
+        )
+        if (idx + 1) % 200 == 0 or (idx + 1) == len(refs):
+            print(f"[lpb_score] {progress_label} {idx + 1}/{len(refs)} hits={cache_hits} misses={cache_misses}")
+
+    print(
+        f"[lpb_score] {progress_label} cache_root={to_absolute_path(str(cache_root))} "
+        f"cache_hits={cache_hits} cache_misses={cache_misses}"
+    )
+    return cached_refs
+
+
+def estimate_trajectories_nbytes(trajectories: Sequence[PreparedTrajectory]) -> int:
+    total = 0
+    for traj in trajectories:
+        total += int(traj.images.nbytes)
+        total += int(traj.proprio.nbytes)
+        total += int(traj.actions.nbytes)
+    return int(total)
+
+
 class LatentTransitionDataset(Dataset):
-    """Temporal latent-window samples with ``traj_type`` and ``task_index``."""
+    """Temporal raw-input windows with task and class labels."""
 
     def __init__(
         self,
-        trajectory_refs: Sequence[EncodedTrajectoryRef],
+        trajectories: Sequence[PreparedTrajectory] | None = None,
+        cached_refs: Sequence[CachedTrajectoryRef] | None = None,
         window_size: int = 8,
-        preload_to_memory: bool = False,
+        cache_trajectory_limit: int = 4,
     ) -> None:
         super().__init__()
-        self.trajectory_refs = list(trajectory_refs)
+        self.trajectories = list(trajectories or [])
+        self.cached_refs = list(cached_refs or [])
         self.window_size = int(window_size)
+        self.cache_trajectory_limit = max(0, int(cache_trajectory_limit))
         if self.window_size <= 0:
             raise ValueError(f"window_size must be positive, got {self.window_size}")
-        if not self.trajectory_refs:
-            raise ValueError("trajectory_refs cannot be empty")
+        if bool(self.trajectories) == bool(self.cached_refs):
+            raise ValueError("Provide exactly one of trajectories or cached_refs.")
 
-        self.preload_to_memory = bool(preload_to_memory)
-        self._trajectory_cache: dict[int, LatentTrajectory] = {}
-        self._latent_dim: Optional[int] = None
         self._transition_refs: list[TransitionRef] = []
         self._sample_is_positive: list[bool] = []
+        self._trajectory_cache: OrderedDict[int, TensorTrajectory] = OrderedDict()
+        self._trajectory_tensors: list[TensorTrajectory] = []
+        self._window_index_cache: dict[int, torch.Tensor] = {}
 
-        for traj_idx, ref in enumerate(self.trajectory_refs):
-            traj = load_cached_latent_trajectory(ref)
-            length = int(traj.latents.shape[0])
-            if length <= 0:
-                continue
-            if self._latent_dim is None:
-                self._latent_dim = int(traj.latents.shape[-1])
-            elif int(traj.latents.shape[-1]) != self._latent_dim:
-                raise ValueError(
-                    f"Latent dim mismatch in {traj.file_path}:{traj.demo_key}. "
-                    f"expected={self._latent_dim}, got={traj.latents.shape[-1]}"
-                )
-            for t in range(length):
-                traj_type = 1 if ref.data_type == "fail_rollout" else 0
+        sources: Sequence[PreparedTrajectory | CachedTrajectoryRef]
+        if self.trajectories:
+            self._num_cameras = int(self.trajectories[0].images.shape[1])
+            self._proprio_dim = int(self.trajectories[0].proprio.shape[1])
+            sources = self.trajectories
+        else:
+            self._num_cameras = int(self.cached_refs[0].num_cameras)
+            self._proprio_dim = int(self.cached_refs[0].proprio_dim)
+            sources = self.cached_refs
+
+        for traj_idx, traj in enumerate(sources):
+            if isinstance(traj, PreparedTrajectory):
+                if int(traj.images.shape[0]) != int(traj.proprio.shape[0]):
+                    raise ValueError(
+                        f"Trajectory length mismatch for {traj.file_path}:{traj.demo_key}: "
+                        f"images={traj.images.shape[0]} proprio={traj.proprio.shape[0]}"
+                    )
+                if int(traj.images.shape[1]) != self._num_cameras:
+                    raise ValueError("All trajectories must use the same camera count.")
+                if int(traj.proprio.shape[1]) != self._proprio_dim:
+                    raise ValueError("All trajectories must use the same proprio dim.")
+                tensor_traj = self._prepare_tensor_trajectory(traj)
+                self._trajectory_tensors.append(tensor_traj)
+                length = int(tensor_traj.images.shape[0])
+                data_type = tensor_traj.data_type
+            else:
+                if int(traj.num_cameras) != self._num_cameras:
+                    raise ValueError("All cached trajectories must use the same camera count.")
+                if int(traj.proprio_dim) != self._proprio_dim:
+                    raise ValueError("All cached trajectories must use the same proprio dim.")
+                length = int(traj.num_steps)
+                data_type = traj.data_type
+            self._window_index_cache[traj_idx] = self._build_window_indices(length)
+            traj_type = 1 if data_type == "fail_rollout" else 0
+            for t in range(max(0, length)):
                 self._transition_refs.append(
                     TransitionRef(
                         trajectory_index=traj_idx,
@@ -502,20 +571,23 @@ class LatentTransitionDataset(Dataset):
                     )
                 )
                 self._sample_is_positive.append(traj_type == 0)
-            if self.preload_to_memory:
-                self._trajectory_cache[traj_idx] = traj
 
         if not self._transition_refs:
-            raise RuntimeError("No valid latent windows found for the provided trajectory refs.")
-
-    @property
-    def latent_dim(self) -> int:
-        assert self._latent_dim is not None
-        return self._latent_dim
+            raise RuntimeError("No valid temporal windows found for the provided trajectories.")
 
     @property
     def sample_is_positive(self) -> list[bool]:
         return self._sample_is_positive
+
+    def iter_positive_trajectories(self) -> Iterable[PreparedTrajectory]:
+        if self.trajectories:
+            for traj in self.trajectories:
+                if traj.data_type != "fail_rollout":
+                    yield traj
+            return
+        for idx, ref in enumerate(self.cached_refs):
+            if ref.data_type != "fail_rollout":
+                yield self._get_cached_trajectory(idx)
 
     @property
     def num_positive_samples(self) -> int:
@@ -525,67 +597,98 @@ class LatentTransitionDataset(Dataset):
     def num_negative_samples(self) -> int:
         return len(self._sample_is_positive) - self.num_positive_samples
 
+    @property
+    def num_cameras(self) -> int:
+        return self._num_cameras
+
+    @property
+    def proprio_dim(self) -> int:
+        return self._proprio_dim
+
     def __len__(self) -> int:
         return len(self._transition_refs)
 
-    def _get_trajectory(self, trajectory_index: int) -> LatentTrajectory:
-        traj = self._trajectory_cache.get(trajectory_index)
-        if traj is not None:
-            return traj
-        traj = load_cached_latent_trajectory(self.trajectory_refs[trajectory_index])
-        self._trajectory_cache[trajectory_index] = traj
+    @staticmethod
+    def _as_float_tensor(value: np.ndarray) -> torch.Tensor:
+        array = np.asarray(value)
+        if array.dtype == np.uint8:
+            array = array.astype(np.float32) / 255.0
+        else:
+            array = np.asarray(array, dtype=np.float32)
+        return torch.from_numpy(np.ascontiguousarray(array))
+
+    @staticmethod
+    def _as_long_scalar(value: int) -> torch.Tensor:
+        return torch.tensor(int(value), dtype=torch.int64)
+
+    def _prepare_tensor_trajectory(self, traj: PreparedTrajectory) -> TensorTrajectory:
+        return TensorTrajectory(
+            images=self._as_float_tensor(traj.images),
+            proprio=torch.from_numpy(np.ascontiguousarray(np.asarray(traj.proprio, dtype=np.float32))),
+            actions=torch.from_numpy(np.ascontiguousarray(np.asarray(traj.actions, dtype=np.float32))),
+            task_index_tensor=self._as_long_scalar(traj.task_index),
+            data_type_index_tensor=self._as_long_scalar(traj.data_type_index),
+            task_name=traj.task_name,
+            task_index=int(traj.task_index),
+            data_type=traj.data_type,
+            data_type_index=int(traj.data_type_index),
+            split=traj.split,
+            file_path=traj.file_path,
+            demo_key=traj.demo_key,
+        )
+
+    def _load_cached_trajectory(self, ref: CachedTrajectoryRef) -> TensorTrajectory:
+        with np.load(ref.cache_path) as cached:
+            images = np.asarray(cached["images_chw"])
+            proprio = np.asarray(cached["proprio"], dtype=np.float32)
+            actions = np.asarray(cached["actions"], dtype=np.float32)
+        return self._prepare_tensor_trajectory(
+            PreparedTrajectory(
+            images=images,
+            proprio=proprio,
+            actions=actions,
+            task_name=ref.task_name,
+            task_index=int(ref.task_index),
+            data_type=ref.data_type,
+            data_type_index=int(ref.data_type_index),
+            split=ref.split,
+            file_path=ref.file_path,
+            demo_key=ref.demo_key,
+            )
+        )
+
+    def _get_cached_trajectory(self, trajectory_index: int) -> TensorTrajectory:
+        cached = self._trajectory_cache.get(int(trajectory_index))
+        if cached is not None:
+            self._trajectory_cache.move_to_end(int(trajectory_index))
+            return cached
+        traj = self._load_cached_trajectory(self.cached_refs[int(trajectory_index)])
+        if self.cache_trajectory_limit > 0:
+            self._trajectory_cache[int(trajectory_index)] = traj
+            while len(self._trajectory_cache) > self.cache_trajectory_limit:
+                self._trajectory_cache.popitem(last=False)
         return traj
 
-    def _build_latent_window(self, traj: LatentTrajectory, t: int) -> np.ndarray:
-        latents = np.asarray(traj.latents, dtype=np.float32)
-        start = int(t) - self.window_size + 1
-        if start >= 0:
-            return latents[start : int(t) + 1]
-        pad = np.repeat(latents[:1], -start, axis=0)
-        return np.concatenate([pad, latents[: int(t) + 1]], axis=0)
+    def _get_trajectory(self, trajectory_index: int) -> TensorTrajectory:
+        if self.trajectories:
+            return self._trajectory_tensors[int(trajectory_index)]
+        return self._get_cached_trajectory(int(trajectory_index))
+
+    def _build_window_indices(self, length: int) -> torch.Tensor:
+        steps = torch.arange(int(length), dtype=torch.long).unsqueeze(1)
+        offsets = torch.arange(self.window_size - 1, -1, -1, dtype=torch.long).unsqueeze(0)
+        return torch.clamp(steps - offsets, min=0)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Return tensors for one latent window."""
         ref = self._transition_refs[index]
         traj = self._get_trajectory(ref.trajectory_index)
-        latent_window = self._build_latent_window(traj, t=int(ref.t))
+        window_index = self._window_index_cache[int(ref.trajectory_index)][int(ref.t)]
+        image_window = traj.images.index_select(0, window_index)
+        proprio_window = traj.proprio.index_select(0, window_index)
         return {
-            "latent_window": torch.from_numpy(np.asarray(latent_window, dtype=np.float32)),
-            "task_index": torch.tensor(int(traj.task_index), dtype=torch.int64),
-            "data_type_index": torch.tensor(int(traj.data_type_index), dtype=torch.int64),
-            "traj_type": torch.tensor(int(ref.traj_type), dtype=torch.int64),
+            "image_window": image_window,
+            "proprio_window": proprio_window,
+            "task_index": traj.task_index_tensor,
+            "data_type_index": traj.data_type_index_tensor,
+            "traj_type": self._as_long_scalar(ref.traj_type),
         }
-
-
-def build_cached_splits(
-    cfg_data: Any,
-    encoder: FrozenFlowMultitaskEncoder,
-    seed: int,
-    build_missing_cache: bool = True,
-) -> tuple[dict[str, list[EncodedTrajectoryRef]], dict[str, dict[str, dict[str, int]]], dict[str, int]]:
-    """Split demos by config, then resolve or create per-demo ``.npz`` caches under ``cache_dir``."""
-    split_refs, split_summary, task_to_index = build_split_refs(cfg_data=cfg_data, seed=seed)
-    _print_split_summary(split_summary)
-
-    cached_splits: dict[str, list[EncodedTrajectoryRef]] = {}
-    cache_root = to_absolute_path(str(_cfg_get(cfg_data, "cache_dir")))
-    batch_size = int(_cfg_get(cfg_data, "encode_demo_batch_size", 8))
-    legacy_cache_root = to_absolute_path("./data/.lpb_new_cache")
-    fallback_cache_roots: list[str] = []
-    if os.path.abspath(cache_root) != os.path.abspath(legacy_cache_root) and os.path.isdir(legacy_cache_root):
-        fallback_cache_roots.append(legacy_cache_root)
-        print(f"[lpb_score] Reusing legacy cache when available: {legacy_cache_root}")
-
-    for split_name, refs in split_refs.items():
-        action_label = "building latent cache" if bool(build_missing_cache) else "loading latent cache"
-        print(f"[lpb_score] {action_label} for split={split_name} num_trajectories={len(refs)}")
-        cached_splits[split_name] = prepare_cached_trajectories(
-            refs=refs,
-            encoder=encoder,
-            cache_root=cache_root,
-            task_to_index=task_to_index,
-            encode_demo_batch_size=batch_size,
-            fallback_cache_roots=fallback_cache_roots,
-            build_missing_cache=bool(build_missing_cache),
-        )
-    return cached_splits, split_summary, task_to_index

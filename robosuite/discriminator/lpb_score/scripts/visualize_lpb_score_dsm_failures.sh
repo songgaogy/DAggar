@@ -6,10 +6,8 @@ ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
-CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new-v3/lpb_dipole_dsm_20260417_005436/lpb_dipole_dsm_20260417_005436.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v3/visualize}"
-CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
+DSM_CKPT="${DSM_CKPT:-checkpoints/multitask_6/lpb_dipole-new-v3/lpb_dipole_dsm_20260417_005436/lpb_dipole_dsm_20260417_005436.pt}"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v4/visualize}"
 NUM_VIDEOS=12
 
 BANK_SIZE=100
@@ -34,13 +32,26 @@ WINDOW_SIZE=10
 DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE:-10}"
 # ---------------------------------------
 
-IMAGE_SIZE="${IMAGE_SIZE:-128}"
-ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-96}"
 FPS="${FPS:-20}"
 CAMERA_NAME="${CAMERA_NAME:-agentview}"
 SAVE_PDF="${SAVE_PDF:-true}"
 NUM_PLOT_FRAMES="${NUM_PLOT_FRAMES:-8}"
 CALIBRATION_SEED="${CALIBRATION_SEED:-${SEED}}"
+PREPROCESSED_CACHE_DIR="${PREPROCESSED_CACHE_DIR:-${ROOT}/data/.lpb_score_preprocessed_cache}"
+USE_PREPROCESSED_CACHE="${USE_PREPROCESSED_CACHE:-1}"
+REFRESH_PREPROCESSED_CACHE="${REFRESH_PREPROCESSED_CACHE:-0}"
+
+if [[ "${USE_PREPROCESSED_CACHE}" == "1" ]]; then
+  USE_PREPROCESSED_CACHE_BOOL="true"
+else
+  USE_PREPROCESSED_CACHE_BOOL="false"
+fi
+
+if [[ "${REFRESH_PREPROCESSED_CACHE}" == "1" ]]; then
+  REFRESH_PREPROCESSED_CACHE_BOOL="true"
+else
+  REFRESH_PREPROCESSED_CACHE_BOOL="false"
+fi
 
 if [[ -z "${DSM_CKPT}" ]]; then
   mapfile -t DSM_CKPT_CANDIDATES < <(
@@ -53,36 +64,11 @@ if [[ -z "${DSM_CKPT}" ]]; then
   fi
 fi
 
-if [[ ! -f "${CKPT}" ]]; then
-  echo "[visualize_lpb_score_dsm] Missing policy checkpoint: ${CKPT}" >&2
-  exit 1
-fi
-
 if [[ ! -f "${DSM_CKPT}" ]]; then
   echo "[visualize_lpb_score_dsm] Missing DSM checkpoint: ${DSM_CKPT}" >&2
   echo "[visualize_lpb_score_dsm] Set DSM_CKPT=/abs/path/to/lpb_score_dsm_*.pt if you want a specific run." >&2
   exit 1
 fi
-
-validate_policy_ckpt() {
-  "${PYTHON_BIN}" - "${1}" <<'PY'
-import sys
-import torch
-
-path = sys.argv[1]
-try:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-except TypeError:
-    payload = torch.load(path, map_location="cpu")
-
-if "camera_names" not in payload or "model_cfg" not in payload:
-    raise SystemExit(
-        f"[visualize_lpb_score_dsm] Invalid policy checkpoint: {path}\n"
-        "Expected a flow policy checkpoint with keys like `camera_names` and `model_cfg`.\n"
-        "It looks like you may have passed a DSM checkpoint as policy.ckpt."
-    )
-PY
-}
 
 validate_dsm_ckpt() {
   "${PYTHON_BIN}" - "${1}" <<'PY'
@@ -95,23 +81,23 @@ try:
 except TypeError:
     payload = torch.load(path, map_location="cpu")
 
-if "model" not in payload or "latent_dim" not in payload or "window_size" not in payload:
+required = {"model", "latent_dim", "window_size", "policy_checkpoint_payload"}
+missing = sorted(required.difference(payload.keys()))
+if missing:
     raise SystemExit(
         f"[visualize_lpb_score_dsm] Invalid DSM checkpoint: {path}\n"
-        "Expected an lpb_score DSM checkpoint with keys like `model`, `latent_dim`, and `window_size`."
+        "Expected a self-contained joint DSM checkpoint with encoder payload.\n"
+        f"Missing keys: {missing}"
     )
 PY
 }
 
-validate_policy_ckpt "${CKPT}"
 validate_dsm_ckpt "${DSM_CKPT}"
 
 export CUDA_VISIBLE_DEVICES=1
 
 echo "[visualize_lpb_score_dsm] ROOT=${ROOT}"
-echo "[visualize_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[visualize_lpb_score_dsm] model.dsm_ckpt=${DSM_CKPT}"
-echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
 echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
@@ -119,15 +105,17 @@ echo "[visualize_lpb_score_dsm] dataset.window_size=${DSM_WINDOW_SIZE}"
 echo "[visualize_lpb_score_dsm] detector.score_mode=${SCORE_MODE}"
 echo "[visualize_lpb_score_dsm] detector.alpha=${ALPHA}"
 echo "[visualize_lpb_score_dsm] detector.beta=${BETA}"
+echo "[visualize_lpb_score_dsm] data.preprocessed_cache_dir=${PREPROCESSED_CACHE_DIR}"
+echo "[visualize_lpb_score_dsm] data.use_preprocessed_cache=${USE_PREPROCESSED_CACHE_BOOL}"
+echo "[visualize_lpb_score_dsm] data.refresh_preprocessed_cache=${REFRESH_PREPROCESSED_CACHE_BOOL}"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/visualize_failures.py" \
   seed="${SEED}" \
   save_dir="${SAVE_DIR}" \
-  data.cache_dir="${CACHE_DIR}" \
-  policy.ckpt="${CKPT}" \
-  policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
-  data.image_size="${IMAGE_SIZE}" \
   model.dsm_ckpt="${DSM_CKPT}" \
+  data.preprocessed_cache_dir="${PREPROCESSED_CACHE_DIR}" \
+  data.use_preprocessed_cache="${USE_PREPROCESSED_CACHE_BOOL}" \
+  data.refresh_preprocessed_cache="${REFRESH_PREPROCESSED_CACHE_BOOL}" \
   dataset.window_size="${DSM_WINDOW_SIZE}" \
   visualization.data_source="${VIS_DATA_SOURCE}" \
   visualization.bank_size="${BANK_SIZE}" \

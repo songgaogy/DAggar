@@ -1,4 +1,4 @@
-"""AdamW training loop for ``DSMModel`` with optional positive vs failure balanced sampling."""
+"""AdamW training loop for the joint encoder + chunk DSM model."""
 
 from __future__ import annotations
 
@@ -15,8 +15,6 @@ from .model import DSMModel
 
 @dataclass
 class TrainerConfig:
-    """Hyperparameters for ``Trainer`` (batching, optimization, logging, class balance)."""
-
     batch_size: int = 64
     num_workers: int = 4
     learning_rate: float = 3e-4
@@ -32,11 +30,14 @@ class TrainerConfig:
     save_ema_in_checkpoint: bool = True
     shared_lr_multiplier: float = 1.0
     chunk_branch_lr_multiplier: float = 1.0
+    encoder_branch_lr_multiplier: float = 1.0
+    normalization_batch_size: int = 256
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 4
 
 
 class Trainer:
-    """Trains ``DSMModel`` via ``compute_dsm_loss``; uses ``WeightedRandomSampler`` when both traj classes exist."""
-
     def __init__(
         self,
         model: DSMModel,
@@ -45,7 +46,6 @@ class Trainer:
         config: Optional[TrainerConfig] = None,
         device: Optional[str] = None,
     ) -> None:
-        """Attach model, build optimizers and loaders, move parameters to ``device``."""
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -75,15 +75,17 @@ class Trainer:
                 self.val_dataset,
                 batch_size=self.cfg.batch_size,
                 shuffle=False,
-                num_workers=self.cfg.num_workers,
-                pin_memory=torch.cuda.is_available(),
+                **self._loader_kwargs(),
             )
             if self.val_dataset is not None and len(self.val_dataset) > 0
             else None
         )
+        self._online_norm_stats: dict[str, torch.Tensor] | None = None
+        self._ema_norm_stats: dict[str, torch.Tensor] | None = None
 
     def _build_optimizer_param_groups(self) -> list[dict[str, object]]:
         multipliers = {
+            "encoder_branch": float(self.cfg.encoder_branch_lr_multiplier),
             "shared": float(self.cfg.shared_lr_multiplier),
             "chunk_branch": float(self.cfg.chunk_branch_lr_multiplier),
         }
@@ -91,9 +93,9 @@ class Trainer:
             if multiplier < 0.0:
                 raise ValueError(f"{name} lr multiplier must be non-negative, got {multiplier}")
 
-        groups = self.model.predictor.optimizer_parameter_groups()
+        groups = self.model.optimizer_parameter_groups()
         param_groups: list[dict[str, object]] = []
-        for name in ("shared", "chunk_branch"):
+        for name in ("encoder_branch", "shared", "chunk_branch"):
             params = groups.get(name, [])
             if not params:
                 continue
@@ -114,6 +116,13 @@ class Trainer:
             base = dataset.dataset.sample_is_positive
             return [base[i] for i in dataset.indices]
         return None
+
+    def _resolve_positive_trajectories(self):
+        if isinstance(self.train_dataset, LatentTransitionDataset):
+            return self.train_dataset.iter_positive_trajectories()
+        if isinstance(self.train_dataset, Subset) and isinstance(self.train_dataset.dataset, LatentTransitionDataset):
+            raise TypeError("Subset normalization refresh is not supported for cached transition datasets.")
+        raise TypeError("Trainer normalization refresh requires LatentTransitionDataset or Subset thereof.")
 
     def _build_train_loader(self) -> DataLoader:
         labels = self._resolve_positive_labels(self.train_dataset)
@@ -140,17 +149,25 @@ class Trainer:
                 self.train_dataset,
                 batch_size=self.cfg.batch_size,
                 sampler=sampler,
-                num_workers=self.cfg.num_workers,
-                pin_memory=torch.cuda.is_available(),
+                **self._loader_kwargs(),
             )
 
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.batch_size,
             shuffle=True,
-            num_workers=self.cfg.num_workers,
-            pin_memory=torch.cuda.is_available(),
+            **self._loader_kwargs(),
         )
+
+    def _loader_kwargs(self) -> dict[str, object]:
+        kwargs: dict[str, object] = {
+            "num_workers": int(self.cfg.num_workers),
+            "pin_memory": bool(self.cfg.pin_memory) and self.device.type == "cuda",
+        }
+        if int(self.cfg.num_workers) > 0:
+            kwargs["persistent_workers"] = bool(self.cfg.persistent_workers)
+            kwargs["prefetch_factor"] = max(2, int(self.cfg.prefetch_factor))
+        return kwargs
 
     def _move_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
@@ -160,8 +177,33 @@ class Trainer:
         }
 
     @torch.no_grad()
+    def _refresh_normalization_stats(
+        self,
+        model: DSMModel,
+        *,
+        target: str,
+    ) -> dict[str, torch.Tensor]:
+        stats = model.compute_normalization_stats(
+            self._resolve_positive_trajectories(),
+            batch_size=int(self.cfg.normalization_batch_size),
+        )
+        model.set_normalization_stats(
+            latent_mean=stats["latent_mean"],
+            latent_var=stats["latent_var"],
+        )
+        if target == "online":
+            self._online_norm_stats = stats
+        elif target == "ema":
+            self._ema_norm_stats = stats
+        else:
+            raise ValueError(f"Unsupported normalization target: {target}")
+        print(
+            f"[lpb_score] refreshed_{target}_norm_stats latent_count={int(stats['latent_count'].item())}"
+        )
+        return stats
+
+    @torch.no_grad()
     def _update_ema(self) -> None:
-        """EMA: ``ema <- decay * ema + (1 - decay) * online`` on learnable parameters."""
         if self.ema_model is None:
             return
         decay = float(self.cfg.ema_decay)
@@ -176,7 +218,6 @@ class Trainer:
         train: bool,
         model: Optional[DSMModel] = None,
     ) -> dict[str, float]:
-        """Single forward/backward on ``task_index`` and ``traj_type`` batches from ``LatentTransitionDataset``."""
         active = model if model is not None else self.model
         data = self._move_batch(batch)
         if train:
@@ -184,7 +225,8 @@ class Trainer:
 
         with torch.set_grad_enabled(train):
             stats = active.compute_dsm_loss(
-                latent_window=data["latent_window"],
+                image_window=data["image_window"],
+                proprio_window=data["proprio_window"],
                 traj_type=data["traj_type"],
                 task_index=data["task_index"],
             )
@@ -213,30 +255,29 @@ class Trainer:
         return {key: float(sum(item[key] for item in metrics) / len(metrics)) for key in keys}
 
     def eval_model_for_inference(self) -> DSMModel:
-        """Weights used for validation (and checkpoints when ``save_ema_in_checkpoint``)."""
-        if (
-            self.cfg.use_ema
-            and self.cfg.val_use_ema
-            and self.ema_model is not None
-        ):
+        if self.cfg.use_ema and self.cfg.val_use_ema and self.ema_model is not None:
             return self.ema_model
         return self.model
 
     def checkpoint_state_dicts(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
-        """Return ``(payload['model'], extra_or_none)`` for ``torch.save``.
-
-        If EMA is enabled and ``save_ema_in_checkpoint``, ``model`` is the EMA weights (recommended
-        for ``DSMTransitionScorer``); the second dict is online weights for ``model_online``.
-        If ``save_ema_in_checkpoint`` is false, only the online weights are returned as primary.
-        """
         if self.ema_model is None:
             return self.model.state_dict(), None
         if self.cfg.save_ema_in_checkpoint:
             return self.ema_model.state_dict(), self.model.state_dict()
         return self.model.state_dict(), None
 
+    def checkpoint_normalization_stats(self) -> dict[str, torch.Tensor]:
+        if self.ema_model is None or not self.cfg.save_ema_in_checkpoint:
+            if self._online_norm_stats is None:
+                self._refresh_normalization_stats(self.model, target="online")
+            assert self._online_norm_stats is not None
+            return self._online_norm_stats
+        if self._ema_norm_stats is None:
+            self._refresh_normalization_stats(self.ema_model, target="ema")
+        assert self._ema_norm_stats is not None
+        return self._ema_norm_stats
+
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
-        """One full pass over the training loader; returns mean logged scalars."""
         self.model.train()
         logs: list[dict[str, float]] = []
         for step, batch in enumerate(self.train_loader):
@@ -254,10 +295,8 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch: int) -> dict[str, float]:
-        """Validation pass; returns ``{}`` if no validation loader."""
         if self.val_loader is None:
             return {}
-        self.model.eval()
         eval_model = self.eval_model_for_inference()
         eval_model.eval()
         logs: list[dict[str, float]] = []
@@ -279,11 +318,14 @@ class Trainer:
         save_freq: int = 0,
         save_callback: Optional[Callable[[int, dict[str, dict[str, float]]], None]] = None,
     ) -> dict[str, dict[str, float]]:
-        """Train for ``epochs``; optional ``save_callback(epoch, history)`` every ``save_freq`` epochs."""
         history: dict[str, dict[str, float]] = {}
         freq = int(save_freq)
         for epoch in range(1, self.cfg.epochs + 1):
+            self._refresh_normalization_stats(self.model, target="online")
             train_stats = self.train_one_epoch(epoch)
+            self._refresh_normalization_stats(self.model, target="online")
+            if self.ema_model is not None:
+                self._refresh_normalization_stats(self.ema_model, target="ema")
             val_stats = self.validate(epoch)
             history[f"epoch_{epoch:03d}"] = {"train": train_stats, "valid": val_stats}
             print(f"[epoch {epoch:03d}] train={train_stats} valid={val_stats}")

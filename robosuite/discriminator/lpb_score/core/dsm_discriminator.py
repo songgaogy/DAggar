@@ -1,4 +1,4 @@
-"""Offline DSM-based trajectory discriminator for chunk energies and margins."""
+"""Offline DSM-based trajectory discriminator for joint encoder + chunk scoring."""
 
 from __future__ import annotations
 
@@ -9,15 +9,15 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import torch
 
+from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
 from robosuite.discriminator.utils.base import OfflineTrajectoryDiscriminator
 from robosuite.discriminator.utils.types import DetectorCalibrationSummary, TrajectoryDetectionResult
 
-from .dataset import LatentTrajectory, resolve_window_size
+from .dataset import PreparedTrajectory, resolve_window_size
 from .model import MODEL_ARCHITECTURE, DSMModel, build_dsm_model
 
 
 def _cfg_get(cfg: Any, path: str, default: Any) -> Any:
-    """Dot-path lookup for nested checkpoint or Hydra config blobs."""
     if cfg is None:
         return default
     cur = cfg
@@ -52,8 +52,6 @@ def _torch_load_checkpoint(path: str, map_location: str = "cpu") -> Any:
 
 @dataclass
 class TrajectoryScoreBundle:
-    """Per-step chunk terms for one trajectory."""
-
     chunk_positive_scores: np.ndarray
     chunk_negative_scores: np.ndarray
     chunk_margin_scores: np.ndarray
@@ -62,8 +60,6 @@ class TrajectoryScoreBundle:
 
 
 class DSMTransitionScorer:
-    """Load a trained chunk DSM checkpoint and score latent windows."""
-
     def __init__(
         self,
         checkpoint_path: str,
@@ -71,19 +67,20 @@ class DSMTransitionScorer:
         batch_size: int = 256,
         window_size: int = -1,
     ) -> None:
+        self.checkpoint_path = str(checkpoint_path)
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
         self.model, self.window_size, self.latent_dim = self._load_model(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=self.checkpoint_path,
             override_window_size=window_size,
         )
+        self.encoder = self.model.policy_encoder
 
     def _load_model(
         self,
         checkpoint_path: str,
         override_window_size: int,
     ) -> tuple[DSMModel, int, int]:
-        """Rebuild ``build_dsm_model`` from checkpoint metadata."""
         payload = _torch_load_checkpoint(checkpoint_path, map_location="cpu")
         if "model" not in payload:
             raise ValueError(f"Checkpoint missing key `model`: {checkpoint_path}")
@@ -91,38 +88,32 @@ class DSMTransitionScorer:
         if checkpoint_architecture and checkpoint_architecture != MODEL_ARCHITECTURE:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected `{MODEL_ARCHITECTURE}` but got `{checkpoint_architecture}` from {checkpoint_path}. "
-                "Old two-head DSM checkpoints are not load-compatible with the chunk-only model."
+                f"Expected `{MODEL_ARCHITECTURE}` but got `{checkpoint_architecture}` from {checkpoint_path}."
+            )
+        if "policy_checkpoint_payload" not in payload:
+            raise RuntimeError(
+                "Checkpoint is missing `policy_checkpoint_payload`. "
+                "Old latent-only DSM checkpoints are not load-compatible with the joint encoder model."
             )
 
         cfg = payload.get("cfg", None)
         latent_dim = int(payload.get("latent_dim"))
-        num_tasks = int(payload.get("num_tasks", 0))
-        if num_tasks <= 0:
-            task_to_index = payload.get("task_to_index", None)
-            if isinstance(task_to_index, dict) and task_to_index:
-                num_tasks = int(len(task_to_index))
-        if num_tasks <= 0:
-            cfg_tasks = _cfg_get(cfg, "data.tasks", None)
-            if cfg_tasks is not None:
-                try:
-                    num_tasks = int(len(cfg_tasks))
-                except Exception:
-                    num_tasks = 0
-        if num_tasks <= 0:
+        task_to_index = dict(payload.get("task_to_index", {}) or {})
+        num_tasks = int(payload.get("num_tasks", len(task_to_index)))
+        if num_tasks <= 0 or not task_to_index:
             raise ValueError(
                 "Checkpoint is missing task vocabulary metadata. "
-                f"Expected `num_tasks` or `task_to_index` in {checkpoint_path}."
+                f"Expected `num_tasks` and `task_to_index` in {checkpoint_path}."
             )
+
+        task_names = payload.get("task_names", None)
+        if not task_names:
+            task_names = [name for name, _ in sorted(task_to_index.items(), key=lambda item: int(item[1]))]
+        task_names = [str(name) for name in task_names]
 
         if "window_size" in payload:
             window_size_ckpt = int(payload["window_size"])
         else:
-            if checkpoint_architecture != MODEL_ARCHITECTURE:
-                raise RuntimeError(
-                    "Checkpoint architecture mismatch. "
-                    "Expected a chunk-only DSM checkpoint with `window_size` metadata."
-                )
             window_size_ckpt = int(resolve_window_size(cfg, default=0))
         if window_size_ckpt <= 0:
             raise ValueError(f"Checkpoint has invalid window_size={window_size_ckpt}: {checkpoint_path}")
@@ -133,11 +124,20 @@ class DSMTransitionScorer:
             )
         window_size = window_size_ckpt if int(override_window_size) <= 0 else int(override_window_size)
 
+        encoder = FlowMultitaskEncoder(
+            checkpoint_payload=dict(payload["policy_checkpoint_payload"]),
+            device=str(self.device),
+            image_size=int(payload.get("image_size", _cfg_get(cfg, "data.image_size", 128))),
+            batch_size=self.batch_size,
+            trainable=False,
+        )
         model = build_dsm_model(
             latent_dim=latent_dim,
             num_tasks=num_tasks,
             cfg_model=_cfg_get(cfg, "model", {}),
             window_size=window_size,
+            policy_encoder=encoder,
+            task_names=task_names,
         )
         normalization_stats = payload.get("normalization_stats", None)
         if normalization_stats is not None:
@@ -152,33 +152,18 @@ class DSMTransitionScorer:
         if unexpected:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a `{MODEL_ARCHITECTURE}` checkpoint from lpb_score, but got incompatible weights from "
-                f"{checkpoint_path}. "
-                f"Unexpected keys: {sorted(unexpected)}"
+                f"Unexpected keys from {checkpoint_path}: {sorted(unexpected)}"
             )
         if missing and not missing.issubset(allowed_missing):
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Expected a `{MODEL_ARCHITECTURE}` checkpoint from lpb_score, but got incompatible weights from "
-                f"{checkpoint_path}. "
-                f"Missing keys: {sorted(missing)}"
+                f"Missing keys from {checkpoint_path}: {sorted(missing)}"
             )
         model.to(self.device)
         model.eval()
         return model, window_size, latent_dim
 
-    def _prepare_latents(self, latents: np.ndarray) -> np.ndarray:
-        """Trim or pad latent features to checkpoint latent_dim."""
-        latents = np.asarray(latents, dtype=np.float32)
-        if latents.shape[1] < self.latent_dim:
-            pad = np.zeros((latents.shape[0], self.latent_dim - latents.shape[1]), dtype=np.float32)
-            latents = np.concatenate([latents, pad], axis=1)
-        elif latents.shape[1] > self.latent_dim:
-            latents = latents[:, : self.latent_dim]
-        return latents
-
     def _build_latent_windows(self, latents: np.ndarray) -> np.ndarray:
-        """Build fixed-size history windows with left padding."""
         t_len = int(latents.shape[0])
         windows = np.zeros((t_len, self.window_size, self.latent_dim), dtype=np.float32)
         for t in range(t_len):
@@ -190,13 +175,17 @@ class DSMTransitionScorer:
         return windows
 
     @torch.no_grad()
-    def score_trajectory(self, traj: LatentTrajectory) -> TrajectoryScoreBundle:
-        """Batch-infer chunk energies and margins for each latent timestep."""
-        t_len = int(traj.latents.shape[0])
+    def score_trajectory(self, traj: PreparedTrajectory) -> TrajectoryScoreBundle:
+        t_len = int(traj.images.shape[0])
         if t_len <= 0:
             raise ValueError("Trajectory has zero valid timesteps")
 
-        latents = self._prepare_latents(traj.latents[:t_len])
+        latents = self.model.encode_trajectory(
+            images=traj.images,
+            proprio=traj.proprio,
+            task_index=int(traj.task_index),
+            batch_size=self.batch_size,
+        ).detach().cpu().numpy().astype(np.float32)
         latent_windows = self._build_latent_windows(latents)
         latent_window_t = torch.from_numpy(latent_windows)
 
@@ -207,7 +196,7 @@ class DSMTransitionScorer:
         for start in range(0, t_len, self.batch_size):
             end = min(start + self.batch_size, t_len)
             latent_window_b = latent_window_t[start:end].to(self.device)
-            fisher = self.model.compute_fisher_score(
+            fisher = self.model.compute_fisher_score_from_latent_window(
                 latent_window=latent_window_b,
                 task_index=int(traj.task_index),
             )
@@ -226,10 +215,11 @@ class DSMTransitionScorer:
             t3_margin_terms=chunk_margin.copy(),
         )
 
+    def close(self) -> None:
+        self.encoder.close()
 
-class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
-    """Thresholded detector on top of chunk DSM scores."""
 
+class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
     SCORE_T3 = "t3_weighted_combo"
     COMPONENT_ORDER: tuple[str, ...] = ("chunk_energy", "chunk_margin")
 
@@ -305,7 +295,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
 
     def collect_lambdas_by_task(
         self,
-        trajectories: Sequence[LatentTrajectory],
+        trajectories: Sequence[PreparedTrajectory],
     ) -> dict[str, np.ndarray]:
         lambdas_by_task: dict[str, list[np.ndarray]] = {}
         for traj in trajectories:
@@ -375,7 +365,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         *,
         task_name: str,
     ) -> dict[str, np.ndarray | dict[str, np.ndarray]]:
-        """Convert one scored trajectory into chunk T3 step scores."""
         t3_stats = self._resolve_t3_norm_stats(task_name)
         alpha_terms = {
             "chunk_energy": (
@@ -435,7 +424,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         return out
 
     def _aggregate_lambda(self, step_scores: np.ndarray) -> np.ndarray:
-        """Aggregate per-step scores into detector ``lambda_t`` sequence."""
         vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
         n = vals.shape[0]
         if n == 0:
@@ -467,7 +455,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self,
         step_scores: np.ndarray,
     ) -> np.ndarray:
-        """Return argmax support indices used by max-based lambda aggregation."""
         vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
         n = int(vals.shape[0])
         support = np.zeros((n,), dtype=np.int64)
@@ -519,7 +506,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         contributions: dict[str, np.ndarray],
         step_scores: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Aggregate component terms with the same temporal rule used for lambda."""
         if self.lambda_mode == "mean":
             return {
                 key: self._aggregate_lambda(values)
@@ -546,10 +532,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
 
     def fit(
         self,
-        normal_bank_trajectories: Sequence[LatentTrajectory],
-        calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
+        normal_bank_trajectories: Sequence[PreparedTrajectory],
+        calibration_trajectories: Optional[Sequence[PreparedTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
-        """Calibrate global and task thresholds from normal trajectories."""
         normal_bank_set = list(normal_bank_trajectories)
         calibration_set = (
             list(calibration_trajectories)
@@ -594,6 +579,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             threshold=float(self.threshold),
             metadata={
                 "dsm_ckpt": self.checkpoint_path,
+                "encoder_source": self.extractor.encoder.source_description,
                 "noise_scale": float(self.extractor.model.noise_scale),
                 "noise_sigma": float(self.extractor.model.noise_scale),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
@@ -651,7 +637,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
 
     def detect_trajectory(
         self,
-        trajectory: LatentTrajectory,
+        trajectory: PreparedTrajectory,
         *,
         labels: Optional[np.ndarray] = None,
         adaptive_threshold: bool = False,
@@ -660,7 +646,6 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         warmup_steps: int = 0,
         update_interval: int = 1,
     ) -> TrajectoryDetectionResult:
-        """Score one trajectory over time and emit thresholded anomaly predictions."""
         if self.threshold is None or self._calib_lambdas is None:
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
@@ -758,9 +743,27 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "threshold_by_score": {
                     self.SCORE_T3: float(task_threshold if task_threshold is not None else self.threshold)
                 },
-                "chunk_positive_scores": np.asarray(bundle.chunk_positive_scores, dtype=np.float32),
-                "chunk_negative_scores": np.asarray(bundle.chunk_negative_scores, dtype=np.float32),
-                "chunk_margin_scores": np.asarray(bundle.chunk_margin_scores, dtype=np.float32),
+                "step_contributions": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in component_scores.items()
+                },
+                "step_contribution_shares": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in step_contribution_shares.items()
+                },
+                "aggregate_contributions": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in aggregate_contributions.items()
+                },
+                "aggregate_contribution_shares": {
+                    key: np.asarray(values, dtype=np.float32)
+                    for key, values in aggregate_contribution_shares.items()
+                },
+                "dominant_step_terms": list(dominant_step_terms),
+                "dominant_aggregate_terms": list(dominant_aggregate_terms),
+                "first_crossing_index": first_crossing_index,
+                "first_crossing_dominant_term": first_crossing_dominant_term,
+                "first_crossing_term_shares": first_crossing_term_shares,
                 "t3_alpha_terms": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in family["alpha_terms"].items()
@@ -771,32 +774,8 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 },
                 "t3_alpha": {key: float(value) for key, value in self.t3_alpha.items()},
                 "t3_beta": {key: float(value) for key, value in self.t3_beta.items()},
-                "weighted_step_contributions": {
-                    key: np.asarray(values, dtype=np.float32)
-                    for key, values in component_scores.items()
-                },
-                "aggregate_contributions": {
-                    key: np.asarray(values, dtype=np.float32)
-                    for key, values in aggregate_contributions.items()
-                },
-                "step_contribution_shares": {
-                    key: np.asarray(values, dtype=np.float32)
-                    for key, values in step_contribution_shares.items()
-                },
-                "aggregate_contribution_shares": {
-                    key: np.asarray(values, dtype=np.float32)
-                    for key, values in aggregate_contribution_shares.items()
-                },
-                "dominant_step_terms": list(dominant_step_terms),
-                "dominant_aggregate_terms": list(dominant_aggregate_terms),
-                "first_crossing_index": first_crossing_index,
-                "first_crossing_dominant_term": first_crossing_dominant_term,
-                "first_crossing_term_shares": dict(first_crossing_term_shares),
-                "chunk_positive_mean": float(np.mean(bundle.chunk_positive_scores)),
-                "chunk_negative_mean": float(np.mean(bundle.chunk_negative_scores)),
-                "chunk_margin_mean": float(np.mean(bundle.chunk_margin_scores)),
             },
         )
 
     def close(self) -> None:
-        return None
+        self.extractor.close()

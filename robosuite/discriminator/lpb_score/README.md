@@ -1,336 +1,589 @@
-# LPB Score: Two-Head Conditional Fisher DSM
+# LPB Score: LoRA Encoder + Temporal-Conv Chunk DSM
 
-Offline failure detection on **latent transitions** produced by a **frozen multitask flow policy encoder**. The pipeline trains a **two-head conditional denoising score model (DSM)** shared across manipulation tasks, then scores trajectories by **contrasting** two trajectory-type conditionals with a **weighted Fisher-type** gap between success-like and failure-like predictions.
+`lpb_score` is an offline failure detector built from three parts:
 
-This document merges the former user guide and design summary and records the **mathematical formulation** implemented in `core/model.py` and `core/dsm_discriminator.py`.
+1. a multitask flow-policy encoder
+2. a single-head conditional denoising score model over temporal latent chunks
+3. a T3 detector defined on chunk reconstruction energy and chunk margin
 
----
+The active implementation is in:
 
-## 1. Problem setup
+- `core/model.py`
+- `core/dsm_discriminator.py`
+- `core/dataset.py`
+- `app/train.py`
+- `app/visualize.py`
+- `../../dyn_bce/modules/flow_encoder.py`
 
-### 1.1 Latent transition
+This document describes the current implementation only. It does not describe the removed two-head state/action/transition DSM.
 
-At time \(t\) with horizon \(H = \texttt{transition\_horizon}\), a training example is
+## 1. Problem Setting
 
-$$
-\tau = \bigl(z_t,\, a_{t:t+H-1},\, z_{t+H}\bigr),
-$$
+The detector is designed for the case where a single frame is ambiguous. A state from an early successful phase can overlap geometrically with a later failure state. A pointwise detector cannot resolve this well because it only sees one latent `z_t`.
 
-where \(z_t, z_{t+H} \in \mathbb{R}^{d_z}\) are policy latents and \(a_{t:t+H-1} \in \mathbb{R}^{H \times d_a}\) is an action chunk. A discrete **task index** \(k \in \{0,\ldots,K-1\}\) identifies the manipulation task (\(K = \texttt{num\_tasks}\)). A binary **trajectory type** \(c \in \{0,1\}\) (denoted `traj_type` in code) indicates whether the source trajectory is treated as **positive** (\(c=0\), expert or success rollout) or **failure-conditioned** (\(c=1\), fail rollout).
+The current solution evaluates a short trajectory chunk instead of an isolated point. The model reasons over a fixed-length history window, reconstructs that window under positive and failure conditions, and compares the two reconstruction energies.
 
-### 1.2 Standardization
+## 2. End-to-End Pipeline
 
-Let \(\mu_z, \sigma_z\) and \(\mu_a, \sigma_a\) be **per-dimension** mean and standard deviation estimated from **positive training data only** (expert + success rollouts). Define
+For each timestep `t`:
 
-$$
-\bar{z} = \frac{z - \mu_z}{\sigma_z}, \qquad
-\bar{a} = \mathrm{flatten}(a_{t:t+H-1}) \;\text{ standardized per action dim with horizon-tiled stats.}
-$$
+1. read raw multi-view RGB and proprio
+2. encode each frame into a latent `z_t`
+3. build a left-padded temporal window `X_t`
+4. normalize the latent window
+5. corrupt the normalized window with Gaussian noise during training
+6. denoise the whole window with a conditional temporal Conv1d network
+7. flatten the reconstructed window only for loss and scoring
 
-The **dynamics factor** does not predict \(\bar{z}_{t+H}\) directly; it predicts the **normalized residual**
+At inference, the same latent window is evaluated twice:
 
-$$
-\delta_t = \bar{z}_{t+H} - \bar{z}_t \in \mathbb{R}^{d_z}.
-$$
+- once with the positive condition `c = 0`
+- once with the failure condition `c = 1`
 
-The three **clean normalized targets** used inside the model are:
+The detector then uses:
 
-- **State factor:** \(\bar{z}_t\)
-- **Actor factor:** \(\bar{a}\) (flattened dimension \(H d_a\))
-- **Dynamics factor:** \(\delta_t\)
+- positive chunk energy
+- chunk margin between failure-conditioned and positive-conditioned energies
 
----
+## 3. Temporal Chunk Formulation
 
-## 2. Two-head conditional DSM (training)
+Let:
 
-### 2.1 Denoising targets and noise
+- `W` be the temporal window size
+- `D` be the encoder latent dimension
+- `K` be the number of tasks
+- `k in {0, ..., K-1}` be the task index
+- `c in {0, 1}` be the trajectory-type condition
 
-The model uses two denoisers:
-
-- **Occupancy head:** joint state-action target \(x_{sa} = [\bar{z}_t, \bar{a}]\)
-- **Transition head:** residual target \(x_{\mathrm{dyn}} = \delta_t\)
-
-Training uses **isotropic Gaussian noise** in **normalized** space:
-
-$$
-\tilde{x}_{sa} = x_{sa} + \sigma \,\varepsilon_{sa}, \qquad
-\tilde{x}_{\mathrm{dyn}} = x_{\mathrm{dyn}} + \sigma \,\varepsilon_{\mathrm{dyn}},
-$$
-
-with fixed \(\sigma = \texttt{noise\_scale}\) (see config).
-
-### 2.2 Predictor and conditioning
-
-Let \(g_\theta\) denote the current denoiser (`UnifiedConditionedDSM`, name kept for compatibility). The implementation is now a **two-head decoupled conditional DSM** with **AdaLN-conditioned ResNet-MLP** backbones:
-
-1. **Condition embeddings**
-
-   Learnable embeddings for:
-
-   - trajectory type \(c \in \{0,1\}\),
-   - task \(k \in \{0,\ldots,K-1\}\),
-
-   are summed and passed through a small MLP to form a dense condition vector \(e_{\mathrm{cond}}\).
-
-2. **Occupancy denoiser**
-
-   The occupancy head denoises the joint noisy vector
-
-   $$
-   \tilde{x}_{sa} = [\tilde{s}, \tilde{a}],
-   $$
-
-   and outputs one hidden feature that is decoded into:
-
-   - state prediction \(\hat{s}\),
-   - action prediction \(\hat{a}\).
-
-3. **Transition denoiser**
-
-   The transition head denoises noisy residual \(\tilde{\delta}_t\), but conditions on **clean** normalized state-action context. Concretely, clean \([\bar{z}_t, \bar{a}]\) is projected to a context feature, concatenated with \(\tilde{\delta}_t\), and then passed into the transition backbone.
-
-4. **AdaLN residual blocks**
-
-   Each backbone applies condition-dependent scale and shift at every hidden block:
-
-   $$
-   h_{l+1} = h_l + \mathrm{MLP}\bigl(\gamma_l(e_{\mathrm{cond}}) \odot \mathrm{LN}(h_l) + \beta_l(e_{\mathrm{cond}})\bigr).
-   $$
-
-The config still accepts `model.num_heads` for backward compatibility with older YAMLs, but it is a **compatibility no-op** because the backbone is MLP-only.
+At timestep `t`, define the latent history window:
 
 $$
-\hat{x}_{sa}^{(c)} = g_{\theta,sa}\bigl(\tilde{x}_{sa}, c, k\bigr), \qquad
-\hat{\delta}_t^{(c)} = g_{\theta,\mathrm{dyn}}\bigl(\tilde{\delta}_t, \bar{z}_t, \bar{a}, c, k\bigr).
+X_t = [z_{t-W+1}, z_{t-W+2}, \dots, z_t] \in \mathbb{R}^{W \times D}.
 $$
 
-### 2.3 DSM training loss
+If `t < W - 1`, the missing left context is padded by repeating the first latent `z_0`. This keeps every sample at shape `(W, D)`.
 
-Define the reconstruction energies
-
-$$
-E_{\mathrm{state}} = \frac{1}{d_z}\left\lVert \hat{s} - \bar{z}_t \right\rVert_2^2,
-$$
-$$
-E_{\pi} = \frac{1}{H d_a}\left\lVert \hat{a} - \bar{a} \right\rVert_2^2,
-$$
-$$
-E_{\mathrm{dyn}} = \frac{1}{d_z}\left\lVert \hat{\delta}_t - \delta_t \right\rVert_2^2.
-$$
-
-Training minimizes a **weighted** sum of branch energies:
+The current predictor does not flatten the chunk before processing. It treats the chunk as a temporal sequence and applies Conv1d blocks across the window dimension. Flattening is used only after reconstruction so that the loss and detector remain defined on the full chunk vector:
 
 $$
-\mathcal{L}_{\mathrm{DSM}}
-= \mathbb{E}_{\tau,\,\varepsilon}\left[
-w_{\mathrm{state}} E_{\mathrm{state}}
-+ w_{\pi} E_{\pi}
-+ w_{\mathrm{dyn}} E_{\mathrm{dyn}}
-\right],
+z_{\text{chunk}} = \mathrm{flatten}(X_t) \in \mathbb{R}^{W D}.
 $$
 
-implemented in `compute_dsm_loss`.
+## 4. Encoder Front End
 
-Default branch weights are:
+### 4.1 Raw inputs
 
-- \(w_{\mathrm{state}} = 1.0\)
-- \(w_{\pi} = 0.5\)
-- \(w_{\mathrm{dyn}} = 1.0\)
+The training dataset returns:
 
-so the action branch contributes **half** the gradient weight of the state and dynamics branches by default. The training logs also keep an `unweighted_score`, which is the raw sum \(E_{\mathrm{state}} + E_{\pi} + E_{\mathrm{dyn}}\), for comparison with older experiments.
+- `image_window` with shape `(B, W, V, 3, H, W_img)`
+- `proprio_window` with shape `(B, W, P)`
+- `traj_type`
+- `task_index`
 
-Optional **balanced sampling** over \(c=0\) vs \(c=1\) transitions still enforces a target fraction of positives (`training.positive_ratio`).
+Here:
 
-**Theory:** This is a **conditional DSM / score-matching** style objective: learn to map corrupted targets back to clean ones under explicit \((c,k)\) conditioning, so the model encodes **transition plausibility** under each label.
+- `B` is batch size
+- `V` is number of cameras
+- `P` is proprio dimension
 
-### 2.4 Branch-wise learning rates
+The raw source is HDF5 demonstration data. The active path does not use latent caches.
 
-The optimizer uses separate AdamW parameter groups for:
+### 4.2 Base encoder
 
-- shared occupancy backbone and occupancy conditioning modules,
-- state branch,
-- action branch,
-- full transition network.
+The latent encoder is the multitask flow-policy context encoder from `robosuite/policy/flow_multi/model.py`. The `lpb_score` wrapper uses the same modules that produce the policy condition token:
 
-Given base learning rate `training.lr`, the effective per-group learning rates are:
+- `image_encoder`
+- `proprio_tokenizer`
+- `language_encoder`
+- `language_guided_modulation`
+- `fusion`
+- `condition_aggregator`
 
-$$
-\eta_{\mathrm{group}} = \eta_{\mathrm{base}} \times m_{\mathrm{group}}.
-$$
+The `flow_head` is restored for checkpoint compatibility but is never optimized or used by `lpb_score`.
 
-Default multipliers are:
-
-- shared: `1.0`
-- state branch: `1.0`
-- action branch: `0.5`
-- dynamics branch: `1.0`
-
-So by default the action denoising branch is trained with both:
-
-- **half loss weight**, via `model.action_loss_weight = 0.5`
-- **half learning rate**, via `training.action_branch_lr_multiplier = 0.5`
-
-relative to the state and dynamics branches.
-
----
-
-## 3. Inference: weighted Fisher contrast and energies
-
-At inference, **no noise** is added. The same \(\tau\) and task \(k\) are evaluated under **two** type conditionals, \(c=0\) and \(c=1\), producing:
-
-- occupancy outputs \((\hat{s}^{(0)}, \hat{a}^{(0)})\) and \((\hat{s}^{(1)}, \hat{a}^{(1)})\),
-- transition outputs \(\hat{\delta}^{(0)}\) and \(\hat{\delta}^{(1)}\).
-
-### 3.1 Fisher-type divergence per factor
-
-Define
+For a single timestep:
 
 $$
-\Delta_s = \hat{s}^{(0)} - \hat{s}^{(1)}, \qquad
-\Delta_a = \hat{a}^{(0)} - \hat{a}^{(1)}, \qquad
-\Delta_{\mathrm{dyn}} = \hat{\delta}^{(0)} - \hat{\delta}^{(1)}.
+z_t = f_{\phi}(o_t, p_t, \ell_k),
 $$
 
-The raw per-factor Fisher terms are
+where:
+
+- `o_t` is the multi-view image observation
+- `p_t` is proprio
+- `\ell_k` is the task language prompt
+- `f_\phi` is the policy encoder
+
+### 4.3 LoRA fine-tuning
+
+The encoder is no longer fully fine-tuned. When `policy.trainable_encoder=true`, the base encoder weights stay frozen and only LoRA adapters are optimized.
+
+For each target linear layer with pretrained weight `W_0`, the effective weight becomes:
 
 $$
-D_{\mathrm{state}} = \left\lVert \Delta_s \right\rVert_2^2, \qquad
-D_{\pi} = \left\lVert \Delta_a \right\rVert_2^2, \qquad
-D_{\mathrm{dyn}} = \left\lVert \Delta_{\mathrm{dyn}} \right\rVert_2^2.
+W_{\text{eff}} = W_0 + \frac{\alpha}{r} B A,
 $$
 
-The **default step score** is the weighted Fisher score
+where:
+
+- `A \in \mathbb{R}^{r \times d_{\text{in}}}`
+- `B \in \mathbb{R}^{d_{\text{out}} \times r}`
+- `r` is the LoRA rank
+- `\alpha` is the LoRA scaling factor
+
+The base layer output is:
 
 $$
-S^{\mathrm{Fisher}} = D_{\mathrm{state}} + \lambda_a D_{\pi} + \lambda_{\mathrm{trans}} D_{\mathrm{dyn}},
+y = W_0 x + \frac{\alpha}{r} B A x.
 $$
 
-with default detector settings:
+In code, each adapted `nn.Linear` is replaced by `LoRALinear` in `../../dyn_bce/modules/flow_encoder.py`.
 
-- `detector.lambda_a = 0.1`
-- `detector.lambda_trans = 1.0`
+LoRA is injected only into the encoder path used by `encode_context`. The optimizer sees only:
 
-Large \(S^{\mathrm{Fisher}}\) indicates the two conditionals disagree strongly on the same transition, with the **action occupancy term explicitly suppressed**.
+- `lora_a`
+- `lora_b`
 
-### 3.2 Branch reconstruction energies and margins
+All original encoder weights remain frozen.
 
-Independently, each branch \(c \in \{0,1\}\) yields a **reconstruction energy** per factor (mean coordinate MSE vs. clean target):
+### 4.4 Window encoding
 
-$$
-E_b^{(c)} = \frac{1}{\dim(x_b)} \left\lVert \hat{x}_b^{(c)} - x_b \right\rVert_2^2 .
-$$
-
-**Margins** (used in T2/T3) compare energies between branches, e.g.
+Given a raw window batch:
 
 $$
-M_b = E_b^{(1)} - E_b^{(0)} .
+O \in \mathbb{R}^{B \times W \times V \times 3 \times H \times W_{\text{img}}},
+\qquad
+P \in \mathbb{R}^{B \times W \times P},
 $$
 
-Implementation details, weighted contributions, and auxiliary reconstruction terms are returned by `compute_fisher_score` and packaged into a `TrajectoryScoreBundle`.
-
----
-
-## 4. Detector: step scores, \(\lambda\), and thresholds
-
-Let \(u_t\) denote a **scalar step score** at time \(t\) chosen from a **score family** (below). The detector maps \(\{u_t\}\) to an aggregate **\(\lambda\)** sequence:
-
-- **Mean mode:** if \(\texttt{lambda\_window\_size} \le 0\), prefix average \(\lambda_t = \frac{1}{t+1}\sum_{i=0}^{t} u_i\). If \(W = \texttt{lambda\_window\_size} > 0\), **sliding arithmetic mean** over the last \(W\) steps.
-- **Max mode:** prefix maximum if \(\texttt{lambda\_window\_size} \le 0\), else rolling maximum over a window of size \(W\).
-
-A **threshold** \(\tau\) is calibrated from **normal** trajectories (e.g. success bank) as a high quantile of \(\lambda\) values, controlled by **`delta`** (percentile-style budget). Alarms occur when \(\lambda_t \ge \tau\) (per-task thresholds optional).
-
-### 4.1 Score families (T1 / T2 / T3)
-
-Let \(M_b\) denote the margin terms above. For T1, the implementation uses the **weighted Fisher contributions**:
+the code reshapes them to `(B * W, ...)`, encodes each timestep independently, and reshapes back:
 
 $$
-C_{\mathrm{state}} = D_{\mathrm{state}}, \qquad
-C_{\pi} = \lambda_a D_{\pi}, \qquad
-C_{\mathrm{dyn}} = \lambda_{\mathrm{trans}} D_{\mathrm{dyn}}.
+Z_t = [z_{t-W+1}, \dots, z_t] \in \mathbb{R}^{B \times W \times D}.
 $$
 
-- **T1 — weighted Fisher:**  
-  $$
-  u_t^{\mathrm{(T1)}} = C_{\mathrm{state}} + C_{\pi} + C_{\mathrm{dyn}}.
-  $$
+This is implemented by `DSMModel.encode_latent_window(...)`.
 
-- **T2 — negative margin:** uses **negative** linear combinations of margin terms. This path is kept for compatibility.
+## 5. Latent Normalization
 
-- **T3 — weighted standardized combo:** blends **z-scored** positive energies and margins with weights \(\alpha_b, \beta_b\) (config `alpha_*`, `beta_*`). Normalization statistics for z-scoring are estimated from a **success bank** of trajectories.
+The DSM operates on normalized latents. Let `\mu` and `\sigma^2` be the mean and variance computed from positive trajectories only. For each latent vector:
 
-The active mode is `detector.score_mode` in `config/visualize.yaml`. The default detector config still points to T1, which now means the **weighted Fisher** score above.
+$$
+\bar{z} = \frac{z - \mu}{\max(\sqrt{\sigma^2}, \sigma_{\min})},
+$$
 
----
+where `\sigma_{\min}` is `std_clamp_min`.
 
-## 5. Data and implementation mapping
+This produces the normalized latent window:
 
-### 5.1 Data families and splits
+$$
+\bar{X}_t = [\bar{z}_{t-W+1}, \dots, \bar{z}_t].
+$$
 
-| Family | Use |
-|--------|-----|
-| `expert`, `success_rollout` | Pooled for **positive** trajectory sampling (`num_pos_traj` per split) |
-| `fail_rollout` | **Negative** trajectories (`num_neg_traj`) |
+Because the encoder can move during training, these statistics are recomputed from current positive-train encoder outputs at the start of each epoch. If EMA is enabled and used for validation or checkpoint export, EMA statistics are recomputed for the EMA model as well.
 
-Per-task directories are set in `config/train.yaml`. Cached latents live under `data.cache_dir` as `.npz` files.
+## 6. Chunk DSM Architecture
 
-### 5.2 Dataset tensors (`LatentTransitionDataset`)
+The active denoiser is `ChunkConditionedDSM` in `core/model.py`.
 
-| Field | Symbol / role |
-|--------|----------------|
-| `current_latent` | \(z_t\) |
-| `action_sequence` | \(a_{t:t+H-1}\) |
-| `target_latent` | \(z_{t+H}\) |
-| `task_index` | \(k\) |
-| `traj_type` | \(c\) |
+### 6.1 Conditioning
 
-### 5.3 Code map
+The model uses:
 
-| Component | Path |
-|-----------|------|
-| Two-head DSM + `DSMModel` | `core/model.py` |
-| Training loop | `core/trainer.py` |
-| Data + caches | `core/dataset.py` |
-| Scorer + detector | `core/dsm_discriminator.py` |
-| Hydra train / visualize | `train.py`, `visualize_failures.py` |
+- a trajectory-type embedding for `c`
+- a task embedding for `k`
 
----
+The condition vector is:
 
-## 6. Training and inference workflows
+$$
+e_{\text{cond}} = \mathrm{MLP}(e_c + e_k).
+$$
 
-**Training:** `train.py` + `config/train.yaml` — builds caches, sets `num_tasks = \|task_to_index\|`, fits \(\mu,\sigma\) from positives, builds the two-head DSM, applies branch-weighted loss and branch-wise optimizer LRs, runs `Trainer.fit`, and saves checkpoints.
+This condition is shared by all timesteps in the chunk.
 
-**Visualization:** `visualize_failures.py` + `config/visualize.yaml` — loads `model.dsm_ckpt`, calibrates detector from `eval.bank_*`, applies `detector.lambda_a` / `detector.lambda_trans` inside the default Fisher score, and renders failures from `eval.fail_*` or **suboptimal** HDF5 (`visualization.data_source`).
+### 6.2 Per-step input projection
 
-**Shell helpers:** `scripts/train_lpb_score_dsm.sh`, `scripts/visualize_lpb_score_dsm_failures.sh`.
+Each normalized latent in the window is projected independently:
 
-Example:
+$$
+h_i^{(0)} = \mathrm{Proj}(\bar{z}_i),
+$$
+
+where `Proj` is:
+
+$$
+\mathrm{Linear} \rightarrow \mathrm{LayerNorm} \rightarrow \mathrm{SiLU} \rightarrow \mathrm{Dropout} \rightarrow \mathrm{Linear}.
+$$
+
+Stacking all projected steps yields:
+
+$$
+H^{(0)} \in \mathbb{R}^{B \times C \times W},
+$$
+
+where `C` is the hidden embedding dimension.
+
+### 6.3 AdaLN temporal Conv1d blocks
+
+The old MLP-style `AdaLNResidualBlock` has been replaced by `AdaLNTemporalConvBlock`.
+
+For each block:
+
+1. transpose to channel-last for layer normalization
+2. apply condition-dependent AdaLN modulation
+3. transpose back to `(B, C, W)`
+4. apply a residual temporal Conv1d stack
+
+For hidden sequence `H` and condition `e_cond`, the modulation is:
+
+$$
+(\beta, \gamma) = W_{\text{mod}} e_{\text{cond}},
+$$
+
+$$
+\tilde{H} = \mathrm{LN}(H),
+$$
+
+$$
+\hat{H} = (1 + \gamma) \odot \tilde{H} + \beta.
+$$
+
+The temporal residual branch is:
+
+$$
+\mathrm{Conv1d}(C \rightarrow F, k)
+\rightarrow \mathrm{GELU}
+\rightarrow \mathrm{Dropout}
+\rightarrow \mathrm{Conv1d}(F \rightarrow C, k)
+\rightarrow \mathrm{Dropout},
+$$
+
+where:
+
+- `F` is `ffn_dim`
+- `k` is `kernel_size`
+
+The block output is:
+
+$$
+H' = H + \mathrm{TemporalConv}(\hat{H}).
+$$
+
+The kernel size must be a positive odd integer so the temporal length stays unchanged under symmetric padding.
+
+### 6.4 Output head
+
+After `L` temporal blocks and a final `LayerNorm`, the model predicts a reconstructed latent for every timestep:
+
+$$
+\hat{X}_t = [\hat{z}_{t-W+1}, \dots, \hat{z}_t]
+          \in \mathbb{R}^{W \times D}.
+$$
+
+The output head is a linear map from hidden dimension back to latent dimension, applied per timestep.
+
+Flattening is then applied only for reporting and loss computation:
+
+$$
+\hat{z}_{\text{chunk}} = \mathrm{flatten}(\hat{X}_t).
+$$
+
+### 6.5 About `num_heads`
+
+The config still accepts `model.num_heads`, but the current temporal Conv1d DSM does not use attention. This field is kept only for compatibility with older configs and checkpoint metadata.
+
+## 7. Denoising Objective
+
+### 7.1 Noise model
+
+Gaussian noise is added in normalized latent-window space:
+
+$$
+\tilde{X}_t = \bar{X}_t + \sigma \varepsilon,
+\qquad
+\varepsilon \sim \mathcal{N}(0, I),
+$$
+
+with `\sigma = noise_scale`.
+
+### 7.2 Reconstruction target
+
+The conditional denoiser reconstructs the clean normalized window:
+
+$$
+\hat{X}_t = g_{\theta}(\tilde{X}_t, c, k).
+$$
+
+Equivalently in flattened form:
+
+$$
+\hat{z}_{\text{chunk}} = \mathrm{flatten}(\hat{X}_t),
+\qquad
+z_{\text{chunk}} = \mathrm{flatten}(\bar{X}_t).
+$$
+
+### 7.3 Training loss
+
+The current DSM objective is pure chunk reconstruction MSE:
+
+$$
+\mathcal{L}_{\text{DSM}}
+=
+\mathbb{E}_{X_t,\varepsilon,c,k}
+\left[
+\frac{1}{W D}
+\left\|
+\hat{z}_{\text{chunk}} - z_{\text{chunk}}
+\right\|_2^2
+\right].
+$$
+
+There are no active:
+
+- action losses
+- transition losses
+- Fisher branch losses
+- multi-branch balancing weights
+
+The optimizer uses three parameter groups:
+
+- `encoder_branch`
+- `shared`
+- `chunk_branch`
+
+In the current design:
+
+- `encoder_branch` contains LoRA parameters only
+- `shared` contains embeddings, condition MLP, input projection, temporal blocks, and final norm
+- `chunk_branch` contains the per-step output head
+
+## 8. Inference Scores
+
+At inference, no noise is added. The same clean latent window is scored twice.
+
+### 8.1 Positive chunk energy
+
+$$
+E^{(0)}_{\text{chunk}}
+=
+\frac{1}{W D}
+\left\|
+g_{\theta}(\bar{X}_t, c=0, k) - \bar{X}_t
+\right\|_2^2.
+$$
+
+### 8.2 Failure chunk energy
+
+$$
+E^{(1)}_{\text{chunk}}
+=
+\frac{1}{W D}
+\left\|
+g_{\theta}(\bar{X}_t, c=1, k) - \bar{X}_t
+\right\|_2^2.
+$$
+
+### 8.3 Chunk margin
+
+$$
+M_{\text{chunk}} = E^{(1)}_{\text{chunk}} - E^{(0)}_{\text{chunk}}.
+$$
+
+Interpretation:
+
+- low `E^{(0)}_{\text{chunk}}` means the snippet fits the positive manifold
+- high `M_{\text{chunk}}` means the failure-conditioned reconstruction is worse than the positive-conditioned one
+
+## 9. T3 Detector
+
+The detector supports one active score family: `t3_weighted_combo`.
+
+### 9.1 Success-bank standardization
+
+Using a bank of positive trajectories, the detector estimates mean and standard deviation for:
+
+- positive chunk energy
+- chunk margin
+
+These statistics are computed globally and per task. Task-specific values are used when available; otherwise the detector falls back to global values.
+
+### 9.2 Per-step T3 score
+
+The standardized terms are:
+
+$$
+\widetilde{E}^{(0)}_{\text{chunk}}
+=
+\frac{E^{(0)}_{\text{chunk}} - \mu_E}{\sigma_E},
+$$
+
+$$
+\widetilde{M}_{\text{chunk}}
+=
+\frac{M_{\text{chunk}} - \mu_M}{\sigma_M}.
+$$
+
+The T3 step score is:
+
+$$
+u_t = \alpha \widetilde{E}^{(0)}_{\text{chunk}} - \beta \widetilde{M}_{\text{chunk}}.
+$$
+
+The code records this as two signed components:
+
+- `chunk_energy`
+- `chunk_margin`
+
+### 9.3 Lambda aggregation
+
+The detector thresholds an aggregated sequence `\lambda_t`, not raw `u_t`.
+
+If `lambda_mode = mean`:
+
+$$
+\lambda_t = \frac{1}{|I_t|} \sum_{i \in I_t} u_i.
+$$
+
+If `lambda_mode = max`:
+
+$$
+\lambda_t = \max_{i \in I_t} u_i.
+$$
+
+`I_t` is either:
+
+- the prefix `[0, t]`, or
+- a trailing window of size `lambda_window_size`
+
+depending on detector config.
+
+### 9.4 Threshold calibration
+
+Given calibration lambdas and detector percentile parameter `delta`, the threshold is:
+
+$$
+\tau = \mathrm{Percentile}(\lambda, 100 - \delta).
+$$
+
+A larger `delta` lowers the threshold and makes the detector more aggressive.
+
+## 10. Data Path and Cache
+
+### 10.1 Preprocessed cache
+
+The active fast path uses a disk-backed preprocessed cache, not a latent cache. Each cache file stores:
+
+- `images_chw`
+- `proprio`
+- `actions`
+
+The current cache version stores:
+
+- images as `uint8`
+- proprio as `float32`
+- actions as `float32`
+
+This keeps disk usage lower and avoids full-RAM trajectory preload.
+
+### 10.2 Lazy loading
+
+Training no longer keeps every trajectory resident in RAM. The dataset indexes cached trajectories and loads only the needed sample window in `__getitem__`.
+
+This reduces peak memory while preserving fast repeated access after the first cache build.
+
+### 10.3 Cache invalidation
+
+The cache key depends on:
+
+- task name
+- task metadata token
+- resolved file path
+- demo key
+- source file modification time
+- image size
+- camera names
+- proprio normalization stats
+- cache version token
+
+So the cache is rebuilt automatically if the underlying data or preprocessing contract changes.
+
+## 11. Self-Contained Checkpoints
+
+`lpb_score` checkpoints are self-contained. They store:
+
+- the full joint model state dict
+- optional online model weights when EMA is primary
+- `policy_checkpoint_payload`
+- `latent_dim`
+- `window_size`
+- `chunk_dim`
+- normalization stats
+- task vocabulary metadata
+- config snapshot
+- `model_architecture`
+
+This means visualization and offline detection can rebuild the encoder directly from `model.dsm_ckpt` without a separate `policy.ckpt`.
+
+Old latent-only checkpoints are intentionally incompatible.
+
+## 12. Main Configuration Keys
+
+Important training keys:
+
+- `dataset.window_size`
+- `policy.trainable_encoder`
+- `policy.lora.rank`
+- `policy.lora.alpha`
+- `policy.lora.dropout`
+- `model.embed_dim`
+- `model.num_layers`
+- `model.ffn_dim`
+- `model.kernel_size`
+- `model.noise_scale`
+- `model.std_clamp_min`
+- `training.encoder_branch_lr_multiplier`
+- `training.shared_lr_multiplier`
+- `training.chunk_branch_lr_multiplier`
+
+Important detector keys:
+
+- `detector.alpha`
+- `detector.beta`
+- `detector.lambda_mode`
+- `detector.lambda_window_size`
+- `detector.delta`
+
+## 13. Scripts
+
+Training:
 
 ```bash
-NUM_POS=240 NUM_NEG=120 GPU=0 \
-  bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
+bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
 ```
 
-Example with explicit action-branch overrides:
+Useful overrides:
 
 ```bash
-GPU=0 \
-  bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh \
-  model.action_loss_weight=0.5 \
-  training.action_branch_lr_multiplier=0.5
+TRAIN_ENCODER=1 \
+LORA_RANK=8 \
+LORA_ALPHA=16.0 \
+LORA_DROPOUT=0.0 \
+DSM_WINDOW_SIZE=10 \
+TEMPORAL_KERNEL_SIZE=3 \
+bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
 ```
 
----
+Visualization:
 
-## 7. Checkpoints and compatibility
+```bash
+DSM_CKPT=/abs/path/to/model.pt \
+bash robosuite/discriminator/lpb_score/scripts/visualize_lpb_score_dsm_failures.sh
+```
 
-Saved payloads include `model`, `cfg`, `latent_dim`, `action_dim`, `horizon`, `num_tasks`, `task_to_index`, `normalization_stats`, and `model_architecture: two_head_decoupled_conditional_dsm`.
+## 14. Practical Notes
 
-Checkpoints must contain the current two-head architecture. Older checkpoints from the former unified multitask DSM are **not** weight-compatible with the current `UnifiedConditionedDSM`, even though the class name was kept for API compatibility.
-
----
-
-## References (informal)
-
-- **Denoising / score matching:** learn \(g_\theta\) to invert small Gaussian corruptions (DSM-style objectives).
-- **Fisher-type contrast:** compare two conditional predictors at the same input; squared differences act as a **divergence** between manifolds induced by \(c=0\) vs \(c=1\).
-- **Failure detection:** high \(\lambda\) vs calibrated \(\tau\) flags transitions inconsistent with the success bank.
+- `TRAIN_ENCODER=1` means LoRA tuning, not full encoder fine-tuning.
+- `TRAIN_ENCODER=0` keeps the encoder fully frozen.
+- `dataset.window_size` used at visualize time must match the checkpoint window size.
+- The first run can still be slow because preprocessed cache files must be built.
+- Large `batch_size`, `encoder_batch_size`, and `num_workers` can still cause the process to be killed if system memory is insufficient.
