@@ -1,127 +1,117 @@
-# LPB Score Refactor Summary
+# SσDC v1 — Single-σ Diffusion Classifier (lpb_score)
 
-This document summarizes the current `robosuite/discriminator/lpb_score` design after the conditional Fisher DSM refactor.
+## 1. Goal
 
-## Goal
+`lpb_score` trains a task-conditioned latent DSM and uses it as an offline
+anomaly detector on trajectory prefixes. SσDC v1 replaces the previous
+`T1 / T2 / T3 + action` detector with **one probabilistically grounded score**
+over two factors (state and dynamics). The action sequence is treated as
+observed conditioning — it is never denoised.
 
-The detector operates on latent transitions:
+## 2. Factorization
 
-- current latent `z_t`
-- action chunk `a_{t:t+H-1}`
-- future latent `z_{t+H}`
+For each transition `τ = (z_t, a, z_{t+H})` and class label `c ∈ {0: success,
+1: failure}`:
 
-It estimates whether a transition is more consistent with the positive manifold or the failure manifold.
+```
+p(τ | c) = p(z_t | c) · p(z_{t+H} | z_t, a, c)
+```
 
-## Data Semantics
+Two factors. No action factor. The old `p(a | z_t, c)` term from uni-dsm is
+dropped entirely in both training and inference.
 
-Per task, the module uses three raw data families:
+## 3. SσDC identity
 
-- `expert`
-- `success_rollout`
-- `fail_rollout`
+For fixed noise scale σ, the DSM training objective is an unbiased estimator
+of the conditional marginal log-density up to a constant that does not depend
+on `c`:
 
-For split construction:
+```
+-log p_σ(x | c) = (1 / 2σ²) · E_ε ‖ g_θ(x + σε, c) − x ‖²  +  C(x, σ)
+```
 
-- positives = pooled `expert + success_rollout`
-- negatives = `fail_rollout`
+Because `C(x, σ)` is independent of `c`, the conditional
+log-likelihood ratio reduces to the difference of per-class reconstruction
+energies:
 
-The split config uses:
+```
+LLR(x) = log [ p(x | c=0) / p(x | c=1) ]
+       = (1 / 2σ²) · ( E⁽¹⁾(x) − E⁽⁰⁾(x) )
+```
 
-- `num_pos_traj`
-- `num_neg_traj`
+where `E⁽ᶜ⁾(x) = E_ε ‖ g_θ(x + σε, c) − x ‖²`. At inference we use the
+single-sample estimator with `add_noise=False`, `K=1`, `ε=0`:
 
-Sampling is done independently per task. Positive refs are shuffled once from the merged pool and then sliced into non-overlapping `train / val / test` subsets. Negative refs are handled the same way from `fail_rollout`.
+```
+Ê⁽ᶜ⁾(x) = ‖ g_θ(x, c) − x ‖²
+```
 
-The transition dataset emits:
+This estimator is biased but low-variance and empirically preferable to MC
+Tweedie on this data.
 
-- `current_latent`
-- `action_sequence`
-- `target_latent`
-- `traj_type`
+## 4. Score formula and probabilistic reading
 
-with:
+Let `b ∈ {state, dynamics}` and let `z(·)` denote per-task, per-branch
+z-score standardization on a success calibration bank. The per-step SσDC
+score is:
 
-- `traj_type = 0` for positive
-- `traj_type = 1` for negative
+```
+u(x) = Σ_b [ α_b · z(Ê_b⁽⁰⁾(x)) + β_b · ( z(Ê_b⁽⁰⁾(x)) − z(Ê_b⁽¹⁾(x)) ) ]
+```
 
-## Model
+Probabilistic reading:
 
-The model is still a unified transformer over three routed denoising tasks:
+- `α_b · z(Ê_b⁽⁰⁾)` — per-task calibrated NLL under the success class; an
+  OOD prior on the factor `b`.
+- `β_b · ( z(Ê_b⁽⁰⁾) − z(Ê_b⁽¹⁾) )` — per-task calibrated signed LLR; a
+  Bayes classifier term.
 
-1. state
-2. action
-3. dynamics
+The sum is a scaled posterior log-odds with a tunable OOD prior weight. The
+per-task z-score is a gauge-fixing operation that removes the task-dependent
+`C(x, σ)` term in the LLR derivation.
 
-The refactor adds trajectory-type conditioning:
+## 5. Training recipe
 
-- `task_embedding(task_id)`
-- `type_embedding(traj_type)`
-- `task_name_embedding(task_index)`
+- Fixed `σ = 0.08` (`model.noise_scale` in `config/train.yaml`).
+- `DSMModel.forward(..., add_noise=True)` for training;
+  `add_noise=False` at inference (see `compute_conditional_energies`).
+- Loss: `state_loss_weight · E_state + dynamics_loss_weight · E_dynamics`,
+  with defaults `1.0` and `1.0`.
+- Positive vs. failure balanced sampling via `WeightedRandomSampler`
+  (`positive_sampling_ratio`).
+- Optimizer LR multipliers: `shared = state_branch = dynamics_branch = 1.0`.
 
-These enter the shared backbone as separate attention tokens alongside the context and target tokens.
+## 6. Architecture note — shared-backbone CFG
 
-The output head is deterministic:
+`UnifiedConditionedDSM` is a single transformer parameterized by
+`φ(c, task, route)` through AdaLN-Zero modulation. Each factor has its own
+routed target encoder and head, a global condition vector combining
+`(route_embedding, type_embedding, task_name_embedding, context_feature)`,
+and runs through the **same shared DiT blocks**. Factor independence holds
+because each `forward_task` call consumes only its own `context_feature` and
+target token; there is no cross-factor attention inside the backbone.
 
-- only `pred_mean`
+## 7. Default weights
 
-There is no variance head and no `logvar` optimization.
+```
+α_state = α_dynamics = 0,   β_state = β_dynamics = 1
+```
 
-## Training
+These defaults replicate the R5 recipe (β-only, state + dynamics). Per-task
+α, β is future work.
 
-Training remains denoising-style in normalized space:
+## 8. Monitoring — class-signal-collapse
 
-1. standardize latent and action features
-2. build clean routed targets
-3. add Gaussian noise to the routed targets
-4. predict clean routed targets conditioned on `traj_type` and `task_index`
-5. optimize plain MSE
+`DSMModel.class_conditional_diff` returns per-factor
+`‖ g_θ(x, c=0) − g_θ(x, c=1) ‖²` with `add_noise=False`. `Trainer` calls it
+once per epoch on a training batch and prints:
 
-Normalization stats are computed from the sampled positive training refs.
+```
+[collapse] epoch=<N> state_diff_l2=<val> dynamics_diff_l2=<val>
+```
 
-Weighted batch sampling still exists, but it now balances:
-
-- positive samples
-- negative samples
-
-through `training.positive_ratio`.
-
-## Inference
-
-Inference is no longer reconstruction scoring. For each transition, the model runs:
-
-1. positive-conditioned forward pass with `traj_type = 0`
-2. negative-conditioned forward pass with `traj_type = 1`
-
-Per-branch Fisher energies are:
-
-- `state_error = ||state_pos - state_neg||^2`
-- `action_error = ||action_pos - action_neg||^2`
-- `next_state_error = ||dynamics_pos - dynamics_neg||^2`
-
-The step score is:
-
-- `u_t = state_error + action_error + next_state_error`
-
-The existing `lambda_t` aggregation and threshold calibration logic are unchanged.
-
-## Runtime Surface
-
-The module now supports two workflows:
-
-- training
-- visualization
-
-Removed from the module:
-
-- standalone analyse entrypoint
-- standalone eval entrypoint
-- their YAML configs
-- their bash scripts
-
-Visualization still performs self-calibration from the configured positive bank trajectories before rendering fail trajectories.
-
-## Practical Notes
-
-- Compatibility keys such as `state_error_scores` are still present in detector metadata and summaries, but they now store Fisher L2 energies.
-- Old checkpoints from the previous heteroscedastic DSM are intentionally incompatible with the new architecture.
-- The training bash script exposes `NUM_POS` and `NUM_NEG` so per-task training counts can be overridden without editing YAML.
+A rolling deque of the last 3 values per factor triggers a
+`WARNING[collapse]` line when either factor stays below `1e-4` for 3
+consecutive epochs. This is the class-signal-collapse signature that
+wrecked the sibling `uni-dsm-new` branch — hold commits and report if it
+fires.
