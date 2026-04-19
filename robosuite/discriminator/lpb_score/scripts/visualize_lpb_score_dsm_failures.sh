@@ -7,6 +7,9 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
+# TODO: update DSM_CKPT after the SσDC refactor retrain; the old uni-dsm three-head checkpoint
+# (checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031) is no longer loadable
+# because the action head has been dropped from the architecture.
 DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031/lpb_dipole_dsm_20260412_002031_ep0050.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
@@ -14,24 +17,21 @@ NUM_VIDEOS=12
 
 BANK_SIZE=100
 VIS_DATA_SOURCE="suboptimal"  # suboptimal | expert | success_rollout | fail_rollout
-SCORE_MODE="t3_weighted_combo"   # t1_positive_energy / t2_negative_margin / t3_weighted_combo
 
 # ---------------------------------------
-# positive energy
-ALPHA_STATE=1
-ALPHA_ACTION=0
-ALPHA_DYNAMICS=1
+# SσDC per-branch weights. Default (α=0, β=1) replicates the R5 recipe.
+# α_b · z(E_b^+) is the OOD-prior term; β_b · (z(E_b^+) - z(E_b^-)) is the LLR term.
+ALPHA_STATE=0
+ALPHA_DYNAMICS=0
 
-# energy margin gap
 BETA_STATE=1
-BETA_ACTION=0
 BETA_DYNAMICS=1
 
 # threshold
 # NOTE: 3-5% should be better
 DELTA_THRESHOLD=5
 
-LAMBDA_MODE="ema"  # mean | ema | max
+LAMBDA_MODE="mean"   # mean | max (SσDC detector does not support ema)
 WINDOW_SIZE=6
 # ---------------------------------------
 
@@ -117,9 +117,9 @@ echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
 echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
-echo "[visualize_lpb_score_dsm] detector.score_mode=${SCORE_MODE}"
-echo "[visualize_lpb_score_dsm] detector.alpha=(state=${ALPHA_STATE}, action=${ALPHA_ACTION}, dynamics=${ALPHA_DYNAMICS})"
-echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BETA_ACTION}, dynamics=${BETA_DYNAMICS})"
+echo "[visualize_lpb_score_dsm] detector.alpha=(state=${ALPHA_STATE}, dynamics=${ALPHA_DYNAMICS})"
+echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, dynamics=${BETA_DYNAMICS})"
+echo "[visualize_lpb_score_dsm] detector.lambda_mode=${LAMBDA_MODE}"
 
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/visualize_failures.py" \
   seed="${SEED}" \
@@ -138,13 +138,11 @@ echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, action=${BET
   visualization.camera_name="${CAMERA_NAME}" \
   visualization.save_pdf="${SAVE_PDF}" \
   visualization.num_plot_frames="${NUM_PLOT_FRAMES}" \
+  detector.lambda_mode="${LAMBDA_MODE}" \
   detector.lambda_window_size=$WINDOW_SIZE \
   detector.delta="${DELTA_THRESHOLD}" \
-  detector.score_mode="${SCORE_MODE}" \
   detector.alpha_state="${ALPHA_STATE}" \
-  detector.alpha_action="${ALPHA_ACTION}" \
   detector.alpha_dynamics="${ALPHA_DYNAMICS}" \
   detector.beta_state="${BETA_STATE}" \
-  detector.beta_action="${BETA_ACTION}" \
   detector.beta_dynamics="${BETA_DYNAMICS}" \
   "$@"
