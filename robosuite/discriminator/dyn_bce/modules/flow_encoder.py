@@ -4,6 +4,9 @@ import copy
 import hashlib
 import json
 import os
+import shutil
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -48,6 +51,18 @@ class PreparedEncoderDemo:
     task_name: str
     file_path: str
     demo_key: str
+
+
+@dataclass(frozen=True)
+class PreprocessedCacheRecord:
+    cache_format: str
+    cache_path: str
+    images_path: str | None
+    proprio_path: str | None
+    actions_path: str | None
+    num_steps: int
+    num_cameras: int
+    proprio_dim: int
 
 
 def _torch_load_checkpoint(path: str):
@@ -109,6 +124,11 @@ class LoRALinear(nn.Module):
 
 
 class FlowMultitaskEncoder(nn.Module):
+    _BUNDLE_META_FILENAME = "meta.json"
+    _BUNDLE_IMAGES_FILENAME = "images_chw.npy"
+    _BUNDLE_PROPRIO_FILENAME = "proprio.npy"
+    _BUNDLE_ACTIONS_FILENAME = "actions.npy"
+
     def __init__(
         self,
         checkpoint_path: str | None = None,
@@ -119,6 +139,8 @@ class FlowMultitaskEncoder(nn.Module):
         batch_size: int = 96,
         trainable: bool = False,
         lora_cfg: dict[str, Any] | None = None,
+        preprocessed_cache_layout: str = "bundle",
+        upgrade_legacy_preprocessed_cache: bool = True,
     ) -> None:
         super().__init__()
         if checkpoint_path is None and checkpoint_payload is None:
@@ -131,6 +153,14 @@ class FlowMultitaskEncoder(nn.Module):
         self.image_size = int(image_size)
         self.batch_size = int(batch_size)
         self.trainable = bool(trainable)
+        normalized_cache_layout = str(preprocessed_cache_layout).strip().lower()
+        if normalized_cache_layout not in {"bundle", "npz"}:
+            raise ValueError(
+                "preprocessed_cache_layout must be 'bundle' or 'npz', "
+                f"got {preprocessed_cache_layout!r}"
+            )
+        self.preprocessed_cache_layout = normalized_cache_layout
+        self.upgrade_legacy_preprocessed_cache = bool(upgrade_legacy_preprocessed_cache)
         if self.image_size <= 0:
             raise ValueError(f"image_size must be positive, got {self.image_size}")
 
@@ -193,8 +223,10 @@ class FlowMultitaskEncoder(nn.Module):
         )
 
         self._extractors: dict[str, RobosuiteProprioExtractor] = {}
+        self._resolved_instruction_cache: dict[str, str] = {}
         self._resize_index_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._preprocessed_cache_version = "lpb_score_preprocessed_v2"
+        self._preprocessed_bundle_version = "bundle_v1"
         prop_mean_token = (
             "none"
             if self.prop_mean is None
@@ -372,7 +404,12 @@ class FlowMultitaskEncoder(nn.Module):
 
     def resolve_language_instruction(self, task_name: str) -> str:
         ckpt_task_name = resolve_checkpoint_task_name(task_name)
-        return resolve_language_instruction(self.task_prompt_map, ckpt_task_name)
+        cached = self._resolved_instruction_cache.get(ckpt_task_name)
+        if cached is not None:
+            return cached
+        resolved = resolve_language_instruction(self.task_prompt_map, ckpt_task_name)
+        self._resolved_instruction_cache[ckpt_task_name] = resolved
+        return resolved
 
     def _normalize_proprio(self, proprio: np.ndarray) -> np.ndarray:
         x = np.asarray(proprio, dtype=np.float32)
@@ -509,6 +546,200 @@ class FlowMultitaskEncoder(nn.Module):
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, f"{self.preprocessed_cache_key(task_name, file_path, demo_key)}.npz")
 
+    def preprocessed_cache_bundle_path(self, cache_root: str, task_name: str, file_path: str, demo_key: str) -> str:
+        legacy_path = self.preprocessed_cache_path(
+            cache_root=cache_root,
+            task_name=task_name,
+            file_path=file_path,
+            demo_key=demo_key,
+        )
+        if legacy_path.endswith(".npz"):
+            return f"{legacy_path[:-4]}.bundle"
+        return f"{legacy_path}.bundle"
+
+    def _bundle_meta_path(self, bundle_dir: str) -> str:
+        return os.path.join(bundle_dir, self._BUNDLE_META_FILENAME)
+
+    def _bundle_images_path(self, bundle_dir: str) -> str:
+        return os.path.join(bundle_dir, self._BUNDLE_IMAGES_FILENAME)
+
+    def _bundle_proprio_path(self, bundle_dir: str) -> str:
+        return os.path.join(bundle_dir, self._BUNDLE_PROPRIO_FILENAME)
+
+    def _bundle_actions_path(self, bundle_dir: str) -> str:
+        return os.path.join(bundle_dir, self._BUNDLE_ACTIONS_FILENAME)
+
+    def _is_preprocessed_bundle_ready(self, bundle_dir: str) -> bool:
+        return (
+            os.path.isdir(bundle_dir)
+            and os.path.isfile(self._bundle_meta_path(bundle_dir))
+            and os.path.isfile(self._bundle_images_path(bundle_dir))
+            and os.path.isfile(self._bundle_proprio_path(bundle_dir))
+            and os.path.isfile(self._bundle_actions_path(bundle_dir))
+        )
+
+    def _bundle_metadata_from_arrays(
+        self,
+        *,
+        images: np.ndarray,
+        proprio: np.ndarray,
+        actions: np.ndarray,
+    ) -> dict[str, Any]:
+        return {
+            "bundle_version": self._preprocessed_bundle_version,
+            "images_dtype": str(np.asarray(images).dtype),
+            "proprio_dtype": str(np.asarray(proprio).dtype),
+            "actions_dtype": str(np.asarray(actions).dtype),
+            "num_steps": int(np.asarray(images).shape[0]),
+            "num_cameras": int(np.asarray(images).shape[1]),
+            "proprio_dim": int(np.asarray(proprio).shape[1]) if np.asarray(proprio).ndim >= 2 else 0,
+            "action_dim": int(np.asarray(actions).shape[1]) if np.asarray(actions).ndim >= 2 else 0,
+            "image_shape": [int(x) for x in np.asarray(images).shape],
+            "proprio_shape": [int(x) for x in np.asarray(proprio).shape],
+            "actions_shape": [int(x) for x in np.asarray(actions).shape],
+        }
+
+    def _load_preprocessed_bundle_metadata(self, bundle_dir: str) -> dict[str, Any]:
+        with open(self._bundle_meta_path(bundle_dir), "r", encoding="utf-8") as file_handle:
+            return json.load(file_handle)
+
+    def _write_preprocessed_bundle(
+        self,
+        *,
+        bundle_dir: str,
+        images: np.ndarray,
+        proprio: np.ndarray,
+        actions: np.ndarray,
+    ) -> str:
+        os.makedirs(os.path.dirname(bundle_dir), exist_ok=True)
+        tmp_dir = f"{bundle_dir}.tmp.{os.getpid()}.{threading.get_ident()}"
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.makedirs(tmp_dir, exist_ok=False)
+        try:
+            np.save(self._bundle_images_path(tmp_dir), np.asarray(images), allow_pickle=False)
+            np.save(self._bundle_proprio_path(tmp_dir), np.asarray(proprio, dtype=np.float32), allow_pickle=False)
+            np.save(self._bundle_actions_path(tmp_dir), np.asarray(actions, dtype=np.float32), allow_pickle=False)
+            metadata = self._bundle_metadata_from_arrays(
+                images=np.asarray(images),
+                proprio=np.asarray(proprio, dtype=np.float32),
+                actions=np.asarray(actions, dtype=np.float32),
+            )
+            with open(self._bundle_meta_path(tmp_dir), "w", encoding="utf-8") as file_handle:
+                json.dump(metadata, file_handle, sort_keys=True)
+            try:
+                os.replace(tmp_dir, bundle_dir)
+            except OSError:
+                if not self._is_preprocessed_bundle_ready(bundle_dir):
+                    raise
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except BaseException:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+        return bundle_dir
+
+    def _bundle_record(self, bundle_dir: str) -> PreprocessedCacheRecord:
+        metadata = self._load_preprocessed_bundle_metadata(bundle_dir)
+        return PreprocessedCacheRecord(
+            cache_format="bundle",
+            cache_path=bundle_dir,
+            images_path=self._bundle_images_path(bundle_dir),
+            proprio_path=self._bundle_proprio_path(bundle_dir),
+            actions_path=self._bundle_actions_path(bundle_dir),
+            num_steps=int(metadata["num_steps"]),
+            num_cameras=int(metadata["num_cameras"]),
+            proprio_dim=int(metadata["proprio_dim"]),
+        )
+
+    def _legacy_npz_record(self, cache_path: str) -> PreprocessedCacheRecord:
+        with np.load(cache_path) as cached:
+            images = cached["images_chw"]
+            proprio = cached["proprio"]
+            return PreprocessedCacheRecord(
+                cache_format="npz",
+                cache_path=cache_path,
+                images_path=None,
+                proprio_path=None,
+                actions_path=None,
+                num_steps=int(images.shape[0]),
+                num_cameras=int(images.shape[1]),
+                proprio_dim=int(proprio.shape[1]),
+            )
+
+    def _load_bundle_arrays(
+        self,
+        bundle_dir: str,
+        *,
+        mmap_mode: str | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        images = np.load(self._bundle_images_path(bundle_dir), mmap_mode=mmap_mode, allow_pickle=False)
+        proprio = np.load(self._bundle_proprio_path(bundle_dir), mmap_mode=mmap_mode, allow_pickle=False)
+        actions = np.load(self._bundle_actions_path(bundle_dir), mmap_mode=mmap_mode, allow_pickle=False)
+        return images, proprio, actions
+
+    def _upgrade_legacy_npz_to_bundle(self, cache_path: str, bundle_dir: str) -> str:
+        if self._is_preprocessed_bundle_ready(bundle_dir):
+            return bundle_dir
+        with np.load(cache_path) as cached:
+            images = np.asarray(cached["images_chw"])
+            proprio = np.asarray(cached["proprio"], dtype=np.float32)
+            actions = np.asarray(cached["actions"], dtype=np.float32)
+        return self._write_preprocessed_bundle(
+            bundle_dir=bundle_dir,
+            images=images,
+            proprio=proprio,
+            actions=actions,
+        )
+
+    def describe_preprocessed_demo(
+        self,
+        cache_root: str,
+        task_name: str,
+        file_path: str,
+        demo_key: str,
+        *,
+        refresh_cache: bool = False,
+        allow_upgrade: bool | None = None,
+    ) -> PreprocessedCacheRecord:
+        cache_path = self.preprocessed_cache_path(
+            cache_root=cache_root,
+            task_name=task_name,
+            file_path=file_path,
+            demo_key=demo_key,
+        )
+        bundle_dir = self.preprocessed_cache_bundle_path(
+            cache_root=cache_root,
+            task_name=task_name,
+            file_path=file_path,
+            demo_key=demo_key,
+        )
+        allow_upgrade = self.upgrade_legacy_preprocessed_cache if allow_upgrade is None else bool(allow_upgrade)
+
+        if bool(refresh_cache):
+            materialized = self.materialize_prepared_demo(
+                self.load_demo_raw(task_name=task_name, file_path=file_path, demo_key=demo_key)
+            )
+            self.save_preprocessed_demo(cache_root=cache_root, prepared=materialized)
+            if self.preprocessed_cache_layout == "bundle":
+                return self._bundle_record(bundle_dir)
+            return self._legacy_npz_record(cache_path)
+
+        if self.preprocessed_cache_layout == "bundle" and self._is_preprocessed_bundle_ready(bundle_dir):
+            return self._bundle_record(bundle_dir)
+        if os.path.isfile(cache_path):
+            if self.preprocessed_cache_layout == "bundle" and bool(allow_upgrade):
+                self._upgrade_legacy_npz_to_bundle(cache_path, bundle_dir)
+                if self._is_preprocessed_bundle_ready(bundle_dir):
+                    return self._bundle_record(bundle_dir)
+            return self._legacy_npz_record(cache_path)
+
+        materialized = self.materialize_prepared_demo(
+            self.load_demo_raw(task_name=task_name, file_path=file_path, demo_key=demo_key)
+        )
+        self.save_preprocessed_demo(cache_root=cache_root, prepared=materialized)
+        if self.preprocessed_cache_layout == "bundle":
+            return self._bundle_record(bundle_dir)
+        return self._legacy_npz_record(cache_path)
+
     def load_preprocessed_demo(
         self,
         cache_root: str,
@@ -517,28 +748,37 @@ class FlowMultitaskEncoder(nn.Module):
         demo_key: str,
         *,
         normalize_images: bool = True,
+        mmap_mode: str | None = None,
     ) -> PreparedEncoderDemo:
-        cache_path = self.preprocessed_cache_path(
+        record = self.describe_preprocessed_demo(
             cache_root=cache_root,
             task_name=task_name,
             file_path=file_path,
             demo_key=demo_key,
+            refresh_cache=False,
+            allow_upgrade=True,
         )
-        with np.load(cache_path) as cached:
-            images = np.asarray(cached["images_chw"])
-            if normalize_images:
-                if images.dtype == np.uint8:
-                    images = images.astype(np.float32) / 255.0
-                else:
-                    images = np.asarray(images, dtype=np.float32)
-            return PreparedEncoderDemo(
-                images_chw=images,
-                proprio=np.asarray(cached["proprio"], dtype=np.float32),
-                actions=np.asarray(cached["actions"], dtype=np.float32),
-                task_name=str(task_name),
-                file_path=str(file_path),
-                demo_key=str(demo_key),
-            )
+        if record.cache_format == "bundle":
+            assert record.cache_path
+            images, proprio, actions = self._load_bundle_arrays(record.cache_path, mmap_mode=mmap_mode)
+        else:
+            with np.load(record.cache_path) as cached:
+                images = np.asarray(cached["images_chw"])
+                proprio = np.asarray(cached["proprio"], dtype=np.float32)
+                actions = np.asarray(cached["actions"], dtype=np.float32)
+        if normalize_images:
+            if images.dtype == np.uint8:
+                images = np.asarray(images, dtype=np.float32) / 255.0
+            else:
+                images = np.asarray(images, dtype=np.float32)
+        return PreparedEncoderDemo(
+            images_chw=images,
+            proprio=np.asarray(proprio, dtype=np.float32),
+            actions=np.asarray(actions, dtype=np.float32),
+            task_name=str(task_name),
+            file_path=str(file_path),
+            demo_key=str(demo_key),
+        )
 
     def save_preprocessed_demo(
         self,
@@ -551,18 +791,34 @@ class FlowMultitaskEncoder(nn.Module):
             file_path=prepared.file_path,
             demo_key=prepared.demo_key,
         )
-        tmp_path = f"{cache_path}.tmp"
         images = np.asarray(prepared.images_chw)
         if images.dtype != np.uint8:
             images = np.clip(np.rint(images * 255.0), 0.0, 255.0).astype(np.uint8)
-        with open(tmp_path, "wb") as file_handle:
-            np.savez(
-                file_handle,
-                images_chw=images,
-                proprio=np.asarray(prepared.proprio, dtype=np.float32),
-                actions=np.asarray(prepared.actions, dtype=np.float32),
+        proprio = np.asarray(prepared.proprio, dtype=np.float32)
+        actions = np.asarray(prepared.actions, dtype=np.float32)
+        if self.preprocessed_cache_layout == "bundle":
+            bundle_dir = self.preprocessed_cache_bundle_path(
+                cache_root=cache_root,
+                task_name=prepared.task_name,
+                file_path=prepared.file_path,
+                demo_key=prepared.demo_key,
             )
-        os.replace(tmp_path, cache_path)
+            self._write_preprocessed_bundle(
+                bundle_dir=bundle_dir,
+                images=images,
+                proprio=proprio,
+                actions=actions,
+            )
+        else:
+            tmp_path = f"{cache_path}.tmp"
+            with open(tmp_path, "wb") as file_handle:
+                np.savez(
+                    file_handle,
+                    images_chw=images,
+                    proprio=proprio,
+                    actions=actions,
+                )
+            os.replace(tmp_path, cache_path)
         return cache_path
 
     def materialize_demo_inputs(
@@ -577,13 +833,15 @@ class FlowMultitaskEncoder(nn.Module):
     ) -> PreparedEncoderDemo:
         use_preprocessed_cache = bool(use_cache) and cache_root is not None and str(cache_root) != ""
         if use_preprocessed_cache and not bool(refresh_cache):
-            cache_path = self.preprocessed_cache_path(
+            record = self.describe_preprocessed_demo(
                 cache_root=cache_root,
                 task_name=task_name,
                 file_path=file_path,
                 demo_key=demo_key,
+                refresh_cache=False,
+                allow_upgrade=True,
             )
-            if os.path.isfile(cache_path):
+            if record is not None:
                 return self.load_preprocessed_demo(
                     cache_root=cache_root,
                     task_name=task_name,
@@ -605,6 +863,7 @@ class FlowMultitaskEncoder(nn.Module):
         images: torch.Tensor,
         proprio: torch.Tensor,
         task_names: Sequence[str] | str,
+        profiler: Any | None = None,
     ) -> torch.Tensor:
         if images.ndim != 5:
             raise ValueError(f"Expected images shape (B,V,3,H,W), got {tuple(images.shape)}")
@@ -624,17 +883,23 @@ class FlowMultitaskEncoder(nn.Module):
             raise ValueError(f"Expected {batch_size} task names, got {len(task_names)}")
 
         target_device = self._image_mean.device
-        image_batch = images.to(device=target_device, dtype=torch.float32)
+        if images.dtype == torch.uint8:
+            image_batch = images.to(device=target_device, dtype=torch.float32).div_(255.0)
+        else:
+            image_batch = images.to(device=target_device, dtype=torch.float32)
         prop_batch = proprio.to(device=target_device, dtype=torch.float32)
         image_batch = (image_batch - self._image_mean.to(dtype=image_batch.dtype)) / self._image_std.to(
             dtype=image_batch.dtype
         )
-        language = [self.resolve_language_instruction(str(task_name)) for task_name in task_names]
-        return self.model.encode_context(
-            images=image_batch,
-            proprio=prop_batch,
-            language=language,
-        )
+        with (profiler.section("prompt_resolve") if profiler is not None else nullcontext()):
+            language = [self.resolve_language_instruction(str(task_name)) for task_name in task_names]
+        with (profiler.section("flow_encode_context") if profiler is not None else nullcontext()):
+            return self.model.encode_context(
+                images=image_batch,
+                proprio=prop_batch,
+                language=language,
+                profiler=profiler,
+            )
 
     @torch.no_grad()
     def encode_sequence(
@@ -645,7 +910,10 @@ class FlowMultitaskEncoder(nn.Module):
         task_name: str,
         batch_size: int | None = None,
     ) -> torch.Tensor:
-        image_tensor = torch.as_tensor(images, dtype=torch.float32)
+        if torch.is_tensor(images):
+            image_tensor = images
+        else:
+            image_tensor = torch.as_tensor(images)
         proprio_tensor = torch.as_tensor(proprio, dtype=torch.float32)
         if image_tensor.ndim != 5 or proprio_tensor.ndim != 2:
             raise ValueError("encode_sequence expects images (T,V,3,H,W) and proprio (T,P).")

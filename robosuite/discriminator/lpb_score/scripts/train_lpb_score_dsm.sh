@@ -4,42 +4,50 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/home/dodo/miniconda3/envs/daggar/bin/torchrun}"
 
-GPU="${GPU:-0}"
+GPU="${GPU:-0,1}"
 SEED="${SEED:-42}"
 BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v4}"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_NAME="lpb_dipole_dsm_${TIMESTAMP}"
-SAVE_NAME="${RUN_NAME}.pt"
-SAVE_DIR="${BASE_SAVE_DIR}/${RUN_NAME}"
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-lpb_dipole_dsm_${TIMESTAMP}}"
+SAVE_NAME="${SAVE_NAME:-${RUN_NAME}.pt}"
+SAVE_DIR="${SAVE_DIR:-${BASE_SAVE_DIR}/${RUN_NAME}}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 
-BATCH_SIZE=128
-NUM_WORKERS=16
-PREFETCH_FACTOR=8
-PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-1}"
-PIN_MEMORY="${PIN_MEMORY:-1}"
-CUDNN_BENCHMARK="${CUDNN_BENCHMARK:-1}"
+BATCH_SIZE=256
+ENCODER_BATCH_SIZE=64
+NUM_WORKERS=4
+EPOCHS=25
+TRAIN_ENCODER=0   # whether to train the encoder using LoRA
+LORA_RANK=8
+LORA_ALPHA=16.0
+
+CUDA_PREFETCH=1
+DATA_IN_RAM=100
+TRAIN_PRELOAD_RAM_GB=16
+VAL_PRELOAD_RAM_GB="${VAL_PRELOAD_RAM_GB:-0}"
+LR="${LR:-2e-4}"
+BATCH_PREFETCH_DEPTH="${BATCH_PREFETCH_DEPTH:-2}"
+BATCHED_TRAJECTORY_CACHE_GB=16
+PREPROCESSED_CACHE_LAYOUT="${PREPROCESSED_CACHE_LAYOUT:-bundle}"
+UPGRADE_LEGACY_PREPROCESSED_CACHE="${UPGRADE_LEGACY_PREPROCESSED_CACHE:-1}"
+
 NUM_POS=100
 NUM_NEG=100
 POSITIVE_RATIO="${POSITIVE_RATIO:-0.7}"
-EPOCHS="${EPOCHS:-25}"
 
-LR="${LR:-2e-4}"
-IMAGE_SIZE="${IMAGE_SIZE:-128}"
+
 HORIZON="${HORIZON:-10}"
 DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE:-${HORIZON}}"
-ENCODER_BATCH_SIZE="${ENCODER_BATCH_SIZE:-64}"
-TRAIN_ENCODER="${TRAIN_ENCODER:-1}"
-LORA_RANK="${LORA_RANK:-8}"
-LORA_ALPHA="${LORA_ALPHA:-16.0}"
+
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
-PREPROCESSED_CACHE_DIR="${PREPROCESSED_CACHE_DIR:-${ROOT}/data/.lpb_score_preprocessed_cache}"
-USE_PREPROCESSED_CACHE="${USE_PREPROCESSED_CACHE:-1}"
-REFRESH_PREPROCESSED_CACHE="${REFRESH_PREPROCESSED_CACHE:-0}"
-STD_CLAMP_MIN="${STD_CLAMP_MIN:-0.05}"
-NOISE_SCALE="${NOISE_SCALE:-0.08}"
-TEMPORAL_KERNEL_SIZE="${TEMPORAL_KERNEL_SIZE:-3}"
+DDP_FIND_UNUSED="${DDP_FIND_UNUSED:-0}"
+DDP_STATIC_GRAPH="${DDP_STATIC_GRAPH:-1}"
+DDP_BUCKET_VIEW="${DDP_BUCKET_VIEW:-1}"
+USE_TMUX="${USE_TMUX:-1}"
+TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-${RUN_NAME}}"
+LOG_FILE="${LOG_FILE:-${SAVE_DIR}/train.log}"
 
 if [[ "${TRAIN_ENCODER}" == "1" ]]; then
   TRAIN_ENCODER_BOOL="true"
@@ -47,34 +55,34 @@ else
   TRAIN_ENCODER_BOOL="false"
 fi
 
-if [[ "${USE_PREPROCESSED_CACHE}" == "1" ]]; then
-  USE_PREPROCESSED_CACHE_BOOL="true"
+if [[ "${CUDA_PREFETCH}" == "1" ]]; then
+  CUDA_PREFETCH_BOOL="true"
 else
-  USE_PREPROCESSED_CACHE_BOOL="false"
+  CUDA_PREFETCH_BOOL="false"
 fi
 
-if [[ "${REFRESH_PREPROCESSED_CACHE}" == "1" ]]; then
-  REFRESH_PREPROCESSED_CACHE_BOOL="true"
+if [[ "${UPGRADE_LEGACY_PREPROCESSED_CACHE}" == "1" ]]; then
+  UPGRADE_LEGACY_PREPROCESSED_CACHE_BOOL="true"
 else
-  REFRESH_PREPROCESSED_CACHE_BOOL="false"
+  UPGRADE_LEGACY_PREPROCESSED_CACHE_BOOL="false"
 fi
 
-if [[ "${PERSISTENT_WORKERS}" == "1" ]]; then
-  PERSISTENT_WORKERS_BOOL="true"
+if [[ "${DDP_FIND_UNUSED}" == "1" ]]; then
+  DDP_FIND_UNUSED_BOOL="true"
 else
-  PERSISTENT_WORKERS_BOOL="false"
+  DDP_FIND_UNUSED_BOOL="false"
 fi
 
-if [[ "${PIN_MEMORY}" == "1" ]]; then
-  PIN_MEMORY_BOOL="true"
+if [[ "${DDP_STATIC_GRAPH}" == "1" ]]; then
+  DDP_STATIC_GRAPH_BOOL="true"
 else
-  PIN_MEMORY_BOOL="false"
+  DDP_STATIC_GRAPH_BOOL="false"
 fi
 
-if [[ "${CUDNN_BENCHMARK}" == "1" ]]; then
-  CUDNN_BENCHMARK_BOOL="true"
+if [[ "${DDP_BUCKET_VIEW}" == "1" ]]; then
+  DDP_BUCKET_VIEW_BOOL="true"
 else
-  CUDNN_BENCHMARK_BOOL="false"
+  DDP_BUCKET_VIEW_BOOL="false"
 fi
 
 
@@ -83,25 +91,95 @@ if [[ ! -f "${CKPT}" ]]; then
   exit 1
 fi
 
-export CUDA_VISIBLE_DEVICES="${GPU}"
+mkdir -p "${SAVE_DIR}"
 
-echo "[train_lpb_score_dsm] ROOT=${ROOT}"
+if [[ "${USE_TMUX}" == "1" && -z "${TMUX:-}" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "[train_lpb_score_dsm] tmux is not installed; falling back to direct launch." >&2
+  else
+    SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+    INNER_CMD="$(
+      printf '%q ' \
+        env \
+        USE_TMUX=0 \
+        GPU="${GPU}" \
+        SEED="${SEED}" \
+        BASE_SAVE_DIR="${BASE_SAVE_DIR}" \
+        TIMESTAMP="${TIMESTAMP}" \
+        RUN_NAME="${RUN_NAME}" \
+        SAVE_NAME="${SAVE_NAME}" \
+        SAVE_DIR="${SAVE_DIR}" \
+        CKPT="${CKPT}" \
+        CUDA_PREFETCH="${CUDA_PREFETCH}" \
+        DATA_IN_RAM="${DATA_IN_RAM}" \
+        POSITIVE_RATIO="${POSITIVE_RATIO}" \
+        HORIZON="${HORIZON}" \
+        DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE}" \
+        TRAIN_ENCODER="${TRAIN_ENCODER}" \
+        LORA_RANK="${LORA_RANK}" \
+        LORA_ALPHA="${LORA_ALPHA}" \
+        LORA_DROPOUT="${LORA_DROPOUT}" \
+        DDP_FIND_UNUSED="${DDP_FIND_UNUSED}" \
+        DDP_STATIC_GRAPH="${DDP_STATIC_GRAPH}" \
+        DDP_BUCKET_VIEW="${DDP_BUCKET_VIEW}" \
+        LOG_FILE="${LOG_FILE}" \
+        PYTHON_BIN="${PYTHON_BIN}" \
+        TORCHRUN_BIN="${TORCHRUN_BIN}" \
+        MASTER_PORT="${MASTER_PORT:-29501}" \
+        bash \
+        "${SCRIPT_PATH}" \
+        "$@"
+    )"
+    TRAIN_PANE_CMD="bash -lc '${INNER_CMD}; status=\$?; echo; echo \"[train_lpb_score_dsm] training exited with status=\${status}\"; exec bash'"
+    GPU_PANE_CMD="bash -lc 'while true; do clear; date; echo; nvidia-smi; sleep 1; done'"
+    SYS_PANE_CMD="bash -lc 'while true; do clear; date; echo; free -h; echo; ps -eo pid,ppid,%cpu,%mem,rss,cmd --sort=-rss | head -n 15; sleep 2; done'"
+    LOG_PANE_CMD="bash -lc 'touch \"${LOG_FILE}\"; tail -n 80 -f \"${LOG_FILE}\"'"
+
+    tmux new-session -d -s "${TMUX_SESSION_NAME}" "${TRAIN_PANE_CMD}"
+    tmux split-window -h -t "${TMUX_SESSION_NAME}:0.0" "${GPU_PANE_CMD}"
+    tmux split-window -v -t "${TMUX_SESSION_NAME}:0.1" "${SYS_PANE_CMD}"
+    tmux split-window -v -t "${TMUX_SESSION_NAME}:0.0" "${LOG_PANE_CMD}"
+    tmux select-layout -t "${TMUX_SESSION_NAME}:0" tiled >/dev/null
+    tmux select-pane -t "${TMUX_SESSION_NAME}:0.0"
+    echo "[train_lpb_score_dsm] launched tmux session=${TMUX_SESSION_NAME}"
+    echo "[train_lpb_score_dsm] log_file=${LOG_FILE}"
+    exec tmux attach-session -t "${TMUX_SESSION_NAME}"
+  fi
+fi
+
+export CUDA_VISIBLE_DEVICES="${GPU}"
+IFS=',' read -r -a GPU_IDS <<< "${GPU}"
+NUM_PROCS="${#GPU_IDS[@]}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+LOCAL_NUM_WORKERS="${NUM_WORKERS}"
+if [[ "${NUM_PROCS}" -gt 1 ]]; then
+  LOCAL_NUM_WORKERS="$(( (NUM_WORKERS + NUM_PROCS - 1) / NUM_PROCS ))"
+fi
+LOCAL_TRAIN_BATCH_BUILD_WORKERS="${TRAIN_BATCH_BUILD_WORKERS:-2}"
+
 echo "[train_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[train_lpb_score_dsm] save_dir=${SAVE_DIR}"
-echo "[train_lpb_score_dsm] train.num_pos_traj=${NUM_POS}"
-echo "[train_lpb_score_dsm] train.num_neg_traj=${NUM_NEG}"
-echo "[train_lpb_score_dsm] dataset.window_size=${DSM_WINDOW_SIZE}"
-echo "[train_lpb_score_dsm] training.batch_size=${BATCH_SIZE} policy.encoder_batch_size=${ENCODER_BATCH_SIZE} training.num_workers=${NUM_WORKERS}"
-echo "[train_lpb_score_dsm] training.prefetch_factor=${PREFETCH_FACTOR} training.persistent_workers=${PERSISTENT_WORKERS_BOOL} training.pin_memory=${PIN_MEMORY_BOOL}"
-echo "[train_lpb_score_dsm] training.cudnn_benchmark=${CUDNN_BENCHMARK_BOOL}"
-echo "[train_lpb_score_dsm] policy.trainable_encoder=${TRAIN_ENCODER_BOOL}"
-echo "[train_lpb_score_dsm] policy.lora={enabled=${TRAIN_ENCODER_BOOL}, rank=${LORA_RANK}, alpha=${LORA_ALPHA}, dropout=${LORA_DROPOUT}}"
-echo "[train_lpb_score_dsm] model.kernel_size=${TEMPORAL_KERNEL_SIZE}"
-echo "[train_lpb_score_dsm] data.preprocessed_cache_dir=${PREPROCESSED_CACHE_DIR}"
-echo "[train_lpb_score_dsm] data.use_preprocessed_cache=${USE_PREPROCESSED_CACHE_BOOL}"
-echo "[train_lpb_score_dsm] data.refresh_preprocessed_cache=${REFRESH_PREPROCESSED_CACHE_BOOL}"
+echo "[train_lpb_score_dsm] log_file=${LOG_FILE}"
+echo "[train_lpb_score_dsm] batch_size=${BATCH_SIZE} encoder_batch_size=${ENCODER_BATCH_SIZE} num_workers=${LOCAL_NUM_WORKERS}/rank num_procs=${NUM_PROCS}"
+echo "[train_lpb_score_dsm] window_size=${DSM_WINDOW_SIZE} num_pos=${NUM_POS} num_neg=${NUM_NEG} data_in_ram=${DATA_IN_RAM} cuda_prefetch=${CUDA_PREFETCH_BOOL}"
+echo "[train_lpb_score_dsm] train_preload_ram_gb=${TRAIN_PRELOAD_RAM_GB} val_preload_ram_gb=${VAL_PRELOAD_RAM_GB}"
+echo "[train_lpb_score_dsm] train_batch_build_workers=${LOCAL_TRAIN_BATCH_BUILD_WORKERS} batch_prefetch_depth=${BATCH_PREFETCH_DEPTH} batched_trajectory_cache_gb=${BATCHED_TRAJECTORY_CACHE_GB}"
+echo "[train_lpb_score_dsm] preprocessed_cache_layout=${PREPROCESSED_CACHE_LAYOUT} upgrade_legacy_preprocessed_cache=${UPGRADE_LEGACY_PREPROCESSED_CACHE_BOOL}"
+echo "[train_lpb_score_dsm] ddp_find_unused=${DDP_FIND_UNUSED_BOOL} ddp_static_graph=${DDP_STATIC_GRAPH_BOOL} ddp_bucket_view=${DDP_BUCKET_VIEW_BOOL}"
 
-"${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/train.py" \
+if [[ "${NUM_PROCS}" -le 1 ]]; then
+  LAUNCHER=("${PYTHON_BIN}")
+else
+  LAUNCHER=(
+    "${TORCHRUN_BIN}"
+    --standalone
+    --nproc_per_node="${NUM_PROCS}"
+    --master_port="${MASTER_PORT}"
+  )
+fi
+
+set -o pipefail
+"${LAUNCHER[@]}" "${ROOT}/robosuite/discriminator/lpb_score/train.py" \
   seed="${SEED}" \
   hydra.run.dir="${SAVE_DIR}" \
   save_name="${SAVE_NAME}" \
@@ -113,23 +191,25 @@ echo "[train_lpb_score_dsm] data.refresh_preprocessed_cache=${REFRESH_PREPROCESS
   policy.lora.rank="${LORA_RANK}" \
   policy.lora.alpha="${LORA_ALPHA}" \
   policy.lora.dropout="${LORA_DROPOUT}" \
-  data.image_size="${IMAGE_SIZE}" \
-  data.preprocessed_cache_dir="${PREPROCESSED_CACHE_DIR}" \
-  data.use_preprocessed_cache="${USE_PREPROCESSED_CACHE_BOOL}" \
-  data.refresh_preprocessed_cache="${REFRESH_PREPROCESSED_CACHE_BOOL}" \
   dataset.window_size="${DSM_WINDOW_SIZE}" \
-  model.kernel_size="${TEMPORAL_KERNEL_SIZE}" \
-  model.std_clamp_min="${STD_CLAMP_MIN}" \
-  model.noise_scale="${NOISE_SCALE}" \
   data.splits.train.num_pos_traj="${NUM_POS}" \
   data.splits.train.num_neg_traj="${NUM_NEG}" \
+  data.preprocessed_cache_layout="${PREPROCESSED_CACHE_LAYOUT}" \
+  data.upgrade_legacy_preprocessed_cache="${UPGRADE_LEGACY_PREPROCESSED_CACHE_BOOL}" \
   training.batch_size="${BATCH_SIZE}" \
-  training.num_workers="${NUM_WORKERS}" \
-  training.prefetch_factor="${PREFETCH_FACTOR}" \
-  training.persistent_workers="${PERSISTENT_WORKERS_BOOL}" \
-  training.pin_memory="${PIN_MEMORY_BOOL}" \
-  training.cudnn_benchmark="${CUDNN_BENCHMARK_BOOL}" \
+  training.num_workers="${LOCAL_NUM_WORKERS}" \
+  training.data_in_ram="${DATA_IN_RAM}" \
+  training.train_preload_ram_gb="${TRAIN_PRELOAD_RAM_GB}" \
+  training.val_preload_ram_gb="${VAL_PRELOAD_RAM_GB}" \
+  training.cuda_prefetch="${CUDA_PREFETCH_BOOL}" \
+  training.batch_prefetch_depth="${BATCH_PREFETCH_DEPTH}" \
+  training.train_batch_build_workers="${LOCAL_TRAIN_BATCH_BUILD_WORKERS}" \
+  training.batched_trajectory_cache_gb="${BATCHED_TRAJECTORY_CACHE_GB}" \
+  training.ddp_find_unused_parameters="${DDP_FIND_UNUSED_BOOL}" \
+  training.ddp_static_graph="${DDP_STATIC_GRAPH_BOOL}" \
+  training.ddp_gradient_as_bucket_view="${DDP_BUCKET_VIEW_BOOL}" \
+  training.run_validation=false \
   training.epochs="${EPOCHS}" \
   training.lr="${LR}" \
   training.positive_ratio="${POSITIVE_RATIO}" \
-  "$@"
+  "$@" 2>&1 | tee -a "${LOG_FILE}"

@@ -3,6 +3,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from contextlib import nullcontext
+
 from robosuite.policy.flow_multi.modules.encoders import build_image_encoder, build_proprio_tokenizer
 from robosuite.policy.flow_multi.modules.fusion import (
     build_condition_aggregator,
@@ -79,43 +81,50 @@ class MultiModalFlowPolicy(nn.Module):
         images: torch.Tensor,
         proprio: torch.Tensor,
         language: list[str] | tuple[str, ...] | str,
+        profiler=None,
     ) -> dict[str, torch.Tensor]:
         batch_size, num_cameras, channels, height, width = images.shape
         if num_cameras != len(self.camera_names):
             raise ValueError(f"Expected {len(self.camera_names)} cameras, got {num_cameras}")
 
-        flat_images = images.reshape(batch_size * num_cameras, channels, height, width)
-        if flat_images.device.type == "cuda":
-            flat_images = flat_images.contiguous(memory_format=torch.channels_last)
+        # DataParallel plus channels-last occasionally triggers misaligned-address
+        # failures in the ResNet stem on some driver / kernel combinations.
+        flat_images = images.reshape(batch_size * num_cameras, channels, height, width).contiguous()
         
         # pass through pretrained model
-        image_tokens = self.image_encoder(flat_images)
-        image_tokens = image_tokens.reshape(batch_size, num_cameras * image_tokens.shape[1], image_tokens.shape[2])
-        proprio_tokens = self.proprio_tokenizer(proprio)
-        language_tokens, language_global, language_mask = self.language_encoder(language)
+        with (profiler.section("flow_image_encoder") if profiler is not None else nullcontext()):
+            image_tokens = self.image_encoder(flat_images)
+            image_tokens = image_tokens.reshape(batch_size, num_cameras * image_tokens.shape[1], image_tokens.shape[2])
+        with (profiler.section("flow_proprio_tokenizer") if profiler is not None else nullcontext()):
+            proprio_tokens = self.proprio_tokenizer(proprio)
+        with (profiler.section("flow_language_encoder") if profiler is not None else nullcontext()):
+            language_tokens, language_global, language_mask = self.language_encoder(language, profiler=profiler)
 
         # language guided pre-processing
-        image_tokens, proprio_tokens = self.language_guided_modulation(
-            visual_tokens=image_tokens,
-            proprio_tokens=proprio_tokens,
-            language_global=language_global,
-        )
+        with (profiler.section("flow_language_modulation") if profiler is not None else nullcontext()):
+            image_tokens, proprio_tokens = self.language_guided_modulation(
+                visual_tokens=image_tokens,
+                proprio_tokens=proprio_tokens,
+                language_global=language_global,
+            )
 
         # language guided transformer
-        fused_tokens, token_padding_mask = self.fusion(
-            language_tokens=language_tokens,
-            language_mask=language_mask,
-            proprio_tokens=proprio_tokens,
-            image_tokens=image_tokens,
-            language_global=language_global,
-        )
+        with (profiler.section("flow_fusion") if profiler is not None else nullcontext()):
+            fused_tokens, token_padding_mask = self.fusion(
+                language_tokens=language_tokens,
+                language_mask=language_mask,
+                proprio_tokens=proprio_tokens,
+                image_tokens=image_tokens,
+                language_global=language_global,
+            )
 
         # condense all the information into one token for flow head
-        task_scene_cond = self.condition_aggregator(
-            fused_tokens=fused_tokens,
-            token_padding_mask=token_padding_mask,
-            language_global=language_global,
-        )
+        with (profiler.section("flow_condition_agg") if profiler is not None else nullcontext()):
+            task_scene_cond = self.condition_aggregator(
+                fused_tokens=fused_tokens,
+                token_padding_mask=token_padding_mask,
+                language_global=language_global,
+            )
 
         context_tokens = torch.cat([language_tokens, fused_tokens], dim=1)      # add language again
         context_padding_mask = torch.cat([~language_mask, token_padding_mask], dim=1)
@@ -131,8 +140,14 @@ class MultiModalFlowPolicy(nn.Module):
         images: torch.Tensor,
         proprio: torch.Tensor,
         language: list[str] | tuple[str, ...] | str,
+        profiler=None,
     ) -> torch.Tensor:
-        return self.encode_multimodal_context(images=images, proprio=proprio, language=language)["task_scene_cond"]
+        return self.encode_multimodal_context(
+            images=images,
+            proprio=proprio,
+            language=language,
+            profiler=profiler,
+        )["task_scene_cond"]
 
     def get_cond_features(
         self,

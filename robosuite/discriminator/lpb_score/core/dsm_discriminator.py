@@ -167,10 +167,12 @@ class DSMTransitionScorer:
         t_len = int(latents.shape[0])
         windows = np.zeros((t_len, self.window_size, self.latent_dim), dtype=np.float32)
         for t in range(t_len):
+            # Build causal windows: each step only sees current and past latents.
             start = max(0, t - self.window_size + 1)
             chunk = latents[start : t + 1]
             windows[t, -chunk.shape[0] :] = chunk
             if chunk.shape[0] < self.window_size:
+                # Left-pad the prefix with the first latent to keep fixed-length windows.
                 windows[t, : self.window_size - chunk.shape[0]] = latents[0]
         return windows
 
@@ -366,6 +368,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         task_name: str,
     ) -> dict[str, np.ndarray | dict[str, np.ndarray]]:
         t3_stats = self._resolve_t3_norm_stats(task_name)
+        # T3 score = alpha * z(positive_energy) - beta * z(margin).
         alpha_terms = {
             "chunk_energy": (
                 self.t3_alpha["chunk_energy"]
@@ -433,6 +436,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         full_prefix = window <= 0
 
         if self.lambda_mode == "mean":
+            # Mean mode smooths step scores into a running average alarm signal.
             if full_prefix:
                 csum = np.cumsum(vals, dtype=np.float64)
                 denom = np.arange(1, n + 1, dtype=np.float64)
@@ -447,6 +451,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
             denom = (idx - start + 1).astype(np.float64)
             return (win_sum / denom).astype(np.float32)
 
+        # Max mode tracks worst-case evidence over the configured support window.
         if full_prefix:
             return np.maximum.accumulate(vals)
         return self._rolling_max(vals, window=window)
@@ -697,6 +702,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
                 should_update = (t + 1) > warmup and ((t + 1 - warmup) % update_every == 0)
                 if should_update:
                     label = int(labels_np[t])
+                    # Increase delta when missing failures, decrease when over-triggering.
                     if label == 1 and pred == 0:
                         cur_delta += self.delta_step
                     elif label == 0 and pred == 1:

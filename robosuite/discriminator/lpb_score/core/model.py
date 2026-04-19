@@ -1,8 +1,10 @@
-"""Single-head chunk DSM with LoRA encoder tuning and temporal Conv1d aggregation."""
+"""Window-conditioned denoising score matching model for trajectory scoring."""
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Sequence
+from contextlib import nullcontext
+import time
+from typing import Any, Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
@@ -24,6 +26,8 @@ def _cfg_get(cfg: Any, key: str, default=None):
 
 
 class AdaLNModulation(nn.Module):
+    """Generate adaptive shift/scale parameters from a condition embedding."""
+
     def __init__(self, cond_dim: int, embed_dim: int) -> None:
         super().__init__()
         self.linear = nn.Linear(cond_dim, 2 * embed_dim)
@@ -36,6 +40,8 @@ class AdaLNModulation(nn.Module):
 
 
 class AdaLNTemporalConvBlock(nn.Module):
+    """Temporal convolution block modulated by task and trajectory type."""
+
     def __init__(
         self,
         embed_dim: int,
@@ -66,6 +72,8 @@ class AdaLNTemporalConvBlock(nn.Module):
 
 
 class ChunkConditionedDSM(nn.Module):
+    """Predict a clean latent window from a noisy window under task conditioning."""
+
     def __init__(
         self,
         latent_dim: int,
@@ -227,6 +235,7 @@ class ChunkConditionedDSM(nn.Module):
             traj_type=traj_type_tensor,
             task_index=task_index_tensor,
         )
+        # Conditioned temporal blocks denoise each latent token in the window.
         hidden = self.input_proj(latent_window_input).transpose(1, 2)
         for block in self.blocks:
             hidden = block(hidden, cond)
@@ -240,6 +249,8 @@ JointManifoldDenoiser = ChunkConditionedDSM
 
 
 class DSMModel(nn.Module):
+    """Joint wrapper around the policy encoder and the chunk-level DSM predictor."""
+
     def __init__(
         self,
         predictor: ChunkConditionedDSM,
@@ -307,11 +318,7 @@ class DSMModel(nn.Module):
         return torch.clamp(torch.sqrt(self.latent_var), min=float(self.std_clamp_min))
 
     def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        latent_mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype)
-        latent_std = self.latent_std.to(device=latent.device, dtype=latent.dtype)
-        shape = [1] * latent.ndim
-        shape[-1] = self.latent_dim
-        return (latent - latent_mean.view(*shape)) / latent_std.view(*shape)
+        return latent
 
     def flatten_latent_window(self, latent_window: torch.Tensor) -> torch.Tensor:
         if latent_window.ndim != 3:
@@ -325,13 +332,6 @@ class DSMModel(nn.Module):
                 f"latent_window dim mismatch: expected {self.latent_dim}, got {latent_window.shape[2]}"
             )
         return latent_window.reshape(latent_window.shape[0], self.chunk_dim)
-
-    def add_noise(self, *, chunk_clean: torch.Tensor) -> dict[str, torch.Tensor]:
-        chunk_noise = torch.randn_like(chunk_clean) * float(self.noise_scale)
-        return {
-            "chunk_input": chunk_clean + chunk_noise,
-            "chunk_noise": chunk_noise,
-        }
 
     @staticmethod
     def _require_traj_type(batch_size: int, traj_type: torch.Tensor | int, device: torch.device) -> torch.Tensor:
@@ -373,7 +373,9 @@ class DSMModel(nn.Module):
         image_window: torch.Tensor,
         proprio_window: torch.Tensor,
         task_index: torch.Tensor | int,
+        profiler: Any | None = None,
     ) -> torch.Tensor:
+        """Encode a batch of temporal windows into latent features."""
         if image_window.ndim != 6:
             raise ValueError(f"Expected image_window shape (B,W,V,3,H,W), got {tuple(image_window.shape)}")
         if proprio_window.ndim != 3:
@@ -401,12 +403,15 @@ class DSMModel(nn.Module):
             int(image_window.shape[5]),
         )
         proprio_flat = proprio_window.reshape(batch_size * self.window_size, int(proprio_window.shape[2]))
-        task_names = self._task_names_from_index(task_index=task_index_tensor, repeat_each=self.window_size)
-        latents_flat = self.policy_encoder.encode_context_tensors(
-            images=images_flat,
-            proprio=proprio_flat,
-            task_names=task_names,
-        )
+        with (profiler.section("task_name_build") if profiler is not None else nullcontext()):
+            task_names = self._task_names_from_index(task_index=task_index_tensor, repeat_each=self.window_size)
+        with (profiler.section("encoder_total") if profiler is not None else nullcontext()):
+            latents_flat = self.policy_encoder.encode_context_tensors(
+                images=images_flat,
+                proprio=proprio_flat,
+                task_names=task_names,
+                profiler=profiler,
+            )
         return latents_flat.reshape(batch_size, self.window_size, self.latent_dim)
 
     def encode_trajectory(
@@ -417,7 +422,10 @@ class DSMModel(nn.Module):
         task_index: torch.Tensor | int,
         batch_size: int | None = None,
     ) -> torch.Tensor:
-        image_tensor = torch.as_tensor(images, dtype=torch.float32, device=self.latent_mean.device)
+        if torch.is_tensor(images):
+            image_tensor = images.to(device=self.latent_mean.device)
+        else:
+            image_tensor = torch.as_tensor(images, device=self.latent_mean.device)
         proprio_tensor = torch.as_tensor(proprio, dtype=torch.float32, device=self.latent_mean.device)
         if image_tensor.ndim != 5 or proprio_tensor.ndim != 2:
             raise ValueError("encode_trajectory expects images (T,V,3,H,W) and proprio (T,P).")
@@ -451,15 +459,20 @@ class DSMModel(nn.Module):
         *,
         batch_size: int | None = None,
         min_variance: float = 1e-6,
+        progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Estimate latent statistics over positive trajectories for calibration."""
         was_training = self.training
         self.eval()
 
         latent_sum = torch.zeros((self.latent_dim,), dtype=torch.float64, device=self.latent_mean.device)
         latent_sq_sum = torch.zeros((self.latent_dim,), dtype=torch.float64, device=self.latent_mean.device)
         latent_count = 0
+        trajectory_list = list(trajectories)
+        total_trajectories = int(len(trajectory_list))
+        start_time = time.perf_counter()
 
-        for traj in trajectories:
+        for traj_idx, traj in enumerate(trajectory_list, start=1):
             latents = self.encode_trajectory(
                 images=traj.images,
                 proprio=traj.proprio,
@@ -469,6 +482,8 @@ class DSMModel(nn.Module):
             latent_sum += latents.sum(dim=0)
             latent_sq_sum += torch.square(latents).sum(dim=0)
             latent_count += int(latents.shape[0])
+            if progress_callback is not None:
+                progress_callback(int(traj_idx), int(total_trajectories), float(time.perf_counter() - start_time))
 
         if was_training:
             self.train()
@@ -509,7 +524,9 @@ class DSMModel(nn.Module):
         traj_type: torch.Tensor | int,
         task_index: torch.Tensor | int,
         add_noise: bool = False,
+        profiler: Any | None = None,
     ) -> dict[str, torch.Tensor]:
+        # DSM training perturbs clean latent windows and learns to reconstruct the clean target.
         latent_window_clean = self.normalize_latent(latent_window)
         latent_window_input = latent_window_clean
         latent_window_noise = torch.zeros_like(latent_window_clean)
@@ -531,11 +548,12 @@ class DSMModel(nn.Module):
             device=latent_window.device,
         )
 
-        preds = self.predictor(
-            latent_window_input=latent_window_input,
-            traj_type=traj_type_tensor,
-            task_index=task_index_tensor,
-        )
+        with (profiler.section("predictor") if profiler is not None else nullcontext()):
+            preds = self.predictor(
+                latent_window_input=latent_window_input,
+                traj_type=traj_type_tensor,
+                task_index=task_index_tensor,
+            )
         latent_window_hat = preds["latent_window_hat"]
         return {
             "latent_window": latent_window,
@@ -558,54 +576,24 @@ class DSMModel(nn.Module):
         traj_type: torch.Tensor | int,
         task_index: torch.Tensor | int,
         add_noise: bool = False,
+        profiler: Any | None = None,
     ) -> dict[str, torch.Tensor]:
         latent_window = self.encode_latent_window(
             image_window=image_window,
             proprio_window=proprio_window,
             task_index=task_index,
+            profiler=profiler,
         )
         out = self.forward_from_latent_window(
             latent_window=latent_window,
             traj_type=traj_type,
             task_index=task_index,
             add_noise=add_noise,
+            profiler=profiler,
         )
         out["image_window"] = image_window
         out["proprio_window"] = proprio_window
         return out
-
-    def compute_dsm_loss(
-        self,
-        image_window: torch.Tensor,
-        proprio_window: torch.Tensor,
-        traj_type: torch.Tensor,
-        task_index: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        out = self.forward(
-            image_window=image_window,
-            proprio_window=proprio_window,
-            traj_type=traj_type,
-            task_index=task_index,
-            add_noise=True,
-        )
-        recon = self.reconstruction_components(
-            chunk_clean=out["chunk_clean"],
-            chunk_hat=out["chunk_hat"],
-        )
-        loss = recon["chunk_energy_per_sample"].mean()
-        return {
-            "loss": loss,
-            "score": loss,
-            "unweighted_score": loss,
-            "chunk_mse": recon["chunk_mse_per_sample"].mean(),
-            "chunk_energy": recon["chunk_energy_per_sample"].mean(),
-            "latent_window": out["latent_window"],
-            "traj_type": out["traj_type"],
-            "task_index": out["task_index"],
-            "chunk_clean": out["chunk_clean"],
-            "chunk_input": out["chunk_input"],
-            "chunk_hat": out["chunk_hat"],
-        }
 
     def compute_fisher_score_from_latent_window(
         self,
@@ -613,6 +601,7 @@ class DSMModel(nn.Module):
         latent_window: torch.Tensor,
         task_index: torch.Tensor | int,
     ) -> dict[str, torch.Tensor]:
+        # Evaluate the same latent window with positive vs negative trajectory-type conditions.
         pos_out = self.forward_from_latent_window(
             latent_window=latent_window,
             traj_type=0,
@@ -633,6 +622,7 @@ class DSMModel(nn.Module):
             chunk_clean=pos_out["chunk_clean"],
             chunk_hat=neg_out["chunk_hat"],
         )
+        # Margin > 0 means the negative-conditioned branch reconstructs worse than positive.
         chunk_margin = neg_recon["chunk_energy_per_sample"] - pos_recon["chunk_energy_per_sample"]
         return {
             "chunk_positive_energy_per_sample": pos_recon["chunk_energy_per_sample"],
@@ -644,23 +634,6 @@ class DSMModel(nn.Module):
             "chunk_pos_hat": pos_out["chunk_hat"],
             "chunk_neg_hat": neg_out["chunk_hat"],
         }
-
-    def compute_fisher_score(
-        self,
-        *,
-        image_window: torch.Tensor,
-        proprio_window: torch.Tensor,
-        task_index: torch.Tensor | int,
-    ) -> dict[str, torch.Tensor]:
-        latent_window = self.encode_latent_window(
-            image_window=image_window,
-            proprio_window=proprio_window,
-            task_index=task_index,
-        )
-        return self.compute_fisher_score_from_latent_window(
-            latent_window=latent_window,
-            task_index=task_index,
-        )
 
 
 def build_unified_conditioned_dsm(

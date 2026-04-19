@@ -27,6 +27,8 @@ data:
   preprocessed_cache_dir: "./data/.lpb_score_preprocessed_cache"
   use_preprocessed_cache: true
   refresh_preprocessed_cache: false
+  preprocessed_cache_layout: "bundle"
+  upgrade_legacy_preprocessed_cache: true
   splits:
     train: {num_pos_traj: 360, num_neg_traj: 180}
     val: {num_pos_traj: 30, num_neg_traj: 15}
@@ -81,11 +83,35 @@ training:
   shared_lr_multiplier: 1.0
   chunk_branch_lr_multiplier: 1.0
   encoder_branch_lr_multiplier: 1.0
-  normalization_batch_size: 256
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 4
+  input_pipeline: "batched_iterator"
+  val_input_pipeline: "legacy_dataloader"
+  batch_prefetch_depth: 2
+  train_prefetch_pinned: true
+  train_prefetch_thread: true
+  train_batch_build_workers: 2
+  cuda_prefetch: true
+  batched_trajectory_cache_gb: 4
+  data_in_ram: 0
+  train_preload_ram_gb: 0.0
+  val_preload_ram_gb: 0.0
+  run_validation: false
+  amp_enabled: true
+  amp_dtype: "bf16"
+  matmul_precision: "high"
   cudnn_benchmark: true
+  # DDP runtime tuning: keep these fast-path defaults unless debugging gradients.
+  ddp_find_unused_parameters: false
+  ddp_static_graph: true
+  ddp_gradient_as_bucket_view: true
+  profile_enabled: false
+  profile_log_every: 20
+  profile_warmup_steps: 0
+  profile_cuda_sync: true
+  profile_first_step_immediate: true
+  profile_norm_progress_every: 10
   # EMA shadow weights: ema <- decay * ema + (1 - decay) * online after each step.
   use_ema: false
   ema_decay: 0.999

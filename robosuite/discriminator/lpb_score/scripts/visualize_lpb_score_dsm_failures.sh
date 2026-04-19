@@ -6,25 +6,20 @@ ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
-DSM_CKPT="${DSM_CKPT:-checkpoints/multitask_6/lpb_dipole-new-v3/lpb_dipole_dsm_20260417_005436/lpb_dipole_dsm_20260417_005436.pt}"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v4/lpb_dipole_dsm_20260419_004434/lpb_dipole_dsm_20260419_004434.pt"
 SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v4/visualize}"
 NUM_VIDEOS=12
 
 BANK_SIZE=100
-VIS_DATA_SOURCE="fail_rollout"  # suboptimal | expert | success_rollout | fail_rollout
-SCORE_MODE="t3_weighted_combo"   # only supported score
+VIS_DATA_SOURCE="fail_rollout"    # suboptimal | expert | success_rollout | fail_rollout
+SCORE_MODE="t3_weighted_combo"    # only supported score
 
 # ---------------------------------------
 # chunk energy
-ALPHA_STATE=1
-ALPHA="${ALPHA:-${ALPHA_STATE}}"
-
-# chunk margin
-BETA_STATE=1
-BETA="${BETA:-${BETA_STATE}}"
+ALPHA=1
+BETA=1
 
 # threshold
-# NOTE: 5-8% should be better
 DELTA_THRESHOLD=8
 
 LAMBDA_MODE="mean"  # mean | max

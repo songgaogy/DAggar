@@ -45,7 +45,6 @@ from .core import (
     estimate_trajectories_nbytes,
     filter_refs_by_data_types,
     prepare_trajectories,
-    print_split_summary,
     resolve_window_size,
 )
 
@@ -67,7 +66,6 @@ __all__ = [
     "PreparedTrajectory",
     "LatentTransitionDataset",
     "build_split_refs",
-    "print_split_summary",
     "filter_refs_by_data_types",
     "prepare_trajectories",
     "estimate_trajectories_nbytes",

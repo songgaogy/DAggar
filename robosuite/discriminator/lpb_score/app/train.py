@@ -1,11 +1,11 @@
-"""Hydra training entry for the joint encoder + chunk DSM pipeline."""
+"""Training entrypoint for the window-conditioned DSM model."""
 
 from __future__ import annotations
 
 import os
 
-import numpy as np
 import torch
+import torch.distributed as dist
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
@@ -17,7 +17,6 @@ from robosuite.discriminator.lpb_score.app.pipeline import (
 from robosuite.discriminator.lpb_score.core.dataset import (
     LatentTransitionDataset,
     build_split_refs,
-    print_split_summary,
     resolve_window_size,
 )
 from robosuite.discriminator.lpb_score.core.model import MODEL_ARCHITECTURE, DSMModel, build_dsm_model
@@ -26,16 +25,6 @@ from robosuite.discriminator.lpb_score.core.trainer import Trainer, TrainerConfi
 
 def _task_names_from_index(task_to_index: dict[str, int]) -> list[str]:
     return [name for name, _ in sorted(task_to_index.items(), key=lambda item: int(item[1]))]
-
-
-def _normalize_stats_to_numpy(normalization_stats: dict[str, torch.Tensor | np.ndarray]) -> dict[str, np.ndarray]:
-    out: dict[str, np.ndarray] = {}
-    for key, value in normalization_stats.items():
-        if torch.is_tensor(value):
-            out[key] = value.detach().cpu().numpy()
-        else:
-            out[key] = np.asarray(value)
-    return out
 
 
 def _cfg_value(cfg: object, key: str, default):
@@ -61,7 +50,6 @@ def _build_payload(
     task_to_index: dict[str, int],
     split_summary: dict[str, dict[str, dict[str, int]]],
     epoch: int,
-    normalization_stats: dict[str, torch.Tensor | np.ndarray],
     policy_checkpoint_payload: dict,
     model_online_state: dict | None = None,
 ) -> dict:
@@ -79,7 +67,6 @@ def _build_payload(
         "split_summary": split_summary,
         "image_size": int(model.policy_encoder.image_size),
         "epoch": int(epoch),
-        "normalization_stats": _normalize_stats_to_numpy(normalization_stats),
         "policy_checkpoint_payload": policy_checkpoint_payload,
     }
     if model_online_state is not None:
@@ -92,6 +79,12 @@ def _build_trainer(
     model: DSMModel,
     train_dataset: LatentTransitionDataset,
     val_dataset: LatentTransitionDataset | None,
+    *,
+    device: str,
+    distributed: bool,
+    distributed_rank: int,
+    distributed_world_size: int,
+    distributed_local_rank: int,
 ) -> Trainer:
     trainer_cfg = TrainerConfig(
         batch_size=int(cfg.training.batch_size),
@@ -102,7 +95,7 @@ def _build_trainer(
         positive_sampling_ratio=float(cfg.training.positive_ratio),
         grad_clip_norm=float(cfg.training.grad_clip_norm),
         log_every=int(cfg.training.log_every),
-        device=str(cfg.training.device),
+        device=str(device),
         use_ema=bool(getattr(cfg.training, "use_ema", False)),
         ema_decay=float(getattr(cfg.training, "ema_decay", 0.999)),
         val_use_ema=bool(getattr(cfg.training, "val_use_ema", True)),
@@ -110,41 +103,94 @@ def _build_trainer(
         shared_lr_multiplier=float(getattr(cfg.training, "shared_lr_multiplier", 1.0)),
         chunk_branch_lr_multiplier=float(getattr(cfg.training, "chunk_branch_lr_multiplier", 1.0)),
         encoder_branch_lr_multiplier=float(getattr(cfg.training, "encoder_branch_lr_multiplier", 1.0)),
-        normalization_batch_size=int(getattr(cfg.training, "normalization_batch_size", 256)),
         pin_memory=bool(getattr(cfg.training, "pin_memory", True)),
         persistent_workers=bool(getattr(cfg.training, "persistent_workers", True)),
         prefetch_factor=int(getattr(cfg.training, "prefetch_factor", 4)),
+        profile_enabled=bool(getattr(cfg.training, "profile_enabled", False)),
+        profile_log_every=int(getattr(cfg.training, "profile_log_every", 20)),
+        profile_warmup_steps=int(getattr(cfg.training, "profile_warmup_steps", 0)),
+        profile_cuda_sync=bool(getattr(cfg.training, "profile_cuda_sync", True)),
+        profile_first_step_immediate=bool(getattr(cfg.training, "profile_first_step_immediate", True)),
+        profile_norm_progress_every=int(getattr(cfg.training, "profile_norm_progress_every", 10)),
+        input_pipeline=str(getattr(cfg.training, "input_pipeline", "batched_iterator")),
+        val_input_pipeline=str(getattr(cfg.training, "val_input_pipeline", "legacy_dataloader")),
+        batch_prefetch_depth=int(getattr(cfg.training, "batch_prefetch_depth", 2)),
+        train_prefetch_pinned=bool(getattr(cfg.training, "train_prefetch_pinned", True)),
+        train_prefetch_thread=bool(getattr(cfg.training, "train_prefetch_thread", True)),
+        train_batch_build_workers=int(getattr(cfg.training, "train_batch_build_workers", 4)),
+        cuda_prefetch=bool(getattr(cfg.training, "cuda_prefetch", True)),
+        batched_trajectory_cache_gb=float(getattr(cfg.training, "batched_trajectory_cache_gb", 8.0)),
+        amp_enabled=bool(getattr(cfg.training, "amp_enabled", True)),
+        amp_dtype=str(getattr(cfg.training, "amp_dtype", "bf16")),
+        seed=int(cfg.seed),
+        distributed=bool(distributed),
+        distributed_rank=int(distributed_rank),
+        distributed_world_size=int(distributed_world_size),
+        distributed_local_rank=int(distributed_local_rank),
+        ddp_find_unused_parameters=bool(getattr(cfg.training, "ddp_find_unused_parameters", False)),
+        ddp_static_graph=bool(getattr(cfg.training, "ddp_static_graph", True)),
+        ddp_gradient_as_bucket_view=bool(getattr(cfg.training, "ddp_gradient_as_bucket_view", True)),
     )
     return Trainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         config=trainer_cfg,
-        device=str(cfg.training.device),
+        device=str(device),
     )
 
 
+def _distributed_context(cfg: DictConfig) -> tuple[bool, int, int, int, str]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+    if distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        return True, rank, world_size, local_rank, device
+    return False, 0, 1, 0, str(cfg.training.device)
+
+
 def run_train(cfg: DictConfig) -> None:
+    distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    is_main_process = True
     seed = int(cfg.seed)
-    torch.manual_seed(seed)
-    if bool(getattr(cfg.training, "cudnn_benchmark", True)) and torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    encoder = build_flow_encoder(cfg)
-
     try:
+        distributed, rank, world_size, local_rank, resolved_device = _distributed_context(cfg)
+        is_main_process = rank == 0
+        full_seed = seed + rank
+        torch.manual_seed(full_seed)
+        matmul_precision = str(getattr(cfg.training, "matmul_precision", "high"))
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision(matmul_precision)
+        if bool(getattr(cfg.training, "cudnn_benchmark", True)) and torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(full_seed)
+
+        encoder = build_flow_encoder(cfg, device_override=resolved_device)
+        skip_validation = not bool(getattr(cfg.training, "run_validation", False))
+
         split_refs, split_summary, task_to_index = build_split_refs(
             cfg_data=cfg.data,
             seed=seed,
+            include_val=not skip_validation,
         )
-        print_split_summary(split_summary)
         datasets = build_training_datasets(
             cfg=cfg,
             split_refs=split_refs,
             encoder=encoder,
             task_to_index=task_to_index,
+            build_val_dataset=not skip_validation,
+            replica_count=world_size,
         )
         train_dataset = datasets.train_dataset
         val_dataset = datasets.val_dataset
@@ -157,23 +203,30 @@ def run_train(cfg: DictConfig) -> None:
         lora_enabled = bool(_cfg_value(lora_cfg, "enabled", False))
         kernel_size = int(_cfg_value(cfg.model, "kernel_size", 3))
 
-        print(
-            f"[lpb_score] train_windows={len(train_dataset)} "
-            f"positive_samples={train_dataset.num_positive_samples} "
-            f"negative_samples={train_dataset.num_negative_samples} "
-            f"num_train_trajectories={len(train_refs)} "
-            f"latent_dim={encoder.latent_dim} window_size={window_size} "
-            f"trainable_encoder={bool(getattr(cfg.policy, 'trainable_encoder', False))} "
-            f"lora_enabled={lora_enabled} lora_rank={lora_rank} "
-            f"kernel_size={kernel_size}"
-        )
-        if val_dataset is not None:
+        if is_main_process:
             print(
-                f"[lpb_score] val_windows={len(val_dataset)} "
-                f"positive_samples={val_dataset.num_positive_samples} "
-                f"negative_samples={val_dataset.num_negative_samples} "
-                f"num_val_trajectories={len(val_refs)}"
+                f"[lpb_score] train_windows={len(train_dataset)} "
+                f"positive_samples={train_dataset.num_positive_samples} "
+                f"negative_samples={train_dataset.num_negative_samples} "
+                f"num_train_trajectories={len(train_refs)} "
+                f"latent_dim={encoder.latent_dim} window_size={window_size} "
+                f"storage={'in_memory' if train_dataset.uses_in_memory_trajectories else 'cached_refs'} "
+                f"resident={train_dataset.num_resident_trajectories} "
+                f"trainable_encoder={bool(getattr(cfg.policy, 'trainable_encoder', False))} "
+                f"lora_enabled={lora_enabled} lora_rank={lora_rank} "
+                f"kernel_size={kernel_size} "
+                f"distributed={distributed} world_size={world_size} "
+                f"validation={'enabled' if not skip_validation else 'disabled'}"
             )
+            if val_dataset is not None:
+                print(
+                    f"[lpb_score] val_windows={len(val_dataset)} "
+                    f"positive_samples={val_dataset.num_positive_samples} "
+                    f"negative_samples={val_dataset.num_negative_samples} "
+                    f"num_val_trajectories={len(val_refs)} "
+                    f"storage={'in_memory' if val_dataset.uses_in_memory_trajectories else 'cached_refs'} "
+                    f"resident={val_dataset.num_resident_trajectories}"
+                )
 
         model = build_dsm_model(
             latent_dim=int(encoder.latent_dim),
@@ -187,26 +240,27 @@ def run_train(cfg: DictConfig) -> None:
         encoder_total, encoder_trainable = _parameter_counts(model.policy_encoder)
         model_ratio = 0.0 if model_total <= 0 else float(model_trainable) / float(model_total)
         encoder_ratio = 0.0 if encoder_total <= 0 else float(encoder_trainable) / float(encoder_total)
-        print(
-            f"[lpb_score] trainable_params model={model_trainable}/{model_total} "
-            f"({100.0 * model_ratio:.4f}%) encoder={encoder_trainable}/{encoder_total} "
-            f"({100.0 * encoder_ratio:.4f}%)"
-        )
+        if is_main_process:
+            print(
+                f"[lpb_score] trainable_params model={model_trainable}/{model_total} "
+                f"({100.0 * model_ratio:.4f}%) encoder={encoder_trainable}/{encoder_total} "
+                f"({100.0 * encoder_ratio:.4f}%)"
+            )
         trainer = _build_trainer(
             cfg=cfg,
             model=model,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
+            device=resolved_device,
+            distributed=distributed,
+            distributed_rank=rank,
+            distributed_world_size=world_size,
+            distributed_local_rank=local_rank,
         )
-        if bool(getattr(cfg.training, "use_ema", False)):
-            print(
-                f"[lpb_score] EMA enabled decay={float(getattr(cfg.training, 'ema_decay', 0.999))} "
-                f"val_use_ema={bool(getattr(cfg.training, 'val_use_ema', True))} "
-                f"save_ema_in_checkpoint={bool(getattr(cfg.training, 'save_ema_in_checkpoint', True))}"
-            )
 
         save_dir = to_absolute_path(str(cfg.save_dir))
-        os.makedirs(save_dir, exist_ok=True)
+        if is_main_process:
+            os.makedirs(save_dir, exist_ok=True)
         if str(cfg.save_name) in {"", "None", "null"}:
             save_name = f"lpb_score_dsm_{now_tag()}.pt"
         else:
@@ -230,7 +284,6 @@ def run_train(cfg: DictConfig) -> None:
                 task_to_index=task_to_index,
                 split_summary=split_summary,
                 epoch=epoch,
-                normalization_stats=trainer.checkpoint_normalization_stats(),
                 policy_checkpoint_payload=policy_checkpoint_payload,
                 model_online_state=online_sd,
             )
@@ -242,20 +295,25 @@ def run_train(cfg: DictConfig) -> None:
             save_callback=_save_periodic,
         )
 
-        primary_sd, online_sd = trainer.checkpoint_state_dicts()
-        final_payload = _build_payload(
-            model_state=primary_sd,
-            history=history,
-            cfg=cfg,
-            model=model,
-            task_to_index=task_to_index,
-            split_summary=split_summary,
-            epoch=int(cfg.training.epochs),
-            normalization_stats=trainer.checkpoint_normalization_stats(),
-            policy_checkpoint_payload=policy_checkpoint_payload,
-            model_online_state=online_sd,
-        )
-        torch.save(final_payload, save_path_final)
-        print(f"[lpb_score] Saved final checkpoint to: {save_path_final}")
+        if distributed:
+            dist.barrier()
+        if is_main_process:
+            primary_sd, online_sd = trainer.checkpoint_state_dicts()
+            final_payload = _build_payload(
+                model_state=primary_sd,
+                history=history,
+                cfg=cfg,
+                model=model,
+                task_to_index=task_to_index,
+                split_summary=split_summary,
+                epoch=int(cfg.training.epochs),
+                policy_checkpoint_payload=policy_checkpoint_payload,
+                model_online_state=online_sd,
+            )
+            torch.save(final_payload, save_path_final)
+            print(f"[lpb_score] Saved final checkpoint to: {save_path_final}")
     finally:
-        encoder.close()
+        if "encoder" in locals():
+            encoder.close()
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()

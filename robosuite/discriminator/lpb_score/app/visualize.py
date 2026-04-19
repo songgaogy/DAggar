@@ -37,7 +37,6 @@ from robosuite.discriminator.lpb_score.core.dataset import (
     PreparedTrajectory,
     build_split_refs,
     prepare_trajectories,
-    print_split_summary,
     resolve_preprocessed_cache_root,
 )
 from robosuite.discriminator.utils.types import VideoRenderRecord
@@ -95,7 +94,10 @@ def _sample_refs(
     """Choose a reproducible subset of trajectories to render."""
     if not refs:
         return []
-    num = min(len(refs), max(1, int(num_samples)))
+    requested = int(num_samples)
+    if requested <= 0:
+        return []
+    num = min(len(refs), requested)
     rng = np.random.default_rng(int(seed))
     indices = rng.choice(len(refs), size=num, replace=False)
     indices = np.sort(indices)
@@ -151,8 +153,6 @@ def _save_failure_plot_pdf(
     fps: int,
     frame_scores: np.ndarray,
     frame_thresholds: np.ndarray,
-    frame_scores_by_mode: dict[str, np.ndarray],
-    frame_thresholds_by_mode: dict[str, np.ndarray],
     active_score_mode: str,
     t3_alpha: dict[str, float],
     t3_beta: dict[str, float],
@@ -699,7 +699,6 @@ def _load_visualization_targets(
             refs=selected_fail_refs,
             encoder=encoder,
             task_to_index=task_to_index,
-            progress_label="preload_visualize_targets",
             cache_root=cache_root,
             use_preprocessed_cache=use_preprocessed_cache,
             refresh_preprocessed_cache=refresh_preprocessed_cache,
@@ -774,6 +773,7 @@ def _load_visualization_targets(
 
 
 def run_visualize(cfg: DictConfig) -> None:
+    """Calibrate the detector, render failure videos, and dump run artifacts."""
     detector = None
     encoder = None
 
@@ -782,11 +782,11 @@ def run_visualize(cfg: DictConfig) -> None:
         encoder = detector.extractor.encoder
         cache_root, use_preprocessed_cache, refresh_preprocessed_cache = _resolve_preprocessed_cache_settings(cfg)
 
+        # Build split indices and sample a success bank used for threshold calibration.
         split_refs, split_summary, task_to_index = build_split_refs(
             cfg_data=cfg.data,
             seed=int(cfg.seed),
         )
-        print_split_summary(split_summary)
         bank_refs = select_split_refs(
             split_refs=split_refs,
             split_name=str(cfg.eval.bank_split),
@@ -807,7 +807,6 @@ def run_visualize(cfg: DictConfig) -> None:
             refs=sampled_bank_refs,
             encoder=encoder,
             task_to_index=task_to_index,
-            progress_label="preload_bank",
             cache_root=cache_root,
             use_preprocessed_cache=use_preprocessed_cache,
             refresh_preprocessed_cache=refresh_preprocessed_cache,
@@ -824,12 +823,12 @@ def run_visualize(cfg: DictConfig) -> None:
             refs=fail_distribution_refs,
             encoder=encoder,
             task_to_index=task_to_index,
-            progress_label="preload_fail_distribution",
             cache_root=cache_root,
             use_preprocessed_cache=use_preprocessed_cache,
             refresh_preprocessed_cache=refresh_preprocessed_cache,
         )
 
+        # Load trajectories that will be visualized (suboptimal pool or fail-eval split).
         selected_refs, target_trajectories, gt_label_sequences, target_summary = _load_visualization_targets(
             cfg,
             encoder=encoder,
@@ -841,11 +840,13 @@ def run_visualize(cfg: DictConfig) -> None:
             use_preprocessed_cache=use_preprocessed_cache,
             refresh_preprocessed_cache=refresh_preprocessed_cache,
         )
+        # Fit detector statistics once, then reuse for all rendered trajectories.
         calibration_summary = detector.fit(
             normal_bank_trajectories=bank_trajectories,
             calibration_trajectories=calibration_trajectories,
         )
 
+        # Create run artifact directories and threshold distribution diagnostics.
         run_dir = os.path.join(to_absolute_path(str(cfg.save_dir)), f"run_{now_tag()}")
         os.makedirs(run_dir, exist_ok=True)
         threshold_dir = os.path.join(run_dir, "threshold")
@@ -864,6 +865,7 @@ def run_visualize(cfg: DictConfig) -> None:
             for traj_idx, (ref, latent_traj, gt_labels) in enumerate(
                 zip(selected_refs, target_trajectories, gt_label_sequences)
             ):
+                # Run trajectory-level detection and optionally adapt delta online with labels.
                 use_adaptive = bool(getattr(cfg.online, "adaptive_delta", False)) and gt_labels is not None
                 result = detector.detect_trajectory(
                     latent_traj,
@@ -875,6 +877,7 @@ def run_visualize(cfg: DictConfig) -> None:
                     update_interval=int(getattr(cfg.online, "update_interval", 1)),
                 )
 
+                # Map step-level detector outputs to frame timeline for video overlay.
                 prepared = encoder.load_demo_raw(
                     task_name=ref.task_name,
                     file_path=ref.file_path,
@@ -927,7 +930,6 @@ def run_visualize(cfg: DictConfig) -> None:
                     num_frames=num_frames,
                 )
                 aggregate_scores_by_mode = result.metadata.get("aggregate_scores_by_mode", {}) or {}
-                threshold_by_score = result.metadata.get("threshold_by_score", {}) or {}
                 active_score_mode = str(result.metadata.get("score_mode", detector.score_mode))
                 t3_alpha = result.metadata.get("t3_alpha", {}) or {}
                 t3_beta = result.metadata.get("t3_beta", {}) or {}
@@ -940,23 +942,6 @@ def run_visualize(cfg: DictConfig) -> None:
                     for score_mode, values in aggregate_scores_by_mode.items()
                     if np.asarray(values).size > 0
                 }
-                frame_thresholds_by_mode: dict[str, np.ndarray] = {}
-                for score_mode in SCORE_MODE_ORDER:
-                    if score_mode == active_score_mode:
-                        threshold_steps = np.asarray(result.thresholds, dtype=np.float32)
-                    else:
-                        scalar_threshold = float(threshold_by_score.get(score_mode, np.nan))
-                        ref_steps = np.asarray(aggregate_scores_by_mode.get(score_mode, []), dtype=np.float32)
-                        if ref_steps.size == 0:
-                            continue
-                        threshold_steps = np.full(ref_steps.shape, scalar_threshold, dtype=np.float32)
-                    if threshold_steps.size == 0:
-                        continue
-                    frame_thresholds_by_mode[score_mode] = map_step_values_to_frames(
-                        threshold_steps,
-                        num_frames=num_frames,
-                        tail_fill=float(threshold_steps[-1]),
-                    )
                 term_summary = summarize_trajectory_term_attribution(result)
 
                 stem = (
@@ -964,6 +949,7 @@ def run_visualize(cfg: DictConfig) -> None:
                     f"{os.path.basename(ref.file_path).replace('.hdf5', '')}_{ref.demo_key}"
                 )
                 video_path = os.path.join(run_dir, f"{stem}.mp4")
+                # Render per-frame overlays with active score/threshold and attribution cues.
                 writer = create_vscode_mp4_writer(video_path, fps=int(cfg.visualization.fps))
                 try:
                     for frame_id in range(num_frames):
@@ -1014,6 +1000,7 @@ def run_visualize(cfg: DictConfig) -> None:
 
                 plot_pdf_path = None
                 if bool(cfg.visualization.save_pdf):
+                    # Save a per-trajectory PDF panel and append it to the merged report.
                     thumbnail_indices = _select_thumbnail_indices(
                         num_frames=num_frames,
                         num_thumbnails=int(cfg.visualization.num_plot_frames),
@@ -1038,14 +1025,6 @@ def run_visualize(cfg: DictConfig) -> None:
                         thumbnail_indices=thumbnail_indices,
                         delta_final=float(result.metadata.get("delta_final", np.nan)),
                         threshold_final=float(result.metadata.get("threshold_final", np.nan)),
-                        frame_scores_by_mode={
-                            key: np.asarray(values, dtype=np.float32)
-                            for key, values in frame_scores_by_mode.items()
-                        },
-                        frame_thresholds_by_mode={
-                            key: np.asarray(values, dtype=np.float32)
-                            for key, values in frame_thresholds_by_mode.items()
-                        },
                         active_score_mode=active_score_mode,
                         t3_alpha={
                             key: float(value)
@@ -1107,6 +1086,7 @@ def run_visualize(cfg: DictConfig) -> None:
             if report_pdf is not None:
                 report_pdf.close()
 
+        # Persist run metadata so the visualization can be reproduced offline.
         summary = {
             "timestamp": now_tag(),
             "split_summary": split_summary,
