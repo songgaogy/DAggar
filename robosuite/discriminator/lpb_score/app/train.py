@@ -1,5 +1,18 @@
-"""Training entrypoint for the window-conditioned DSM model."""
+"""Training orchestration for the window-conditioned latent DSM.
 
+Execution order in ``run_train``:
+    1) Distributed setup (optional DDP) and seeds.
+    2) ``build_flow_encoder``: load multitask flow policy checkpoint as encoder.
+    3) ``build_split_refs``: sample train/val demo references from HDF5 trees.
+    4) ``build_training_datasets``: materialize or index trajectories, build
+       ``LatentTransitionDataset`` (window samples + optional RAM residency).
+    5) ``build_dsm_model``: wrap encoder + ``ChunkConditionedDSM`` predictor.
+    6) ``Trainer``: normalization warmup (positive latents), then epoch loop with
+       AMP, gradient clip, optional EMA, checkpoints via ``_build_payload``.
+
+Checkpoint payloads include DSM weights, policy encoder export metadata, latent
+normalization buffers, and Hydra config for reproducibility.
+"""
 from __future__ import annotations
 
 import os
@@ -68,6 +81,11 @@ def _build_payload(
         "image_size": int(model.policy_encoder.image_size),
         "epoch": int(epoch),
         "policy_checkpoint_payload": policy_checkpoint_payload,
+        "normalization_stats": {
+            "latent_mean": model.latent_mean.detach().cpu(),
+            "latent_var": model.latent_var.detach().cpu(),
+            "normalize_enabled": bool(model.normalize_enabled.item()),
+        },
     }
     if model_online_state is not None:
         payload["model_online"] = model_online_state
@@ -130,6 +148,8 @@ def _build_trainer(
         ddp_find_unused_parameters=bool(getattr(cfg.training, "ddp_find_unused_parameters", False)),
         ddp_static_graph=bool(getattr(cfg.training, "ddp_static_graph", True)),
         ddp_gradient_as_bucket_view=bool(getattr(cfg.training, "ddp_gradient_as_bucket_view", True)),
+        aux_contrastive_weight=float(getattr(cfg.training, "aux_contrastive_weight", 0.1)),
+        aux_contrastive_margin=float(getattr(cfg.training, "aux_contrastive_margin", 1.0e-3)),
     )
     return Trainer(
         model=model,
@@ -157,6 +177,7 @@ def _distributed_context(cfg: DictConfig) -> tuple[bool, int, int, int, str]:
 
 
 def run_train(cfg: DictConfig) -> None:
+    """Wire data, model, and trainer from Hydra ``cfg``; save checkpoints on completion."""
     distributed = False
     rank = 0
     world_size = 1
@@ -164,6 +185,7 @@ def run_train(cfg: DictConfig) -> None:
     is_main_process = True
     seed = int(cfg.seed)
     try:
+        # build DDP
         distributed, rank, world_size, local_rank, resolved_device = _distributed_context(cfg)
         is_main_process = rank == 0
         full_seed = seed + rank
@@ -176,14 +198,17 @@ def run_train(cfg: DictConfig) -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(full_seed)
 
+        # Encoder: frozen (or LoRA) FlowMultitaskEncoder from flow policy ckpt.
         encoder = build_flow_encoder(cfg, device_override=resolved_device)
         skip_validation = not bool(getattr(cfg.training, "run_validation", False))
 
+        # HDF5 demo refs: expert + success_rollout -> positive; fail_rollout -> negative.
         split_refs, split_summary, task_to_index = build_split_refs(
             cfg_data=cfg.data,
             seed=seed,
             include_val=not skip_validation,
         )
+        # Dataset: cached refs (default) or full tensors; windowed transition samples.
         datasets = build_training_datasets(
             cfg=cfg,
             split_refs=split_refs,
@@ -228,6 +253,7 @@ def run_train(cfg: DictConfig) -> None:
                     f"resident={val_dataset.num_resident_trajectories}"
                 )
 
+        # DSM: temporal conv denoiser on latent chunks + shared encoder.
         model = build_dsm_model(
             latent_dim=int(encoder.latent_dim),
             num_tasks=int(len(task_to_index)),
@@ -235,17 +261,21 @@ def run_train(cfg: DictConfig) -> None:
             window_size=window_size,
             policy_encoder=encoder,
             task_names=task_names,
+            inference_seed=int(cfg.seed),
         )
         model_total, model_trainable = _parameter_counts(model)
         encoder_total, encoder_trainable = _parameter_counts(model.policy_encoder)
         model_ratio = 0.0 if model_total <= 0 else float(model_trainable) / float(model_total)
         encoder_ratio = 0.0 if encoder_total <= 0 else float(encoder_trainable) / float(encoder_total)
+
         if is_main_process:
             print(
                 f"[lpb_score] trainable_params model={model_trainable}/{model_total} "
                 f"({100.0 * model_ratio:.4f}%) encoder={encoder_trainable}/{encoder_total} "
                 f"({100.0 * encoder_ratio:.4f}%)"
             )
+
+        # Training loop: sigma-sampled DSM loss + optional contrastive margin; warmup stats first.
         trainer = _build_trainer(
             cfg=cfg,
             model=model,
@@ -312,6 +342,7 @@ def run_train(cfg: DictConfig) -> None:
             )
             torch.save(final_payload, save_path_final)
             print(f"[lpb_score] Saved final checkpoint to: {save_path_final}")
+            
     finally:
         if "encoder" in locals():
             encoder.close()

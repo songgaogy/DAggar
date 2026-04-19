@@ -1,11 +1,23 @@
-"""Training loop for the window-conditioned DSM model."""
+"""Training loop: dataloaders, AMP, DDP, normalization warmup, DSM + aux loss.
+
+Per-step algorithm (``_run_step``):
+    Sample ``sigma`` ~ log-uniform in ``[sigma_min, sigma_max]``, Gaussian noise on
+    latent window scaled by ``sigma``. Forward ``DSMModel`` with
+    ``return_condition_pair=True`` to obtain reconstructions under traj-type 0 and 1.
+    DSM loss uses MSE of predicted vs clean chunk on the branch matching the label;
+    auxiliary contrastive loss encourages margin between the two branches. Optional
+    Welford warmup on positive samples initializes latent normalization before epoch 1.
+"""
 
 from __future__ import annotations
 
 import copy
+import io
 import inspect
+import math
+import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable, Optional
 
 import torch
@@ -21,6 +33,8 @@ from .profiling import StepProfiler
 
 @dataclass
 class TrainerConfig:
+    """Hyperparameters for ``Trainer``: optimization, loaders, AMP/DDP, DSM losses, warmup caps."""
+
     batch_size: int = 64
     num_workers: int = 4
     learning_rate: float = 3e-4
@@ -64,10 +78,40 @@ class TrainerConfig:
     ddp_find_unused_parameters: bool = False
     ddp_static_graph: bool = True
     ddp_gradient_as_bucket_view: bool = True
+    aux_contrastive_weight: float = 0.1
+    aux_contrastive_margin: float = 1e-2
+    # Normalization warmup budget: stop at first hit of either bound.
+    normalization_warmup_max_samples: int = 5000
+    normalization_warmup_max_batches: int = 20
+
+
+@dataclass
+class WelfordState:
+    """Online sufficient stats for per-dimension mean and variance (Welford)."""
+
+    count: int
+    mean: torch.Tensor
+    m2: torch.Tensor
+
+    @classmethod
+    def zeros(cls, dim: int, *, device: torch.device) -> "WelfordState":
+        return cls(
+            count=0,
+            mean=torch.zeros((int(dim),), dtype=torch.float64, device=device),
+            m2=torch.zeros((int(dim),), dtype=torch.float64, device=device),
+        )
 
 
 class Trainer:
-    """Coordinate data loading, mixed-precision training, and validation."""
+    """Owns optimizer(s), dataloaders (standard or batched trajectory iterator), and ``fit``.
+
+    Training stages:
+        1. ``fit`` -> ``_run_normalization_warmup`` (positive-only latent stats).
+        2. Each epoch: ``train_one_epoch`` (``_run_step`` with gradients) then ``validate``.
+    ``_run_step`` samples one ``sigma`` per step (shared across the batch), builds Gaussian
+    noise in latent space, runs ``DSMModel`` with ``return_condition_pair=True``, and combines
+    DSM + auxiliary contrastive losses (see module docstring).
+    """
 
     def __init__(
         self,
@@ -87,11 +131,13 @@ class Trainer:
         self.local_rank = int(self.cfg.distributed_local_rank)
         self.is_main_process = self.rank == 0
 
+        # Device: DDP uses LOCAL_RANK; single-process uses cfg.training.device.
         resolved_device = device or self.cfg.device
         if str(resolved_device).lower().startswith("cuda") and not torch.cuda.is_available():
             resolved_device = "cpu"
         self.device = torch.device(resolved_device)
         self.model.to(self.device)
+        # Forward/backward target: DDP wrapper in multi-GPU mode, else raw model.
         self._train_model: DSMModel | DistributedDataParallel = self.model
         if self.is_distributed:
             if self.device.type != "cuda":
@@ -124,12 +170,14 @@ class Trainer:
                 f"bucket_view={bool(self.cfg.ddp_gradient_as_bucket_view)}"
             )
 
+        # Optional EMA weights for validation / checkpointing.
         self.ema_model: Optional[DSMModel] = None
         if self.cfg.use_ema:
             self.ema_model = copy.deepcopy(self.model)
             self.ema_model.to(self.device)
             self.ema_model.eval()
 
+        # Parameter groups: encoder vs chunk DSM vs shared (multipliers from cfg).
         self.optimizer = torch.optim.AdamW(
             self._build_optimizer_param_groups(),
             lr=self.cfg.learning_rate,
@@ -143,14 +191,43 @@ class Trainer:
             device=self.device.type,
         )
 
+        # Train: BatchedTrainLoader (default) co-batches windows from same trajectories; val: classic DataLoader.
         self.train_loader = self._build_train_loader()
         self.val_loader = self._build_val_loader()
         self._profile_accumulator: dict[str, dict[str, float]] = {"train": {}, "valid": {}}
         self._profile_counts: dict[str, int] = {"train": 0, "valid": 0}
+        self._train_rng = self._new_rng(seed_offset=0)
+        self._eval_rng = self._new_rng(seed_offset=100_000)
+        self._normalization_warmup_done = False
+        self._wandb_module = None
+        self.wandb_run = self._init_wandb()
+        self._global_train_step = 0
+        self._global_valid_step = 0
+        # Log-space bin edges for logging sigma strata (four bins via three interior boundaries).
+        log_min = math.log(float(self.model.sigma_min))
+        log_max = math.log(float(self.model.sigma_max))
+        if abs(log_max - log_min) < 1e-12:
+            self._sigma_log_boundaries: tuple[float, float, float] = (log_max, log_max, log_max)
+        else:
+            step = (log_max - log_min) / 4.0
+            self._sigma_log_boundaries = (
+                log_min + step,
+                log_min + 2.0 * step,
+                log_min + 3.0 * step,
+            )
 
     def _log(self, message: str) -> None:
         if self.is_main_process:
             print(message)
+
+    def _new_rng(self, *, seed_offset: int) -> torch.Generator:
+        seed_value = int(self.cfg.seed) + int(seed_offset) + int(self.rank) * 10_000
+        if self.device.type == "cuda":
+            generator = torch.Generator(device=self.device)
+        else:
+            generator = torch.Generator()
+        generator.manual_seed(seed_value)
+        return generator
 
     @staticmethod
     def _resolve_amp_dtype(name: str) -> torch.dtype:
@@ -195,14 +272,8 @@ class Trainer:
             return [base[i] for i in dataset.indices]
         return None
 
-    def _resolve_positive_trajectories(self):
-        if isinstance(self.train_dataset, LatentTransitionDataset):
-            return self.train_dataset.iter_positive_trajectories()
-        if isinstance(self.train_dataset, Subset) and isinstance(self.train_dataset.dataset, LatentTransitionDataset):
-            raise TypeError("Subset normalization refresh is not supported for cached transition datasets.")
-        raise TypeError("Trainer normalization refresh requires LatentTransitionDataset or Subset thereof.")
-
     def _build_val_loader(self):
+        """Validation DataLoader when ``val_input_pipeline`` is ``legacy_dataloader`` and dataset non-empty."""
         if (
             self.val_dataset is None
             or len(self.val_dataset) <= 0
@@ -227,6 +298,7 @@ class Trainer:
         )
 
     def _build_legacy_train_loader(self):
+        """Shuffle or weighted sampling over window indices; used when not using ``BatchedTrainLoader``."""
         if self.is_distributed:
             sampler = DistributedSampler(
                 self.train_dataset,
@@ -277,6 +349,7 @@ class Trainer:
         )
 
     def _build_train_loader(self):
+        """Return ``BatchedTrainLoader`` (default) or legacy ``DataLoader`` with balanced positive ratio."""
         if str(self.cfg.input_pipeline) == "batched_iterator":
             if not isinstance(self.train_dataset, LatentTransitionDataset):
                 raise TypeError("batched_iterator train pipeline requires LatentTransitionDataset.")
@@ -307,6 +380,7 @@ class Trainer:
         return kwargs
 
     def _move_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Copy tensor batch fields to ``self.device`` (non-blocking for overlap with prefetch)."""
         return {
             key: value.to(self.device, non_blocking=True)
             for key, value in batch.items()
@@ -314,6 +388,8 @@ class Trainer:
         }
 
     class _CUDAPrefetchIterator:
+        """Overlap host dataloader with async H2D copy on a side CUDA stream."""
+
         def __init__(self, trainer: "Trainer", loader) -> None:
             self._trainer = trainer
             self._loader_iter = iter(loader)
@@ -346,6 +422,7 @@ class Trainer:
             return batch
 
     def _loader_iter(self, loader):
+        """Iterable over ``loader``; optionally CUDA-stream prefetch for faster steps."""
         if bool(self.cfg.cuda_prefetch) and self.device.type == "cuda":
             return self._CUDAPrefetchIterator(self, loader)
         return iter(loader)
@@ -425,6 +502,281 @@ class Trainer:
             raise ValueError(f"ema_decay must be in [0, 1), got {decay}")
         for p_ema, p in zip(self.ema_model.parameters(), self.model.parameters()):
             p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+        for b_ema, b in zip(self.ema_model.buffers(), self.model.buffers()):
+            b_ema.data.copy_(b.data)
+
+    def _sample_sigma(self, *, batch_size: int, train: bool, model: DSMModel) -> torch.Tensor:
+        """One scalar ``sigma`` per step (log-uniform in [sigma_min, sigma_max]), broadcast to batch."""
+        generator = self._train_rng if train else self._eval_rng
+        if str(model.sigma_distribution) != "log_uniform":
+            raise ValueError(f"Unsupported sigma_distribution={model.sigma_distribution!r}")
+        log_min = math.log(float(model.sigma_min))
+        log_max = math.log(float(model.sigma_max))
+        sigma_scalar = torch.exp(
+            torch.rand((1,), device=self.device, generator=generator, dtype=torch.float32) * (log_max - log_min)
+            + log_min
+        )
+        return sigma_scalar.expand(int(batch_size))
+
+    def _sigma_bin_index(self, sigma_value: float) -> int:
+        """Bucket ``sigma`` into 0..3 for wandb stratified metrics."""
+        log_sigma = math.log(max(float(sigma_value), 1e-12))
+        boundaries = self._sigma_log_boundaries
+        return int(log_sigma >= boundaries[0]) + int(log_sigma >= boundaries[1]) + int(log_sigma >= boundaries[2])
+
+    def _init_wandb(self):
+        if not self.is_main_process:
+            return None
+        mode = str(os.environ.get("WANDB_MODE", "offline"))
+        if mode.lower() == "disabled":
+            return None
+        try:
+            import wandb
+        except Exception:
+            self._log("[lpb_score] wandb is unavailable, skipping logging.")
+            return None
+
+        entity = str(os.environ.get("WANDB_ENTITY", os.environ.get("WANDB_NAME", "songgao-personal")))
+        project = str(os.environ.get("WANDB_PROJECT", "robosuite-lpb-score"))
+        os.environ.setdefault("WANDB_MODE", mode)
+        os.environ.setdefault("WANDB_ENTITY", entity)
+        self._wandb_module = wandb
+        return wandb.init(
+            project=project,
+            entity=entity,
+            mode=mode,
+            config={
+                "trainer": asdict(self.cfg),
+                "model": {
+                    "sigma_min": float(self.model.sigma_min),
+                    "sigma_max": float(self.model.sigma_max),
+                    "sigma_distribution": str(self.model.sigma_distribution),
+                    "num_mc_samples": int(self.model.num_mc_samples),
+                    "std_clamp_min": float(self.model.std_clamp_min),
+                },
+            },
+        )
+
+    def _log_wandb_step(self, *, phase: str, epoch: int, step: int, metrics: dict[str, float]) -> None:
+        if self.wandb_run is None:
+            return
+        payload = {
+            f"{phase}/{key}": float(value)
+            for key, value in metrics.items()
+            if key not in {"sigma_bin_index"}
+        }
+        sigma_bin_index = int(metrics.get("sigma_bin_index", 0))
+        payload[f"{phase}/sigma_bin_{sigma_bin_index}_loss_dsm"] = float(metrics["loss_dsm"])
+        payload[f"{phase}/sigma_bin_{sigma_bin_index}_loss_total"] = float(metrics["loss"])
+        payload["epoch"] = int(epoch)
+        payload[f"{phase}_step"] = int(step)
+        self.wandb_run.log(payload)
+
+    def _log_wandb_warmup(
+        self,
+        *,
+        latent_abs_before: torch.Tensor,
+        latent_abs_after: torch.Tensor,
+        latent_count: int,
+    ) -> None:
+        if self.wandb_run is None or self._wandb_module is None:
+            return
+        payload = {
+            "warmup/latent_count": float(latent_count),
+            "warmup/latent_abs_before_hist": self._wandb_module.Histogram(latent_abs_before.cpu().numpy()),
+            "warmup/latent_abs_after_hist": self._wandb_module.Histogram(latent_abs_after.cpu().numpy()),
+            "warmup/latent_abs_before_mean": float(latent_abs_before.mean().item()),
+            "warmup/latent_abs_after_mean": float(latent_abs_after.mean().item()),
+        }
+        self.wandb_run.log(payload)
+
+    def _finish_wandb(self) -> None:
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+            self.wandb_run = None
+
+    def _build_positive_warmup_loader(self):
+        """Subset of train windows with positive ``traj_type`` only (for Welford stats)."""
+        if not isinstance(self.train_dataset, LatentTransitionDataset):
+            raise TypeError("Normalization warmup requires LatentTransitionDataset.")
+        refs = self.train_dataset.sample_refs_array
+        positive_indices = [int(idx) for idx in torch.nonzero(torch.from_numpy(refs[:, 3] == 0), as_tuple=False).view(-1)]
+        if not positive_indices:
+            raise RuntimeError("Normalization warmup requires at least one positive sample.")
+        if self.is_distributed:
+            positive_indices = positive_indices[self.rank :: self.world_size]
+        subset = Subset(self.train_dataset, positive_indices)
+        return DataLoader(
+            subset,
+            batch_size=max(1, int(self.cfg.batch_size) // self.world_size) if self.is_distributed else self.cfg.batch_size,
+            shuffle=False,
+            **self._loader_kwargs(),
+        )
+
+    @staticmethod
+    def _merge_welford_states(state_a: WelfordState, state_b: WelfordState) -> WelfordState:
+        if int(state_b.count) <= 0:
+            return state_a
+        if int(state_a.count) <= 0:
+            return state_b
+        total = int(state_a.count + state_b.count)
+        delta = state_b.mean - state_a.mean
+        mean = state_a.mean + delta * (float(state_b.count) / float(total))
+        m2 = (
+            state_a.m2
+            + state_b.m2
+            + torch.square(delta) * (float(state_a.count) * float(state_b.count) / float(total))
+        )
+        return WelfordState(count=total, mean=mean, m2=m2)
+
+    def _update_welford_state(self, state: WelfordState, flat_latents: torch.Tensor) -> WelfordState:
+        if int(flat_latents.shape[0]) <= 0:
+            return state
+        batch = flat_latents.to(dtype=torch.float64)
+        batch_count = int(batch.shape[0])
+        batch_mean = batch.mean(dim=0)
+        batch_m2 = torch.square(batch - batch_mean).sum(dim=0)
+        batch_state = WelfordState(count=batch_count, mean=batch_mean, m2=batch_m2)
+        return self._merge_welford_states(state, batch_state)
+
+    def _reduce_welford_state(self, state: WelfordState) -> WelfordState:
+        if not self.is_distributed:
+            return state
+        gathered: list[dict[str, object] | None] = [None] * int(self.world_size)
+        dist.all_gather_object(
+            gathered,
+            {
+                "count": int(state.count),
+                "mean": state.mean.detach().cpu(),
+                "m2": state.m2.detach().cpu(),
+            },
+        )
+        merged = WelfordState.zeros(self.model.latent_dim, device=self.device)
+        for item in gathered:
+            assert item is not None
+            merged = self._merge_welford_states(
+                merged,
+                WelfordState(
+                    count=int(item["count"]),
+                    mean=torch.as_tensor(item["mean"], dtype=torch.float64, device=self.device),
+                    m2=torch.as_tensor(item["m2"], dtype=torch.float64, device=self.device),
+                ),
+            )
+        return merged
+
+    def _roundtrip_normalization_check(self, sample_latent: torch.Tensor) -> None:
+        sample_cpu = sample_latent.detach().cpu()
+        reference = self.model.normalize_latent(sample_latent.to(self.device)).detach().cpu()
+        payload = io.BytesIO()
+        torch.save({"model": self.model.state_dict()}, payload)
+        payload.seek(0)
+        loaded = torch.load(payload, map_location="cpu")
+        state_dict = loaded["model"]
+        loaded_mean = torch.as_tensor(state_dict["latent_mean"], dtype=torch.float32)
+        loaded_var = torch.as_tensor(state_dict["latent_var"], dtype=torch.float32)
+        loaded_enable = bool(torch.as_tensor(state_dict["normalize_enabled"]).item())
+        if loaded_enable:
+            std = torch.clamp(torch.sqrt(loaded_var), min=float(self.model.std_clamp_min))
+            loaded_norm = (sample_cpu - loaded_mean.view(1, 1, -1)) / std.view(1, 1, -1)
+        else:
+            loaded_norm = sample_cpu
+        if not torch.allclose(reference, loaded_norm, atol=1e-6, rtol=1e-6):
+            raise RuntimeError("Normalization stats did not round-trip through torch.save / torch.load.")
+
+    @torch.no_grad()
+    def _run_normalization_warmup(self) -> None:
+        """Estimate ``latent_mean`` / ``latent_var`` from encoded positive windows before epoch 1.
+
+        Uses Welford over flattened latents; DDP merges states. Stops early when
+        ``normalization_warmup_max_samples`` or ``normalization_warmup_max_batches`` hits.
+        """
+        if self._normalization_warmup_done:
+            return
+        loader = self._build_positive_warmup_loader()
+        was_training = self.model.training
+        self.model.eval()
+        state = WelfordState.zeros(self.model.latent_dim, device=self.device)
+        sampled_latents: list[torch.Tensor] = []
+        sample_budget = 512
+        total_batches = len(loader)
+        start_time = time.perf_counter()
+
+        max_samples = int(self.cfg.normalization_warmup_max_samples)
+        max_batches = int(self.cfg.normalization_warmup_max_batches)
+        for step, batch in enumerate(loader):
+            data = self._move_batch(batch)
+            latents = self.model.encode_latent_window(
+                image_window=data["image_window"],
+                proprio_window=data["proprio_window"],
+                task_index=data["task_index"],
+            )
+            flat = latents.reshape(-1, self.model.latent_dim)
+            state = self._update_welford_state(state, flat)
+
+            if sample_budget > 0:
+                take = min(sample_budget, int(latents.shape[0]))
+                sampled_latents.append(latents[:take].detach().cpu())
+                sample_budget -= take
+
+            if self.is_main_process and (
+                step == 0 or (step + 1) % max(1, int(self.cfg.profile_norm_progress_every)) == 0 or (step + 1) == total_batches
+            ):
+                elapsed = time.perf_counter() - start_time
+                self._log(
+                    f"[lpb_score] normalization_warmup step={step + 1}/{total_batches} "
+                    f"count={state.count} elapsed_s={elapsed:.1f}"
+                )
+
+            # Early-stop once stats are sufficiently estimated: random sample is fine.
+            if max_samples > 0 and int(state.count) >= max_samples:
+                if self.is_main_process:
+                    self._log(
+                        f"[lpb_score] normalization_warmup early-stop by samples "
+                        f"count={state.count} >= max_samples={max_samples} step={step + 1}"
+                    )
+                break
+            if max_batches > 0 and (step + 1) >= max_batches:
+                if self.is_main_process:
+                    self._log(
+                        f"[lpb_score] normalization_warmup early-stop by batches "
+                        f"step={step + 1} >= max_batches={max_batches} count={state.count}"
+                    )
+                break
+
+        state = self._reduce_welford_state(state)
+        if int(state.count) <= 0:
+            raise RuntimeError("Normalization warmup observed zero positive latent samples.")
+        latent_var = torch.clamp(state.m2 / float(state.count), min=1e-6)
+
+        # perform normalization stats update
+        self.model.set_normalization_stats(
+            latent_mean=state.mean.to(dtype=torch.float32),
+            latent_var=latent_var.to(dtype=torch.float32),
+        )
+        if was_training:
+            self.model.train()
+
+        sampled = (
+            torch.cat(sampled_latents, dim=0).to(self.device)
+            if sampled_latents
+            else torch.zeros((1, self.model.window_size, self.model.latent_dim), dtype=torch.float32, device=self.device)
+        )
+        latent_abs_before = sampled.abs().mean(dim=(1, 2)).detach().cpu()
+        latent_abs_after = self.model.normalize_latent(sampled).abs().mean(dim=(1, 2)).detach().cpu()
+        self._roundtrip_normalization_check(sampled[:1])
+
+        # Log normalization warmup stats
+        self._log(
+            "[lpb_score] normalization_warmup "
+            f"count={state.count} latent_abs_before_mean={float(latent_abs_before.mean().item()):.6f} "
+            f"latent_abs_after_mean={float(latent_abs_after.mean().item()):.6f}"
+        )
+        self._log_wandb_warmup(
+            latent_abs_before=latent_abs_before,
+            latent_abs_after=latent_abs_after,
+            latent_count=int(state.count),
+        )
+        self._normalization_warmup_done = True
 
     def _run_step(
         self,
@@ -433,6 +785,7 @@ class Trainer:
         model: Optional[DSMModel] = None,
         profiler: Optional[StepProfiler] = None,
     ) -> dict[str, float]:
+        """Single train/val step: sample ``sigma``, noise latents, dual-branch forward, DSM + aux loss."""
         active = model if model is not None else self.model
         step_profiler = profiler or self._new_step_profiler()
         if self.device.type == "cuda" and all(
@@ -447,6 +800,20 @@ class Trainer:
         if train:
             self.optimizer.zero_grad(set_to_none=True)
 
+        batch_size = int(data["traj_type"].shape[0])
+        sigma_tensor = self._sample_sigma(batch_size=batch_size, train=train, model=active)
+        # Isotropic Gaussian noise in latent space, scaled per-sample by sigma (same sigma for whole batch).
+        latent_window_noise = (
+            torch.randn(
+                (batch_size, active.window_size, active.latent_dim),
+                device=self.device,
+                dtype=torch.float32,
+                generator=self._train_rng if train else self._eval_rng,
+            )
+            * sigma_tensor.view(batch_size, 1, 1)
+        )
+
+        # Under DDP, always forward through wrapped module; eval may use EMA copy.
         train_model = self._train_model if active is self.model else active
         with torch.set_grad_enabled(train):
             with torch.amp.autocast(
@@ -460,31 +827,48 @@ class Trainer:
                         proprio_window=data["proprio_window"],
                         traj_type=data["traj_type"],
                         task_index=data["task_index"],
-                        add_noise=True,
+                        sigma=sigma_tensor,
+                        latent_window_noise=latent_window_noise,
+                        return_condition_pair=True,
                         profiler=step_profiler,
                     )
-                    recon = self.model.reconstruction_components(
-                        chunk_clean=out["chunk_clean"],
-                        chunk_hat=out["chunk_hat"],
+                    # Branch energies: d0 = recon error if predictor thinks "positive", d1 = "failure".
+                    positive_recon = active.reconstruction_components(
+                        chunk_clean=out["chunk_clean_norm"],
+                        chunk_hat=out["positive"]["chunk_hat_norm"],
                     )
-                    loss = recon["chunk_energy_per_sample"].mean()
+                    negative_recon = active.reconstruction_components(
+                        chunk_clean=out["chunk_clean_norm"],
+                        chunk_hat=out["negative"]["chunk_hat_norm"],
+                    )
+                    traj_type = out["traj_type"].reshape(-1)
+                    d0 = positive_recon["chunk_energy_per_sample"]
+                    d1 = negative_recon["chunk_energy_per_sample"]
+                    # DSM: supervise the branch that matches dataset traj_type (0=pos, 1=neg).
+                    loss_dsm_per_sample = torch.where(traj_type == 0, d0, d1)
+                    margin = float(self.cfg.aux_contrastive_margin)
+                    # Aux: hinge margin so the label-consistent branch is lower energy than the other.
+                    loss_aux_per_sample = torch.where(
+                        traj_type == 0,
+                        torch.relu(d0 - d1 + margin),
+                        torch.relu(d1 - d0 + margin),
+                    )
+                    loss_dsm = loss_dsm_per_sample.mean()
+                    loss_aux = loss_aux_per_sample.mean()
+                    loss = loss_dsm + float(self.cfg.aux_contrastive_weight) * loss_aux
                     stats = {
                         "loss": loss,
                         "score": loss,
-                        "unweighted_score": loss,
-                        "chunk_mse": recon["chunk_mse_per_sample"].mean(),
-                        "chunk_energy": recon["chunk_energy_per_sample"].mean(),
-                        "latent_window": out["latent_window"],
-                        "traj_type": out["traj_type"],
-                        "task_index": out["task_index"],
-                        "chunk_clean": out["chunk_clean"],
-                        "chunk_input": out["chunk_input"],
-                        "chunk_hat": out["chunk_hat"],
+                        "unweighted_score": loss_dsm,
+                        "chunk_mse": loss_dsm,
+                        "chunk_energy": loss_dsm,
+                        "loss_dsm": loss_dsm,
+                        "loss_aux": loss_aux,
+                        "sigma": sigma_tensor[0],
                     }
-            loss = stats["loss"]
             if train:
                 with step_profiler.section("backward"):
-                    self._grad_scaler.scale(loss).backward()
+                    self._grad_scaler.scale(stats["loss"]).backward()
                 if self.cfg.grad_clip_norm > 0:
                     if self._use_grad_scaler:
                         self._grad_scaler.unscale_(self.optimizer)
@@ -495,19 +879,24 @@ class Trainer:
                 if self.ema_model is not None:
                     self._update_ema()
 
+        sigma_value = float(stats["sigma"].detach().item())
         return {
             "loss": float(stats["loss"].detach().item()),
             "score": float(stats["score"].detach().item()),
             "unweighted_score": float(stats["unweighted_score"].detach().item()),
             "chunk_mse": float(stats["chunk_mse"].detach().item()),
             "chunk_energy": float(stats["chunk_energy"].detach().item()),
+            "loss_dsm": float(stats["loss_dsm"].detach().item()),
+            "loss_aux": float(stats["loss_aux"].detach().item()),
+            "sigma": sigma_value,
+            "sigma_bin_index": float(self._sigma_bin_index(sigma_value)),
         }
 
     @staticmethod
     def _mean_metrics(metrics: list[dict[str, float]]) -> dict[str, float]:
         if not metrics:
             return {}
-        keys = sorted(metrics[0].keys())
+        keys = sorted(key for key in metrics[0].keys() if key != "sigma_bin_index")
         return {key: float(sum(item[key] for item in metrics) / len(metrics)) for key in keys}
 
     def _reduce_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
@@ -525,11 +914,13 @@ class Trainer:
             sampler.set_epoch(int(epoch) - 1)
 
     def eval_model_for_inference(self) -> DSMModel:
+        """Return EMA copy for validation when enabled, else the training module."""
         if self.cfg.use_ema and self.cfg.val_use_ema and self.ema_model is not None:
             return self.ema_model
         return self.model
 
     def checkpoint_state_dicts(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
+        """Primary weights for saving; optionally second state dict (online vs EMA) per cfg."""
         if self.ema_model is None:
             return self.model.state_dict(), None
         if self.cfg.save_ema_in_checkpoint:
@@ -537,6 +928,7 @@ class Trainer:
         return self.model.state_dict(), None
 
     def train_one_epoch(self, epoch: int) -> dict[str, float]:
+        """Run one full pass over ``train_loader``; mean-reduced metrics (DDP-allreduced)."""
         self.model.train()
         self._set_loader_epoch(self.train_loader, epoch)
         logs: list[dict[str, float]] = []
@@ -548,18 +940,20 @@ class Trainer:
             out = self._run_step(batch, train=True, profiler=profiler)
             logs.append(out)
             self._record_profile(phase="train", epoch=epoch, step=step, profiler=profiler)
+            self._log_wandb_step(phase="train", epoch=epoch, step=self._global_train_step, metrics=out)
+            self._global_train_step += 1
             if self.is_main_process and self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 self._log(
                     f"[train] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} "
-                    f"unweighted_score={out['unweighted_score']:.6f} "
-                    f"chunk_mse={out['chunk_mse']:.6f} "
+                    f"loss={out['loss']:.6f} loss_dsm={out['loss_dsm']:.6f} "
+                    f"loss_aux={out['loss_aux']:.6f} sigma={out['sigma']:.6f} "
                     f"chunk_energy={out['chunk_energy']:.6f}"
                 )
         return self._reduce_metrics(self._mean_metrics(logs))
 
     @torch.no_grad()
     def validate(self, epoch: int) -> dict[str, float]:
+        """Same loss computation as train but no backward; optional EMA weights."""
         if self.val_loader is None:
             return {}
         eval_model = self.eval_model_for_inference()
@@ -574,12 +968,13 @@ class Trainer:
             out = self._run_step(batch, train=False, model=eval_model, profiler=profiler)
             logs.append(out)
             self._record_profile(phase="valid", epoch=epoch, step=step, profiler=profiler)
+            self._log_wandb_step(phase="valid", epoch=epoch, step=self._global_valid_step, metrics=out)
+            self._global_valid_step += 1
             if self.is_main_process and self.cfg.log_every > 0 and step % self.cfg.log_every == 0:
                 self._log(
                     f"[valid] epoch={epoch:03d} step={step:05d} "
-                    f"loss={out['loss']:.6f} score={out['score']:.6f} "
-                    f"unweighted_score={out['unweighted_score']:.6f} "
-                    f"chunk_mse={out['chunk_mse']:.6f} "
+                    f"loss={out['loss']:.6f} loss_dsm={out['loss_dsm']:.6f} "
+                    f"loss_aux={out['loss_aux']:.6f} sigma={out['sigma']:.6f} "
                     f"chunk_energy={out['chunk_energy']:.6f}"
                 )
         return self._reduce_metrics(self._mean_metrics(logs))
@@ -589,19 +984,34 @@ class Trainer:
         save_freq: int = 0,
         save_callback: Optional[Callable[[int, dict[str, dict[str, float]]], None]] = None,
     ) -> dict[str, dict[str, float]]:
+        """Warmup latent stats, then each epoch train + validate; optional periodic ``save_callback``."""
         history: dict[str, dict[str, float]] = {}
         freq = int(save_freq)
-        for epoch in range(1, self.cfg.epochs + 1):
-            train_stats = self.train_one_epoch(epoch)
-            start = time.perf_counter()
-            val_stats = self.validate(epoch)
-            if self.is_main_process and bool(self.cfg.profile_enabled):
-                self._log(
-                    f"[profile boundary] epoch={epoch:03d} phase=validate "
-                    f"wall_ms={(time.perf_counter() - start) * 1000.0:.1f}"
-                )
-            history[f"epoch_{epoch:03d}"] = {"train": train_stats, "valid": val_stats}
-            self._log(f"[epoch {epoch:03d}] train={train_stats} valid={val_stats}")
-            if self.is_main_process and save_callback is not None and freq > 0 and (epoch % freq == 0):
-                save_callback(epoch, history)
-        return history
+        try:
+            # Warmup latent stats, normalization warmup is done before epoch 1.
+            self._run_normalization_warmup()
+
+            for epoch in range(1, self.cfg.epochs + 1):
+                train_stats = self.train_one_epoch(epoch)
+                start = time.perf_counter()
+                val_stats = self.validate(epoch)
+
+                if self.is_main_process and bool(self.cfg.profile_enabled):
+                    self._log(
+                        f"[profile boundary] epoch={epoch:03d} phase=validate "
+                        f"wall_ms={(time.perf_counter() - start) * 1000.0:.1f}"
+                    )
+                history[f"epoch_{epoch:03d}"] = {"train": train_stats, "valid": val_stats}
+                self._log(f"[epoch {epoch:03d}] train={train_stats} valid={val_stats}")
+
+                if self.wandb_run is not None:
+                    epoch_payload = {f"epoch/train/{k}": v for k, v in train_stats.items()}
+                    epoch_payload.update({f"epoch/valid/{k}": v for k, v in val_stats.items()})
+                    epoch_payload["epoch"] = int(epoch)
+                    self.wandb_run.log(epoch_payload)
+                if self.is_main_process and save_callback is not None and freq > 0 and (epoch % freq == 0):
+                    save_callback(epoch, history)
+
+            return history
+        finally:
+            self._finish_wandb()

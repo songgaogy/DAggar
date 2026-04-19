@@ -1,19 +1,18 @@
-"""Window-conditioned denoising score matching model for trajectory scoring."""
-
 from __future__ import annotations
 
 from contextlib import nullcontext
+import math
 import time
 from typing import Any, Callable, Iterable, Sequence
 
 import torch
 import torch.nn as nn
 
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
-
+from .policy_encoder import FlowMultitaskEncoder
 from .dataset import PreparedTrajectory
 
 
+# Checkpoint tag: multitask flow encoder + one ChunkConditionedDSM head (latent chunk only).
 MODEL_ARCHITECTURE = "joint_lora_encoder_single_head_temporal_conv_chunk_state_only_conditional_dsm"
 
 
@@ -25,8 +24,33 @@ def _cfg_get(cfg: Any, key: str, default=None):
     return getattr(cfg, key, default)
 
 
+def _sigma_fourier_embedding(log_sigma: torch.Tensor, embed_dim: int) -> torch.Tensor:
+    """Random Fourier features of ``log_sigma`` for noise-level conditioning (σ multi-scale DSM)."""
+    if int(embed_dim) <= 0:
+        raise ValueError(f"sigma_embed_dim must be positive, got {embed_dim}")
+    half_dim = max(1, int(embed_dim) // 2)
+    dtype = log_sigma.dtype
+    device = log_sigma.device
+    if half_dim == 1:
+        frequencies = torch.ones((1,), dtype=dtype, device=device)
+    else:
+        frequencies = torch.exp(
+            torch.linspace(0.0, math.log(1000.0), steps=half_dim, dtype=dtype, device=device)
+        )
+    angles = log_sigma.unsqueeze(-1) * frequencies.unsqueeze(0)
+    embedding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    if int(embedding.shape[-1]) < int(embed_dim):
+        padding = torch.zeros(
+            (int(embedding.shape[0]), int(embed_dim) - int(embedding.shape[-1])),
+            dtype=dtype,
+            device=device,
+        )
+        embedding = torch.cat([embedding, padding], dim=-1)
+    return embedding[:, : int(embed_dim)]
+
+
 class AdaLNModulation(nn.Module):
-    """Generate adaptive shift/scale parameters from a condition embedding."""
+    """Linear map from global condition -> per-channel shift and scale (before conv)."""
 
     def __init__(self, cond_dim: int, embed_dim: int) -> None:
         super().__init__()
@@ -40,7 +64,10 @@ class AdaLNModulation(nn.Module):
 
 
 class AdaLNTemporalConvBlock(nn.Module):
-    """Temporal convolution block modulated by task and trajectory type."""
+    """Residual Conv1d block on sequence length ``W``; AdaLN modulates normalized activations.
+
+    ``x`` layout: ``(B, embed_dim, W)`` after transpose from ``(B, W, embed_dim)``.
+    """
 
     def __init__(
         self,
@@ -72,7 +99,12 @@ class AdaLNTemporalConvBlock(nn.Module):
 
 
 class ChunkConditionedDSM(nn.Module):
-    """Predict a clean latent window from a noisy window under task conditioning."""
+    """Temporal Conv DSM head: noisy normalized latent window -> predicted clean window.
+
+    Conditioning (see ``_build_condition``): ``traj_type`` in ``{0,1}`` (success vs
+    failure hypothesis), ``task_index``, and ``sigma`` (via Fourier(log σ) + MLP).
+    Optimizer groups: ``shared`` (embeddings + trunk) vs ``chunk_head`` (final linear).
+    """
 
     def __init__(
         self,
@@ -85,6 +117,7 @@ class ChunkConditionedDSM(nn.Module):
         ffn_dim: int = 2048,
         kernel_size: int = 3,
         dropout: float = 0.1,
+        sigma_embed_dim: int = 64,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -96,6 +129,7 @@ class ChunkConditionedDSM(nn.Module):
         self.ffn_dim = int(ffn_dim)
         self.kernel_size = int(kernel_size)
         self.dropout = float(dropout)
+        self.sigma_embed_dim = int(sigma_embed_dim)
         self.chunk_dim = int(self.latent_dim * self.window_size)
 
         if self.latent_dim <= 0:
@@ -104,9 +138,13 @@ class ChunkConditionedDSM(nn.Module):
             raise ValueError("window_size must be positive.")
         if self.num_tasks <= 0:
             raise ValueError("num_tasks must be positive.")
+        if self.sigma_embed_dim <= 0:
+            raise ValueError("sigma_embed_dim must be positive.")
 
         self.type_embedding = nn.Embedding(2, self.embed_dim)
         self.task_embedding = nn.Embedding(self.num_tasks, self.embed_dim)
+        # Map Fourier(log σ) to embed_dim; last layer zero-init so σ modulates gently at start.
+        self.sigma_condition_mlp = self._build_sigma_condition_mlp(self.sigma_embed_dim, self.embed_dim)
         self.condition_mlp = self._build_condition_mlp(self.embed_dim, self.embed_dim)
         self.input_proj = self._build_input_proj(self.latent_dim)
         self.blocks = nn.ModuleList(
@@ -140,6 +178,19 @@ class ChunkConditionedDSM(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(self.embed_dim, output_dim),
         )
+
+    def _build_sigma_condition_mlp(self, input_dim: int, output_dim: int) -> nn.Sequential:
+        mlp = nn.Sequential(
+            nn.Linear(input_dim, self.embed_dim),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(self.embed_dim, output_dim),
+        )
+        final_linear = mlp[-1]
+        assert isinstance(final_linear, nn.Linear)
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
+        return mlp
 
     def _require_latent_window(self, name: str, x: torch.Tensor) -> None:
         if x.ndim != 3:
@@ -181,13 +232,39 @@ class ChunkConditionedDSM(nn.Module):
             raise ValueError("traj_type must contain only 0 or 1.")
         return traj_type_tensor
 
+    @staticmethod
+    def _require_sigma(
+        batch_size: int,
+        sigma: torch.Tensor | float | int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        sigma_tensor = torch.as_tensor(sigma, dtype=dtype, device=device).reshape(-1)
+        if int(sigma_tensor.numel()) == 1:
+            sigma_tensor = sigma_tensor.expand(batch_size)
+        if int(sigma_tensor.shape[0]) != int(batch_size):
+            raise ValueError(f"Expected sigma shape ({batch_size},), got {tuple(sigma_tensor.shape)}")
+        if torch.any(sigma_tensor <= 0):
+            raise ValueError("sigma must be strictly positive.")
+        return sigma_tensor
+
     def _build_condition(
         self,
         *,
         traj_type: torch.Tensor,
         task_index: torch.Tensor,
+        sigma: torch.Tensor,
     ) -> torch.Tensor:
-        cond_embed = self.type_embedding(traj_type) + self.task_embedding(task_index)
+        """Fused global condition ``(B, embed_dim)`` for AdaLN blocks."""
+        sigma_embed = self.sigma_condition_mlp(
+            _sigma_fourier_embedding(
+                log_sigma=torch.log(torch.clamp(sigma, min=1e-6)),
+                embed_dim=self.sigma_embed_dim,
+            )
+        )
+        # Additive fusion then MLP; same cond broadcast to every temporal Conv block.
+        cond_embed = self.type_embedding(traj_type) + self.task_embedding(task_index) + sigma_embed
         return self.condition_mlp(cond_embed)
 
     @staticmethod
@@ -202,6 +279,7 @@ class ChunkConditionedDSM(nn.Module):
             "shared": self._module_parameters(
                 self.type_embedding,
                 self.task_embedding,
+                self.sigma_condition_mlp,
                 self.condition_mlp,
                 self.input_proj,
                 self.blocks,
@@ -214,9 +292,11 @@ class ChunkConditionedDSM(nn.Module):
         self,
         *,
         latent_window_input: torch.Tensor,
-        traj_type: torch.Tensor,
-        task_index: torch.Tensor,
+        traj_type: torch.Tensor | int,
+        task_index: torch.Tensor | int,
+        sigma: torch.Tensor | float | int,
     ) -> dict[str, torch.Tensor]:
+        """Denoise: ``latent_window_input`` is typically **normalized** clean + noise (see DSMModel)."""
         batch_size = int(latent_window_input.shape[0])
         self._require_latent_window("latent_window_input", latent_window_input)
 
@@ -230,26 +310,46 @@ class ChunkConditionedDSM(nn.Module):
             task_index=task_index,
             device=latent_window_input.device,
         )
+        sigma_tensor = self._require_sigma(
+            batch_size=batch_size,
+            sigma=sigma,
+            device=latent_window_input.device,
+            dtype=latent_window_input.dtype,
+        )
 
         cond = self._build_condition(
             traj_type=traj_type_tensor,
             task_index=task_index_tensor,
+            sigma=sigma_tensor,
         )
-        # Conditioned temporal blocks denoise each latent token in the window.
+        # (B, W, D) -> (B, W, embed) -> (B, embed, W) for Conv1d over time.
         hidden = self.input_proj(latent_window_input).transpose(1, 2)
         for block in self.blocks:
             hidden = block(hidden, cond)
         hidden = self.final_norm(hidden.transpose(1, 2))
-        return {"latent_window_hat": self.chunk_head(hidden)}
+        return {
+            "latent_window_hat": self.chunk_head(hidden),
+            "sigma": sigma_tensor,
+            "traj_type": traj_type_tensor,
+            "task_index": task_index_tensor,
+        }
 
 
+# Backward-compatible aliases for the single ChunkConditionedDSM implementation.
 UnifiedConditionedDSM = ChunkConditionedDSM
 ConditionalManifoldDenoiser = ChunkConditionedDSM
 JointManifoldDenoiser = ChunkConditionedDSM
 
 
 class DSMModel(nn.Module):
-    """Joint wrapper around the policy encoder and the chunk-level DSM predictor."""
+    """Full graph: ``FlowMultitaskEncoder`` -> latent window -> ``ChunkConditionedDSM``.
+
+    - **Buffers**: ``latent_mean``, ``latent_var``, ``normalize_enabled`` (set after warmup).
+    - **Sigma training range**: ``sigma_min``/``sigma_max`` (Trainer samples log-uniform).
+    - **Inference**: ``num_mc_samples``, ``default_eval_sigma`` for Fisher / detector code.
+    Public entry: ``forward(image_window, proprio_window, ...)``; internal path
+    ``forward_from_latent_window`` adds noise on **normalized** latents then calls predictor.
+    """
 
     def __init__(
         self,
@@ -258,8 +358,14 @@ class DSMModel(nn.Module):
         task_names: Sequence[str],
         latent_dim: int,
         window_size: int,
-        noise_scale: float,
         std_clamp_min: float,
+        normalize_enabled: bool,
+        sigma_min: float,
+        sigma_max: float,
+        sigma_distribution: str,
+        num_mc_samples: int,
+        default_eval_sigma: float,
+        inference_seed: int,
     ) -> None:
         super().__init__()
         self.predictor = predictor
@@ -267,14 +373,28 @@ class DSMModel(nn.Module):
         self.task_names = [str(name) for name in task_names]
         self.latent_dim = int(latent_dim)
         self.window_size = int(window_size)
-        self.noise_scale = float(noise_scale)
-        self.noise_sigma = self.noise_scale
         self.std_clamp_min = float(std_clamp_min)
+        self.sigma_min = float(sigma_min)
+        self.sigma_max = float(sigma_max)
+        self.sigma_distribution = str(sigma_distribution)
+        self.num_mc_samples = max(1, int(num_mc_samples))
+        self.default_eval_sigma = float(default_eval_sigma)
+        self.inference_seed = int(inference_seed)
+        self.noise_scale = float(self.default_eval_sigma)
+        self.noise_sigma = float(self.default_eval_sigma)
         self.num_tasks = int(self.predictor.num_tasks)
         self.chunk_dim = int(self.latent_dim * self.window_size)
 
+        if self.sigma_min <= 0.0 or self.sigma_max <= 0.0:
+            raise ValueError("sigma_min and sigma_max must be strictly positive.")
+        if self.sigma_min > self.sigma_max:
+            raise ValueError(f"sigma_min must be <= sigma_max, got {self.sigma_min} > {self.sigma_max}")
+        if self.sigma_distribution not in {"log_uniform"}:
+            raise ValueError(f"Unsupported sigma_distribution={self.sigma_distribution!r}")
+
         self.register_buffer("latent_mean", torch.zeros(self.latent_dim, dtype=torch.float32))
         self.register_buffer("latent_var", torch.ones(self.latent_dim, dtype=torch.float32))
+        self.register_buffer("normalize_enabled", torch.tensor(bool(normalize_enabled), dtype=torch.bool))
 
         if self.num_tasks != len(self.task_names):
             raise ValueError(f"task_names length mismatch: expected {self.num_tasks}, got {len(self.task_names)}")
@@ -318,7 +438,22 @@ class DSMModel(nn.Module):
         return torch.clamp(torch.sqrt(self.latent_var), min=float(self.std_clamp_min))
 
     def normalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
-        return latent
+        if not bool(self.normalize_enabled.item()):
+            return latent
+        shape = [1] * int(latent.ndim)
+        shape[-1] = self.latent_dim
+        mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype).view(shape)
+        std = self.latent_std.to(device=latent.device, dtype=latent.dtype).view(shape)
+        return (latent - mean) / std
+
+    def denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if not bool(self.normalize_enabled.item()):
+            return latent
+        shape = [1] * int(latent.ndim)
+        shape[-1] = self.latent_dim
+        mean = self.latent_mean.to(device=latent.device, dtype=latent.dtype).view(shape)
+        std = self.latent_std.to(device=latent.device, dtype=latent.dtype).view(shape)
+        return latent * std + mean
 
     def flatten_latent_window(self, latent_window: torch.Tensor) -> torch.Tensor:
         if latent_window.ndim != 3:
@@ -355,6 +490,41 @@ class DSMModel(nn.Module):
             task_index=task_index,
             device=device,
         )
+
+    def _require_sigma(
+        self,
+        batch_size: int,
+        sigma: torch.Tensor | float | int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return self.predictor._require_sigma(
+            batch_size=batch_size,
+            sigma=sigma,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _require_latent_window_noise(
+        self,
+        *,
+        latent_window_noise: torch.Tensor | None,
+        latent_window: torch.Tensor,
+    ) -> torch.Tensor:
+        if latent_window_noise is None:
+            return torch.zeros_like(latent_window)
+        noise = torch.as_tensor(
+            latent_window_noise,
+            dtype=latent_window.dtype,
+            device=latent_window.device,
+        )
+        if tuple(noise.shape) != tuple(latent_window.shape):
+            raise ValueError(
+                "latent_window_noise must match latent_window shape "
+                f"{tuple(latent_window.shape)}, got {tuple(noise.shape)}"
+            )
+        return noise
 
     def _task_names_from_index(
         self,
@@ -479,9 +649,10 @@ class DSMModel(nn.Module):
                 task_index=int(traj.task_index),
                 batch_size=batch_size,
             ).to(dtype=torch.float64)
-            latent_sum += latents.sum(dim=0)
-            latent_sq_sum += torch.square(latents).sum(dim=0)
-            latent_count += int(latents.shape[0])
+            flat = latents.reshape(-1, self.latent_dim)
+            latent_sum += flat.sum(dim=0)
+            latent_sq_sum += torch.square(flat).sum(dim=0)
+            latent_count += int(flat.shape[0])
             if progress_callback is not None:
                 progress_callback(int(traj_idx), int(total_trajectories), float(time.perf_counter() - start_time))
 
@@ -507,6 +678,7 @@ class DSMModel(nn.Module):
         chunk_clean: torch.Tensor,
         chunk_hat: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        """Per-sample MSE-style energy over last dim of flattened chunk ``(B, W*D)``."""
         chunk_sq = torch.square(chunk_hat - chunk_clean)
         chunk_energy = chunk_sq.mean(dim=-1)
         return {
@@ -517,56 +689,128 @@ class DSMModel(nn.Module):
             "score_per_sample": chunk_energy,
         }
 
+    def _prediction_outputs(
+        self,
+        *,
+        latent_window_hat_norm: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        latent_window_hat = self.denormalize_latent(latent_window_hat_norm)
+        return {
+            "latent_window_hat_norm": latent_window_hat_norm,
+            "latent_window_hat": latent_window_hat,
+            "chunk_hat_norm": self.flatten_latent_window(latent_window_hat_norm),
+            "chunk_hat": self.flatten_latent_window(latent_window_hat),
+        }
+
+    def _predict_from_normalized_latent_window(
+        self,
+        *,
+        latent_window_input_norm: torch.Tensor,
+        traj_type: torch.Tensor | int,
+        task_index: torch.Tensor | int,
+        sigma: torch.Tensor,
+        profiler: Any | None = None,
+    ) -> dict[str, torch.Tensor]:
+        with (profiler.section("predictor") if profiler is not None else nullcontext()):
+            preds = self.predictor(
+                latent_window_input=latent_window_input_norm,
+                traj_type=traj_type,
+                task_index=task_index,
+                sigma=sigma,
+            )
+        out = self._prediction_outputs(latent_window_hat_norm=preds["latent_window_hat"])
+        out["sigma"] = preds["sigma"]
+        out["traj_type"] = preds["traj_type"]
+        out["task_index"] = preds["task_index"]
+        return out
+
     def forward_from_latent_window(
         self,
         latent_window: torch.Tensor,
         *,
         traj_type: torch.Tensor | int,
         task_index: torch.Tensor | int,
-        add_noise: bool = False,
+        sigma: torch.Tensor | float | int,
+        latent_window_noise: torch.Tensor | None = None,
+        return_condition_pair: bool = False,
         profiler: Any | None = None,
     ) -> dict[str, torch.Tensor]:
-        # DSM training perturbs clean latent windows and learns to reconstruct the clean target.
-        latent_window_clean = self.normalize_latent(latent_window)
-        latent_window_input = latent_window_clean
-        latent_window_noise = torch.zeros_like(latent_window_clean)
-        if add_noise:
-            latent_window_noise = torch.randn_like(latent_window_clean) * float(self.noise_scale)
-            latent_window_input = latent_window_clean + latent_window_noise
-        chunk_clean = self.flatten_latent_window(latent_window_clean)
-        chunk_input = self.flatten_latent_window(latent_window_input)
-        chunk_noise = self.flatten_latent_window(latent_window_noise)
+        """Normalize clean window, add noise in normalized space, run predictor.
 
+        If ``return_condition_pair``, ignore batch ``traj_type`` for the forward and
+        run two predicts with traj_type 0 vs 1 (Trainer uses this for DSM + aux loss).
+        """
+        self.predictor._require_latent_window("latent_window", latent_window)
+        batch_size = int(latent_window.shape[0])
         traj_type_tensor = self._require_traj_type(
-            batch_size=int(latent_window.shape[0]),
+            batch_size=batch_size,
             traj_type=traj_type,
             device=latent_window.device,
         )
         task_index_tensor = self._require_task_index(
-            batch_size=int(latent_window.shape[0]),
+            batch_size=batch_size,
             task_index=task_index,
             device=latent_window.device,
         )
+        sigma_tensor = self._require_sigma(
+            batch_size=batch_size,
+            sigma=sigma,
+            device=latent_window.device,
+            dtype=latent_window.dtype,
+        )
+        latent_window_noise_tensor = self._require_latent_window_noise(
+            latent_window_noise=latent_window_noise,
+            latent_window=latent_window,
+        )
 
-        with (profiler.section("predictor") if profiler is not None else nullcontext()):
-            preds = self.predictor(
-                latent_window_input=latent_window_input,
-                traj_type=traj_type_tensor,
-                task_index=task_index_tensor,
-            )
-        latent_window_hat = preds["latent_window_hat"]
-        return {
+        latent_window_clean_norm = self.normalize_latent(latent_window)
+        latent_window_input_norm = latent_window_clean_norm + latent_window_noise_tensor
+
+        # Raw-scale ``latent_window_input`` / ``chunk_input`` are not consumed by
+        # any caller after the Phase 1 refactor (predictor ingests normalized
+        # latents, Fisher scorer uses ``latent_window_input_norm``). Skipping
+        # the denormalize + flatten avoids unnecessary work per step.
+        out: dict[str, torch.Tensor] = {
             "latent_window": latent_window,
-            "latent_window_clean": latent_window_clean,
-            "latent_window_input": latent_window_input,
-            "latent_window_hat": latent_window_hat,
+            "latent_window_clean_norm": latent_window_clean_norm,
+            "latent_window_input_norm": latent_window_input_norm,
+            "latent_window_noise": latent_window_noise_tensor,
             "traj_type": traj_type_tensor,
             "task_index": task_index_tensor,
-            "chunk_clean": chunk_clean,
-            "chunk_input": chunk_input,
-            "chunk_hat": self.flatten_latent_window(latent_window_hat),
-            "chunk_noise": chunk_noise,
+            "sigma": sigma_tensor,
+            "chunk_clean": self.flatten_latent_window(latent_window),
+            "chunk_clean_norm": self.flatten_latent_window(latent_window_clean_norm),
+            "chunk_input_norm": self.flatten_latent_window(latent_window_input_norm),
+            "chunk_noise": self.flatten_latent_window(latent_window_noise_tensor),
         }
+        if bool(return_condition_pair):
+            positive_traj_type = torch.zeros((batch_size,), dtype=torch.long, device=latent_window.device)
+            negative_traj_type = torch.ones((batch_size,), dtype=torch.long, device=latent_window.device)
+            out["positive"] = self._predict_from_normalized_latent_window(
+                latent_window_input_norm=latent_window_input_norm,
+                traj_type=positive_traj_type,
+                task_index=task_index_tensor,
+                sigma=sigma_tensor,
+                profiler=profiler,
+            )
+            out["negative"] = self._predict_from_normalized_latent_window(
+                latent_window_input_norm=latent_window_input_norm,
+                traj_type=negative_traj_type,
+                task_index=task_index_tensor,
+                sigma=sigma_tensor,
+                profiler=profiler,
+            )
+            return out
+
+        pred = self._predict_from_normalized_latent_window(
+            latent_window_input_norm=latent_window_input_norm,
+            traj_type=traj_type_tensor,
+            task_index=task_index_tensor,
+            sigma=sigma_tensor,
+            profiler=profiler,
+        )
+        out.update(pred)
+        return out
 
     def forward(
         self,
@@ -575,7 +819,9 @@ class DSMModel(nn.Module):
         *,
         traj_type: torch.Tensor | int,
         task_index: torch.Tensor | int,
-        add_noise: bool = False,
+        sigma: torch.Tensor | float | int,
+        latent_window_noise: torch.Tensor | None = None,
+        return_condition_pair: bool = False,
         profiler: Any | None = None,
     ) -> dict[str, torch.Tensor]:
         latent_window = self.encode_latent_window(
@@ -588,51 +834,113 @@ class DSMModel(nn.Module):
             latent_window=latent_window,
             traj_type=traj_type,
             task_index=task_index,
-            add_noise=add_noise,
+            sigma=sigma,
+            latent_window_noise=latent_window_noise,
+            return_condition_pair=return_condition_pair,
             profiler=profiler,
         )
         out["image_window"] = image_window
         out["proprio_window"] = proprio_window
         return out
 
+    def _new_inference_generator(self, device: torch.device, offset: int) -> torch.Generator:
+        if device.type == "cuda":
+            generator = torch.Generator(device=device)
+        else:
+            generator = torch.Generator()
+        generator.manual_seed(int(self.inference_seed + offset))
+        return generator
+
     def compute_fisher_score_from_latent_window(
         self,
         *,
         latent_window: torch.Tensor,
         task_index: torch.Tensor | int,
+        sigma: torch.Tensor | float | int,
     ) -> dict[str, torch.Tensor]:
-        # Evaluate the same latent window with positive vs negative trajectory-type conditions.
-        pos_out = self.forward_from_latent_window(
-            latent_window=latent_window,
-            traj_type=0,
+        """MC Tweedie Fisher score over K MC samples, vectorized across K."""
+        self.predictor._require_latent_window("latent_window", latent_window)
+        batch_size = int(latent_window.shape[0])
+        K = int(self.num_mc_samples)
+        W = int(self.window_size)
+        D = int(self.latent_dim)
+
+        sigma_tensor = self._require_sigma(
+            batch_size=batch_size,
+            sigma=sigma,
+            device=latent_window.device,
+            dtype=latent_window.dtype,
+        )
+        task_index_tensor = self._require_task_index(
+            batch_size=batch_size,
             task_index=task_index,
-            add_noise=False,
+            device=latent_window.device,
         )
-        neg_out = self.forward_from_latent_window(
-            latent_window=latent_window,
-            traj_type=1,
-            task_index=task_index,
-            add_noise=False,
+
+        # Normalize once and broadcast across the MC dimension.
+        clean_norm = self.normalize_latent(latent_window)  # (B, W, D)
+
+        # Single generator, one (K, B, W, D) noise draw.
+        generator = self._new_inference_generator(latent_window.device, offset=0)
+        eps = torch.randn(
+            (K, batch_size, W, D),
+            dtype=latent_window.dtype,
+            device=latent_window.device,
+            generator=generator,
         )
-        pos_recon = self.reconstruction_components(
-            chunk_clean=pos_out["chunk_clean"],
-            chunk_hat=pos_out["chunk_hat"],
+        sigma_kb_view = sigma_tensor.view(1, batch_size, 1, 1)
+        xt_norm_kbwd = clean_norm.unsqueeze(0) + sigma_kb_view * eps  # (K, B, W, D)
+        xt_norm_flat = xt_norm_kbwd.reshape(K * batch_size, W, D)
+
+        # Expand conditioning tensors to (K*B,).
+        sigma_kb = sigma_tensor.unsqueeze(0).expand(K, batch_size).reshape(K * batch_size)
+        task_kb = task_index_tensor.unsqueeze(0).expand(K, batch_size).reshape(K * batch_size)
+        zeros_kb = torch.zeros((K * batch_size,), dtype=torch.long, device=latent_window.device)
+        ones_kb = torch.ones((K * batch_size,), dtype=torch.long, device=latent_window.device)
+
+        # Two predictor forwards, each over batch K*B. Replaces K*2 sequential calls.
+        pos_out = self._predict_from_normalized_latent_window(
+            latent_window_input_norm=xt_norm_flat,
+            traj_type=zeros_kb,
+            task_index=task_kb,
+            sigma=sigma_kb,
         )
-        neg_recon = self.reconstruction_components(
-            chunk_clean=pos_out["chunk_clean"],
-            chunk_hat=neg_out["chunk_hat"],
+        neg_out = self._predict_from_normalized_latent_window(
+            latent_window_input_norm=xt_norm_flat,
+            traj_type=ones_kb,
+            task_index=task_kb,
+            sigma=sigma_kb,
         )
-        # Margin > 0 means the negative-conditioned branch reconstructs worse than positive.
-        chunk_margin = neg_recon["chunk_energy_per_sample"] - pos_recon["chunk_energy_per_sample"]
+
+        pos_hat_norm_kbwd = pos_out["latent_window_hat_norm"].reshape(K, batch_size, W, D)
+        neg_hat_norm_kbwd = neg_out["latent_window_hat_norm"].reshape(K, batch_size, W, D)
+
+        sigma_sq_kb = torch.square(sigma_kb_view)  # (1, B, 1, 1)
+        s_pos_k = (pos_hat_norm_kbwd - xt_norm_kbwd) / sigma_sq_kb
+        s_neg_k = (neg_hat_norm_kbwd - xt_norm_kbwd) / sigma_sq_kb
+
+        score_positive = s_pos_k.mean(dim=0)  # (B, W, D)
+        score_negative = s_neg_k.mean(dim=0)
+        pos_hat_norm_mean = pos_hat_norm_kbwd.mean(dim=0)
+        neg_hat_norm_mean = neg_hat_norm_kbwd.mean(dim=0)
+
+        chunk_positive = torch.square(score_positive).mean(dim=(1, 2))
+        chunk_negative = torch.square(score_negative).mean(dim=(1, 2))
+        chunk_margin = torch.square(score_positive - score_negative).mean(dim=(1, 2))
+
         return {
-            "chunk_positive_energy_per_sample": pos_recon["chunk_energy_per_sample"],
-            "chunk_negative_energy_per_sample": neg_recon["chunk_energy_per_sample"],
+            "chunk_positive_energy_per_sample": chunk_positive,
+            "chunk_negative_energy_per_sample": chunk_negative,
             "chunk_margin_per_sample": chunk_margin,
             "margin_score_per_sample": chunk_margin,
-            "positive_score_per_sample": pos_recon["score_per_sample"],
-            "negative_score_per_sample": neg_recon["score_per_sample"],
-            "chunk_pos_hat": pos_out["chunk_hat"],
-            "chunk_neg_hat": neg_out["chunk_hat"],
+            "positive_score_per_sample": chunk_positive,
+            "negative_score_per_sample": chunk_negative,
+            "score_positive": score_positive,
+            "score_negative": score_negative,
+            "chunk_pos_hat_norm": self.flatten_latent_window(pos_hat_norm_mean),
+            "chunk_neg_hat_norm": self.flatten_latent_window(neg_hat_norm_mean),
+            "chunk_pos_hat": self.flatten_latent_window(self.denormalize_latent(pos_hat_norm_mean)),
+            "chunk_neg_hat": self.flatten_latent_window(self.denormalize_latent(neg_hat_norm_mean)),
         }
 
 
@@ -643,6 +951,7 @@ def build_unified_conditioned_dsm(
     num_tasks: int,
     cfg_model: Any,
 ) -> ChunkConditionedDSM:
+    """Construct ``ChunkConditionedDSM`` from ``cfg.model`` (Hydra-style keys)."""
     embed_dim = int(_cfg_get(cfg_model, "embed_dim", _cfg_get(cfg_model, "backbone_dim", 512)))
     return ChunkConditionedDSM(
         latent_dim=int(latent_dim),
@@ -654,6 +963,7 @@ def build_unified_conditioned_dsm(
         ffn_dim=int(_cfg_get(cfg_model, "ffn_dim", max(4 * embed_dim, embed_dim))),
         kernel_size=int(_cfg_get(cfg_model, "kernel_size", 3)),
         dropout=float(_cfg_get(cfg_model, "dropout", 0.1)),
+        sigma_embed_dim=int(_cfg_get(cfg_model, "sigma_embed_dim", 64)),
     )
 
 
@@ -696,19 +1006,28 @@ def build_dsm_model(
     window_size: int,
     policy_encoder: FlowMultitaskEncoder,
     task_names: Sequence[str],
+    inference_seed: int = 0,
 ) -> DSMModel:
+    """Top-level factory: predictor from ``cfg.model`` + provided ``policy_encoder`` -> ``DSMModel``."""
     predictor = build_unified_conditioned_dsm(
         latent_dim=int(latent_dim),
         window_size=int(window_size),
         num_tasks=int(num_tasks),
         cfg_model=cfg_model,
     )
+    legacy_eval_sigma = float(_cfg_get(cfg_model, "noise_scale", _cfg_get(cfg_model, "noise_sigma", 0.08)))
     return DSMModel(
         predictor=predictor,
         policy_encoder=policy_encoder,
         task_names=task_names,
         latent_dim=int(latent_dim),
         window_size=int(window_size),
-        noise_scale=float(_cfg_get(cfg_model, "noise_scale", _cfg_get(cfg_model, "noise_sigma", 0.08))),
         std_clamp_min=float(_cfg_get(cfg_model, "std_clamp_min", 0.05)),
+        normalize_enabled=bool(_cfg_get(cfg_model, "normalize_enabled", True)),
+        sigma_min=float(_cfg_get(cfg_model, "sigma_min", 0.1)),
+        sigma_max=float(_cfg_get(cfg_model, "sigma_max", 2.0)),
+        sigma_distribution=str(_cfg_get(cfg_model, "sigma_distribution", "log_uniform")),
+        num_mc_samples=int(_cfg_get(cfg_model, "num_mc_samples", 16)),
+        default_eval_sigma=float(_cfg_get(cfg_model, "default_eval_sigma", legacy_eval_sigma)),
+        inference_seed=int(inference_seed),
     )

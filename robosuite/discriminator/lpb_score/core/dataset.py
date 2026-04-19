@@ -1,4 +1,17 @@
-"""Dataset and batch-building utilities for windowed DSM training."""
+"""Data layer: HDF5 demo discovery, train/val splits, windowed DSM datasets, loaders.
+
+Lifecycle:
+    - ``parse_task_specs`` / ``build_split_refs``: locate ``*.hdf5`` demos per task
+      and split into train/val/test counts (positive = expert + success_rollout,
+      negative = fail_rollout).
+    - ``prepare_trajectories`` / cache: convert ``DemoRef`` -> tensors or
+      ``CachedTrajectoryRef`` for on-disk preprocessed bundles.
+    - ``LatentTransitionDataset``: enumerates sliding windows over trajectories,
+      labels ``traj_type`` from data_type, pairs with ``BatchedTrainLoader`` for
+      encoder-efficient batching.
+
+See ``app/pipeline.build_training_datasets`` for how splits become PyTorch datasets.
+"""
 
 from __future__ import annotations
 
@@ -18,8 +31,7 @@ import torch
 from hydra.utils import to_absolute_path
 from torch.utils.data import Dataset
 
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
-from robosuite.discriminator.dyn_bce.task_registry import ordered_task_names
+from .policy_encoder import FlowMultitaskEncoder, ordered_task_names
 
 
 DATA_TYPE_ORDER = ["expert", "success_rollout", "fail_rollout"]
@@ -368,6 +380,25 @@ def build_split_refs(
                     )
                 )
 
+    if len(split_refs["train"]) == 0:
+        detail_lines: list[str] = []
+        for name in ordered_task_names(list(task_specs.keys())):
+            spec = task_specs[name]
+            detail_lines.append(
+                f"  {name}:\n"
+                f"    expert_dir={spec.expert_dir}\n"
+                f"    success_rollout_dir={spec.success_rollout_dir}\n"
+                f"    fail_rollout_dir={spec.fail_rollout_dir}"
+            )
+        raise ValueError(
+            "lpb_score: no training trajectories. "
+            "Each data.tasks.<TASK> directory must exist and contain at least one *.hdf5 with a `demos` group "
+            "(see warnings above for missing dirs). Fix broken symlinks under ./data/ or override "
+            "data.tasks.<TASK>.{expert_dir,success_rollout_dir,fail_rollout_dir}, e.g. "
+            "DATA_ROOT=/path/to/raw bash scripts/train_lpb_score_dsm.sh.\n"
+            + "\n".join(detail_lines)
+        )
+
     return split_refs, split_summary, task_to_index
 
 
@@ -500,7 +531,12 @@ def estimate_trajectories_nbytes(trajectories: Sequence[PreparedTrajectory]) -> 
 
 
 class LatentTransitionDataset(Dataset):
-    """Windowed trajectory dataset backed by RAM, disk cache, or a hybrid mix."""
+    """Windowed trajectory dataset backed by RAM, disk cache, or a hybrid mix.
+
+    Each sample is a time window of RGB + proprio (+ task / traj_type metadata)
+    consumed by ``DSMModel.forward``. ``cached_refs`` mode loads windows lazily
+    from the preprocessed cache; ``resident_trajectories`` pins a hot subset in RAM.
+    """
 
     def __init__(
         self,

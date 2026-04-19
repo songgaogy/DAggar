@@ -18,7 +18,7 @@ from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from omegaconf import DictConfig
 
-from robosuite.discriminator.dyn_bce.task_registry import normalize_task_name, resolve_checkpoint_task_name
+from ..core.policy_encoder import normalize_task_name, resolve_checkpoint_task_name
 from robosuite.discriminator.lpb_score.analysis.attribution import (
     TERM_COLORS,
     TERM_LABELS,

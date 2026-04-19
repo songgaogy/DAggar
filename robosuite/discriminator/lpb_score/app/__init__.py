@@ -1,4 +1,4 @@
-"""Train and visualize entrypoints plus shared encoder/discriminator builders."""
+"""Application layer: ``run_train`` / ``run_visualize`` and ``pipeline`` dataset builders."""
 
 from .pipeline import (
     TrainingDatasets,

@@ -1,4 +1,18 @@
-"""LPB score package: multitask latent DSM training and trajectory failure detection (public exports)."""
+"""LPB score: latent trajectory DSM training and offline failure detection.
+
+Pipeline (training):
+    Raw demos (HDF5) -> split/refs per task -> optional preprocessed cache ->
+    FlowMultitaskEncoder (frozen policy vision + language) maps windows to latents ->
+    DSMModel adds noise on normalized latents; ChunkConditionedDSM denoises under
+    task + trajectory-type + sigma -> DSM + contrastive loss (Trainer).
+
+Inference (see ``core/dsm_discriminator``):
+    Same encoder + trained DSM; score chunks via positive vs failure branches and
+    T3-style detector statistics.
+
+Public symbols below are re-exported for library use; CLI entrypoints are
+``train.py`` and ``visualize_failures.py``.
+"""
 
 from .analysis import (
     TERM_COLORS,
@@ -22,12 +36,15 @@ from .app import (
     select_split_refs,
 )
 from .core import (
+    DEFAULT_TASK_ORDER,
     ConditionalManifoldDenoiser,
     DATA_TYPE_ORDER,
     DemoRef,
     DSMDiscriminator,
     DSMModel,
     DSMTransitionScorer,
+    FlowMultitaskEncoder,
+    MODEL_ARCHITECTURE,
     PreparedTrajectory,
     JointManifoldDenoiser,
     LatentTransitionDataset,
@@ -44,7 +61,10 @@ from .core import (
     build_unified_conditioned_dsm,
     estimate_trajectories_nbytes,
     filter_refs_by_data_types,
+    normalize_task_name,
+    ordered_task_names,
     prepare_trajectories,
+    resolve_checkpoint_task_name,
     resolve_window_size,
 )
 
@@ -60,11 +80,17 @@ __all__ = [
     "ConditionalManifoldDenoiser",
     "UnifiedConditionedDSM",
     "DATA_TYPE_ORDER",
+    "DEFAULT_TASK_ORDER",
     "SplitCounts",
     "TaskDataSpec",
     "DemoRef",
     "PreparedTrajectory",
     "LatentTransitionDataset",
+    "FlowMultitaskEncoder",
+    "MODEL_ARCHITECTURE",
+    "normalize_task_name",
+    "resolve_checkpoint_task_name",
+    "ordered_task_names",
     "build_split_refs",
     "filter_refs_by_data_types",
     "prepare_trajectories",

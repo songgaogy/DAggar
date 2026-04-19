@@ -6,8 +6,8 @@ ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 SEED=2
-DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v4/lpb_dipole_dsm_20260419_004434/lpb_dipole_dsm_20260419_004434.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v4/visualize}"
+DSM_CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v5/lpb_dipole_dsm_20260420_011232/lpb_dipole_dsm_20260420_011232_ep0010.pt"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v5/visualize}"
 NUM_VIDEOS=12
 
 BANK_SIZE=100

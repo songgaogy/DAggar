@@ -8,7 +8,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-/home/dodo/miniconda3/envs/daggar/bin/torchrun}"
 
 GPU="${GPU:-0,1}"
 SEED="${SEED:-42}"
-BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v4}"
+BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v5}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_NAME="${RUN_NAME:-lpb_dipole_dsm_${TIMESTAMP}}"
 SAVE_NAME="${SAVE_NAME:-${RUN_NAME}.pt}"
@@ -16,22 +16,30 @@ SAVE_DIR="${SAVE_DIR:-${BASE_SAVE_DIR}/${RUN_NAME}}"
 CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 
 BATCH_SIZE=256
-ENCODER_BATCH_SIZE=64
+ENCODER_BATCH_SIZE=64    # 64 without LoRA
 NUM_WORKERS=4
 EPOCHS=25
-TRAIN_ENCODER=0   # whether to train the encoder using LoRA
-LORA_RANK=8
-LORA_ALPHA=16.0
+USE_LORA="${USE_LORA:-0}"              # 1 enables LoRA modules in the encoder branch
+TRAIN_ENCODER="${TRAIN_ENCODER:-0}"    # 1 trains the LoRA encoder branch when USE_LORA=1
+LORA_RANK="${LORA_RANK:-8}"            # LoRA rank for encoder adapters
+LORA_ALPHA="${LORA_ALPHA:-16.0}"       # LoRA scaling factor
+AUX_WEIGHT="${AUX_WEIGHT:-0.5}"        # auxiliary conditional contrastive loss weight
+NORM_WARMUP_MAX_SAMPLES="${NORM_WARMUP_MAX_SAMPLES:-2000}"  # cap positive-only warmup sample budget
+NORM_WARMUP_MAX_BATCHES="${NORM_WARMUP_MAX_BATCHES:-32}"    # cap positive-only warmup batch count
 
 CUDA_PREFETCH=1
-DATA_IN_RAM=100
-TRAIN_PRELOAD_RAM_GB=16
+DATA_IN_RAM=50    # 100 without LoRA
+TRAIN_PRELOAD_RAM_GB=8    # 16 without LoRA
 VAL_PRELOAD_RAM_GB="${VAL_PRELOAD_RAM_GB:-0}"
 LR="${LR:-2e-4}"
 BATCH_PREFETCH_DEPTH="${BATCH_PREFETCH_DEPTH:-2}"
-BATCHED_TRAJECTORY_CACHE_GB=16
+BATCHED_TRAJECTORY_CACHE_GB=8    # 16 without LoRA
 PREPROCESSED_CACHE_LAYOUT="${PREPROCESSED_CACHE_LAYOUT:-bundle}"
 UPGRADE_LEGACY_PREPROCESSED_CACHE="${UPGRADE_LEGACY_PREPROCESSED_CACHE:-1}"
+
+# Optional: HDF5 root with layout ${DATA_ROOT}/<Task>/{expert,success_rollout,fail_rollout}/*.hdf5
+# Overrides data.tasks.* paths from train.yaml (use when ./data/<Task> symlinks are broken or data lives elsewhere).
+DATA_ROOT="${DATA_ROOT:-}"
 
 NUM_POS=100
 NUM_NEG=100
@@ -41,7 +49,7 @@ POSITIVE_RATIO="${POSITIVE_RATIO:-0.7}"
 HORIZON="${HORIZON:-10}"
 DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE:-${HORIZON}}"
 
-LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"    # LoRA dropout probability
 DDP_FIND_UNUSED="${DDP_FIND_UNUSED:-0}"
 DDP_STATIC_GRAPH="${DDP_STATIC_GRAPH:-1}"
 DDP_BUCKET_VIEW="${DDP_BUCKET_VIEW:-1}"
@@ -49,7 +57,13 @@ USE_TMUX="${USE_TMUX:-1}"
 TMUX_SESSION_NAME="${TMUX_SESSION_NAME:-${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${SAVE_DIR}/train.log}"
 
-if [[ "${TRAIN_ENCODER}" == "1" ]]; then
+if [[ "${USE_LORA}" == "1" ]]; then
+  USE_LORA_BOOL="true"
+else
+  USE_LORA_BOOL="false"
+fi
+
+if [[ "${USE_LORA}" == "1" && "${TRAIN_ENCODER}" == "1" ]]; then
   TRAIN_ENCODER_BOOL="true"
 else
   TRAIN_ENCODER_BOOL="false"
@@ -112,13 +126,18 @@ if [[ "${USE_TMUX}" == "1" && -z "${TMUX:-}" ]]; then
         CKPT="${CKPT}" \
         CUDA_PREFETCH="${CUDA_PREFETCH}" \
         DATA_IN_RAM="${DATA_IN_RAM}" \
+        DATA_ROOT="${DATA_ROOT}" \
         POSITIVE_RATIO="${POSITIVE_RATIO}" \
         HORIZON="${HORIZON}" \
         DSM_WINDOW_SIZE="${DSM_WINDOW_SIZE}" \
+        USE_LORA="${USE_LORA}" \
         TRAIN_ENCODER="${TRAIN_ENCODER}" \
         LORA_RANK="${LORA_RANK}" \
         LORA_ALPHA="${LORA_ALPHA}" \
         LORA_DROPOUT="${LORA_DROPOUT}" \
+        AUX_WEIGHT="${AUX_WEIGHT}" \
+        NORM_WARMUP_MAX_SAMPLES="${NORM_WARMUP_MAX_SAMPLES}" \
+        NORM_WARMUP_MAX_BATCHES="${NORM_WARMUP_MAX_BATCHES}" \
         DDP_FIND_UNUSED="${DDP_FIND_UNUSED}" \
         DDP_STATIC_GRAPH="${DDP_STATIC_GRAPH}" \
         DDP_BUCKET_VIEW="${DDP_BUCKET_VIEW}" \
@@ -166,6 +185,21 @@ echo "[train_lpb_score_dsm] train_preload_ram_gb=${TRAIN_PRELOAD_RAM_GB} val_pre
 echo "[train_lpb_score_dsm] train_batch_build_workers=${LOCAL_TRAIN_BATCH_BUILD_WORKERS} batch_prefetch_depth=${BATCH_PREFETCH_DEPTH} batched_trajectory_cache_gb=${BATCHED_TRAJECTORY_CACHE_GB}"
 echo "[train_lpb_score_dsm] preprocessed_cache_layout=${PREPROCESSED_CACHE_LAYOUT} upgrade_legacy_preprocessed_cache=${UPGRADE_LEGACY_PREPROCESSED_CACHE_BOOL}"
 echo "[train_lpb_score_dsm] ddp_find_unused=${DDP_FIND_UNUSED_BOOL} ddp_static_graph=${DDP_STATIC_GRAPH_BOOL} ddp_bucket_view=${DDP_BUCKET_VIEW_BOOL}"
+echo "[train_lpb_score_dsm] use_lora=${USE_LORA_BOOL} train_encoder=${TRAIN_ENCODER_BOOL} lora_rank=${LORA_RANK} lora_alpha=${LORA_ALPHA} lora_dropout=${LORA_DROPOUT}"
+echo "[train_lpb_score_dsm] aux_weight=${AUX_WEIGHT}"
+
+HYDRA_DATA_ROOT_OVERRIDES=()
+if [[ -n "${DATA_ROOT}" ]]; then
+  _tasks=(PandaLift PandaPickPlaceCan PandaStack PickPlaceBread PickPlaceCereal PickPlaceMilk)
+  for _t in "${_tasks[@]}"; do
+    HYDRA_DATA_ROOT_OVERRIDES+=(
+      "data.tasks.${_t}.expert_dir=${DATA_ROOT}/${_t}/expert"
+      "data.tasks.${_t}.success_rollout_dir=${DATA_ROOT}/${_t}/success_rollout"
+      "data.tasks.${_t}.fail_rollout_dir=${DATA_ROOT}/${_t}/fail_rollout"
+    )
+  done
+  echo "[train_lpb_score_dsm] DATA_ROOT=${DATA_ROOT} (overriding data.tasks.*_dir for ${_tasks[*]})"
+fi
 
 if [[ "${NUM_PROCS}" -le 1 ]]; then
   LAUNCHER=("${PYTHON_BIN}")
@@ -187,7 +221,7 @@ set -o pipefail
   policy.ckpt="${CKPT}" \
   policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
   policy.trainable_encoder="${TRAIN_ENCODER_BOOL}" \
-  policy.lora.enabled="${TRAIN_ENCODER_BOOL}" \
+  policy.lora.enabled="${USE_LORA_BOOL}" \
   policy.lora.rank="${LORA_RANK}" \
   policy.lora.alpha="${LORA_ALPHA}" \
   policy.lora.dropout="${LORA_DROPOUT}" \
@@ -212,4 +246,8 @@ set -o pipefail
   training.epochs="${EPOCHS}" \
   training.lr="${LR}" \
   training.positive_ratio="${POSITIVE_RATIO}" \
+  training.aux_contrastive_weight="${AUX_WEIGHT}" \
+  training.normalization_warmup_max_samples="${NORM_WARMUP_MAX_SAMPLES}" \
+  training.normalization_warmup_max_batches="${NORM_WARMUP_MAX_BATCHES}" \
+  "${HYDRA_DATA_ROOT_OVERRIDES[@]}" \
   "$@" 2>&1 | tee -a "${LOG_FILE}"

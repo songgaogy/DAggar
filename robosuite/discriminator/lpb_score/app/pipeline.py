@@ -1,4 +1,15 @@
-"""Helpers for assembling the DSM training and visualization pipeline."""
+"""Pipeline helpers: encoder construction, train/val dataset assembly, offline detector build.
+
+Training data path:
+    ``cfg.data.tasks`` maps each task to ``expert_dir``, ``success_rollout_dir``,
+    ``fail_rollout_dir`` (HDF5 with ``demos``). ``build_training_datasets`` either
+    loads full ``PreparedTrajectory`` tensors or (typical) builds
+    ``CachedTrajectoryRef`` indices into ``data.preprocessed_cache_dir`` and a
+    bounded in-RAM subset for hot trajectories. See ``core/dataset.py`` for indexing.
+
+``build_dsm_discriminator`` is used by visualization / evaluation configs, not the
+main ``train.yaml`` DSM training loop (which constructs ``DSMModel`` in ``app/train.py``).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +21,7 @@ import numpy as np
 
 from hydra.utils import to_absolute_path
 
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
+from ..core.policy_encoder import FlowMultitaskEncoder
 
 from ..core.dataset import (
     CachedTrajectoryRef,
@@ -43,6 +54,7 @@ def now_tag() -> str:
 
 
 def build_flow_encoder(cfg: Any, *, device_override: str | None = None) -> FlowMultitaskEncoder:
+    """Load ``FlowMultitaskEncoder`` from ``cfg.policy.ckpt`` (flow policy multimodal encoder)."""
     lora_cfg = dict(getattr(cfg.policy, "lora", {}) or {})
     if bool(getattr(cfg.policy, "trainable_encoder", False)):
         lora_cfg["enabled"] = True
@@ -98,6 +110,7 @@ def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
         lambda_window_size=int(cfg.detector.lambda_window_size),
         alpha=float(getattr(cfg.detector, "alpha", 1.0)),
         beta=float(getattr(cfg.detector, "beta", 1.0)),
+        ewma_alpha=float(getattr(cfg.detector, "ewma_alpha", 0.9)),
     )
 
 
@@ -239,7 +252,13 @@ def build_training_datasets(
     build_val_dataset: bool = True,
     replica_count: int = 1,
 ) -> TrainingDatasets:
-    """Construct train/validation datasets with cache-aware residency decisions."""
+    """Build ``LatentTransitionDataset`` for train/val with optional preprocessed cache.
+
+    When ``use_preprocessed_cache`` is true: build ``CachedTrajectoryRef`` lists,
+    optionally keep a subset of trajectories resident in RAM (``data_in_ram``,
+    preload GB budgets), and use lazy cache reads for the rest. Otherwise
+    materialize ``PreparedTrajectory`` tensors for the full split.
+    """
     train_refs = list(split_refs["train"])
     val_refs = list(split_refs["val"]) if bool(build_val_dataset) else []
     window_size = resolve_window_size(cfg)

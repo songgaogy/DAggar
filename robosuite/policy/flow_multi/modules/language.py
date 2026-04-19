@@ -119,6 +119,28 @@ class CLIPLanguageEncoder(nn.Module):
         denom = weights.sum(dim=1).clamp_min(1.0)
         return (token_features * weights).sum(dim=1) / denom
 
+    def _pad_token_row_to_max_length(self, row: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Pad each batch row to self.max_length so cached rows from different tokenizer batches stack."""
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+        out: dict[str, torch.Tensor] = {}
+        for key, tensor in row.items():
+            if tensor.dim() != 1:
+                out[key] = tensor
+                continue
+            seq_len = int(tensor.shape[0])
+            if seq_len > self.max_length:
+                out[key] = tensor[: self.max_length].clone()
+                continue
+            if seq_len == self.max_length:
+                out[key] = tensor.clone()
+                continue
+            pad_len = self.max_length - seq_len
+            pad = torch.full((pad_len,), pad_id, dtype=tensor.dtype) if key == "input_ids" else torch.zeros(pad_len, dtype=tensor.dtype)
+            out[key] = torch.cat([tensor, pad], dim=0)
+        return out
+
     def _tokenize_cached(self, texts: list[str]) -> dict[str, torch.Tensor]:
         unique_texts = list(dict.fromkeys(str(text) for text in texts))
         missing_texts = [text for text in unique_texts if text not in self._tokenized_text_cache]
@@ -131,10 +153,11 @@ class CLIPLanguageEncoder(nn.Module):
                 return_tensors="pt",
             )
             for row, text in enumerate(missing_texts):
-                self._tokenized_text_cache[text] = {
+                row_dict = {
                     key: value[row].detach().cpu().clone()
                     for key, value in encoded_missing.items()
                 }
+                self._tokenized_text_cache[text] = self._pad_token_row_to_max_length(row_dict)
 
         encoded_rows = [self._tokenized_text_cache[str(text)] for text in texts]
         keys = tuple(encoded_rows[0].keys())

@@ -17,6 +17,69 @@ The active implementation is in:
 
 This document describes the current implementation only. It does not describe the removed two-head state/action/transition DSM.
 
+## Phase 1 Update
+
+The Phase 1 correctness refactor changes the detector semantics in three important ways:
+
+1. latent normalization is now active by default through `normalize_latent(z) = (z - \mu) / \max(\sqrt{v}, \sigma_{\min})`, with positive-only warmup statistics written into checkpoint buffers
+2. training is multi-`σ`, and `σ` is fed into the DSM through a Fourier embedding path
+3. inference now uses Monte-Carlo Tweedie score estimation instead of clean-input reconstruction
+
+The detector terms keep the same field names, but their meanings changed:
+
+- `chunk_energy` is the squared norm of the positive-class score estimate
+- `chunk_margin` is the squared norm of the difference between positive and negative score estimates
+
+The first `W - 1` frames of every trajectory are cold-start masked with success-bank medians for `chunk_energy` and `chunk_margin`.
+
+Useful new training keys:
+
+- `model.sigma_min`
+- `model.sigma_max`
+- `model.sigma_distribution`
+- `model.sigma_embed_dim`
+- `model.num_mc_samples`
+- `model.normalize_enabled`
+- `detector.eval_sigma`
+- `training.aux_contrastive_weight`
+- `training.aux_contrastive_margin`
+- `training.normalization_warmup_max_samples`
+- `training.normalization_warmup_max_batches`
+
+Useful new script env vars:
+
+- `AUX_WEIGHT`
+- `NORM_WARMUP_MAX_SAMPLES`
+- `NORM_WARMUP_MAX_BATCHES`
+- `USE_LORA`
+- `TRAIN_ENCODER`
+- `LORA_RANK`
+- `LORA_ALPHA`
+- `LORA_DROPOUT`
+- `LAMBDA_MODE`
+- `EWMA_ALPHA`
+
+Perf notes:
+
+- Inference MC Tweedie scoring is vectorized across the Monte-Carlo dimension
+  (the K draws are stacked into the predictor batch axis). Scoring a batch of
+  latent windows now invokes the predictor twice (one forward per conditional
+  branch), not `2 * K` times.
+- Positive-only normalization warmup early-stops at the first of
+  `normalization_warmup_max_samples` (default 5000) or
+  `normalization_warmup_max_batches` (default 20). A random positive subset is
+  sufficient to estimate per-dim `\mu` / `\sigma` stably for `D = 512`, and
+  caps the one-time startup cost.
+
+Benchmark wrapper:
+
+```bash
+DSM_CKPT=/abs/path/to/model.pt \
+TASKS=PickPlaceCan \
+OUT_JSON=/tmp/lpb_score_phase1.json \
+bash robosuite/discriminator/lpb_score/scripts/run_lpb_score_benchmark.sh
+```
+
 ## 1. Problem Setting
 
 The detector is designed for the case where a single frame is ambiguous. A state from an early successful phase can overlap geometrically with a later failure state. A pointwise detector cannot resolve this well because it only sees one latent `z_t`.
@@ -30,8 +93,8 @@ For each timestep `t`:
 1. read raw multi-view RGB and proprio
 2. encode each frame into a latent `z_t`
 3. build a left-padded temporal window `X_t`
-4. normalize the latent window
-5. corrupt the normalized window with Gaussian noise during training
+4. optionally normalize the latent window (currently pass-through in active code)
+5. corrupt the latent window with Gaussian noise during training
 6. denoise the whole window with a conditional temporal Conv1d network
 7. flatten the reconstructed window only for loss and scoring
 
@@ -166,21 +229,24 @@ This is implemented by `DSMModel.encode_latent_window(...)`.
 
 ## 5. Latent Normalization
 
-The DSM operates on normalized latents. Let `\mu` and `\sigma^2` be the mean and variance computed from positive trajectories only. For each latent vector:
+`DSMModel` still carries latent normalization buffers (`latent_mean`, `latent_var`) and exposes
+normalization-stat APIs for compatibility with older checkpoints and metadata.
+
+In the active code path, `normalize_latent(...)` is currently an identity map:
+
+$$
+\bar{z} = z.
+$$
+
+So the denoiser operates directly on encoder latents without runtime whitening.
+
+For historical context, the previous normalization form was:
 
 $$
 \bar{z} = \frac{z - \mu}{\max(\sqrt{\sigma^2}, \sigma_{\min})},
 $$
 
 where `\sigma_{\min}` is `std_clamp_min`.
-
-This produces the normalized latent window:
-
-$$
-\bar{X}_t = [\bar{z}_{t-W+1}, \dots, \bar{z}_t].
-$$
-
-Because the encoder can move during training, these statistics are recomputed from current positive-train encoder outputs at the start of each epoch. If EMA is enabled and used for validation or checkpoint export, EMA statistics are recomputed for the EMA model as well.
 
 ## 6. Chunk DSM Architecture
 
@@ -517,7 +583,8 @@ So the cache is rebuilt automatically if the underlying data or preprocessing co
 - `latent_dim`
 - `window_size`
 - `chunk_dim`
-- normalization stats
+- latent normalization buffers in the model state (`latent_mean`, `latent_var`)
+- optional legacy `normalization_stats` metadata (if present in older payload variants)
 - task vocabulary metadata
 - config snapshot
 - `model_architecture`
@@ -539,18 +606,26 @@ Important training keys:
 - `model.num_layers`
 - `model.ffn_dim`
 - `model.kernel_size`
-- `model.noise_scale`
+- `model.sigma_min`
+- `model.sigma_max`
+- `model.sigma_embed_dim`
+- `model.num_mc_samples`
+- `model.normalize_enabled`
 - `model.std_clamp_min`
 - `training.encoder_branch_lr_multiplier`
 - `training.shared_lr_multiplier`
 - `training.chunk_branch_lr_multiplier`
+- `training.aux_contrastive_weight`
+- `training.aux_contrastive_margin`
 
 Important detector keys:
 
 - `detector.alpha`
 - `detector.beta`
+- `detector.eval_sigma`
 - `detector.lambda_mode`
 - `detector.lambda_window_size`
+- `detector.ewma_alpha`
 - `detector.delta`
 
 ## 13. Scripts
@@ -564,13 +639,26 @@ bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
 Useful overrides:
 
 ```bash
+USE_LORA=1 \
 TRAIN_ENCODER=1 \
 LORA_RANK=8 \
 LORA_ALPHA=16.0 \
 LORA_DROPOUT=0.0 \
+AUX_WEIGHT=0.1 \
 DSM_WINDOW_SIZE=10 \
 TEMPORAL_KERNEL_SIZE=3 \
 bash robosuite/discriminator/lpb_score/scripts/train_lpb_score_dsm.sh
+```
+
+Benchmark:
+
+```bash
+DSM_CKPT=/abs/path/to/model.pt \
+TASKS=PickPlaceCan \
+LAMBDA_MODE=ewma \
+EWMA_ALPHA=0.9 \
+OUT_JSON=/tmp/lpb_score_benchmark.json \
+bash robosuite/discriminator/lpb_score/scripts/run_lpb_score_benchmark.sh
 ```
 
 Visualization:
@@ -583,7 +671,7 @@ bash robosuite/discriminator/lpb_score/scripts/visualize_lpb_score_dsm_failures.
 ## 14. Practical Notes
 
 - `TRAIN_ENCODER=1` means LoRA tuning, not full encoder fine-tuning.
-- `TRAIN_ENCODER=0` keeps the encoder fully frozen.
+- `USE_LORA=0` keeps the encoder fully frozen even if `TRAIN_ENCODER=1`.
 - `dataset.window_size` used at visualize time must match the checkpoint window size.
 - The first run can still be slow because preprocessed cache files must be built.
 - Large `batch_size`, `encoder_batch_size`, and `num_workers` can still cause the process to be killed if system memory is insufficient.

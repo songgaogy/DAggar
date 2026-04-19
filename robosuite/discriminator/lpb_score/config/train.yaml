@@ -67,7 +67,17 @@ model:
   kernel_size: 3
   dropout: 0.0
   std_clamp_min: 0.05
-  noise_scale: 0.08
+  sigma_min: 0.1
+  sigma_max: 2.0
+  sigma_distribution: log_uniform
+  sigma_embed_dim: 64
+  num_mc_samples: 16
+  normalize_enabled: true
+
+detector:
+  eval_sigma: 1.0
+  lambda_mode: mean
+  ewma_alpha: 0.9
 
 training:
   device: "cuda"
@@ -118,3 +128,8 @@ training:
   val_use_ema: true
   # When true with use_ema, checkpoint ``model`` is EMA; ``model_online`` holds the training weights.
   save_ema_in_checkpoint: true
+  aux_contrastive_weight: 0.1
+  aux_contrastive_margin: 1.0e-3
+  # Positive-only normalization warmup is capped; first bound to trigger wins.
+  normalization_warmup_max_samples: 5000
+  normalization_warmup_max_batches: 20

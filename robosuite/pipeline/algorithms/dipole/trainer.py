@@ -170,6 +170,7 @@ class DipoleTrainer:
         with self._async_condition:
             if self._async_thread is not None:
                 return
+            
             self._async_stop_requested = False
             self._async_thread = threading.Thread(target=self._async_update_loop, name="dipole_learner", daemon=True)
             self._async_thread.start()

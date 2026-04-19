@@ -1,4 +1,13 @@
-"""Offline DSM-based trajectory discriminator for joint encoder + chunk scoring."""
+"""Offline inference: load trained ``DSMModel``, score full trajectories, run T3 detector.
+
+This module wraps checkpoints produced by ``app/train.py`` into
+``DSMTransitionScorer`` / ``DSMDiscriminator`` for evaluation scripts and
+``app/visualize.py``. It is not imported by the Hydra training entrypoint itself.
+
+Scoring uses the same encoder + DSM as training: chunk-level energies under
+positive vs failure conditioning, combined into margin and calibration logic for
+failure detection (see class docstrings below).
+"""
 
 from __future__ import annotations
 
@@ -9,7 +18,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 import torch
 
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FlowMultitaskEncoder
+from .policy_encoder import FlowMultitaskEncoder
 from robosuite.discriminator.utils.base import OfflineTrajectoryDiscriminator
 from robosuite.discriminator.utils.types import DetectorCalibrationSummary, TrajectoryDetectionResult
 
@@ -70,7 +79,7 @@ class DSMTransitionScorer:
         self.checkpoint_path = str(checkpoint_path)
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
-        self.model, self.window_size, self.latent_dim = self._load_model(
+        self.model, self.window_size, self.latent_dim, self.eval_sigma = self._load_model(
             checkpoint_path=self.checkpoint_path,
             override_window_size=window_size,
         )
@@ -80,7 +89,7 @@ class DSMTransitionScorer:
         self,
         checkpoint_path: str,
         override_window_size: int,
-    ) -> tuple[DSMModel, int, int]:
+    ) -> tuple[DSMModel, int, int, float]:
         payload = _torch_load_checkpoint(checkpoint_path, map_location="cpu")
         if "model" not in payload:
             raise ValueError(f"Checkpoint missing key `model`: {checkpoint_path}")
@@ -138,6 +147,7 @@ class DSMTransitionScorer:
             window_size=window_size,
             policy_encoder=encoder,
             task_names=task_names,
+            inference_seed=int(_cfg_get(cfg, "seed", 0)),
         )
         normalization_stats = payload.get("normalization_stats", None)
         if normalization_stats is not None:
@@ -146,7 +156,6 @@ class DSMTransitionScorer:
                 latent_var=normalization_stats["latent_var"],
             )
         load_result = model.load_state_dict(payload["model"], strict=False)
-        allowed_missing = {"latent_mean", "latent_var"}
         missing = set(load_result.missing_keys)
         unexpected = set(load_result.unexpected_keys)
         if unexpected:
@@ -154,21 +163,42 @@ class DSMTransitionScorer:
                 "Checkpoint architecture mismatch. "
                 f"Unexpected keys from {checkpoint_path}: {sorted(unexpected)}"
             )
-        if missing and not missing.issubset(allowed_missing):
+        allowed_missing_prefixes = (
+            "predictor.sigma_condition_mlp.",
+        )
+        allowed_missing_exact = {
+            "latent_mean",
+            "latent_var",
+            "normalize_enabled",
+        }
+        unexpected_missing = [
+            key
+            for key in sorted(missing)
+            if key not in allowed_missing_exact
+            and not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if unexpected_missing:
             raise RuntimeError(
                 "Checkpoint architecture mismatch. "
-                f"Missing keys from {checkpoint_path}: {sorted(missing)}"
+                f"Missing keys from {checkpoint_path}: {unexpected_missing}"
             )
         model.to(self.device)
         model.eval()
-        return model, window_size, latent_dim
+        eval_sigma = float(
+            _cfg_get(
+                cfg,
+                "detector.eval_sigma",
+                _cfg_get(cfg, "model.default_eval_sigma", _cfg_get(cfg, "model.noise_scale", model.default_eval_sigma)),
+            )
+        )
+        return model, window_size, latent_dim, eval_sigma
 
     def _build_latent_windows(self, latents: np.ndarray) -> np.ndarray:
         t_len = int(latents.shape[0])
         windows = np.zeros((t_len, self.window_size, self.latent_dim), dtype=np.float32)
         for t in range(t_len):
             # Build causal windows: each step only sees current and past latents.
-            start = max(0, t - self.window_size + 1)
+            start = max(30, t - self.window_size + 1)
             chunk = latents[start : t + 1]
             windows[t, -chunk.shape[0] :] = chunk
             if chunk.shape[0] < self.window_size:
@@ -201,6 +231,7 @@ class DSMTransitionScorer:
             fisher = self.model.compute_fisher_score_from_latent_window(
                 latent_window=latent_window_b,
                 task_index=int(traj.task_index),
+                sigma=float(self.eval_sigma),
             )
             chunk_positive_scores.append(fisher["chunk_positive_energy_per_sample"].detach().cpu())
             chunk_negative_scores.append(fisher["chunk_negative_energy_per_sample"].detach().cpu())
@@ -239,6 +270,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         lambda_window_size: int = -1,
         alpha: float = 1.0,
         beta: float = 1.0,
+        ewma_alpha: float = 0.9,
     ) -> None:
         self.checkpoint_path = str(checkpoint_path)
         self.extractor = DSMTransitionScorer(
@@ -255,14 +287,17 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         self.score_mode = self.SCORE_T3
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if self.lambda_mode not in {"mean", "max"}:
-            raise ValueError("lambda_mode must be 'mean' or 'max'")
+        self.ewma_alpha = float(ewma_alpha)
+        if self.lambda_mode not in {"mean", "max", "ewma"}:
+            raise ValueError("lambda_mode must be 'mean', 'max', or 'ewma'")
         if self.lambda_window_size == 0:
             raise ValueError("lambda_window_size must be -1 or >=1")
         if self.alpha < 0.0:
             raise ValueError(f"alpha must be non-negative, got {self.alpha}")
         if self.beta < 0.0:
             raise ValueError(f"beta must be non-negative, got {self.beta}")
+        if not (0.0 <= self.ewma_alpha <= 1.0):
+            raise ValueError(f"ewma_alpha must be in [0, 1], got {self.ewma_alpha}")
 
         self.t3_alpha = {"chunk_energy": self.alpha}
         self.t3_beta = {"chunk_margin": self.beta}
@@ -273,6 +308,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         self.thresholds_by_task: dict[str, float] = {}
         self._t3_norm_stats_global: dict[str, float] = {}
         self._t3_norm_stats_by_task: dict[str, dict[str, float]] = {}
+        self._cold_start_fill_global: dict[str, float] = {}
+        self._cold_start_fill_by_task: dict[str, dict[str, float]] = {}
+        self._sanity_check_ewma()
 
     @property
     def name(self) -> str:
@@ -301,7 +339,10 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
     ) -> dict[str, np.ndarray]:
         lambdas_by_task: dict[str, list[np.ndarray]] = {}
         for traj in trajectories:
-            bundle = self.extractor.score_trajectory(traj)
+            bundle = self._apply_cold_start_mask(
+                self.extractor.score_trajectory(traj),
+                task_name=str(traj.task_name),
+            )
             step_scores = self._bundle_score_family(bundle, task_name=str(traj.task_name))["step_scores"]
             lambdas = self._aggregate_lambda(step_scores)
             lambdas_by_task.setdefault(str(traj.task_name), []).append(lambdas.astype(np.float32, copy=False))
@@ -319,9 +360,64 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
     @staticmethod
     def _bundle_raw_terms(bundle: TrajectoryScoreBundle) -> dict[str, np.ndarray]:
         return {
-            "chunk_positive": np.asarray(bundle.chunk_positive_scores, dtype=np.float32),
+            "chunk_energy": np.asarray(bundle.chunk_positive_scores, dtype=np.float32),
             "chunk_margin": np.asarray(bundle.chunk_margin_scores, dtype=np.float32),
         }
+
+    def _compute_cold_start_fill_stats(
+        self,
+        scored_bundles: Sequence[tuple[str, TrajectoryScoreBundle]],
+    ) -> None:
+        global_terms: dict[str, list[np.ndarray]] = {}
+        task_terms: dict[str, dict[str, list[np.ndarray]]] = {}
+        for task_name, bundle in scored_bundles:
+            raw_terms = self._bundle_raw_terms(bundle)
+            bucket = task_terms.setdefault(str(task_name), {})
+            for key, values in raw_terms.items():
+                global_terms.setdefault(key, []).append(values)
+                bucket.setdefault(key, []).append(values)
+
+        def _reduce(term_map: dict[str, list[np.ndarray]]) -> dict[str, float]:
+            stats: dict[str, float] = {}
+            for key, values in term_map.items():
+                arr = np.concatenate(values, axis=0).astype(np.float32) if values else np.zeros((0,), dtype=np.float32)
+                stats[key] = float(np.median(arr)) if arr.size > 0 else 0.0
+            return stats
+
+        self._cold_start_fill_global = _reduce(global_terms)
+        self._cold_start_fill_by_task = {
+            str(task_name): _reduce(term_map)
+            for task_name, term_map in task_terms.items()
+        }
+
+    def _apply_cold_start_mask(
+        self,
+        bundle: TrajectoryScoreBundle,
+        *,
+        task_name: str,
+    ) -> TrajectoryScoreBundle:
+        prefix = max(0, int(self.extractor.window_size) - 1)
+        if prefix <= 0:
+            return bundle
+        task_fill = self._cold_start_fill_by_task.get(str(task_name), None)
+        fill = task_fill if task_fill is not None else self._cold_start_fill_global
+        if not fill:
+            return bundle
+
+        chunk_positive = np.asarray(bundle.chunk_positive_scores, dtype=np.float32).copy()
+        chunk_negative = np.asarray(bundle.chunk_negative_scores, dtype=np.float32).copy()
+        chunk_margin = np.asarray(bundle.chunk_margin_scores, dtype=np.float32).copy()
+        if chunk_positive.size > 0:
+            chunk_positive[:prefix] = float(fill.get("chunk_energy", 0.0))
+        if chunk_margin.size > 0:
+            chunk_margin[:prefix] = float(fill.get("chunk_margin", 0.0))
+        return TrajectoryScoreBundle(
+            chunk_positive_scores=chunk_positive,
+            chunk_negative_scores=chunk_negative,
+            chunk_margin_scores=chunk_margin,
+            t3_energy_terms=chunk_positive.copy(),
+            t3_margin_terms=chunk_margin.copy(),
+        )
 
     def _compute_t3_norm_stats(
         self,
@@ -368,14 +464,14 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         task_name: str,
     ) -> dict[str, np.ndarray | dict[str, np.ndarray]]:
         t3_stats = self._resolve_t3_norm_stats(task_name)
-        # T3 score = alpha * z(positive_energy) - beta * z(margin).
+        # T3 score = alpha * z(chunk_energy) - beta * z(chunk_margin).
         alpha_terms = {
             "chunk_energy": (
                 self.t3_alpha["chunk_energy"]
                 * self._safe_standardize(
                     bundle.t3_energy_terms,
-                    t3_stats.get("chunk_positive_mean", 0.0),
-                    t3_stats.get("chunk_positive_std", 1.0),
+                    t3_stats.get("chunk_energy_mean", 0.0),
+                    t3_stats.get("chunk_energy_std", 1.0),
                 )
             ).astype(np.float32),
         }
@@ -426,6 +522,26 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
             out[i] = float(values[dq[0]])
         return out
 
+    @staticmethod
+    def _compute_ewma(values: np.ndarray, alpha: float) -> np.ndarray:
+        vals = np.asarray(values, dtype=np.float32).reshape(-1)
+        if vals.size == 0:
+            return vals
+        out = np.empty_like(vals)
+        out[0] = vals[0]
+        for idx in range(1, int(vals.shape[0])):
+            out[idx] = float(alpha) * out[idx - 1] + (1.0 - float(alpha)) * vals[idx]
+        return out
+
+    def _sanity_check_ewma(self) -> None:
+        toy = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+        zero_alpha = self._compute_ewma(toy, alpha=0.0)
+        if not np.allclose(zero_alpha, toy, atol=1e-6):
+            raise RuntimeError("EWMA sanity check failed for alpha=0.0.")
+        near_one = self._compute_ewma(toy, alpha=0.999)
+        if not (near_one[0] == toy[0] and near_one[-1] > 0.99):
+            raise RuntimeError("EWMA sanity check failed for alpha near 1.0.")
+
     def _aggregate_lambda(self, step_scores: np.ndarray) -> np.ndarray:
         vals = np.asarray(step_scores, dtype=np.float32).reshape(-1)
         n = vals.shape[0]
@@ -434,6 +550,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
 
         window = int(self.lambda_window_size)
         full_prefix = window <= 0
+
+        if self.lambda_mode == "ewma":
+            return self._compute_ewma(vals, alpha=float(self.ewma_alpha))
 
         if self.lambda_mode == "mean":
             # Mean mode smooths step scores into a running average alarm signal.
@@ -511,7 +630,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         contributions: dict[str, np.ndarray],
         step_scores: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        if self.lambda_mode == "mean":
+        if self.lambda_mode in {"mean", "ewma"}:
             return {
                 key: self._aggregate_lambda(values)
                 for key, values in contributions.items()
@@ -554,10 +673,24 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         bank_scored_bundles: list[tuple[str, TrajectoryScoreBundle]] = []
         for traj in normal_bank_set:
             bank_scored_bundles.append((str(traj.task_name), self.extractor.score_trajectory(traj)))
+        self._compute_cold_start_fill_stats(bank_scored_bundles)
+        bank_scored_bundles = [
+            (task_name, self._apply_cold_start_mask(bundle, task_name=task_name))
+            for task_name, bundle in bank_scored_bundles
+        ]
 
         scored_bundles: list[tuple[str, TrajectoryScoreBundle]] = []
         for traj in calibration_set:
-            scored_bundles.append((str(traj.task_name), self.extractor.score_trajectory(traj)))
+            task_name = str(traj.task_name)
+            scored_bundles.append(
+                (
+                    task_name,
+                    self._apply_cold_start_mask(
+                        self.extractor.score_trajectory(traj),
+                        task_name=task_name,
+                    ),
+                )
+            )
 
         self._compute_t3_norm_stats(bank_scored_bundles)
         calib_lambdas: list[np.ndarray] = []
@@ -585,14 +718,17 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
             metadata={
                 "dsm_ckpt": self.checkpoint_path,
                 "encoder_source": self.extractor.encoder.source_description,
-                "noise_scale": float(self.extractor.model.noise_scale),
-                "noise_sigma": float(self.extractor.model.noise_scale),
+                "eval_sigma": float(self.extractor.eval_sigma),
+                "default_eval_sigma": float(self.extractor.model.default_eval_sigma),
+                "num_mc_samples": int(self.extractor.model.num_mc_samples),
                 "std_clamp_min": float(self.extractor.model.std_clamp_min),
                 "model_architecture": MODEL_ARCHITECTURE,
                 "score_semantics": self.SCORE_T3,
                 "score_mode": self.SCORE_T3,
                 "supported_score_modes": [self.SCORE_T3],
-                "t3_formula": "alpha * z(chunk_positive) - beta * z(chunk_margin)",
+                "t3_formula": "alpha * z(chunk_energy) - beta * z(chunk_margin)",
+                "chunk_energy_semantics": "squared_norm_positive_score",
+                "chunk_margin_semantics": "squared_norm_score_difference",
                 "latent_dim": int(self.extractor.latent_dim),
                 "window_size": int(self.extractor.window_size),
                 "chunk_dim": int(self.extractor.model.chunk_dim),
@@ -621,6 +757,18 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
                 },
                 "lambda_mode": str(self.lambda_mode),
                 "lambda_window_size": int(self.lambda_window_size),
+                "ewma_alpha": float(self.ewma_alpha),
+                "cold_start_fill_global": {
+                    key: float(value)
+                    for key, value in self._cold_start_fill_global.items()
+                },
+                "cold_start_fill_by_task": {
+                    task_name: {
+                        key: float(value)
+                        for key, value in stats.items()
+                    }
+                    for task_name, stats in self._cold_start_fill_by_task.items()
+                },
                 "num_calibration_trajectories": int(len(calibration_set)),
                 "num_calibration_trajectories_by_task": {
                     task_name: int(sum(1 for bundle_task_name, _ in scored_bundles if bundle_task_name == task_name))
@@ -654,7 +802,10 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
         if self.threshold is None or self._calib_lambdas is None:
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
-        bundle = self.extractor.score_trajectory(trajectory)
+        bundle = self._apply_cold_start_mask(
+            self.extractor.score_trajectory(trajectory),
+            task_name=str(trajectory.task_name),
+        )
         task_name = str(trajectory.task_name)
         family = self._bundle_score_family(bundle, task_name=task_name)
         step_scores = np.asarray(family["step_scores"], dtype=np.float32)
@@ -745,10 +896,14 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[PreparedTrajectory]):
                 "delta_final": float(cur_delta),
                 "threshold_final": float(cur_threshold),
                 "window_size": int(self.extractor.window_size),
+                "eval_sigma": float(self.extractor.eval_sigma),
+                "ewma_alpha": float(self.ewma_alpha),
                 "aggregate_scores_by_mode": {self.SCORE_T3: np.asarray(lamb, dtype=np.float32)},
                 "threshold_by_score": {
                     self.SCORE_T3: float(task_threshold if task_threshold is not None else self.threshold)
                 },
+                "raw_chunk_energy": np.asarray(bundle.chunk_positive_scores, dtype=np.float32),
+                "raw_chunk_margin": np.asarray(bundle.chunk_margin_scores, dtype=np.float32),
                 "step_contributions": {
                     key: np.asarray(values, dtype=np.float32)
                     for key, values in component_scores.items()
