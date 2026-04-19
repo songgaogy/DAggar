@@ -58,7 +58,6 @@ model:
   std_clamp_min: 0.05
   noise_scale: 0.08
   state_loss_weight: 1.0
-  action_loss_weight: 0.5
   dynamics_loss_weight: 1.0
 
 training:
@@ -74,7 +73,6 @@ training:
   log_every: 100
   shared_lr_multiplier: 1.0
   state_branch_lr_multiplier: 1.0
-  action_branch_lr_multiplier: 0.5
   dynamics_branch_lr_multiplier: 1.0
   # EMA shadow weights: ema <- decay * ema + (1 - decay) * online after each step.
   use_ema: false

@@ -48,23 +48,15 @@ def build_flow_encoder(cfg: Any) -> FrozenFlowMultitaskEncoder:
 def _resolve_detector_branch_weight(
     detector_cfg: Any,
     *,
-    explicit_key: str,
-    scalar_key: str,
+    key: str,
     default: float,
 ) -> float:
-    explicit_value = getattr(detector_cfg, explicit_key, None)
-    if explicit_value is not None:
-        return float(explicit_value)
-    scalar_value = getattr(detector_cfg, scalar_key, None)
-    if scalar_value is None:
-        return float(default)
-    if explicit_key.endswith("_action"):
-        return 0.0
-    return float(scalar_value)
+    value = getattr(detector_cfg, key, None)
+    return float(value) if value is not None else float(default)
 
 
 def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
-    """Load checkpoint into ``DSMTransitionScorer`` and configure detector thresholds and T3 weights."""
+    """Load checkpoint into ``DSMTransitionScorer`` and configure SσDC detector weights."""
     detector_cfg = cfg.detector
     return DSMDiscriminator(
         checkpoint_path=to_absolute_path(str(cfg.model.dsm_ckpt)),
@@ -76,43 +68,10 @@ def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
         delta_step=float(detector_cfg.delta_step),
         lambda_mode=str(detector_cfg.lambda_mode),
         lambda_window_size=int(detector_cfg.lambda_window_size),
-        score_mode=str(getattr(detector_cfg, "score_mode", "t1_positive_energy")),
-        alpha_state=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="alpha_state",
-            scalar_key="alpha",
-            default=1.0,
-        ),
-        alpha_action=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="alpha_action",
-            scalar_key="alpha",
-            default=1.0,
-        ),
-        alpha_dynamics=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="alpha_dynamics",
-            scalar_key="alpha",
-            default=1.0,
-        ),
-        beta_state=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="beta_state",
-            scalar_key="beta",
-            default=1.0,
-        ),
-        beta_action=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="beta_action",
-            scalar_key="beta",
-            default=1.0,
-        ),
-        beta_dynamics=_resolve_detector_branch_weight(
-            detector_cfg,
-            explicit_key="beta_dynamics",
-            scalar_key="beta",
-            default=1.0,
-        ),
+        alpha_state=_resolve_detector_branch_weight(detector_cfg, key="alpha_state", default=0.0),
+        alpha_dynamics=_resolve_detector_branch_weight(detector_cfg, key="alpha_dynamics", default=0.0),
+        beta_state=_resolve_detector_branch_weight(detector_cfg, key="beta_state", default=1.0),
+        beta_dynamics=_resolve_detector_branch_weight(detector_cfg, key="beta_dynamics", default=1.0),
     )
 
 
