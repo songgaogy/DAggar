@@ -134,7 +134,6 @@ def _build_trainer(
         save_ema_in_checkpoint=bool(getattr(cfg.training, "save_ema_in_checkpoint", True)),
         shared_lr_multiplier=float(getattr(cfg.training, "shared_lr_multiplier", 1.0)),
         state_branch_lr_multiplier=float(getattr(cfg.training, "state_branch_lr_multiplier", 1.0)),
-        action_branch_lr_multiplier=float(getattr(cfg.training, "action_branch_lr_multiplier", 0.5)),
         dynamics_branch_lr_multiplier=float(getattr(cfg.training, "dynamics_branch_lr_multiplier", 1.0)),
     )
     return Trainer(

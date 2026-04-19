@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -11,6 +12,10 @@ from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 
 from .dataset import LatentTransitionDataset
 from .model import DSMModel
+
+
+_COLLAPSE_ALERT_THRESHOLD = 1e-4
+_COLLAPSE_ALERT_WINDOW = 3
 
 
 @dataclass
@@ -32,7 +37,6 @@ class TrainerConfig:
     save_ema_in_checkpoint: bool = True
     shared_lr_multiplier: float = 1.0
     state_branch_lr_multiplier: float = 1.0
-    action_branch_lr_multiplier: float = 0.5
     dynamics_branch_lr_multiplier: float = 1.0
 
 
@@ -84,11 +88,17 @@ class Trainer:
             else None
         )
 
+        # Class-signal-collapse monitor: sustained near-zero ||g(x, c=0) - g(x, c=1)||^2
+        # indicates the CFG embedding has collapsed (sibling uni-dsm-new failure signature).
+        self._collapse_history: dict[str, deque[float]] = {
+            "state": deque(maxlen=_COLLAPSE_ALERT_WINDOW),
+            "dynamics": deque(maxlen=_COLLAPSE_ALERT_WINDOW),
+        }
+
     def _build_optimizer_param_groups(self) -> list[dict[str, object]]:
         multipliers = {
             "shared": float(self.cfg.shared_lr_multiplier),
             "state_branch": float(self.cfg.state_branch_lr_multiplier),
-            "action_branch": float(self.cfg.action_branch_lr_multiplier),
             "dynamics_branch": float(self.cfg.dynamics_branch_lr_multiplier),
         }
         for name, multiplier in multipliers.items():
@@ -97,7 +107,7 @@ class Trainer:
 
         groups = self.model.predictor.optimizer_parameter_groups()
         param_groups: list[dict[str, object]] = []
-        for name in ("shared", "state_branch", "action_branch", "dynamics_branch"):
+        for name in ("shared", "state_branch", "dynamics_branch"):
             params = groups.get(name, [])
             if not params:
                 continue
@@ -209,10 +219,8 @@ class Trainer:
             "unweighted_score": float(stats["unweighted_score"].detach().item()),
             "tau_mse": float(stats["tau_mse"].detach().item()),
             "state_mse": float(stats["state_mse"].detach().item()),
-            "action_mse": float(stats["action_mse"].detach().item()),
             "next_state_mse": float(stats["next_state_mse"].detach().item()),
             "state_energy": float(stats["state_energy"].detach().item()),
-            "action_energy": float(stats["action_energy"].detach().item()),
             "next_state_energy": float(stats["next_state_energy"].detach().item()),
         }
 
@@ -258,9 +266,8 @@ class Trainer:
                     f"[train] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} score={out['score']:.6f} "
                     f"unweighted_score={out['unweighted_score']:.6f} tau_mse={out['tau_mse']:.6f} "
-                    f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f} "
-                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
+                    f"state_mse={out['state_mse']:.6f} next_state_mse={out['next_state_mse']:.6f} "
+                    f"state_energy={out['state_energy']:.6f} "
                     f"next_state_energy={out['next_state_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
@@ -282,12 +289,46 @@ class Trainer:
                     f"[valid] epoch={epoch:03d} step={step:05d} "
                     f"loss={out['loss']:.6f} score={out['score']:.6f} "
                     f"unweighted_score={out['unweighted_score']:.6f} tau_mse={out['tau_mse']:.6f} "
-                    f"state_mse={out['state_mse']:.6f} action_mse={out['action_mse']:.6f} "
-                    f"next_state_mse={out['next_state_mse']:.6f} "
-                    f"state_energy={out['state_energy']:.6f} action_energy={out['action_energy']:.6f} "
+                    f"state_mse={out['state_mse']:.6f} next_state_mse={out['next_state_mse']:.6f} "
+                    f"state_energy={out['state_energy']:.6f} "
                     f"next_state_energy={out['next_state_energy']:.6f}"
                 )
         return self._mean_metrics(logs)
+
+    @torch.no_grad()
+    def _log_collapse_diagnostic(self, epoch: int) -> dict[str, float]:
+        """Run ``class_conditional_diff`` on one training batch; warn when either factor collapses."""
+        try:
+            batch = next(iter(self.train_loader))
+        except StopIteration:
+            return {}
+        data = self._move_batch(batch)
+        eval_model = self.eval_model_for_inference()
+        eval_model.eval()
+        diag = eval_model.class_conditional_diff(
+            current_latent=data["current_latent"],
+            action_sequence=data["action_sequence"],
+            target_latent=data["target_latent"],
+            task_index=data["task_index"],
+        )
+        means = {key: float(value.mean().item()) for key, value in diag.items()}
+        print(
+            f"[collapse] epoch={epoch:03d} "
+            f"state_diff_l2={means.get('state', float('nan')):.6e} "
+            f"dynamics_diff_l2={means.get('dynamics', float('nan')):.6e}"
+        )
+        for factor, mean_val in means.items():
+            history = self._collapse_history.setdefault(factor, deque(maxlen=_COLLAPSE_ALERT_WINDOW))
+            history.append(mean_val)
+            if (
+                len(history) == _COLLAPSE_ALERT_WINDOW
+                and all(v < _COLLAPSE_ALERT_THRESHOLD for v in history)
+            ):
+                print(
+                    f"WARNING[collapse] epoch={epoch:03d} {factor} diff < "
+                    f"{_COLLAPSE_ALERT_THRESHOLD:.0e} for {_COLLAPSE_ALERT_WINDOW} consecutive epochs"
+                )
+        return means
 
     def fit(
         self,
@@ -300,7 +341,12 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             train_stats = self.train_one_epoch(epoch)
             val_stats = self.validate(epoch)
-            history[f"epoch_{epoch:03d}"] = {"train": train_stats, "valid": val_stats}
+            collapse_stats = self._log_collapse_diagnostic(epoch)
+            history[f"epoch_{epoch:03d}"] = {
+                "train": train_stats,
+                "valid": val_stats,
+                "collapse": collapse_stats,
+            }
             print(f"[epoch {epoch:03d}] train={train_stats} valid={val_stats}")
             if save_callback is not None and freq > 0 and (epoch % freq == 0):
                 save_callback(epoch, history)
