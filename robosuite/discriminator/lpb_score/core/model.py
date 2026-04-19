@@ -2,7 +2,8 @@
 
 ``UnifiedConditionedDSM`` encodes each routed target/context independently, aggregates route/type/task
 conditions into one global vector, and denoises with a lightweight shared MLP backbone.
-``DSMModel`` wraps it with normalization, noise, DSM loss, and Fisher scores for the offline detector.
+``DSMModel`` wraps it with normalization, noise, DSM loss, and per-class conditional energies
+(state + dynamics only) for the offline SσDC detector.
 """
 
 from __future__ import annotations
@@ -83,8 +84,7 @@ class UnifiedConditionedDSM(nn.Module):
     """Late-fusion multitask DSM with routed encoders and a shared AdaLN-Zero denoiser."""
 
     TASK_STATE = 0
-    TASK_ACTOR = 1
-    TASK_DYNAMICS = 2
+    TASK_DYNAMICS = 1
 
     def __init__(
         self,
@@ -121,16 +121,16 @@ class UnifiedConditionedDSM(nn.Module):
         if self.dropout < 0.0:
             raise ValueError("dropout must be non-negative.")
 
-        # route ∈ {state, actor, dynamics}; type ∈ {non-fail, fail}; task_name ∈ {0..num_tasks-1}.
-        self.route_embedding = nn.Embedding(3, self.embed_dim)
+        # route ∈ {state, dynamics}; type ∈ {non-fail, fail}; task_name ∈ {0..num_tasks-1}.
+        self.route_embedding = nn.Embedding(2, self.embed_dim)
         self.type_embedding = nn.Embedding(2, self.embed_dim)
         self.task_name_embedding = nn.Embedding(self.num_tasks, self.embed_dim)
 
         self.state_target_encoder = self._build_feature_encoder(self.latent_dim)
-        self.action_target_encoder = self._build_feature_encoder(self.action_flat_dim)
         self.dynamics_target_encoder = self._build_feature_encoder(self.latent_dim)
 
         self.state_context_encoder = self._build_feature_encoder(self.latent_dim)
+        # Action only participates as dynamics conditioning; no action target head.
         self.action_context_encoder = self._build_feature_encoder(self.action_flat_dim)
         self.dynamics_context_encoder = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
         self.condition_mlp = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
@@ -148,14 +148,11 @@ class UnifiedConditionedDSM(nn.Module):
         )
         self.final_norm = nn.LayerNorm(self.embed_dim)
         self.state_head = nn.Linear(self.embed_dim, self.latent_dim)
-        self.action_head = nn.Linear(self.embed_dim, self.action_flat_dim)
         self.dynamics_head = nn.Linear(self.embed_dim, self.latent_dim)
 
     def _task_target_dim(self, task_id: int) -> int:
         if int(task_id) == self.TASK_STATE:
             return self.latent_dim
-        if int(task_id) == self.TASK_ACTOR:
-            return self.action_flat_dim
         if int(task_id) == self.TASK_DYNAMICS:
             return self.latent_dim
         raise ValueError(f"Unsupported task_id: {task_id}")
@@ -163,8 +160,6 @@ class UnifiedConditionedDSM(nn.Module):
     def _task_head(self, task_id: int) -> nn.Module:
         if int(task_id) == self.TASK_STATE:
             return self.state_head
-        if int(task_id) == self.TASK_ACTOR:
-            return self.action_head
         if int(task_id) == self.TASK_DYNAMICS:
             return self.dynamics_head
         raise ValueError(f"Unsupported task_id: {task_id}")
@@ -172,8 +167,6 @@ class UnifiedConditionedDSM(nn.Module):
     def _task_target_encoder(self, task_id: int) -> nn.Module:
         if int(task_id) == self.TASK_STATE:
             return self.state_target_encoder
-        if int(task_id) == self.TASK_ACTOR:
-            return self.action_target_encoder
         if int(task_id) == self.TASK_DYNAMICS:
             return self.dynamics_target_encoder
         raise ValueError(f"Unsupported task_id: {task_id}")
@@ -291,10 +284,6 @@ class UnifiedConditionedDSM(nn.Module):
                 self.state_target_encoder,
                 self.state_head,
             ),
-            "action_branch": self._module_parameters(
-                self.action_target_encoder,
-                self.action_head,
-            ),
             "dynamics_branch": self._module_parameters(
                 self.action_context_encoder,
                 self.dynamics_context_encoder,
@@ -338,22 +327,18 @@ class UnifiedConditionedDSM(nn.Module):
         *,
         state_input: torch.Tensor,
         current_latent: torch.Tensor,
-        action_input: torch.Tensor,
         action_clean: torch.Tensor,
         next_state_input: torch.Tensor,
         traj_type: torch.Tensor,
         task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run state, action-chunk, and residual dynamics heads; ``task_index`` selects multitask embeddings."""
+        """Run state and residual dynamics heads; ``task_index`` selects multitask embeddings."""
         batch_size = int(state_input.shape[0])
         self._require_2d("state_input", state_input)
         self._require_feature_dim("state_input", state_input, self.latent_dim)
         self._require_2d("current_latent", current_latent)
         self._require_batch_size("current_latent", current_latent, batch_size)
         self._require_feature_dim("current_latent", current_latent, self.latent_dim)
-        self._require_2d("action_input", action_input)
-        self._require_batch_size("action_input", action_input, batch_size)
-        self._require_feature_dim("action_input", action_input, self.action_flat_dim)
         self._require_2d("action_clean", action_clean)
         self._require_batch_size("action_clean", action_clean, batch_size)
         self._require_feature_dim("action_clean", action_clean, self.action_flat_dim)
@@ -374,7 +359,6 @@ class UnifiedConditionedDSM(nn.Module):
 
         state_context_feature = state_input.new_zeros((batch_size, self.embed_dim))
         encoded_current_latent = self.state_context_encoder(current_latent)
-        actor_context_feature = encoded_current_latent
         dynamics_context_feature = self.dynamics_context_encoder(
             torch.cat(
                 [
@@ -392,13 +376,6 @@ class UnifiedConditionedDSM(nn.Module):
             traj_type=traj_type_tensor,
             task_index=task_index_tensor,
         )
-        action_out = self.forward_task(
-            task_id=self.TASK_ACTOR,
-            noisy_target=action_input,
-            context_feature=actor_context_feature,
-            traj_type=traj_type_tensor,
-            task_index=task_index_tensor,
-        )
         dynamics_out = self.forward_task(
             task_id=self.TASK_DYNAMICS,
             noisy_target=next_state_input,
@@ -408,7 +385,6 @@ class UnifiedConditionedDSM(nn.Module):
         )
         return {
             "state_hat": state_out["pred_mean"],
-            "action_hat": action_out["pred_mean"],
             "next_state_hat": dynamics_out["pred_mean"],
         }
 
@@ -429,7 +405,6 @@ class DSMModel(nn.Module):
         noise_scale: float,
         std_clamp_min: float,
         state_loss_weight: float = 1.0,
-        action_loss_weight: float = 0.5,
         dynamics_loss_weight: float = 1.0,
     ) -> None:
         """``predictor.num_tasks`` must match the checkpoint and dataset ``task_index`` range."""
@@ -442,7 +417,6 @@ class DSMModel(nn.Module):
         self.noise_sigma = self.noise_scale
         self.std_clamp_min = float(std_clamp_min)
         self.state_loss_weight = float(state_loss_weight)
-        self.action_loss_weight = float(action_loss_weight)
         self.dynamics_loss_weight = float(dynamics_loss_weight)
         self.num_tasks = int(self.predictor.num_tasks)
         self.action_flat_dim = int(self.action_dim * self.transition_horizon)
@@ -459,8 +433,6 @@ class DSMModel(nn.Module):
 
         if self.state_loss_weight < 0.0:
             raise ValueError(f"state_loss_weight must be non-negative, got {self.state_loss_weight}")
-        if self.action_loss_weight < 0.0:
-            raise ValueError(f"action_loss_weight must be non-negative, got {self.action_loss_weight}")
         if self.dynamics_loss_weight < 0.0:
             raise ValueError(f"dynamics_loss_weight must be non-negative, got {self.dynamics_loss_weight}")
 
@@ -603,19 +575,15 @@ class DSMModel(nn.Module):
         self,
         *,
         state_clean: torch.Tensor,
-        action_clean: torch.Tensor,
         next_state_clean: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Add isotropic Gaussian noise to normalized task targets."""
+        """Add isotropic Gaussian noise to normalized state and residual-dynamics targets."""
         sigma = float(self.noise_scale)
         state_noise = torch.randn_like(state_clean) * sigma
-        action_noise = torch.randn_like(action_clean) * sigma
         next_state_noise = torch.randn_like(next_state_clean) * sigma
         return {
             "state_input": state_clean + state_noise,
             "state_noise": state_noise,
-            "action_input": action_clean + action_noise,
-            "action_noise": action_noise,
             "next_state_input": next_state_clean + next_state_noise,
             "next_state_noise": next_state_noise,
         }
@@ -649,67 +617,57 @@ class DSMModel(nn.Module):
         *,
         state_clean: torch.Tensor,
         state_hat: torch.Tensor,
-        action_clean: torch.Tensor,
-        action_hat: torch.Tensor,
         next_state_clean: torch.Tensor,
         next_state_hat: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute per-task MSE diagnostics."""
+        """Compute per-factor (state, dynamics) MSE diagnostics."""
         state_sq = torch.square(state_hat - state_clean)
-        action_sq = torch.square(action_hat - action_clean)
         next_state_sq = torch.square(next_state_hat - next_state_clean)
 
-        error_sq = torch.cat([state_sq, action_sq, next_state_sq], dim=-1)
+        error_sq = torch.cat([state_sq, next_state_sq], dim=-1)
         state_energy = state_sq.mean(dim=-1)
-        action_energy = action_sq.mean(dim=-1)
         next_state_energy = next_state_sq.mean(dim=-1)
         return {
             "error_sq": error_sq,
             "tau_mse_per_sample": error_sq.mean(dim=-1),
             "tau_sse_per_sample": error_sq.sum(dim=-1),
             "state_mse_per_sample": state_sq.mean(dim=-1),
-            "action_mse_per_sample": action_sq.mean(dim=-1),
             "next_state_mse_per_sample": next_state_sq.mean(dim=-1),
             "state_sse_per_sample": state_sq.sum(dim=-1),
-            "action_sse_per_sample": action_sq.sum(dim=-1),
             "next_state_sse_per_sample": next_state_sq.sum(dim=-1),
             "state_energy_per_sample": state_energy,
-            "action_energy_per_sample": action_energy,
             "next_state_energy_per_sample": next_state_energy,
-            "score_per_sample": state_energy + action_energy + next_state_energy,
+            "score_per_sample": state_energy + next_state_energy,
         }
 
     def weighted_reconstruction_score(self, recon: dict[str, torch.Tensor]) -> torch.Tensor:
         """Weighted reconstruction objective used for DSM training."""
         return (
             self.state_loss_weight * recon["state_energy_per_sample"]
-            + self.action_loss_weight * recon["action_energy_per_sample"]
             + self.dynamics_loss_weight * recon["next_state_energy_per_sample"]
         )
 
-    def fisher_components(
+    def pairwise_energy_gap(
         self,
         *,
         state_pos: torch.Tensor,
         state_neg: torch.Tensor,
-        action_pos: torch.Tensor,
-        action_neg: torch.Tensor,
         next_state_pos: torch.Tensor,
         next_state_neg: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute Fisher-style L2 energies from dual conditional predictions."""
+        """Per-factor ``||g(x, c=0) - g(x, c=1)||^2``.
+
+        NOT Fisher score divergence; this is a diagnostic for class-signal collapse.
+        """
         state_sq = torch.square(state_pos - state_neg)
-        action_sq = torch.square(action_pos - action_neg)
         next_state_sq = torch.square(next_state_pos - next_state_neg)
 
         state_energy = state_sq.sum(dim=-1)
-        action_energy = action_sq.sum(dim=-1)
         next_state_energy = next_state_sq.sum(dim=-1)
         return {
-            "state_error_per_sample": state_energy,
-            "action_error_per_sample": action_energy,
-            "next_state_error_per_sample": next_state_energy,
-            "score_per_sample": state_energy + action_energy + next_state_energy,
+            "state_gap_per_sample": state_energy,
+            "next_state_gap_per_sample": next_state_energy,
+            "gap_per_sample": state_energy + next_state_energy,
         }
 
     def forward(
@@ -734,19 +692,16 @@ class DSMModel(nn.Module):
         # The dynamics branch reconstructs the normalized residual.
         delta_clean = next_state_norm_clean - state_clean
 
-        # Noise is injected only in normalized space.
+        # Noise is injected only in normalized space; action is observed conditioning, not denoised.
         noisy = {
             "state_input": state_clean,
             "state_noise": torch.zeros_like(state_clean),
-            "action_input": action_clean,
-            "action_noise": torch.zeros_like(action_clean),
             "next_state_input": delta_clean,
             "next_state_noise": torch.zeros_like(delta_clean),
         }
         if add_noise:
             noisy = self.add_noise(
                 state_clean=state_clean,
-                action_clean=action_clean,
                 next_state_clean=delta_clean,
             )
 
@@ -764,7 +719,6 @@ class DSMModel(nn.Module):
         preds = self.predictor(
             state_input=noisy["state_input"],
             current_latent=state_clean,
-            action_input=noisy["action_input"],
             action_clean=action_clean,
             next_state_input=noisy["next_state_input"],
             traj_type=traj_type_tensor,
@@ -779,9 +733,6 @@ class DSMModel(nn.Module):
             "state_hat": preds["state_hat"],
             "state_noise": noisy["state_noise"],
             "action_clean": action_clean,
-            "action_input": noisy["action_input"],
-            "action_hat": preds["action_hat"],
-            "action_noise": noisy["action_noise"],
             "next_state_clean": delta_clean,
             "next_state_norm_clean": next_state_norm_clean,
             "next_state_input": noisy["next_state_input"],
@@ -811,8 +762,6 @@ class DSMModel(nn.Module):
         recon = self.reconstruction_components(
             state_clean=out["state_clean"],
             state_hat=out["state_hat"],
-            action_clean=out["action_clean"],
-            action_hat=out["action_hat"],
             next_state_clean=out["next_state_clean"],
             next_state_hat=out["next_state_hat"],
         )
@@ -825,13 +774,10 @@ class DSMModel(nn.Module):
             "weighted_score": loss,
             "tau_mse": recon["tau_mse_per_sample"].mean(),
             "state_mse": recon["state_mse_per_sample"].mean(),
-            "action_mse": recon["action_mse_per_sample"].mean(),
             "next_state_mse": recon["next_state_mse_per_sample"].mean(),
             "state_energy": recon["state_energy_per_sample"].mean(),
-            "action_energy": recon["action_energy_per_sample"].mean(),
             "next_state_energy": recon["next_state_energy_per_sample"].mean(),
             "state_loss_weight": out["state_clean"].new_tensor(self.state_loss_weight),
-            "action_loss_weight": out["state_clean"].new_tensor(self.action_loss_weight),
             "dynamics_loss_weight": out["state_clean"].new_tensor(self.dynamics_loss_weight),
             "current_latent": out["current_latent"],
             "traj_type": out["traj_type"],
@@ -840,14 +786,12 @@ class DSMModel(nn.Module):
             "state_input": out["state_input"],
             "state_hat": out["state_hat"],
             "action_clean": out["action_clean"],
-            "action_input": out["action_input"],
-            "action_hat": out["action_hat"],
             "next_state_clean": out["next_state_clean"],
             "next_state_input": out["next_state_input"],
             "next_state_hat": out["next_state_hat"],
         }
 
-    def compute_fisher_score(
+    def compute_conditional_energies(
         self,
         *,
         current_latent: torch.Tensor,
@@ -855,7 +799,11 @@ class DSMModel(nn.Module):
         target_latent: torch.Tensor,
         task_index: torch.Tensor | int,
     ) -> dict[str, torch.Tensor]:
-        """Compare traj_type 0 vs 1 at fixed ``task_index``; returns Fisher gaps, margins, and branch energies."""
+        """Per-factor reconstruction energy under c=0 and c=1.
+
+        Single-sample estimator: ``add_noise=False`` so ``E_b^(c)(x) = ||g(x, c) - x||^2`` per factor b.
+        Returns positive/negative energies and the signed margin ``E_b^- - E_b^+`` for state and dynamics.
+        """
         pos_out = self.forward(
             current_latent=current_latent,
             action_sequence=action_sequence,
@@ -872,56 +820,68 @@ class DSMModel(nn.Module):
             task_index=task_index,
             add_noise=False,
         )
-        fisher = self.fisher_components(
-            state_pos=pos_out["state_hat"],
-            state_neg=neg_out["state_hat"],
-            action_pos=pos_out["action_hat"],
-            action_neg=neg_out["action_hat"],
-            next_state_pos=pos_out["next_state_hat"],
-            next_state_neg=neg_out["next_state_hat"],
-        )
         pos_recon = self.reconstruction_components(
             state_clean=pos_out["state_clean"],
             state_hat=pos_out["state_hat"],
-            action_clean=pos_out["action_clean"],
-            action_hat=pos_out["action_hat"],
             next_state_clean=pos_out["next_state_clean"],
             next_state_hat=pos_out["next_state_hat"],
         )
         neg_recon = self.reconstruction_components(
             state_clean=pos_out["state_clean"],
             state_hat=neg_out["state_hat"],
-            action_clean=pos_out["action_clean"],
-            action_hat=neg_out["action_hat"],
             next_state_clean=pos_out["next_state_clean"],
             next_state_hat=neg_out["next_state_hat"],
         )
         state_margin = neg_recon["state_energy_per_sample"] - pos_recon["state_energy_per_sample"]
-        action_margin = neg_recon["action_energy_per_sample"] - pos_recon["action_energy_per_sample"]
-        next_state_margin = neg_recon["next_state_energy_per_sample"] - pos_recon["next_state_energy_per_sample"]
+        dynamics_margin = neg_recon["next_state_energy_per_sample"] - pos_recon["next_state_energy_per_sample"]
         return {
-            "score_per_sample": fisher["score_per_sample"],
-            "state_error_per_sample": fisher["state_error_per_sample"],
-            "action_error_per_sample": fisher["action_error_per_sample"],
-            "next_state_error_per_sample": fisher["next_state_error_per_sample"],
             "state_positive_energy_per_sample": pos_recon["state_energy_per_sample"],
-            "action_positive_energy_per_sample": pos_recon["action_energy_per_sample"],
-            "next_state_positive_energy_per_sample": pos_recon["next_state_energy_per_sample"],
-            "positive_score_per_sample": pos_recon["score_per_sample"],
             "state_negative_energy_per_sample": neg_recon["state_energy_per_sample"],
-            "action_negative_energy_per_sample": neg_recon["action_energy_per_sample"],
-            "next_state_negative_energy_per_sample": neg_recon["next_state_energy_per_sample"],
-            "negative_score_per_sample": neg_recon["score_per_sample"],
+            "dynamics_positive_energy_per_sample": pos_recon["next_state_energy_per_sample"],
+            "dynamics_negative_energy_per_sample": neg_recon["next_state_energy_per_sample"],
             "state_margin_per_sample": state_margin,
-            "action_margin_per_sample": action_margin,
-            "next_state_margin_per_sample": next_state_margin,
-            "margin_score_per_sample": state_margin + action_margin + next_state_margin,
+            "dynamics_margin_per_sample": dynamics_margin,
             "state_pos_hat": pos_out["state_hat"],
             "state_neg_hat": neg_out["state_hat"],
-            "action_pos_hat": pos_out["action_hat"],
-            "action_neg_hat": neg_out["action_hat"],
             "next_state_pos_hat": pos_out["next_state_hat"],
             "next_state_neg_hat": neg_out["next_state_hat"],
+        }
+
+    @torch.no_grad()
+    def class_conditional_diff(
+        self,
+        *,
+        current_latent: torch.Tensor,
+        action_sequence: torch.Tensor,
+        target_latent: torch.Tensor,
+        task_index: torch.Tensor | int,
+    ) -> dict[str, torch.Tensor]:
+        """Diagnostic ``||g(x, c=0) - g(x, c=1)||^2`` per factor for class-signal-collapse monitoring."""
+        pos_out = self.forward(
+            current_latent=current_latent,
+            action_sequence=action_sequence,
+            target_latent=target_latent,
+            traj_type=0,
+            task_index=task_index,
+            add_noise=False,
+        )
+        neg_out = self.forward(
+            current_latent=current_latent,
+            action_sequence=action_sequence,
+            target_latent=target_latent,
+            traj_type=1,
+            task_index=task_index,
+            add_noise=False,
+        )
+        gaps = self.pairwise_energy_gap(
+            state_pos=pos_out["state_hat"],
+            state_neg=neg_out["state_hat"],
+            next_state_pos=pos_out["next_state_hat"],
+            next_state_neg=neg_out["next_state_hat"],
+        )
+        return {
+            "state": gaps["state_gap_per_sample"],
+            "dynamics": gaps["next_state_gap_per_sample"],
         }
 
 
@@ -997,6 +957,5 @@ def build_dsm_model(
         noise_scale=float(_cfg_get(cfg_model, "noise_scale", _cfg_get(cfg_model, "noise_sigma", 0.08))),
         std_clamp_min=float(_cfg_get(cfg_model, "std_clamp_min", 0.05)),
         state_loss_weight=float(_cfg_get(cfg_model, "state_loss_weight", 1.0)),
-        action_loss_weight=float(_cfg_get(cfg_model, "action_loss_weight", 0.5)),
         dynamics_loss_weight=float(_cfg_get(cfg_model, "dynamics_loss_weight", 1.0)),
     )
