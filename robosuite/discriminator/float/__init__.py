@@ -1,6 +1,7 @@
+from .float_benchmark import FloatBenchmarkDiscriminator
 from .float_core import (
-    FLOATComputer,
     EmbeddingEncoder,
+    FLOATComputer,
     IdentityEncoder,
     OnlineDetector,
     ThresholdCalibrator,
@@ -9,7 +10,7 @@ from .float_core import (
     cosine_cost_matrix,
     sinkhorn,
 )
-from .float_official import OfficialFloatOfflineEvaluator, StateWindowEmbeddingBuilder
+from .float_dino_encoder import DinoV2ImageEncoder
 
 __all__ = [
     "Trajectory",
@@ -21,6 +22,6 @@ __all__ = [
     "FLOATComputer",
     "ThresholdCalibrator",
     "OnlineDetector",
-    "StateWindowEmbeddingBuilder",
-    "OfficialFloatOfflineEvaluator",
+    "DinoV2ImageEncoder",
+    "FloatBenchmarkDiscriminator",
 ]

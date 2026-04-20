@@ -1,161 +1,80 @@
-## FLOAT in `robosuite/discriminator`
+# FLOAT in `robosuite/discriminator`
 
-This module implements FLOAT (Failure detection based on Optimal Transport) for PandaLift data and aligns the runtime logic with the official ARMADA failure detector as closely as possible within this codebase.
+FLOAT (Failure Detection with Optimal Transport) implemented against the shared failure-detector benchmark in `data/utils/benchmark/`, with a pretrained **DINOv2 ViT-B/14** image encoder for per-frame embeddings.
 
-## What This Implementation Provides
+## Algorithm
 
-- A reusable OT core (`sinkhorn`, cosine cost, trajectory utilities).
-- An ARMADA-style FLOAT evaluator with:
-  - expert candidate retrieval,
-  - online expert rematching,
-  - cumulative greedy OT-cost thresholding.
-- Policy-latent extraction from your Flow Matching policy checkpoint (`./robosuite/policy`, `./checkpoints/PandaLift/flow/BC_warmup`).
-- Training / evaluation scripts and Hydra configs.
+Given expert trajectories `T_{e,n}`, a rollout prefix `T_b[:t0]`, and a frozen image encoder `phi`:
 
-## Algorithm Summary
+1. Embeddings
+   - `F_{e,n} = {phi(o_{e,i})}` for each expert trajectory
+   - `F_b     = {phi(o_{b,j})}` for the current rollout prefix
+2. OT cost with uniform marginals `a_i = 1/l_n`, `b_j = 1/t0` and cosine cost `c(i, j) = 1 - cos(phi(o_{e,i}), phi(o_{b,j}))`, solved with an entropic Sinkhorn plan `mu_n^*`: `lambda_n(T_b) = sum_{ij} mu_{n,i,j}^* * c(i, j)`
+3. FLOAT index: `lambda(T_b) = min_n lambda_n(T_b)`
+4. Threshold calibration over `M` success rollouts: `Lambda = Percentile_{1-delta}({lambda(T_{b,k})})`
+5. Failure signal when `lambda(T_b) > Lambda`.
 
-Given:
+Per-task threshold is calibrated **leave-one-out** over the success bank so a success trajectory never matches itself as an expert (which would trivially collapse `lambda` to ~0 and bias `Lambda` downward).
 
-- expert trajectories `T_e,n`
-- rollout prefix `T_b[1:t]`
-- policy embedding function `phi(o)`
+## Code layout
 
-FLOAT computes:
+- `float_core.py` — OT primitives (`sinkhorn`, `cosine_cost_matrix`) and `FLOATComputer`, `ThresholdCalibrator`, `OnlineDetector`. Matches the paper spec directly.
+- `float_dino_encoder.py` — `DinoV2ImageEncoder`, a thin wrapper around `torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')` returning `(T, 768)` CLS embeddings from `(T, H, W, 3) uint8` images.
+- `float_benchmark.py` — `FloatBenchmarkDiscriminator`, implements the `data.utils.benchmark.discriminator.Discriminator` protocol. Calibrates one FLOAT computer + threshold per task and caches embeddings per trajectory.
+- `float_data.py` / `float_eval.py` — retained for `robosuite.discriminator.lpb.*` which still depends on them. Not used by the FLOAT benchmark path.
+- `scripts/run_float_benchmark.sh` — bash entry point that runs the adapter and writes a `benchmark.json` conforming to `data/utils/benchmark/protocol.md`.
 
-1. **Embeddings**
-- `F_e,n = { phi(o_e,i) }`
-- `F_b,t = { phi(o_b,j) }` for prefix
-
-2. **OT matching cost**
-- cosine-based cost matrix `C` between expert and rollout embeddings
-- entropic Sinkhorn plan `P*`
-- transport cost `lambda_n = sum_ij P*_ij * C_ij`
-
-3. **FLOAT index**
-- implementation supports min-over-experts behavior and ARMADA-style matched-expert behavior
-- the main eval path uses ARMADA-style matched expert and cumulative greedy OT-cost over time
-
-4. **Threshold calibration**
-- collect episode-level success costs
-- threshold `Lambda = percentile(1 - delta)` with `delta` in percent (default 10)
-
-5. **Detection**
-- failure if cumulative OT cost exceeds `Lambda`
-
-## Policy Latent Source
-
-Policy embeddings are extracted from Flow policy internals, not raw states:
-
-- checkpoint loaded from `policy.ckpt`
-- latent source: conditional token from Flow backbone (`flow_cond_token`)
-- code: `robosuite/discriminator/float_policy_latent.py`
-
-Pipeline per trajectory:
-
-1. Load `states` and camera images from HDF5.
-2. Build proprio from states using `PandaLiftProprioExtractor`.
-3. Build history windows (`history_len`) and sample every `Ta`.
-4. Run Flow backbone and extract conditional token embedding.
-
-## Code Structure
-
-- `float_core.py`
-  - generic OT and base FLOAT utilities
-  - `Trajectory`, `IdentityEncoder`, `TorchEncoderWrapper`, `sinkhorn`
-- `float_official.py`
-  - ARMADA-style offline evaluator
-  - candidate matching, rematching, cumulative greedy OT-cost
-- `float_policy_latent.py`
-  - Flow checkpoint loading and policy latent extraction
-- `float_data.py`
-  - HDF5 loading utilities
-  - `PolicyTrajectory` (`states + images + actions`)
-- `eval_discriminator.py`
-  - validation/evaluation entrypoint
-- `train_discriminator_intervention.py`
-  - threshold calibration + split metrics + artifact saving
-- `config/*.yaml`
-  - Hydra configs
-
-## Expected Data Format
-
-Each demo must provide:
-
-- `demos/<demo_key>/states`
-- `demos/<demo_key>/actions`
-- `demos/<demo_key>/observations/<camera_name>/images`
-
-Default camera is `agentview`.
-
-## Quick Start
-
-### 1) Evaluate
+## Quick start
 
 ```bash
 conda activate daggar
-bash robosuite/run/eval_float.sh
+bash robosuite/discriminator/float/scripts/run_float_benchmark.sh
 ```
 
-This writes:
+Output lands at `checkpoints/float/eval/run_<timestamp>/benchmark.json`.
 
-- `outputs/float_eval/summary_quick.json`
+Common overrides (environment variables):
 
-### 2) Train/Calibrate
+| Variable | Default | Meaning |
+|---|---|---|
+| `TASKS` | `PickPlaceBread PickPlaceCan PickPlaceCereal PickPlaceMilk` | Task filter |
+| `FAIL_ROOT` | `data/utils/fail_rollout` | Labeled failure data root |
+| `SUCCESS_ROOT` | `data/utils/success_rollout` | Success manifests root |
+| `DEVICE` | `cuda` | Torch device |
+| `IMAGE_SIZE` | `224` | DINOv2 input size (multiple of 14) |
+| `ENCODER_BATCH_SIZE` | `64` | DINOv2 batch size |
+| `CAMERA_NAME` | `agentview` | Camera stream used for embeddings |
+| `SINKHORN_REG` | `0.05` | Entropic OT regularization |
+| `MAX_ITER` | `300` | Sinkhorn iterations |
+| `TOL` | `1e-5` | Sinkhorn tolerance |
+| `DELTA` | `10.0` | Calibration percentile parameter (%) |
+| `STEP_STRIDE` | `8` | `lambda` recompute cadence across rollout steps |
+| `MAX_FAIL_PER_TASK` | unset | Cap failure trajectories per task (smoke runs) |
+| `MAX_SUCCESS_PER_TASK` | unset | Cap success trajectories per task (smoke runs) |
+| `USE_SIMILARITY_COST` | `0` | Set to `1` to use raw cosine similarity as cost |
+| `RUN_NAME` | `run_<timestamp>` | Output subdirectory name |
+
+Example smoke run on one task:
 
 ```bash
-conda activate daggar
-bash robosuite/run/train_discriminator_intervention.sh
+TASKS="PickPlaceCan" \
+MAX_FAIL_PER_TASK=2 MAX_SUCCESS_PER_TASK=3 \
+bash robosuite/discriminator/float/scripts/run_float_benchmark.sh
 ```
 
-This writes:
+## Output schema
 
-- `float_summary_<timestamp>.json`
-- `float_calibration_<timestamp>.npz`
+`benchmark.json` follows `data/utils/benchmark/protocol.md`:
 
-## Main Config Knobs
+- `discriminator_name == "float_dinov2"`
+- `trajectory_level`, `trajectory_level_per_task`
+- `step_level`, `step_level_per_task` (failure trajectories only)
+- `per_trajectory` — `trajectory_score`, `first_pred_failure_frame`, `first_gt_failure_frame`, `failure_segments`, ...
+- `config` — dataset roots, caps, thresholding knobs
+- `runtime` — wall time and trajectory counts
 
-`robosuite/discriminator/config/eval_discriminator.yaml`
+The `aux` field on each `DiscriminatorOutput` also exposes the per-task threshold `Lambda`, `delta`, `step_stride`, encoder name, image size, embedding dim, and the index (if any) of the expert skipped due to self-match.
 
-- `float.ta`: detector cadence (official-style step aggregation)
-- `float.to`: temporal window size used by FLOAT matching logic
-- `float.num_expert_candidates`: number of candidate experts before rematching
-- `float.sinkhorn_reg`, `float.max_iter`, `float.tol`: OT solver settings
-- `policy.ckpt`: Flow checkpoint path
-- `policy.history_len`: window length used for latent extraction (`-1` means infer from checkpoint)
-- `labels.fail_tail_ratio`: fail labeling rule for offline validation (default 0.2)
+## First run
 
-## Output Metrics
-
-`summary_*.json` includes:
-
-- split counts
-- threshold and delta
-- fail validation metrics (`accuracy`, `precision`, `recall`, `f1`, `fp`, `fn`, ...)
-- success false alarm stats
-- lambda separation stats
-- runtime metadata (`Ta`, `To`, `policy_ckpt`, `policy_latent_source`)
-
-## Unit Tests
-
-```bash
-conda activate daggar
-python -m pytest -q tests/test_float.py
-```
-
-Covers:
-
-- Sinkhorn marginal constraints
-- matching vs mismatching lambda behavior
-- percentile threshold behavior
-- rewind timestep behavior
-
-## Remaining Differences vs Official ARMADA
-
-This implementation is intentionally close, but not byte-identical to `robosuite/armada/failure_detector`:
-
-- It runs offline on stored HDF5 trajectories instead of live async environment hooks.
-- It uses the Flow policy latent (`flow_cond_token`) from `robosuite/policy`, not ARMADA diffusion policy internals.
-- Current dataset setup is single-camera (`agentview`) unless multi-camera data is provided.
-- If rollout-success data is missing, calibration falls back to expert-surrogate success.
-
-These are explicit engineering choices for compatibility with this repository and your data pipeline.
+`torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')` downloads ~340 MB into `~/.cache/torch/hub` on the first invocation. Subsequent runs reuse the cache.
