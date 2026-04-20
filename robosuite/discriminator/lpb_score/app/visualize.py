@@ -66,21 +66,7 @@ class LabeledLatentTrajectory:
     split: str
 
 
-SCORE_MODE_ORDER = (
-    "t1_positive_energy",
-    "t2_negative_margin",
-    "t3_weighted_combo",
-)
-SCORE_MODE_SHORT_LABELS = {
-    "t1_positive_energy": "T1",
-    "t2_negative_margin": "T2",
-    "t3_weighted_combo": "T3",
-}
-SCORE_MODE_COLORS = {
-    "t1_positive_energy": "#1f77b4",
-    "t2_negative_margin": "#2ca02c",
-    "t3_weighted_combo": "#9467bd",
-}
+# SσDC produces a single score; per-branch diagnostics come from attribution.TERM_* constants.
 
 
 def _sample_refs(
@@ -147,9 +133,7 @@ def _save_failure_plot_pdf(
     fps: int,
     frame_scores: np.ndarray,
     frame_thresholds: np.ndarray,
-    frame_scores_by_mode: dict[str, np.ndarray],
-    frame_thresholds_by_mode: dict[str, np.ndarray],
-    active_score_mode: str,
+    frame_component_contributions: dict[str, np.ndarray],
     thumbnail_frames: list[np.ndarray],
     thumbnail_indices: list[int],
     delta_final: float,
@@ -159,7 +143,7 @@ def _save_failure_plot_pdf(
     first_crossing_dominant_term: str | None,
     gt_fail_mask: np.ndarray | None = None,
 ) -> None:
-    """Save a PDF page with active score, T1/T2/T3 traces, and term attributions."""
+    """Save a PDF page with the SσDC λ score, per-branch contributions, and term attributions."""
     num_frames = int(np.asarray(frame_scores).shape[0])
     if num_frames <= 0:
         return
@@ -269,40 +253,25 @@ def _save_failure_plot_pdf(
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#dddddd", "alpha": 0.9},
     )
 
-    for score_mode in SCORE_MODE_ORDER:
-        score_values = np.asarray(frame_scores_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
-        if score_values.size != num_frames:
+    component_keys = ordered_term_keys(frame_component_contributions)
+    for branch in component_keys:
+        values = np.asarray(frame_component_contributions[branch], dtype=np.float32).reshape(-1)
+        if values.size != num_frames:
             continue
-        threshold_values = np.asarray(frame_thresholds_by_mode.get(score_mode, []), dtype=np.float32).reshape(-1)
-        color = SCORE_MODE_COLORS.get(score_mode, "#555555")
-        short_label = SCORE_MODE_SHORT_LABELS.get(score_mode, score_mode)
         mode_ax.plot(
             times,
-            score_values,
-            color=color,
+            values,
+            color=TERM_COLORS.get(branch, "#555555"),
             linewidth=2.0,
             alpha=0.95,
-            label=f"{short_label} score",
+            label=f"{TERM_SHORT_LABELS.get(branch, branch)} contrib",
         )
-        if threshold_values.size == num_frames:
-            mode_ax.plot(
-                times,
-                threshold_values,
-                color=color,
-                linewidth=1.2,
-                linestyle="--",
-                alpha=0.85,
-                label=f"{short_label} th",
-            )
-    mode_ax.set_title(
-        f"T1/T2/T3 Aggregate Scores | active={SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)}",
-        fontsize=12,
-        pad=8,
-    )
+    mode_ax.set_title("SσDC per-branch step contributions", fontsize=12, pad=8)
     mode_ax.set_xlabel("Time (s)")
-    mode_ax.set_ylabel("Aggregate Score")
+    mode_ax.set_ylabel("α·z(E⁺) + β·(z(E⁺) − z(E⁻))")
     mode_ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.8)
-    mode_ax.legend(loc="upper left", ncol=3)
+    if component_keys:
+        mode_ax.legend(loc="upper left", ncol=max(1, len(component_keys)))
 
     term_keys = ordered_term_keys(aggregate_contribution_shares)
     if term_keys:
@@ -857,35 +826,12 @@ def run_visualize(cfg: DictConfig) -> None:
                     aggregate_contribution_shares,
                     num_frames=num_frames,
                 )
-                aggregate_scores_by_mode = result.metadata.get("aggregate_scores_by_mode", {}) or {}
-                threshold_by_score = result.metadata.get("threshold_by_score", {}) or {}
-                active_score_mode = str(result.metadata.get("score_mode", detector.score_mode))
-                frame_scores_by_mode = {
-                    score_mode: map_step_values_to_frames(
-                        np.asarray(values, dtype=np.float32),
-                        num_frames=num_frames,
-                        tail_fill=float(np.asarray(values, dtype=np.float32)[-1]),
-                    )
-                    for score_mode, values in aggregate_scores_by_mode.items()
-                    if np.asarray(values).size > 0
-                }
-                frame_thresholds_by_mode: dict[str, np.ndarray] = {}
-                for score_mode in SCORE_MODE_ORDER:
-                    if score_mode == active_score_mode:
-                        threshold_steps = np.asarray(result.thresholds, dtype=np.float32)
-                    else:
-                        scalar_threshold = float(threshold_by_score.get(score_mode, np.nan))
-                        ref_steps = np.asarray(aggregate_scores_by_mode.get(score_mode, []), dtype=np.float32)
-                        if ref_steps.size == 0:
-                            continue
-                        threshold_steps = np.full(ref_steps.shape, scalar_threshold, dtype=np.float32)
-                    if threshold_steps.size == 0:
-                        continue
-                    frame_thresholds_by_mode[score_mode] = map_step_values_to_frames(
-                        threshold_steps,
-                        num_frames=num_frames,
-                        tail_fill=float(threshold_steps[-1]),
-                    )
+                # Per-step per-branch contribution to the SσDC score, mapped to frames.
+                weighted_step_contributions = result.metadata.get("weighted_step_contributions", {}) or {}
+                frame_component_contributions = map_term_values_to_frames(
+                    weighted_step_contributions,
+                    num_frames=num_frames,
+                )
                 term_summary = summarize_trajectory_term_attribution(result)
 
                 stem = (
@@ -910,16 +856,15 @@ def run_visualize(cfg: DictConfig) -> None:
                             " ".join(
                                 [
                                     (
-                                        f"{SCORE_MODE_SHORT_LABELS.get(score_mode, score_mode)} "
-                                        f"{float(frame_scores_by_mode[score_mode][frame_id]):.2f}"
+                                        f"{TERM_SHORT_LABELS.get(branch, branch)} "
+                                        f"{float(frame_component_contributions[branch][frame_id]):.2f}"
                                     )
-                                    for score_mode in SCORE_MODE_ORDER
-                                    if score_mode in frame_scores_by_mode
+                                    for branch in ordered_term_keys(frame_component_contributions)
+                                    if np.asarray(frame_component_contributions[branch]).shape[0] == num_frames
                                 ]
                             ),
                             (
-                                f"{SCORE_MODE_SHORT_LABELS.get(active_score_mode, active_score_mode)} "
-                                f"{float(frame_scores[frame_id]):.2f}|{float(frame_thresholds[frame_id]):.2f}"
+                                f"λ {float(frame_scores[frame_id]):.2f}|{float(frame_thresholds[frame_id]):.2f}"
                             ),
                         ]
                         frame = draw_detection_overlay(
@@ -967,15 +912,10 @@ def run_visualize(cfg: DictConfig) -> None:
                         thumbnail_indices=thumbnail_indices,
                         delta_final=float(result.metadata.get("delta_final", np.nan)),
                         threshold_final=float(result.metadata.get("threshold_final", np.nan)),
-                        frame_scores_by_mode={
+                        frame_component_contributions={
                             key: np.asarray(values, dtype=np.float32)
-                            for key, values in frame_scores_by_mode.items()
+                            for key, values in frame_component_contributions.items()
                         },
-                        frame_thresholds_by_mode={
-                            key: np.asarray(values, dtype=np.float32)
-                            for key, values in frame_thresholds_by_mode.items()
-                        },
-                        active_score_mode=active_score_mode,
                         aggregate_contribution_shares={
                             key: np.asarray(values, dtype=np.float32)
                             for key, values in frame_aggregate_share_by_term.items()
@@ -1032,12 +972,9 @@ def run_visualize(cfg: DictConfig) -> None:
                     else float("nan")
                 ),
                 "detector_hparams": {
-                    "score_mode": str(getattr(cfg.detector, "score_mode", detector.score_mode)),
-                    "alpha_state": float(getattr(cfg.detector, "alpha_state", 1.0)),
-                    "alpha_action": float(getattr(cfg.detector, "alpha_action", 1.0)),
-                    "alpha_dynamics": float(getattr(cfg.detector, "alpha_dynamics", 1.0)),
+                    "alpha_state": float(getattr(cfg.detector, "alpha_state", 0.0)),
+                    "alpha_dynamics": float(getattr(cfg.detector, "alpha_dynamics", 0.0)),
                     "beta_state": float(getattr(cfg.detector, "beta_state", 1.0)),
-                    "beta_action": float(getattr(cfg.detector, "beta_action", 1.0)),
                     "beta_dynamics": float(getattr(cfg.detector, "beta_dynamics", 1.0)),
                 },
                 **dict(calibration_summary.metadata),
