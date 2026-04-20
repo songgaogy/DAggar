@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 GPU="${GPU:-0}"
 SEED="${SEED:-42}"
-BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new}"
+BASE_SAVE_DIR="${BASE_SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v6}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="lpb_dipole_dsm_${TIMESTAMP}"
 SAVE_NAME="${RUN_NAME}.pt"
@@ -16,7 +16,7 @@ CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_2
 
 BATCH_SIZE=1024
 NUM_WORKERS=16
-NUM_POS=350
+NUM_POS=200
 NUM_NEG=100
 POSITIVE_RATIO=0.7
 EPOCHS=50

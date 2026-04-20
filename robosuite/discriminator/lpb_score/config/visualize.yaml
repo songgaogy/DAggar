@@ -15,6 +15,9 @@ data:
   image_size: 128
   transition_horizon: 1
   cache_dir: "./data/.lpb_score_cache"
+  # If true, encode demos that lack a latent .npz (slow on first run). If false, missing
+  # caches raise FileNotFoundError — typical when HDF5 mtime changed (cache keys include mtime).
+  build_missing_cache: false
   encode_demo_batch_size: 8
   splits:
     train: {num_pos_traj: 360, num_neg_traj: 180}

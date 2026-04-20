@@ -10,13 +10,15 @@ CKPT="${CKPT:-${ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_2
 # TODO: update DSM_CKPT after the SσDC refactor retrain; the old uni-dsm three-head checkpoint
 # (checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031) is no longer loadable
 # because the action head has been dropped from the architecture.
-DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031/lpb_dipole_dsm_20260412_002031_ep0050.pt"
-SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new/visualize}"
+DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new-v6/lpb_dipole_dsm_20260420_070130/lpb_dipole_dsm_20260420_070130.pt"
+SAVE_DIR="${SAVE_DIR:-${ROOT}/checkpoints/multitask_6/lpb_dipole-new-v6/visualize}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/data/.lpb_score_cache}"
+# Set to 1 to encode missing .npz caches on the fly (needed if HDF5 mtimes changed or cache is partial).
+BUILD_MISSING_CACHE=1
 NUM_VIDEOS=12
 
 BANK_SIZE=100
-VIS_DATA_SOURCE="suboptimal"  # suboptimal | expert | success_rollout | fail_rollout
+VIS_DATA_SOURCE="fail_rollout"  # suboptimal | expert | success_rollout | fail_rollout
 
 # ---------------------------------------
 # SσDC per-branch weights. Default (α=0, β=1) replicates the R5 recipe.
@@ -114,6 +116,7 @@ echo "[visualize_lpb_score_dsm] ROOT=${ROOT}"
 echo "[visualize_lpb_score_dsm] policy.ckpt=${CKPT}"
 echo "[visualize_lpb_score_dsm] model.dsm_ckpt=${DSM_CKPT}"
 echo "[visualize_lpb_score_dsm] data.cache_dir=${CACHE_DIR}"
+echo "[visualize_lpb_score_dsm] data.build_missing_cache=${BUILD_MISSING_CACHE}"
 echo "[visualize_lpb_score_dsm] visualization.data_source=${VIS_DATA_SOURCE}"
 echo "[visualize_lpb_score_dsm] visualization.bank_size=${BANK_SIZE}"
 echo "[visualize_lpb_score_dsm] visualization.calibration_seed=${CALIBRATION_SEED}"
@@ -121,10 +124,16 @@ echo "[visualize_lpb_score_dsm] detector.alpha=(state=${ALPHA_STATE}, dynamics=$
 echo "[visualize_lpb_score_dsm] detector.beta=(state=${BETA_STATE}, dynamics=${BETA_DYNAMICS})"
 echo "[visualize_lpb_score_dsm] detector.lambda_mode=${LAMBDA_MODE}"
 
+BUILD_MISSING_CACHE_ARG=()
+if [[ "${BUILD_MISSING_CACHE}" == "1" || "${BUILD_MISSING_CACHE}" == "true" ]]; then
+  BUILD_MISSING_CACHE_ARG=(data.build_missing_cache=true)
+fi
+
 "${PYTHON_BIN}" "${ROOT}/robosuite/discriminator/lpb_score/visualize_failures.py" \
   seed="${SEED}" \
   save_dir="${SAVE_DIR}" \
   data.cache_dir="${CACHE_DIR}" \
+  "${BUILD_MISSING_CACHE_ARG[@]}" \
   policy.ckpt="${CKPT}" \
   policy.encoder_batch_size="${ENCODER_BATCH_SIZE}" \
   data.image_size="${IMAGE_SIZE}" \

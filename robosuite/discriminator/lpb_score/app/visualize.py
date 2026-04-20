@@ -714,11 +714,17 @@ def run_visualize(cfg: DictConfig) -> None:
     encoder = build_flow_encoder(cfg)
 
     try:
+        build_missing_cache = bool(getattr(cfg.data, "build_missing_cache", False))
+        if build_missing_cache:
+            print(
+                "[lpb_score] data.build_missing_cache=true: will encode any demos "
+                "missing a .npz under data.cache_dir (e.g. new HDF5s or changed mtime)."
+            )
         cached_splits, split_summary, task_to_index = build_cached_splits(
             cfg_data=cfg.data,
             encoder=encoder,
             seed=int(cfg.seed),
-            build_missing_cache=False,
+            build_missing_cache=build_missing_cache,
         )
         bank_refs = select_split_refs(
             cached_splits=cached_splits,

@@ -8,7 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 # TODO: update DSM_CKPT after the SσDC refactor retrain; the old uni-dsm three-head checkpoint
 # (checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031) is no longer loadable
 # because the action head has been dropped from the architecture.
-DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new/lpb_dipole_dsm_20260412_002031/lpb_dipole_dsm_20260412_002031.pt"
+DSM_CKPT="checkpoints/multitask_6/lpb_dipole-new-v6/lpb_dipole_dsm_20260420_070130/lpb_dipole_dsm_20260420_070130.pt"
 TASKS="PickPlaceCan PickPlaceBread PickPlaceCereal PickPlaceMilk"
 
 # Default output layout mirrors visualize: <parent-of-run>/eval/<run_name>/benchmark.json
@@ -23,7 +23,7 @@ SUCCESS_ROOT="${SUCCESS_ROOT:-${ROOT}/data/utils/success_rollout}"
 # Runtime and detector settings.
 DEVICE="${DEVICE:-cuda}"
 FEATURE_BATCH_SIZE="${FEATURE_BATCH_SIZE:-256}"
-DELTA="${DELTA:-10.0}"
+DELTA="5"
 DELTA_STEP="${DELTA_STEP:-0.5}"
 LAMBDA_MODE="${LAMBDA_MODE:-mean}"               # mean | max
 LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE:--1}"   # -1 = full-prefix aggregation
