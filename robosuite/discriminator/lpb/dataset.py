@@ -114,26 +114,18 @@ class LatentDynamicsDataset(Dataset):
                     if length <= self.horizon:
                         continue
 
-                    if self._proprio_dim is None:
-                        state_dim = int(states.shape[1])
-                        if self.proprio_indices is not None:
-                            if np.max(self.proprio_indices) >= state_dim:
-                                raise ValueError(
-                                    f"proprio_indices out of range for state_dim={state_dim}"
-                                )
-                            self._proprio_dim = int(self.proprio_indices.shape[0])
-                        else:
-                            self._proprio_dim = state_dim
-                        self._action_dim = int(actions.shape[1])
-                        self._image_shape = tuple(images.shape[1:])  # (H, W, C)
+                    state_dim = int(states.shape[1])
+                    action_dim = int(actions.shape[1])
+                    image_shape = tuple(images.shape[1:])  # (H, W, C)
+
+                    if self.proprio_indices is not None and np.max(self.proprio_indices) >= state_dim:
+                        raise ValueError(
+                            f"proprio_indices out of range in {fp}:{demo_key} for state_dim={state_dim}"
+                        )
+                    if self._action_dim is None:
+                        self._action_dim = action_dim
+                        self._image_shape = image_shape
                     else:
-                        state_dim = int(states.shape[1])
-                        action_dim = int(actions.shape[1])
-                        image_shape = tuple(images.shape[1:])
-                        if self.proprio_indices is not None and np.max(self.proprio_indices) >= state_dim:
-                            raise ValueError(
-                                f"proprio_indices out of range in {fp}:{demo_key} for state_dim={state_dim}"
-                            )
                         if action_dim != self._action_dim:
                             raise ValueError(
                                 f"Action dim mismatch in {fp}:{demo_key}. "
@@ -144,6 +136,16 @@ class LatentDynamicsDataset(Dataset):
                                 f"Image shape mismatch in {fp}:{demo_key}. "
                                 f"expected={self._image_shape}, got={image_shape}"
                             )
+
+                    # Track the target proprio dim across heterogeneous tasks.
+                    # With `proprio_indices`, it's fixed; otherwise we right-pad
+                    # raw state vectors to the max seen state_dim in __getitem__.
+                    if self.proprio_indices is not None:
+                        effective_proprio = int(self.proprio_indices.shape[0])
+                    else:
+                        effective_proprio = state_dim
+                    if self._proprio_dim is None or effective_proprio > self._proprio_dim:
+                        self._proprio_dim = effective_proprio
 
                     max_t = length - self.horizon
                     for t in range(max_t):
@@ -199,9 +201,18 @@ class LatentDynamicsDataset(Dataset):
         return len(self._refs)
 
     def _maybe_slice_proprio(self, state: np.ndarray) -> np.ndarray:
-        if self.proprio_indices is None:
+        if self.proprio_indices is not None:
+            return state[self.proprio_indices]
+        # Multi-task: right-pad / truncate raw state to the shared target dim so
+        # default_collate can stack samples from tasks with different state_dim.
+        target = int(self._proprio_dim) if self._proprio_dim is not None else int(state.shape[0])
+        d = int(state.shape[0])
+        if d == target:
             return state
-        return state[self.proprio_indices]
+        if d > target:
+            return state[:target]
+        pad = np.zeros((target - d,), dtype=state.dtype)
+        return np.concatenate([state, pad], axis=0)
 
     def _to_chw_tensor(self, image_hwc: np.ndarray) -> torch.Tensor:
         img = image_hwc.astype(np.float32)

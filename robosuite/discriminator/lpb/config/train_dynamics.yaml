@@ -4,14 +4,20 @@ hydra:
 
 seed: 42
 
-save_dir: "./checkpoints/PandaLift/discriminator/lpb_dynamics"
+save_dir: "./checkpoints/lpb/dynamics"
 save_name: "dynamics_model.pt"
 
 data:
   expert_paths:
     - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
-  rollout_paths:
-    - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/unlabled"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaStack/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceBread/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert"
+  # Optional extra rollout HDF5 paths to mix into training. Default empty so the
+  # trainer falls back to a plain shuffled DataLoader over expert data only.
+  rollout_paths: []
   camera_name: "agentview"
   horizon: 1
   image_size: 224
