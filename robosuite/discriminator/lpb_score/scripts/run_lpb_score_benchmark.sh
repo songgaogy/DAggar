@@ -26,7 +26,7 @@ FEATURE_BATCH_SIZE="${FEATURE_BATCH_SIZE:-256}"
 DELTA="${DELTA:-5}"
 DELTA_STEP="${DELTA_STEP:-0.5}"
 LAMBDA_MODE="${LAMBDA_MODE:-mean}"               # mean | max
-LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE:-20}"   # -1 = full-prefix aggregation
+LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE:-50}"   # -1 = full-prefix aggregation
 
 # SσDC per-branch weights. Defaults replicate the R5 recipe (β-only, state + dynamics).
 # --------------------------------------

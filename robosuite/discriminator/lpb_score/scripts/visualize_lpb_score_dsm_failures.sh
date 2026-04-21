@@ -34,7 +34,7 @@ BETA_DYNAMICS=1
 DELTA_THRESHOLD=5
 
 LAMBDA_MODE="mean"   # mean | max (SσDC detector does not support ema)
-WINDOW_SIZE=6
+WINDOW_SIZE=80
 # ---------------------------------------
 
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
