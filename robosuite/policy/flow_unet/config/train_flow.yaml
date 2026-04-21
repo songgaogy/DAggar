@@ -1,0 +1,49 @@
+defaults:
+  - flow
+  - _self_
+
+seed: 42
+
+data:
+  data_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert_recover"
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
+  image_size: 128
+  action_horizon: 8
+  stride: 1
+  normalize: true
+  max_demos_per_file: null
+  num_train_traj: null
+  cache_proprio: true
+  use_demo_cache: true
+  max_cached_demos_per_worker: 2
+  preload_all_demos_to_ram: true
+  use_disk_cache: true
+
+train:
+  device: "cuda"
+  batch_size: 256
+  num_workers: 8
+  prefetch_factor: 4
+  epochs: 200
+  lr: 2e-4
+  min_lr: 1e-6
+  weight_decay: 1e-6
+  grad_clip_norm: 1.0
+  lambda_endpoint: 0.5
+  lambda_smooth: 0.05
+  ema_decay: 0.999
+
+augmentation:
+  minimal_shift_pad: 2
+  eye_in_hand_crop_scale: 0.88
+
+logging:
+  enable_wandb: true
+  project: "robosuite-flow-unet"
+  entity: "songgao-personal"
+  mode: "offline"
+  log_every: 20
+
+checkpoint:
+  save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_unet/pickplace_can"
+  save_freq: 10

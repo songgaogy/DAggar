@@ -1,0 +1,25 @@
+flow:
+  image_encoder:
+    type: "shared_resnet18_spatial_softmax"
+    feature_dim: 256
+    pretrained_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"
+    freeze_backbone: false
+
+  proprio_encoder:
+    type: "mlp"
+    hidden_dim: 256
+
+  fusion:
+    type: "transformer"
+    feature_dim: 256
+    depth: 3
+    num_heads: 4
+    dropout: 0.1
+
+  head:
+    type: "unet_1d"
+    hidden_dim: 128
+    time_dim: 128
+    cond_dim: 256
+    channel_mults: [1, 2, 2, 2]
+    dropout: 0.0

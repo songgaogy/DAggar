@@ -1,0 +1,58 @@
+defaults:
+  - flow
+  - _self_
+
+seed: 42
+
+data:
+  data_dir: null
+  data_dirs:
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceBread/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaStack/expert"
+    - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
+  image_size: 128
+  action_horizon: 8
+  stride: 1
+  normalize: true
+  max_demos_per_file: null
+  num_traj: null
+  num_train_traj: null
+  cache_proprio: true
+  use_demo_cache: true
+  max_cached_demos_per_worker: 2
+  preload_all_demos_to_ram: true
+  use_disk_cache: true
+  task_prompt_map: null
+
+train:
+  device: "cuda"
+  batch_size: 128
+  num_workers: 8
+  prefetch_factor: 4
+  epochs: 300
+  lr: 1e-4
+  min_lr: 1e-6
+  weight_decay: 1e-6
+  grad_clip_norm: 1.0
+  lambda_endpoint: 0.5
+  lambda_smooth: 0.05
+  ema_decay: 0.999
+
+augmentation:
+  minimal_shift_pad: 2
+  eye_in_hand_crop_scale: 0.88
+
+logging:
+  enable_wandb: true
+  project: "robosuite-flow-multi"
+  entity: "songgao-personal"
+  mode: "offline"
+  log_every: 100
+
+checkpoint:
+  save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask_6tasks"
+  save_freq: 50

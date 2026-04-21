@@ -1,0 +1,20 @@
+defaults:
+  - flow
+  - _self_
+
+data:
+  image_size: 128
+
+eval:
+  ckpt: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask/flow_multi_ep0010.pt"
+  task_name: "PickPlaceCan"
+  device: "cuda"
+  episodes: 5
+  succ_rate: false
+  succ_rate_episodes: 50
+  max_steps: 300
+  n_ode_steps: 20
+  action_horizon: 4
+  video_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask/videos"
+  video_camera: "agentview"
+  video_fps: 20
