@@ -1,11 +1,3 @@
-"""Multitask latent DSM with late-fusion conditioning and AdaLN-Zero DiT blocks.
-
-``UnifiedConditionedDSM`` encodes each routed target/context independently, aggregates route/type/task
-conditions into one global vector, and denoises with a lightweight shared MLP backbone.
-``DSMModel`` wraps it with normalization, noise, DSM loss, and per-class conditional energies
-(state + dynamics only) for the offline SσDC detector.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -81,7 +73,19 @@ class DiTBlock(nn.Module):
 
 
 class UnifiedConditionedDSM(nn.Module):
-    """Late-fusion multitask DSM with routed encoders and a shared AdaLN-Zero denoiser."""
+    """Late-fusion multitask DSM with routed encoders and a shared AdaLN-Zero denoiser.
+
+    This module implements the conditional denoiser \(g_θ(x, c, task, route)\) used by SσDC.
+
+    Routing:
+    - ``TASK_STATE``: target is ``z_t`` (normalized latent at time t)
+    - ``TASK_DYNAMICS``: target is ``delta_t = z_{t+H}^{norm} - z_t^{norm}`` (normalized residual)
+
+    Conditioning:
+    - ``traj_type`` (0/1): class label \(c\) (success vs failure)
+    - ``task_index``: discrete multitask id (aligns with checkpoint vocabulary)
+    - ``context_feature``: continuous context (zero-vector for state; (z_t, a_{t:t+H}) for dynamics)
+    """
 
     TASK_STATE = 0
     TASK_DYNAMICS = 1
@@ -130,7 +134,7 @@ class UnifiedConditionedDSM(nn.Module):
         self.dynamics_target_encoder = self._build_feature_encoder(self.latent_dim)
 
         self.state_context_encoder = self._build_feature_encoder(self.latent_dim)
-        # Action only participates as dynamics conditioning; no action target head.
+        # Action only participates as dynamics conditioning; there is no action reconstruction head.
         self.action_context_encoder = self._build_feature_encoder(self.action_flat_dim)
         self.dynamics_context_encoder = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
         self.condition_mlp = self._build_condition_mlp(2 * self.embed_dim, self.embed_dim)
@@ -332,7 +336,15 @@ class UnifiedConditionedDSM(nn.Module):
         traj_type: torch.Tensor,
         task_index: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Run state and residual dynamics heads; ``task_index`` selects multitask embeddings."""
+        """Run both routed heads (state and dynamics).
+
+        Inputs are already in the *normalized* space expected by SσDC:
+        - ``state_input`` is the (possibly noised) normalized latent ``z_t^{norm}``
+        - ``current_latent`` is the clean normalized latent ``z_t^{norm}`` used as context
+        - ``action_clean`` is the clean normalized flattened action chunk
+        - ``next_state_input`` is the (possibly noised) normalized residual
+          ``delta_t = z_{t+H}^{norm} - z_t^{norm}``
+        """
         batch_size = int(state_input.shape[0])
         self._require_2d("state_input", state_input)
         self._require_feature_dim("state_input", state_input, self.latent_dim)
@@ -357,6 +369,7 @@ class UnifiedConditionedDSM(nn.Module):
             device=state_input.device,
         )
 
+        # State factor uses only the discrete condition (route/type/task). Dynamics uses (z_t, a).
         state_context_feature = state_input.new_zeros((batch_size, self.embed_dim))
         encoded_current_latent = self.state_context_encoder(current_latent)
         dynamics_context_feature = self.dynamics_context_encoder(
@@ -394,7 +407,20 @@ JointManifoldDenoiser = UnifiedConditionedDSM
 
 
 class DSMModel(nn.Module):
-    """DSM training/inference: latent and action standardization, noised targets, and Fisher diagnostics."""
+    """DSM training/inference wrapper around ``UnifiedConditionedDSM``.
+
+    This class defines the exact tensors that the discriminator treats as the two factors:
+
+    - **State factor** target: normalized ``z_t``
+    - **Dynamics factor** target: normalized residual ``delta_t = z_{t+H}^{norm} - z_t^{norm}``
+
+    Training injects fixed-σ Gaussian noise into these targets (in normalized space) and minimizes
+    a weighted sum of per-factor reconstruction energies.
+
+    Inference uses ``add_noise=False`` so per-class energy is the single-sample reconstruction:
+    ``E_b^(c)(x) = || g_θ(x, c) - x ||^2`` per factor ``b``. This is what ``DSMDiscriminator`` z-scores
+    and aggregates into λ.
+    """
 
     def __init__(
         self,
@@ -508,7 +534,7 @@ class DSMModel(nn.Module):
         return (action_flat - action_mean.unsqueeze(0)) / action_std.unsqueeze(0)
 
     def flatten_action_sequence(self, action_sequence: torch.Tensor) -> torch.Tensor:
-        """Reshape (B, H, A) actions into the routed flat actor target."""
+        """Reshape (B, H, A) actions into a flat (B, H*A) conditioning vector."""
         if action_sequence.ndim != 3:
             raise ValueError(f"Expected action_sequence shape (B,H,A), got {tuple(action_sequence.shape)}")
         if int(action_sequence.shape[1]) != self.transition_horizon:
@@ -528,7 +554,11 @@ class DSMModel(nn.Module):
         action_sequence: torch.Tensor,
         target_latent: torch.Tensor,
     ) -> torch.Tensor:
-        """Pack the raw transition tuple into the legacy flat tau layout."""
+        """Pack raw transition tuple into the legacy flat tau layout.
+
+        This is mainly useful for compatibility / debugging. The SσDC model does *not* denoise τ
+        jointly; it routes the state and residual-dynamics factors separately.
+        """
         if current_latent.ndim != 2:
             raise ValueError(f"Expected current_latent shape (B,D), got {tuple(current_latent.shape)}")
         if action_sequence.ndim != 3:
@@ -680,7 +710,16 @@ class DSMModel(nn.Module):
         task_index: torch.Tensor | int,
         add_noise: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Normalize ``(z_t, a, z_{t+H})``, optionally add DSM noise, and forward through ``predictor``."""
+        """Forward pass shared by training and inference.
+
+        Takes raw transition elements ``(z_t, a_{t:t+H}, z_{t+H})`` and:
+        - normalizes latent and action using stored stats
+        - converts next-state into a normalized residual target ``delta``
+        - optionally injects Gaussian noise (training)
+        - routes into the two-head predictor conditioned on (traj_type, task_index)
+
+        Important: action is **observed conditioning only** (dynamics context). It is never denoised.
+        """
         state_clean_raw = current_latent
         action_clean_raw = self.flatten_action_sequence(action_sequence)
         next_state_clean_raw = target_latent
@@ -689,7 +728,7 @@ class DSMModel(nn.Module):
         state_clean = self.normalize_latent(state_clean_raw)
         action_clean = self.normalize_action_flat(action_clean_raw)
         next_state_norm_clean = self.normalize_latent(next_state_clean_raw)
-        # The dynamics branch reconstructs the normalized residual.
+        # The dynamics branch reconstructs the normalized residual, not the next latent itself.
         delta_clean = next_state_norm_clean - state_clean
 
         # Noise is injected only in normalized space; action is observed conditioning, not denoised.
@@ -801,7 +840,12 @@ class DSMModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Per-factor reconstruction energy under c=0 and c=1.
 
-        Single-sample estimator: ``add_noise=False`` so ``E_b^(c)(x) = ||g(x, c) - x||^2`` per factor b.
+        Single-sample estimator:
+
+        - ``add_noise=False`` means we score the *clean normalized* targets.
+        - For each factor b ∈ {state, dynamics} we compute
+          ``E_b^(c)(x) = || g_θ(x, c) - x ||^2``.
+
         Returns positive/negative energies and the signed margin ``E_b^- - E_b^+`` for state and dynamics.
         """
         pos_out = self.forward(

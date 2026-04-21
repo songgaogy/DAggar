@@ -28,7 +28,15 @@ def _compute_positive_normalization_stats(
     positive_refs,
     min_variance: float = 1e-6,
 ) -> dict[str, np.ndarray]:
-    """Per-dimension mean and variance over all timesteps from non-failure train trajectories only."""
+    """Compute latent/action normalization stats from the *positive* train pool only.
+
+    These stats are stored in the checkpoint and used by ``DSMModel`` for both:
+    - training (noise injection happens in normalized space)
+    - inference (energies are computed in normalized space before being z-scored by the detector)
+
+    Only non-failure trajectories are included so the normalization corresponds to the "normal"
+    manifold; failures should be out-of-distribution relative to this base scale.
+    """
     if not positive_refs:
         raise RuntimeError("Expected non-empty positive refs to compute normalization stats.")
 
@@ -85,7 +93,12 @@ def _build_payload(
     normalization_stats: dict[str, np.ndarray],
     model_online_state: dict | None = None,
 ) -> dict:
-    """Serialize weights, Hydra config, ``task_to_index``, and normalization stats for inference."""
+    """Serialize checkpoint payload for later inference in ``DSMTransitionScorer``.
+
+    The payload intentionally includes:
+    - ``task_to_index`` / ``num_tasks`` so inference can validate ``task_index`` inputs
+    - ``normalization_stats`` so ``DSMModel`` standardizes inputs consistently across runs
+    """
     payload: dict = {
         "model": model_state,
         "history": history,
@@ -155,6 +168,7 @@ def run_train(cfg: DictConfig) -> None:
     encoder = build_flow_encoder(cfg)
 
     try:
+        # 1) Build or reuse latent caches from the frozen encoder (shared across train/eval/bench).
         cached_splits, split_summary, task_to_index = build_cached_splits(
             cfg_data=cfg.data,
             encoder=encoder,
@@ -185,6 +199,7 @@ def run_train(cfg: DictConfig) -> None:
                 f"num_val_trajectories={len(val_refs)}"
             )
 
+        # 2) Instantiate the two-head SσDC model. ``num_tasks`` must match the dataset's task vocab.
         model = build_dsm_model(
             latent_dim=int(train_dataset.latent_dim),
             action_dim=int(train_dataset.action_dim),
@@ -192,6 +207,7 @@ def run_train(cfg: DictConfig) -> None:
             cfg_model=cfg.model,
             transition_horizon=int(cfg.data.transition_horizon),
         )
+        # 3) Standardization stats are computed from positive trajectories only and saved in ckpt.
         normalization_stats = _compute_positive_normalization_stats(positive_refs=positive_train_refs)
         model.set_normalization_stats(
             latent_mean=normalization_stats["latent_mean"],
@@ -204,6 +220,7 @@ def run_train(cfg: DictConfig) -> None:
             f"action_count={int(normalization_stats['action_count'])}"
         )
 
+        # 4) Optimize DSM reconstruction energy under fixed-σ noise in normalized space.
         trainer = _build_trainer(
             cfg=cfg,
             model=model,

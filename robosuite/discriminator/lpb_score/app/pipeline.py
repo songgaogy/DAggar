@@ -1,4 +1,14 @@
-"""Hydra helpers: frozen flow encoder, DSM discriminator wiring, and train/val transition datasets."""
+"""Hydra helpers: frozen flow encoder, DSM discriminator wiring, and datasets.
+
+This file is the "pipeline glue" for SσDC:
+
+- The frozen multitask flow policy provides an encoder that converts raw demos into latent trajectories.
+- Latents/actions are cached to ``.npz`` once (see ``core/dataset.py``) and then reloaded for training,
+  benchmarking, and visualization.
+- The offline detector (``core/dsm_discriminator.DSMDiscriminator``) consumes **latent trajectories**
+  and internally calls into ``core/model.DSMModel.compute_conditional_energies`` to compute the
+  per-class reconstruction energies used by the score.
+"""
 
 from __future__ import annotations
 
@@ -56,7 +66,12 @@ def _resolve_detector_branch_weight(
 
 
 def build_dsm_discriminator(cfg: Any) -> DSMDiscriminator:
-    """Load checkpoint into ``DSMTransitionScorer`` and configure SσDC detector weights."""
+    """Build the offline SσDC discriminator from Hydra config.
+
+    The returned detector expects:
+    - trajectories carrying ``task_name`` and ``task_index`` (task vocab id)
+    - latents/actions that match the checkpoint's latent/action dims and horizon
+    """
     detector_cfg = cfg.detector
     return DSMDiscriminator(
         checkpoint_path=to_absolute_path(str(cfg.model.dsm_ckpt)),
@@ -106,7 +121,13 @@ def build_training_datasets(
     cfg: Any,
     cached_splits: dict[str, Sequence[EncodedTrajectoryRef]],
 ) -> TrainingDatasets:
-    """Create train/val transition datasets from cached latent trajectories."""
+    """Create train/val transition datasets from cached latent trajectories.
+
+    ``LatentTransitionDataset`` produces supervised examples:
+      (z_t, a_{t:t+H}, z_{t+H}, traj_type, task_index)
+    where ``traj_type`` is the class label (0 success / 1 failure) and ``task_index`` is the
+    multitask vocabulary id that must match the model's embeddings.
+    """
     train_refs = list(cached_splits["train"])
     val_refs = list(cached_splits["val"])
 

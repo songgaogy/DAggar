@@ -94,7 +94,15 @@ class DSMTransitionScorer:
         checkpoint_path: str,
         override_action_horizon: int,
     ) -> tuple[DSMModel, int, int, int]:
-        """Rebuild ``build_dsm_model`` from checkpoint metadata, load state dict, eval mode on device."""
+        """Rebuild ``DSMModel`` from checkpoint metadata and load weights.
+
+        ``DSMModel`` inference requires:
+        - architecture hyperparameters (latent/action dims, horizon, num_tasks)
+        - normalization stats (latent/action mean/var) if stored in the checkpoint
+
+        Note: ``num_tasks`` defines the discrete task embedding vocabulary size. It must match the
+        dataset's ``task_index`` range used during training and benchmarking.
+        """
         payload = _torch_load_checkpoint(checkpoint_path, map_location="cpu")
         if "model" not in payload:
             raise ValueError(f"Checkpoint missing key `model`: {checkpoint_path}")
@@ -193,13 +201,24 @@ class DSMTransitionScorer:
             out[t, : chunk.shape[0]] = chunk
             if chunk.shape[0] < horizon:
                 # Repeat the last action when the rollout tail is shorter than H.
+                # This keeps the conditioning tensor shape (H, A) fixed for every t.
                 pad_value = chunk[-1] if chunk.shape[0] > 0 else np.zeros((self.action_dim,), dtype=np.float32)
                 out[t, chunk.shape[0] :] = pad_value
         return out
 
     @torch.no_grad()
     def score_trajectory(self, traj: LatentTrajectory) -> TrajectoryScoreBundle:
-        """Batch-infer per-branch conditional energies and margins for each valid ``(z_t, a, z')`` window."""
+        """Compute per-step per-factor energies for a trajectory.
+
+        For a trajectory of length T and horizon H, SσDC scores the valid windows:
+
+        - current latent: ``z_t`` for t = 0 .. (T - H - 1)
+        - action chunk:  ``a_{t:t+H}`` as a fixed-size (H, A) tensor
+        - target latent: ``z_{t+H}``
+
+        The underlying ``DSMModel.compute_conditional_energies`` returns energies under the
+        success-conditioned (traj_type=0) and failure-conditioned (traj_type=1) denoisers.
+        """
         t_len = min(int(traj.latents.shape[0]), int(traj.actions.shape[0]))
         if t_len <= 0:
             raise ValueError("Trajectory has zero valid timesteps")
@@ -213,6 +232,7 @@ class DSMTransitionScorer:
         latents_t = torch.from_numpy(latents)
         action_t = torch.from_numpy(action_chunks)
 
+        # Align the transition targets so each index i corresponds to (z_i, a_{i:i+H}, z_{i+H}).
         current_t = latents_t[:valid_len]
         action_chunk_t = action_t[:valid_len]
         target_t = latents_t[horizon : horizon + valid_len]
@@ -229,6 +249,8 @@ class DSMTransitionScorer:
             current_b = current_t[start:end].to(self.device)
             action_b = action_chunk_t[start:end].to(self.device)
             target_b = target_t[start:end].to(self.device)
+            # Inference uses add_noise=False inside compute_conditional_energies, producing the
+            # single-sample per-class reconstruction energies E_b^(c)(x) = ||g(x,c) - x||^2.
             energies = self.model.compute_conditional_energies(
                 current_latent=current_b,
                 action_sequence=action_b,
@@ -357,7 +379,12 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         self,
         scored_bundles: Sequence[tuple[str, TrajectoryScoreBundle]],
     ) -> None:
-        """Estimate per-task and global mean/std for each raw per-branch energy from the success bank."""
+        """Estimate z-score normalization stats from the success bank.
+
+        Normalization is intentionally derived only from trajectories treated as "normal"
+        (success bank). These stats define ``z(·)`` in the SσDC score, per task when available,
+        otherwise falling back to global.
+        """
         global_terms: dict[str, list[np.ndarray]] = {}
         task_terms: dict[str, dict[str, list[np.ndarray]]] = {}
 
@@ -398,7 +425,18 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         *,
         task_name: str,
     ) -> np.ndarray:
-        """SσDC step score ``u(x) = Σ_b [α_b · z(E_b^+) + β_b · (z(E_b^+) − z(E_b^-))]``."""
+        """SσDC per-step score.
+
+        Given per-step per-branch energies under the two class-conditional denoisers:
+        - ``E_b^+``: traj_type=0 (success-conditioned)
+        - ``E_b^-``: traj_type=1 (failure-conditioned)
+
+        compute:
+
+            u(x) = Σ_b [ α_b · z(E_b^+) + β_b · ( z(E_b^+) − z(E_b^-) ) ].
+
+        ``z(·)`` is a per-task (or global fallback) z-score using success-bank mean/std.
+        """
         stats = self._resolve_norm_stats(task_name)
         branches: dict[str, tuple[np.ndarray, np.ndarray]] = {
             "state": (bundle.state_positive_scores, bundle.state_negative_scores),
@@ -481,6 +519,10 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         window = int(self.lambda_window_size)
         full_prefix = window <= 0
 
+        # Aggregate step scores u_t into a prefix score λ_t.
+        #
+        # - mean: rolling mean (or full-prefix mean when window <= 0)
+        # - max: rolling max  (or full-prefix max  when window <= 0)
         if self.lambda_mode == "mean":
             if full_prefix:
                 csum = np.cumsum(vals, dtype=np.float64)
@@ -584,6 +626,9 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         normal_bank_trajectories: Sequence[LatentTrajectory],
         calibration_trajectories: Optional[Sequence[LatentTrajectory]] = None,
     ) -> DetectorCalibrationSummary:
+        # Two-stage calibration:
+        # 1) success bank -> per-branch mean/std used for z-score normalization z(·)
+        # 2) calibration set -> λ values whose percentile defines the detection threshold
         normal_bank_set = list(normal_bank_trajectories)
         calibration_set = (
             list(calibration_trajectories)
@@ -624,6 +669,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
             for task_name, values in calib_lambdas_by_task.items()
             if values
         }
+        # Threshold is the (1 - delta/100) quantile of calibration λ values.
         self.threshold = self._compute_threshold(self._calib_lambdas, self.delta)
         self.thresholds_by_task = {
             task_name: self._compute_threshold(values, self.delta)
@@ -693,11 +739,14 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
         if self.threshold is None or self._calib_lambdas is None:
             raise RuntimeError("Call fit(...) before detect_trajectory(...)")
 
+        # 1) Compute per-step energies under the two class-conditional denoisers.
         bundle = self.extractor.score_trajectory(trajectory)
         task_name = str(trajectory.task_name)
+        # 2) Convert energies -> z-scored step scores u_t -> aggregated prefix scores λ_t.
         step_scores = self._compute_step_scores(bundle, task_name=task_name)
         lamb = self._aggregate_lambda(step_scores)
 
+        # Attribution helpers: decompose u_t and λ_t into per-branch additive contributions.
         component_contrib = self._step_components(bundle, task_name=task_name)
         step_contribution_shares = self._compute_component_shares(component_contrib)
         aggregate_contributions = self._aggregate_component_contributions(
@@ -728,6 +777,7 @@ class DSMDiscriminator(OfflineTrajectoryDiscriminator[LatentTrajectory]):
                 "labels length must match the number of aggregate scores when adaptive_threshold=True: "
                 f"got labels={labels_np.shape[0]}, scores={lamb.shape[0]}"
             )
+        # 3) Threshold λ_t into per-step predictions. Optionally adapt δ online using labels.
         for t in range(lamb.shape[0]):
             pred = int(lamb[t] >= cur_threshold)
             preds[t] = pred

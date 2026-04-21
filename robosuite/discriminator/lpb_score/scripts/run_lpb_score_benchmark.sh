@@ -23,16 +23,20 @@ SUCCESS_ROOT="${SUCCESS_ROOT:-${ROOT}/data/utils/success_rollout}"
 # Runtime and detector settings.
 DEVICE="${DEVICE:-cuda}"
 FEATURE_BATCH_SIZE="${FEATURE_BATCH_SIZE:-256}"
-DELTA="5"
+DELTA="${DELTA:-5}"
 DELTA_STEP="${DELTA_STEP:-0.5}"
 LAMBDA_MODE="${LAMBDA_MODE:-mean}"               # mean | max
-LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE:--1}"   # -1 = full-prefix aggregation
+LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE:-20}"   # -1 = full-prefix aggregation
 
 # SσDC per-branch weights. Defaults replicate the R5 recipe (β-only, state + dynamics).
+# --------------------------------------
+# alpha is useless
 ALPHA_STATE="${ALPHA_STATE:-0.0}"
 ALPHA_DYNAMICS="${ALPHA_DYNAMICS:-0.0}"
+
 BETA_STATE="${BETA_STATE:-1.0}"
 BETA_DYNAMICS="${BETA_DYNAMICS:-1.0}"
+# --------------------------------------
 
 # Optional benchmark dataset caps for quick smoke runs.
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-}"
@@ -101,5 +105,28 @@ fi
 if [[ -n "${MAX_SUCCESS_PER_TASK}" ]]; then
   CMD+=(--max-success-per-task "${MAX_SUCCESS_PER_TASK}")
 fi
+
+# Exposed to Python as JSON `config.eval_run.shell_env` (LPB_SCORE_BENCHMARK_* only).
+export LPB_SCORE_BENCHMARK_ROOT="${ROOT}"
+export LPB_SCORE_BENCHMARK_RUN_NAME="${RUN_NAME}"
+export LPB_SCORE_BENCHMARK_EVAL_BASE="${EVAL_BASE}"
+export LPB_SCORE_BENCHMARK_OUT_JSON="${OUT_JSON}"
+export LPB_SCORE_BENCHMARK_PYTHON_BIN="${PYTHON_BIN}"
+export LPB_SCORE_BENCHMARK_DSM_CKPT_REL="${DSM_CKPT}"
+export LPB_SCORE_BENCHMARK_FAIL_ROOT="${FAIL_ROOT}"
+export LPB_SCORE_BENCHMARK_SUCCESS_ROOT="${SUCCESS_ROOT}"
+export LPB_SCORE_BENCHMARK_TASKS="${TASKS}"
+export LPB_SCORE_BENCHMARK_DEVICE="${DEVICE}"
+export LPB_SCORE_BENCHMARK_FEATURE_BATCH_SIZE="${FEATURE_BATCH_SIZE}"
+export LPB_SCORE_BENCHMARK_DELTA="${DELTA}"
+export LPB_SCORE_BENCHMARK_DELTA_STEP="${DELTA_STEP}"
+export LPB_SCORE_BENCHMARK_LAMBDA_MODE="${LAMBDA_MODE}"
+export LPB_SCORE_BENCHMARK_LAMBDA_WINDOW_SIZE="${LAMBDA_WINDOW_SIZE}"
+export LPB_SCORE_BENCHMARK_ALPHA_STATE="${ALPHA_STATE}"
+export LPB_SCORE_BENCHMARK_ALPHA_DYNAMICS="${ALPHA_DYNAMICS}"
+export LPB_SCORE_BENCHMARK_BETA_STATE="${BETA_STATE}"
+export LPB_SCORE_BENCHMARK_BETA_DYNAMICS="${BETA_DYNAMICS}"
+export LPB_SCORE_BENCHMARK_MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-}"
+export LPB_SCORE_BENCHMARK_MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-}"
 
 "${CMD[@]}"
