@@ -121,6 +121,81 @@ def test_benchmark_uses_aggregated_lambda_for_predictions(tmp_path: Path) -> Non
     discriminator.close()
 
 
+def test_benchmark_filters_trajectories_without_cache(tmp_path: Path) -> None:
+    encoder = Encoder(pretrained=False, freeze=True)
+    predictor = ConditionalDynamicsPredictor(
+        latent_dim=512,
+        proprio_dim=4,
+        action_dim=2,
+        d_model=64,
+        num_layers=1,
+        nhead=4,
+        dropout=0.0,
+        max_action_horizon=4,
+        d_cond=16,
+    )
+    ckpt_path = tmp_path / "d4_refactored.pt"
+    torch.save(
+        {
+            "encoder_state_dict": encoder.state_dict(),
+            "encoder_config": {"normalize_input": True, "freeze": True},
+            "arch_args": predictor.arch_args(),
+            "ema_state_dict": predictor.state_dict(),
+            "config": {"horizon": 1, "proprio_indices": [0, 1, 2, 3]},
+            "sigma_sq": 0.5,
+        },
+        ckpt_path,
+    )
+
+    discriminator = D4BenchmarkDiscriminator(
+        d4_ckpt_path=str(ckpt_path),
+        preprocessed_cache_root=str(tmp_path / "cache"),
+        device="cpu",
+        encoder_pretrained=False,
+        encoder_freeze=True,
+    )
+    discriminator.cache_reader.exists = lambda task, file_path, demo_key: file_path != "missing.hdf5"
+
+    trajectories = [
+        BenchmarkTrajectory(
+            task_name="PickPlaceBread",
+            num_frames=3,
+            is_failure=False,
+            video_id="succ_keep",
+            file_path="keep_success.hdf5",
+            demo_path="demos/demo_0",
+        ),
+        BenchmarkTrajectory(
+            task_name="PickPlaceBread",
+            num_frames=3,
+            is_failure=False,
+            video_id="succ_skip",
+            file_path="missing.hdf5",
+            demo_path="demos/demo_1",
+        ),
+        BenchmarkTrajectory(
+            task_name="PickPlaceBread",
+            num_frames=3,
+            is_failure=True,
+            video_id="fail_keep",
+            file_path="fail_out.hdf5",
+            demo_path="demos/demo_2",
+            source_hdf5_path="keep_fail.hdf5",
+            source_demo_key="demo_src",
+        ),
+    ]
+
+    kept, stats = discriminator.filter_cached_trajectories(trajectories)
+    assert [traj.video_id for traj in kept] == ["succ_keep", "fail_keep"]
+    assert stats["PickPlaceBread"] == {
+        "kept_success": 1,
+        "kept_fail": 1,
+        "skipped_success": 1,
+        "skipped_fail": 0,
+    }
+    discriminator.close()
+
+
 def test_benchmark_rejects_old_256d_checkpoint(tmp_path: Path) -> None:
     ckpt_path = tmp_path / "d4_old.pt"
     torch.save(

@@ -35,6 +35,7 @@ from .feature import D4Frames
 
 
 _OMEGA_MAX = 2.0
+_VALID_SCORE_MODES = ("rel", "abs")
 
 
 @dataclass
@@ -46,7 +47,22 @@ class D4StepOutput:
 
 
 class D4Detector:
-    """CFG-guided D4-Disc scorer. One trained predictor serves all omega."""
+    """CFG-guided D4-Disc scorer. One trained predictor serves all omega.
+
+    score_mode:
+        "rel" (default): lambda_t = (||f_omega - z_target||^2 - ||z_t - z_target||^2) / (2 sigma^2).
+            With a residual latent head (pred = z_t + Delta), the raw abs residual
+            is ||Delta - d||^2 where d = z_target - z_t. If the predictor is only
+            a modest improvement over identity (Phase-A only, or early bootstrap),
+            ||d||^2 (motion magnitude) dominates, so the score is confounded by
+            per-task motion statistics (e.g. fail rollouts that stall have lower
+            |d| than success rollouts, inverting AUROC). Subtracting the identity
+            baseline isolates the model's delta-prediction quality and removes the
+            motion confound.
+        "abs": matches d4disc_0423.md §8.2 verbatim: lambda_t = ||f_omega - z_target||^2 / (2 sigma^2).
+            Useful as a reference/ablation. Prefer "rel" unless the predictor has
+            learned transitions to near-zero abs error (post full Phase-B).
+    """
 
     def __init__(
         self,
@@ -59,6 +75,7 @@ class D4Detector:
         lambda_window_size: int = -1,
         device: str = "cuda",
         batch_size: int = 512,
+        score_mode: str = "rel",
     ) -> None:
         if float(omega) < 0.0:
             raise ValueError(f"omega must be >= 0, got {omega}")
@@ -68,6 +85,8 @@ class D4Detector:
             raise ValueError(f"delta must be in [0, 100], got {delta}")
         if lambda_mode not in {"mean", "max"}:
             raise ValueError("lambda_mode must be 'mean' or 'max'")
+        if str(score_mode) not in _VALID_SCORE_MODES:
+            raise ValueError(f"score_mode must be one of {_VALID_SCORE_MODES}, got {score_mode!r}")
 
         self.predictor = predictor
         self.omega = float(min(max(float(omega), 0.0), _OMEGA_MAX))
@@ -75,6 +94,7 @@ class D4Detector:
         self.delta = float(delta)
         self.lambda_mode = str(lambda_mode)
         self.lambda_window_size = int(lambda_window_size)
+        self.score_mode = str(score_mode)
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
         self.predictor.to(self.device)
@@ -112,6 +132,10 @@ class D4Detector:
             f_minus = out_m["pred_latent"]
             f_omega = (1.0 + self.omega) * f_plus - self.omega * f_minus
             lam = ((f_omega - tgt) ** 2).sum(dim=-1) / two_sigma_sq
+            if self.score_mode == "rel":
+                # Remove motion-magnitude confound; see class docstring.
+                id_err = ((obs - tgt) ** 2).sum(dim=-1) / two_sigma_sq
+                lam = lam - id_err
             r_plus = ((f_plus - tgt) ** 2).sum(dim=-1)
             r_minus = ((f_minus - tgt) ** 2).sum(dim=-1)
             advantage = (r_minus - r_plus) / two_sigma_sq

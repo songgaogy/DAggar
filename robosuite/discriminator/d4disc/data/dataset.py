@@ -13,6 +13,11 @@ from torch.utils.data import Dataset
 
 from .cache import PreprocessedCacheReader, PreprocessedDemo
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 
 @dataclass(frozen=True)
 class _TransitionRef:
@@ -115,6 +120,12 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         self.gamma_buffer = torch.full((len(self._refs),), 0.5, dtype=torch.float32)
         self._print_coverage()
 
+    @staticmethod
+    def _progress(iterable, *, desc: str, total: Optional[int] = None):
+        if tqdm is None:
+            return iterable
+        return tqdm(iterable, desc=desc, total=total, dynamic_ncols=True, leave=False)
+
     def _bucket(self, task_name: str, data_type: str) -> Dict[str, int]:
         return self._coverage.setdefault(task_name, {}).setdefault(
             data_type,
@@ -131,7 +142,8 @@ class LatentFlowDynamicsDatasetD4(Dataset):
     ) -> None:
         task_counts: Dict[str, int] = {}
         kept = 0
-        for file_path in files:
+        progress_desc = f"[d4_disc][scan:{data_type}]"
+        for file_path in self._progress(files, desc=progress_desc, total=len(files)):
             task_name = _infer_task_name(file_path)
             try:
                 with h5py.File(file_path, "r") as handle:
@@ -286,11 +298,14 @@ class LatentFlowDynamicsDatasetD4(Dataset):
     def preload_preprocessed(self) -> int:
         loaded = 0
         seen = set()
+        unique_keys: List[Tuple[str, str, str]] = []
         for ref in self._refs:
             key = self._demo_cache_key(ref)
             if key in seen:
                 continue
             seen.add(key)
+            unique_keys.append(key)
+        for key in self._progress(unique_keys, desc="[d4_disc][preload]", total=len(unique_keys)):
             if key not in self._demo_cache:
                 self._demo_cache[key] = self.cache_reader.load(*key)
                 loaded += 1

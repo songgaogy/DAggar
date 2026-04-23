@@ -54,6 +54,60 @@ def _gamma_quantile_diag(gamma: torch.Tensor) -> Dict[str, float]:
 
 
 @torch.no_grad()
+def build_expert_target_bank(
+    dataset: LatentFlowDynamicsDatasetD4,
+    encoder: Encoder,
+    *,
+    max_bank_size: Optional[int] = 100_000,
+    batch_size: int = 512,
+    num_workers: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+) -> torch.Tensor:
+    """Encode target_image of clean positive transitions into a KNN bank.
+
+    Returns (N, latent_dim) tensor on ``device``. Used by the KNN-mode
+    advantage gate (compute_advantage_gate with advantage_mode='knn') as the
+    expert z_{t+h} distribution that pred_latent is scored against.
+    """
+    dev = _resolve_device(device)
+    encoder_was_training = encoder.training
+    encoder.eval()
+    encoder.to(dev)
+
+    clean_idx = (~dataset.is_fail_raw).nonzero(as_tuple=False).squeeze(-1)
+    n_clean = int(clean_idx.numel())
+    if n_clean == 0:
+        if encoder_was_training:
+            encoder.train()
+        raise RuntimeError("expert target bank requires clean positive transitions")
+
+    if max_bank_size is not None and n_clean > int(max_bank_size):
+        gen = torch.Generator().manual_seed(int(seed))
+        perm = torch.randperm(n_clean, generator=gen)[: int(max_bank_size)]
+        clean_idx = clean_idx[perm]
+
+    subset = Subset(dataset, clean_idx.tolist())
+    loader = DataLoader(
+        subset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        collate_fn=_collate,
+        pin_memory=(dev.type == "cuda"),
+    )
+    chunks: list[torch.Tensor] = []
+    for batch in loader:
+        target_images = batch["target_image"].to(dev, non_blocking=True)
+        chunks.append(encoder(target_images).detach().float())
+    bank = torch.cat(chunks, dim=0).to(dev)
+
+    if encoder_was_training:
+        encoder.train()
+    return bank
+
+
+@torch.no_grad()
 def compute_advantage_gate(
     predictor: ConditionalDynamicsPredictor,
     encoder: Encoder,
@@ -66,7 +120,34 @@ def compute_advantage_gate(
     batch_size: int = 256,
     num_workers: int = 0,
     ema_alpha: float = 0.5,
+    advantage_mode: str = "knn",
+    expert_z_bank: Optional[torch.Tensor] = None,
+    knn_k: int = 1,
+    knn_chunk_size: int = 8192,
 ) -> Dict[str, float]:
+    """Compute per-sample advantage A = (r_minus - r_plus) / 2σ² and update γ.
+
+    advantage_mode:
+        "residual": r_c = ||f(c) - z_target||² (raw next-latent MSE;
+            d4disc_0423.md §5 verbatim). Score is dominated by motion
+            magnitude when the predictor is modestly trained.
+        "knn" (default): r_c = knn_sqdist(f(c), expert_z_bank) — min
+            squared L2 distance from the conditional prediction to a bank
+            of expert target latents. Under a Gaussian-KNN interpretation
+            this equals -log p_c(z_{t+h}|o,a) up to a constant, so the
+            advantage is exactly log p_+ - log p_- over the expert
+            distribution. Matches the inference-time score_mode='knn'
+            paradigm (LPB-parity density estimation).
+
+    ``expert_z_bank`` must be provided (and pre-encoded) when
+    ``advantage_mode='knn'``; typically built once per Phase-B loop by
+    ``build_expert_target_bank``.
+    """
+    if str(advantage_mode) not in {"residual", "knn"}:
+        raise ValueError(f"advantage_mode must be 'residual' or 'knn', got {advantage_mode!r}")
+    if advantage_mode == "knn" and (expert_z_bank is None or expert_z_bank.numel() == 0):
+        raise ValueError("advantage_mode='knn' requires non-empty expert_z_bank")
+
     predictor_was_training = predictor.training
     encoder_was_training = encoder.training
     predictor.eval()
@@ -75,6 +156,9 @@ def compute_advantage_gate(
     dev = _resolve_device(device)
     predictor.to(dev)
     encoder.to(dev)
+    bank_dev: Optional[torch.Tensor] = None
+    if advantage_mode == "knn":
+        bank_dev = expert_z_bank.to(dev, dtype=torch.float32, non_blocking=True)
 
     fail_idx = dataset.fail_indices()
     n_fail = int(fail_idx.numel())
@@ -91,6 +175,7 @@ def compute_advantage_gate(
             "alpha_used": float(alpha_k),
             "kappa_used": float(kappa_k),
             "num_fail_raw": 0,
+            "advantage_mode": advantage_mode,
         }
 
     subset = Subset(dataset, fail_idx.tolist())
@@ -124,9 +209,16 @@ def compute_advantage_gate(
 
         out_plus = predictor(z_t, prop, act, cond_idx=c_plus)
         out_minus = predictor(z_t, prop, act, cond_idx=c_minus)
+        pred_plus = out_plus["pred_latent"]
+        pred_minus = out_minus["pred_latent"]
 
-        r_plus = ((out_plus["pred_latent"] - z_target) ** 2).sum(dim=-1)
-        r_minus = ((out_minus["pred_latent"] - z_target) ** 2).sum(dim=-1)
+        if advantage_mode == "residual":
+            r_plus = ((pred_plus - z_target) ** 2).sum(dim=-1)
+            r_minus = ((pred_minus - z_target) ** 2).sum(dim=-1)
+        else:
+            # KNN: score each prediction against the expert target-latent bank.
+            r_plus = knn_sqdist(pred_plus, bank_dev, k=int(knn_k), chunk_size=int(knn_chunk_size))
+            r_minus = knn_sqdist(pred_minus, bank_dev, k=int(knn_k), chunk_size=int(knn_chunk_size))
         advantage = (r_minus - r_plus) / two_sigma_sq
         gamma_new = torch.sigmoid(float(alpha_k) * (-advantage - float(kappa_k)))
 
@@ -158,6 +250,8 @@ def compute_advantage_gate(
             "alpha_used": float(alpha_k),
             "kappa_used": float(kappa_k),
             "num_fail_raw": int(n_fail),
+            "advantage_mode": advantage_mode,
+            "bank_size": int(bank_dev.shape[0]) if bank_dev is not None else 0,
         }
     )
     return diag

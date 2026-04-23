@@ -17,10 +17,15 @@ from ..models.adaln import ConditionEmbedder
 from ..models.dynamics import ConditionalDynamicsPredictor
 from ..models.encoder import Encoder
 from .ema import ModelEMA
-from .filter import _collate, _gamma_quantile_diag, compute_advantage_gate, warm_start_gamma_from_knn
+from .filter import (
+    _collate,
+    _gamma_quantile_diag,
+    build_expert_target_bank,
+    compute_advantage_gate,
+    warm_start_gamma_from_knn,
+)
 from .monitor import CollapseDetector, D4Health
 from .schedule import D4Schedule
-
 
 try:
     import wandb  # type: ignore
@@ -59,7 +64,7 @@ class D4TrainerConfig:
 
     use_bfloat16: bool = False
 
-    log_every: int = 50
+    log_every: int = 200
     save_freq: int = 0
     run_name: str = ""
     wandb_project: str = "d4disc"
@@ -74,6 +79,18 @@ class D4TrainerConfig:
     warm_start_mode: str = "rank"
     gate_freeze_epochs: int = 2
     skip_bootstrap: bool = False
+
+    # Phase-B advantage gate mode. "knn" (default) scores each conditional
+    # prediction against an expert z_{t+h} bank via min-sqdist, giving an
+    # advantage that is exactly log p_+ - log p_- under Gaussian-KNN. This
+    # matches the inference-time score_mode="knn" density paradigm and
+    # avoids the motion-magnitude confound that raw residual scoring has on
+    # Phase-A-only checkpoints (d4disc_0424_debug_lpb_degraded.md).
+    # "residual" keeps d4disc_0423.md §5 verbatim for ablations.
+    advantage_mode: str = "knn"
+    advantage_knn_bank_size: int = 100_000
+    advantage_knn_chunk_size: int = 8192
+    advantage_knn_k: int = 1
 
     horizon: int = 1
     proprio_indices: Optional[List[int]] = None
@@ -484,6 +501,25 @@ class D4Trainer:
 
         self._cache_probe_batch()
 
+        # Build expert z_{t+h} bank once for KNN-mode advantage gate. Encoder
+        # is frozen during Phase-B so the bank is stable across outer epochs.
+        self._expert_z_bank: Optional[torch.Tensor] = None
+        if str(self.cfg.advantage_mode) == "knn":
+            self._expert_z_bank = build_expert_target_bank(
+                self.dataset,
+                self.encoder,
+                max_bank_size=int(self.cfg.advantage_knn_bank_size),
+                batch_size=int(self.cfg.batch_size),
+                num_workers=int(self.cfg.num_workers),
+                device=str(self.device),
+                seed=0,
+            )
+            print(
+                f"[d4_trainer] built KNN advantage bank: "
+                f"{int(self._expert_z_bank.shape[0])} expert target latents "
+                f"(dim={int(self._expert_z_bank.shape[1])})"
+            )
+
         freeze_epochs = int(self.cfg.gate_freeze_epochs) if bool(self.cfg.f3_warm_start) else 0
         for k in range(bootstrap_epochs):
             outer_epoch = warm_epochs + k + 1
@@ -518,6 +554,10 @@ class D4Trainer:
                         batch_size=int(self.cfg.batch_size),
                         num_workers=int(self.cfg.num_workers),
                         ema_alpha=float(self.cfg.ema_alpha_gamma),
+                        advantage_mode=str(self.cfg.advantage_mode),
+                        expert_z_bank=self._expert_z_bank,
+                        knn_k=int(self.cfg.advantage_knn_k),
+                        knn_chunk_size=int(self.cfg.advantage_knn_chunk_size),
                     )
                     gate_diag["gate_frozen"] = 0
 

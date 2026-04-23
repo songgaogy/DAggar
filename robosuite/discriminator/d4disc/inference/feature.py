@@ -7,8 +7,10 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..data.cache import PreprocessedCacheReader
+from ..models.dynamics import ConditionalDynamicsPredictor
 from ..models.encoder import Encoder
 
 
@@ -154,3 +156,62 @@ class D4FeatureExtractor:
             "encoder_batch_size": self.encoder_batch_size,
             "cache_root": self.cache_reader.cache_root,
         }
+
+
+class D4LPBFeatureExtractor:
+    """LPB-parity KNN feature from a trained D4 ``ConditionalDynamicsPredictor``.
+
+    Feature per timestep (matches ``lpb.knn_discriminator.LPBFeatureExtractor``):
+        feat_t = L2Norm([ obs_proj(z_t), proprio_proj(s_t),
+                          mean_h action_proj(a_{t:t+h}) ]).
+
+    The predictor's three input projections are used as a feature extractor only;
+    the rest of the decoder (AdaLN blocks, heads) is not evaluated. This yields
+    an LPB-KNN-compatible score path from any D4 checkpoint that matches the
+    LPB predictor's projection signature (always true under the current codebase).
+    """
+
+    def __init__(
+        self,
+        *,
+        frame_extractor: D4FeatureExtractor,
+        predictor: ConditionalDynamicsPredictor,
+        device: str = "cuda",
+        batch_size: int = 512,
+        normalize_feature: bool = True,
+    ) -> None:
+        self.frame_extractor = frame_extractor
+        self.predictor = predictor
+        self.device = (
+            torch.device(device)
+            if str(device).lower().startswith("cuda") and torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        self.batch_size = int(batch_size)
+        self.normalize_feature = bool(normalize_feature)
+        self.predictor.to(self.device)
+        self.predictor.eval()
+
+    @property
+    def feature_dim(self) -> int:
+        return 3 * int(self.predictor.d_model)
+
+    @torch.no_grad()
+    def encode_frames(self, frames: D4Frames) -> torch.Tensor:
+        T = int(frames.length)
+        d_model = int(self.predictor.d_model)
+        out = torch.empty((T, 3 * d_model), dtype=torch.float32)
+        for start in range(0, T, self.batch_size):
+            end = min(start + self.batch_size, T)
+            z = frames.z_current[start:end].to(self.device, dtype=torch.float32)
+            prop = frames.proprio[start:end].to(self.device, dtype=torch.float32)
+            act = frames.action_chunks[start:end].to(self.device, dtype=torch.float32)
+
+            obs_tok = self.predictor.obs_proj(z)
+            prop_tok = self.predictor.proprio_proj(prop)
+            act_tok = self.predictor.action_proj(act).mean(dim=1)
+            f = torch.cat([obs_tok, prop_tok, act_tok], dim=-1)
+            if self.normalize_feature:
+                f = F.normalize(f, p=2.0, dim=-1)
+            out[start:end] = f.detach().cpu()
+        return out

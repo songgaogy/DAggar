@@ -13,11 +13,21 @@ if [[ ! -d "${PREPROCESSED_CACHE_ROOT}" ]]; then
     exit 1
 fi
 
-TASKS="${TASKS:-PandaLift PandaPickPlaceCan PandaStack PickPlaceBread PickPlaceCereal PickPlaceMilk}"
+TASKS="PandaLift PandaPickPlaceCan PandaStack PickPlaceBread PickPlaceCereal PickPlaceMilk"
 
+# ------------------------------
+# data
 EXPERT_NUM="${EXPERT_NUM:-0}"
 SUCC_NUM="${SUCC_NUM:-200}"
 FAIL_NUM="${FAIL_NUM:-100}"
+
+WARM_UP_EPOCHS="${WARM_UP_EPOCHS:-10}"
+BOOTSTRAP_EPOCHS="${BOOTSTRAP_EPOCHS:-40}"
+
+F3_WARM_START="${F3_WARM_START:-1}"          # 1: KNN-based gamma warm-start at end of Phase A (recommended)
+SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"        # 1: run Phase A only (pos-branch baseline; use omega=0 at eval)
+F3_WARM_START_K="${F3_WARM_START_K:-1}"                  # KNN order (k=1 is 1-NN)
+# ------------------------------
 
 EXPERT_PATHS=()
 ROLLOUT_PATHS=()
@@ -38,9 +48,15 @@ fi
 HORIZON="${HORIZON:-1}"
 IMAGE_SIZE="${IMAGE_SIZE:-128}"
 
-ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-}"
-ENCODER_PRETRAINED="${ENCODER_PRETRAINED:-0}"
-ENCODER_FREEZE="${ENCODER_FREEZE:-0}"
+# Encoder defaults mirror lpb/train_lpb_dynamics.sh to avoid
+# representation collapse: ImageNet-pretrained ResNet-18 (loaded from the same
+# checkpoint LPB uses), frozen during training. With a trainable + randomly
+# initialized encoder, `pred_latent = z_t + Delta(...)` trivially minimizes by
+# making all embeddings identical (latent_mse -> ~1e-6 but AUROC collapses to
+# chance). Override via env vars for encoder-training ablations.
+ENCODER_CHECKPOINT="${ENCODER_CHECKPOINT:-${REPO_ROOT}/robosuite/RL/models/resnet18-f37072fd.pth}"
+ENCODER_PRETRAINED="${ENCODER_PRETRAINED:-1}"
+ENCODER_FREEZE="${ENCODER_FREEZE:-1}"
 ENCODER_LR_MULT="${ENCODER_LR_MULT:-0.1}"
 
 D_MODEL="${D_MODEL:-512}"
@@ -51,12 +67,9 @@ MAX_ACTION_HORIZON="${MAX_ACTION_HORIZON:-32}"
 D_COND="${D_COND:-64}"
 ADALN_INIT_STD="${ADALN_INIT_STD:-0.05}"
 
-WARM_UP_EPOCHS="${WARM_UP_EPOCHS:-10}"
-BOOTSTRAP_EPOCHS="${BOOTSTRAP_EPOCHS:-40}"
-
 DEVICE="${DEVICE:-cuda}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 LR="${LR:-3e-4}"
 WD="${WD:-1e-4}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
@@ -73,17 +86,30 @@ ALPHA_CAP_RATE="${ALPHA_CAP_RATE:-5.0}"
 ETA_FINAL="${ETA_FINAL:-0.3}"
 ETA_RAMP_EPOCHS="${ETA_RAMP_EPOCHS:-5}"
 
-F3_WARM_START="${F3_WARM_START:-1}"
-F3_WARM_START_K="${F3_WARM_START_K:-1}"
-F3_WARM_START_MAX_CLEAN="${F3_WARM_START_MAX_CLEAN:-100000}"
-WARM_START_MODE="${WARM_START_MODE:-rank}"
-GATE_FREEZE_EPOCHS="${GATE_FREEZE_EPOCHS:-4}"
-SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"
+# F3 warm-start (Phase A -> Phase B): initialize gamma on fail_raw samples from
+# a D3-style KNN distance to the clean bank, to break the gamma≈0.5 symmetric
+# fixed point early in bootstrap.
+F3_WARM_START_MAX_CLEAN="${F3_WARM_START_MAX_CLEAN:-100000}"  # subsample clean bank cap
+WARM_START_MODE="${WARM_START_MODE:-rank}"              # {'rank','sigmoid'} mapping d2 -> gamma
+GATE_FREEZE_EPOCHS="${GATE_FREEZE_EPOCHS:-4}"           # hold gamma fixed for first N bootstrap epochs
 
-EMA_DECAY="${EMA_DECAY:-0.999}"
-EMA_ALPHA_GAMMA="${EMA_ALPHA_GAMMA:-0.5}"
-GAMMA_CLAMP="${GAMMA_CLAMP:-1e-3}"
-HELD_OUT_RATIO="${HELD_OUT_RATIO:-0.05}"
+# Phase-B advantage gate.
+#   "knn"      (default): score each conditional prediction against an expert
+#                         z_{t+h} bank; advantage = log p_+ - log p_-. Matches
+#                         inference-time score_mode=knn. Removes the motion-
+#                         magnitude confound of raw residual scoring.
+#   "residual"          : legacy ||f(c) - z_target||² (d4disc_0423.md §5).
+ADVANTAGE_MODE="${ADVANTAGE_MODE:-knn}"
+ADVANTAGE_KNN_BANK_SIZE="${ADVANTAGE_KNN_BANK_SIZE:-100000}"
+ADVANTAGE_KNN_CHUNK_SIZE="${ADVANTAGE_KNN_CHUNK_SIZE:-8192}"
+ADVANTAGE_KNN_K="${ADVANTAGE_KNN_K:-1}"
+
+# EMA + stability: EMA weights are used both for the advantage gate and for the
+# inference-time checkpoint payload.
+EMA_DECAY="${EMA_DECAY:-0.999}"                         # predictor weight EMA decay
+EMA_ALPHA_GAMMA="${EMA_ALPHA_GAMMA:-0.5}"               # gamma_buffer EMA smoothing (higher = slower updates)
+GAMMA_CLAMP="${GAMMA_CLAMP:-1e-3}"                      # clamp gamma to [eps, 1-eps] to avoid hard 0/1 routing
+HELD_OUT_RATIO="${HELD_OUT_RATIO:-0.05}"                # fraction of clean positives held out to monitor r_plus
 
 SEED="${SEED:-0}"
 
@@ -142,6 +168,10 @@ EXTRA_ARGS+=(--f3-warm-start-k "${F3_WARM_START_K}")
 EXTRA_ARGS+=(--f3-warm-start-max-clean "${F3_WARM_START_MAX_CLEAN}")
 EXTRA_ARGS+=(--warm-start-mode "${WARM_START_MODE}")
 EXTRA_ARGS+=(--gate-freeze-epochs "${GATE_FREEZE_EPOCHS}")
+EXTRA_ARGS+=(--advantage-mode "${ADVANTAGE_MODE}")
+EXTRA_ARGS+=(--advantage-knn-bank-size "${ADVANTAGE_KNN_BANK_SIZE}")
+EXTRA_ARGS+=(--advantage-knn-chunk-size "${ADVANTAGE_KNN_CHUNK_SIZE}")
+EXTRA_ARGS+=(--advantage-knn-k "${ADVANTAGE_KNN_K}")
 if [[ "${SKIP_BOOTSTRAP}" == "1" ]]; then
     EXTRA_ARGS+=(--skip-bootstrap)
 fi
@@ -153,7 +183,7 @@ if [[ ${#EXPERT_PATHS[@]} -gt 0 ]]; then EXPERT_ARG+=(--expert-paths "${EXPERT_P
 if [[ ${#ROLLOUT_PATHS[@]} -gt 0 ]]; then ROLLOUT_ARG+=(--rollout-paths "${ROLLOUT_PATHS[@]}"); fi
 if [[ ${#FAIL_PATHS[@]} -gt 0 ]]; then FAIL_ARG+=(--fail-paths "${FAIL_PATHS[@]}"); fi
 
-WANDB_MODE="${WANDB_MODE:-offline}" WANDB_NAME="${WANDB_NAME:-songgao-personal}" \
+PYTHONUNBUFFERED=1 WANDB_MODE="${WANDB_MODE:-offline}" WANDB_NAME="${WANDB_NAME:-songgao-personal}" \
 "${PYTHON_BIN}" -m robosuite.discriminator.d4disc.train_d4 \
     --preprocessed-cache-root  "${PREPROCESSED_CACHE_ROOT}" \
     "${EXPERT_ARG[@]}" \

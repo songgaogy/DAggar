@@ -117,6 +117,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gate-freeze-epochs", type=int, default=2)
     p.add_argument("--skip-bootstrap", action="store_true")
 
+    # Phase-B advantage gate.
+    p.add_argument(
+        "--advantage-mode",
+        type=str,
+        default="knn",
+        choices=["knn", "residual"],
+        help=(
+            "Phase-B advantage score. 'knn' (default): r_c = min-sqdist(f(c), expert z_{t+h} bank); "
+            "advantage = log p_+ - log p_- under Gaussian-KNN. 'residual': legacy raw MSE to z_target."
+        ),
+    )
+    p.add_argument("--advantage-knn-bank-size", type=int, default=100_000)
+    p.add_argument("--advantage-knn-chunk-size", type=int, default=8192)
+    p.add_argument("--advantage-knn-k", type=int, default=1)
+
     # Logging
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-freq", type=int, default=0)
@@ -248,6 +263,10 @@ def main() -> None:
         warm_start_mode=str(args.warm_start_mode),
         gate_freeze_epochs=int(args.gate_freeze_epochs),
         skip_bootstrap=bool(args.skip_bootstrap),
+        advantage_mode=str(args.advantage_mode),
+        advantage_knn_bank_size=int(args.advantage_knn_bank_size),
+        advantage_knn_chunk_size=int(args.advantage_knn_chunk_size),
+        advantage_knn_k=int(args.advantage_knn_k),
         horizon=int(args.horizon),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
     )

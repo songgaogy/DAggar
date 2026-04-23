@@ -13,7 +13,11 @@ from ..data.cache import PreprocessedCacheReader
 from ..models.dynamics import ConditionalDynamicsPredictor
 from ..models.encoder import Encoder
 from .detector import D4Detector
-from .feature import D4FeatureExtractor, D4Frames
+from .feature import D4FeatureExtractor, D4Frames, D4LPBFeatureExtractor
+from robosuite.discriminator.lpb.knn_discriminator import AdaptiveKNNDiscriminator
+
+
+_VALID_SCORE_MODES = ("rel", "abs", "knn")
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
@@ -61,9 +65,14 @@ class D4BenchmarkDiscriminator:
         per_task_calibration: bool = True,
         scoring_batch_size: int = 512,
         verbose_fit: bool = True,
+        score_mode: str = "knn",
+        knn_chunk_size: int = 8192,
+        knn_normalize_feature: bool = True,
     ) -> None:
         if not (0.0 < float(calib_fraction) < 1.0):
             raise ValueError(f"calib_fraction must be in (0,1), got {calib_fraction}")
+        if str(score_mode) not in _VALID_SCORE_MODES:
+            raise ValueError(f"score_mode must be one of {_VALID_SCORE_MODES}, got {score_mode!r}")
 
         self.d4_ckpt_path = str(d4_ckpt_path)
         self.preprocessed_cache_root = str(preprocessed_cache_root)
@@ -77,6 +86,9 @@ class D4BenchmarkDiscriminator:
         self.per_task_calibration = bool(per_task_calibration)
         self.verbose_fit = bool(verbose_fit)
         self.horizon = int(horizon)
+        self.score_mode = str(score_mode)
+        self.knn_chunk_size = int(knn_chunk_size)
+        self.knn_normalize_feature = bool(knn_normalize_feature)
 
         payload = _torch_load(self.d4_ckpt_path)
         if "encoder_state_dict" not in payload:
@@ -140,20 +152,39 @@ class D4BenchmarkDiscriminator:
             encoder_batch_size=int(encoder_batch_size),
             device=self.device,
         )
-        self.detector = D4Detector(
-            self.predictor,
-            omega=self.omega,
-            sigma_sq=self.sigma_sq,
-            delta=self.delta,
-            lambda_mode=self.lambda_mode,
-            lambda_window_size=self.lambda_window_size,
-            device=self.device,
-            batch_size=int(scoring_batch_size),
-        )
+        # KNN path shares the D4Frames pipeline but bypasses the CFG detector;
+        # in that mode D4Detector is not constructed (omega/sigma_sq unused).
+        self.detector: Optional[D4Detector]
+        self.lpb_feature_extractor: Optional[D4LPBFeatureExtractor]
+        if self.score_mode == "knn":
+            self.detector = None
+            self.lpb_feature_extractor = D4LPBFeatureExtractor(
+                frame_extractor=self.feature_extractor,
+                predictor=self.predictor,
+                device=self.device,
+                batch_size=int(scoring_batch_size),
+                normalize_feature=self.knn_normalize_feature,
+            )
+        else:
+            self.detector = D4Detector(
+                self.predictor,
+                omega=self.omega,
+                sigma_sq=self.sigma_sq,
+                delta=self.delta,
+                lambda_mode=self.lambda_mode,
+                lambda_window_size=self.lambda_window_size,
+                device=self.device,
+                batch_size=int(scoring_batch_size),
+                score_mode=self.score_mode,
+            )
+            self.lpb_feature_extractor = None
 
         self._tau_per_task: dict[str, float] = {}
         self._calibration_stats: dict[str, dict[str, Any]] = {}
         self._frames_cache: dict[tuple[str, str], D4Frames] = {}
+        # KNN per-task detector + per-trajectory feature cache.
+        self._knn_per_task: dict[str, AdaptiveKNNDiscriminator] = {}
+        self._knn_feature_cache: dict[tuple[str, str], torch.Tensor] = {}
 
     def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str]:
         return (str(trajectory.file_path), str(trajectory.demo_path))
@@ -162,6 +193,48 @@ class D4BenchmarkDiscriminator:
         src_file = trajectory.source_hdf5_path or trajectory.file_path
         src_key = trajectory.source_demo_key or trajectory.demo_path.split("/")[-1]
         return str(src_file), str(src_key)
+
+    def has_preprocessed_cache(self, trajectory: BenchmarkTrajectory) -> bool:
+        src_file, src_key = self._source_ids(trajectory)
+        return self.cache_reader.exists(str(trajectory.task_name), src_file, src_key)
+
+    def filter_cached_trajectories(
+        self,
+        trajectories: list[BenchmarkTrajectory],
+    ) -> tuple[list[BenchmarkTrajectory], dict[str, dict[str, int]]]:
+        kept: list[BenchmarkTrajectory] = []
+        stats: dict[str, dict[str, int]] = {}
+
+        for traj in trajectories:
+            task = str(traj.task_name)
+            bucket = stats.setdefault(
+                task,
+                {
+                    "kept_success": 0,
+                    "kept_fail": 0,
+                    "skipped_success": 0,
+                    "skipped_fail": 0,
+                },
+            )
+            is_fail = bool(traj.is_failure)
+            if self.has_preprocessed_cache(traj):
+                kept.append(traj)
+                bucket["kept_fail" if is_fail else "kept_success"] += 1
+            else:
+                bucket["skipped_fail" if is_fail else "skipped_success"] += 1
+
+        return kept, stats
+
+    def _knn_feature(self, trajectory: BenchmarkTrajectory) -> torch.Tensor:
+        assert self.lpb_feature_extractor is not None
+        key = self._trajectory_key(trajectory)
+        cached = self._knn_feature_cache.get(key)
+        if cached is not None:
+            return cached
+        frames = self._frames(trajectory)
+        feat = self.lpb_feature_extractor.encode_frames(frames)
+        self._knn_feature_cache[key] = feat
+        return feat
 
     def _frames(self, trajectory: BenchmarkTrajectory) -> D4Frames:
         key = self._trajectory_key(trajectory)
@@ -206,6 +279,60 @@ class D4BenchmarkDiscriminator:
             calib_succ_per_task[task] = [t for i, t in enumerate(succ_list) if i in calib_set]
 
         tasks_seen = sorted(set(bank_succ_per_task) | set(fail_per_task))
+
+        if self.score_mode == "knn":
+            if not self.per_task_calibration:
+                raise ValueError(
+                    "score_mode='knn' requires per_task_calibration=True "
+                    "(each task owns its own expert bank, matching LPB)."
+                )
+            for task in tasks_seen:
+                bank_list = bank_succ_per_task.get(task, [])
+                calib_list = calib_succ_per_task.get(task, [])
+                if not bank_list or not calib_list:
+                    if self.verbose_fit:
+                        print(f"[d4_disc][fit] task={task} SKIP knn — insufficient success trajectories")
+                    continue
+                bank_feats = [self._knn_feature(t) for t in bank_list]
+                calib_feats = [self._knn_feature(t) for t in calib_list]
+                knn = AdaptiveKNNDiscriminator(
+                    delta=self.delta,
+                    delta_step=1.0,
+                    knn_chunk_size=self.knn_chunk_size,
+                    lambda_mode=self.lambda_mode,
+                    lambda_window_size=self.lambda_window_size,
+                    aux_weight=0.0,
+                    device=self.device,
+                )
+                threshold = knn.fit(
+                    expert_sequences=bank_feats,
+                    calibration_sequences=calib_feats,
+                    calibration_aux=None,
+                )
+                self._knn_per_task[task] = knn
+                bank_steps = int(sum(int(f.shape[0]) for f in bank_feats))
+                calib_steps = int(sum(int(f.shape[0]) for f in calib_feats))
+                self._calibration_stats[task] = {
+                    "num_success_trajectories": int(len(succ_per_task.get(task, []))),
+                    "num_bank_trajectories": int(len(bank_list)),
+                    "num_calib_trajectories": int(len(calib_list)),
+                    "num_fail_trajectories": int(len(fail_per_task.get(task, []))),
+                    "num_bank_steps": bank_steps,
+                    "num_calib_steps": calib_steps,
+                    "threshold": float(threshold),
+                    "delta": self.delta,
+                    "score_mode": "knn",
+                    "feature_dim": int(self.lpb_feature_extractor.feature_dim),
+                }
+                if self.verbose_fit:
+                    print(
+                        f"[d4_disc][fit] task={task} mode=knn "
+                        f"bank_trajs={len(bank_list)} ({bank_steps} steps)  "
+                        f"calib_trajs={len(calib_list)} ({calib_steps} steps)  "
+                        f"tau={threshold:.6f}"
+                    )
+            return
+
         if self.per_task_calibration:
             for task in tasks_seen:
                 calib_list = calib_succ_per_task.get(task, [])
@@ -252,10 +379,50 @@ class D4BenchmarkDiscriminator:
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
         task = str(trajectory.task_name)
+        T = int(trajectory.num_frames)
+
+        if self.score_mode == "knn":
+            knn = self._knn_per_task.get(task)
+            if knn is None:
+                raise KeyError(
+                    f"Task {task!r} not calibrated (knn). Available: {sorted(self._knn_per_task)}"
+                )
+            feat = self._knn_feature(trajectory)
+            det = knn.detect_sequence(feat, labels=None, adaptive_delta=False)
+
+            step_scores = _pad_to_length(det.lambda_values, T, dtype=np.float32)
+            predictions = _pad_to_length(det.preds, T, dtype=np.int64).astype(np.int64)
+            thresholds = _pad_to_length(det.thresholds, T, dtype=np.float32)
+            raw_step = _pad_to_length(det.step_scores, T, dtype=np.float32)
+
+            positive = np.where(predictions == 1)[0]
+            first_failure_frame = int(positive[0]) if positive.size > 0 else None
+
+            aux_knn: dict[str, Any] = {
+                "task": task,
+                "threshold": float(knn.threshold) if knn.threshold is not None else float("nan"),
+                "delta": float(knn.delta),
+                "aggregated_lambda": step_scores,
+                "raw_step_scores": raw_step,
+                "thresholds": thresholds,
+                "lambda_mode": self.lambda_mode,
+                "lambda_window_size": self.lambda_window_size,
+                "feature_len": int(feat.shape[0]),
+                "feature_dim": int(feat.shape[1]),
+                "score_mode": "knn",
+            }
+            return DiscriminatorOutput(
+                step_scores=step_scores,
+                predictions=predictions,
+                first_failure_frame=first_failure_frame,
+                aux=aux_knn,
+            )
+
         tau = self._tau_per_task.get(task)
         if tau is None:
             raise KeyError(f"Task {task!r} not calibrated. Available: {sorted(self._tau_per_task)}")
 
+        assert self.detector is not None
         frames = self._frames(trajectory)
         result = self.detector.score(frames, tau=float(tau))
 
@@ -309,6 +476,9 @@ class D4BenchmarkDiscriminator:
             "seed": self.seed,
             "arch_args": dict(self.arch_args),
             "horizon": self.horizon,
+            "score_mode": self.score_mode,
+            "knn_chunk_size": self.knn_chunk_size if self.score_mode == "knn" else None,
+            "knn_normalize_feature": self.knn_normalize_feature if self.score_mode == "knn" else None,
         }
 
     def close(self) -> None:
