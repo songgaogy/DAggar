@@ -137,6 +137,7 @@ video/
 checkpoints/
 error.txt
 ./lpb/
+/wandb/
 
 # expect
 !robosuite/discriminator/d4disc/data
