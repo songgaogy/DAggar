@@ -32,6 +32,7 @@ def knn_sqdist(
     *,
     k: int = 1,
     chunk_size: int = 8192,
+    query_chunk_size: int = 4096,
     exclude_self: bool = False,
 ) -> torch.Tensor:
     """k-NN mean squared L2 distance from each query to the bank.
@@ -40,6 +41,11 @@ def knn_sqdist(
         query: (B, D) — query features.
         bank:  (N, D) — bank features.
         k:     number of nearest neighbors to average.
+        chunk_size: bank-side chunk size. Peak intermediate tensor is
+            ``qcsz × chunk_size × 4 B``.
+        query_chunk_size: query-side chunk size. Needed because cdist allocates
+            a full ``Q × C`` matrix; without query chunking 399k × 8192 cdist
+            is 13 GB and OOMs on 24 GB cards.
         exclude_self: when ``bank is query``, drop the trivial self match
             (diagonal) before taking the min/top-k.
     Returns:
@@ -53,28 +59,37 @@ def knn_sqdist(
         raise ValueError("bank cannot be empty")
 
     n_bank = int(bank.shape[0])
+    n_query = int(query.shape[0])
     eff_k = max(1, min(int(k), n_bank))
-
-    # One-shot top-k across all chunks via min-heap-like running buffer.
-    best = torch.full((query.shape[0], eff_k), float("inf"), device=query.device, dtype=query.dtype)
-
     csz = int(chunk_size)
-    for start in range(0, n_bank, csz):
-        end = min(start + csz, n_bank)
-        chunk = bank[start:end].to(device=query.device, dtype=query.dtype)
-        d2 = torch.cdist(query, chunk, p=2.0).pow(2)
+    qcsz = max(1, int(query_chunk_size))
 
-        if exclude_self:
-            # Only meaningful when query is bank; mask the diagonal entries that fall in this chunk.
-            rows_in_chunk = torch.arange(start, end, device=query.device)
-            query_rows = torch.arange(query.shape[0], device=query.device).unsqueeze(1)
-            mask = query_rows == rows_in_chunk.unsqueeze(0)
-            d2 = d2.masked_fill(mask, float("inf"))
+    out = torch.empty(n_query, device=query.device, dtype=query.dtype)
 
-        merged = torch.cat([best, d2], dim=1)
-        best = torch.topk(merged, k=eff_k, dim=1, largest=False).values
+    for qstart in range(0, n_query, qcsz):
+        qend = min(qstart + qcsz, n_query)
+        q = query[qstart:qend]
+        best = torch.full((q.shape[0], eff_k), float("inf"), device=q.device, dtype=q.dtype)
 
-    return best.mean(dim=1)
+        for start in range(0, n_bank, csz):
+            end = min(start + csz, n_bank)
+            chunk = bank[start:end].to(device=q.device, dtype=q.dtype)
+            d2 = torch.cdist(q, chunk, p=2.0).pow(2)
+
+            if exclude_self:
+                # Diagonal i == j in the global (query, bank) frame; shift into
+                # the (qstart..qend, start..end) sub-block.
+                rows_in_chunk = torch.arange(start, end, device=q.device)
+                query_rows = torch.arange(qstart, qend, device=q.device).unsqueeze(1)
+                mask = query_rows == rows_in_chunk.unsqueeze(0)
+                d2 = d2.masked_fill(mask, float("inf"))
+
+            merged = torch.cat([best, d2], dim=1)
+            best = torch.topk(merged, k=eff_k, dim=1, largest=False).values
+
+        out[qstart:qend] = best.mean(dim=1)
+
+    return out
 
 
 @torch.no_grad()

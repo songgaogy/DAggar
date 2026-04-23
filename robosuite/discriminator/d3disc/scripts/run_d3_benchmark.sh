@@ -25,7 +25,7 @@ FAIL_NUM="${FAIL_NUM:-100}"
 DYN_CKPT="checkpoints/d3disc/dynamics/d3dyn_20260422_034143/d3_dynamics.pt"
 
 # D3 hyperparameters.
-OMEGA=0.5
+OMEGA=0
 K=1
 BETA="${BETA:-auto}"
 KAPPA="${KAPPA:-auto}"

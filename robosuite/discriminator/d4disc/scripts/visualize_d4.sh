@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
-# D4-Disc visualization entry point.
-# Run from repo root:
-#   D4_CKPT=/abs/d4_dynamics.pt TASK=PickPlaceBread \
-#     bash robosuite/discriminator/d4disc/scripts/visualize_d4.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
-POLICY_CKPT="${POLICY_CKPT:-${REPO_ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-CACHE_ROOT="${CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
+PREPROCESSED_CACHE_ROOT="${PREPROCESSED_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
 FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
 SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
 
@@ -52,27 +47,26 @@ if [[ "${QUIET_FIT:-0}" == "1" ]]; then
 fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.d4disc.visualize \
-    --policy-ckpt          "${POLICY_CKPT}" \
-    --d4-ckpt              "${D4_CKPT}" \
-    --cache-root           "${CACHE_ROOT}" \
-    --fail-root            "${FAIL_ROOT}" \
-    --success-root         "${SUCCESS_ROOT}" \
-    --task                 "${TASK}" \
-    --num-trajs            "${NUM_TRAJS}" \
-    --out-dir              "${OUT_DIR}" \
-    --pdf-name             "${PDF_NAME}" \
-    --seed                 "${SEED}" \
-    --fps                  "${FPS}" \
-    --border-thickness     "${BORDER_THICKNESS}" \
-    --device               "${DEVICE}" \
-    --encoder-batch-size   "${ENCODER_BATCH_SIZE}" \
-    --image-size           "${IMAGE_SIZE}" \
-    --camera-name          "${CAMERA_NAME}" \
-    --omega                "${OMEGA}" \
-    --delta                "${DELTA}" \
-    --lambda-mode          "${LAMBDA_MODE}" \
-    --lambda-window-size   "${LAMBDA_WINDOW_SIZE}" \
-    --calib-fraction       "${CALIB_FRACTION}" \
+    --d4-ckpt                "${D4_CKPT}" \
+    --preprocessed-cache-root "${PREPROCESSED_CACHE_ROOT}" \
+    --fail-root              "${FAIL_ROOT}" \
+    --success-root           "${SUCCESS_ROOT}" \
+    --task                   "${TASK}" \
+    --num-trajs              "${NUM_TRAJS}" \
+    --out-dir                "${OUT_DIR}" \
+    --pdf-name               "${PDF_NAME}" \
+    --seed                   "${SEED}" \
+    --fps                    "${FPS}" \
+    --border-thickness       "${BORDER_THICKNESS}" \
+    --device                 "${DEVICE}" \
+    --encoder-batch-size     "${ENCODER_BATCH_SIZE}" \
+    --image-size             "${IMAGE_SIZE}" \
+    --camera-name            "${CAMERA_NAME}" \
+    --omega                  "${OMEGA}" \
+    --delta                  "${DELTA}" \
+    --lambda-mode            "${LAMBDA_MODE}" \
+    --lambda-window-size     "${LAMBDA_WINDOW_SIZE}" \
+    --calib-fraction         "${CALIB_FRACTION}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 

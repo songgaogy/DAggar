@@ -30,7 +30,7 @@ mkdir -p "${OUT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # Required checkpoint.
-LPB_CKPT="${LPB_CKPT:-${REPO_ROOT}/checkpoints/lpb/dynamics/dynamics_model.pt}"
+LPB_CKPT="checkpoints/lpb/dynamics/dynamics_model_ep0010.pt"
 if [[ ! -f "${LPB_CKPT}" ]]; then
     echo "[lpb] ERROR: LPB_CKPT not found: ${LPB_CKPT}" >&2
     echo "       Set LPB_CKPT=/abs/path/to/model.pt (from train_lpb_dynamics.sh)." >&2

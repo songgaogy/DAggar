@@ -29,9 +29,9 @@ from robosuite.discriminator.d3disc.detector import (
     _resolve_device,
 )
 
-from .adaln import ConditionEmbedder
-from .dynamics_feature import D4Frames
-from .model import ConditionalDynamicsPredictor
+from ..models.adaln import ConditionEmbedder
+from ..models.dynamics import ConditionalDynamicsPredictor
+from .feature import D4Frames
 
 
 _OMEGA_MAX = 2.0

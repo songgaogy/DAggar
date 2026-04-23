@@ -11,18 +11,23 @@ that replaces D3-Disc's static F3 filter. Design spec:
 
 ```
 robosuite/discriminator/d4disc/
-├── adaln.py               AdaLN-Zero + ConditionEmbedder
-├── model.py               ConditionalDynamicsPredictor
-├── ema.py                 ModelEMA
-├── schedule.py            D4Schedule (alpha/kappa/eta)
-├── dataset.py             LatentFlowDynamicsDatasetD4 (+ is_fail_raw, gamma buffer)
-├── filter.py              compute_advantage_gate
-├── monitor.py             CollapseDetector + D4Health
-├── trainer.py             D4Trainer (phase A / phase B state machine)
-├── train_d4.py            CLI entry
-├── detector.py            D4Detector (CFG residual scoring)
-├── dynamics_feature.py    D4FeatureExtractor (frame assembly)
-├── d4_benchmark.py        D4BenchmarkDiscriminator
+├── data/
+│   └── cache.py           PreprocessedCacheReader (cache IO)
+├── models/
+│   ├── adaln.py           AdaLN-Zero + ConditionEmbedder (+, -, null)
+│   ├── encoder.py         Image encoder wrapper / checkpoint loading
+│   └── dynamics.py        ConditionalDynamicsPredictor (LPB backbone + AdaLN)
+├── training/
+│   ├── ema.py             EMA utilities
+│   ├── filter.py          advantage gate + warm start utilities
+│   ├── monitor.py         training health / collapse monitor
+│   ├── schedule.py        D4Schedule (alpha/eta ramp, caps)
+│   └── trainer.py         D4Trainer (warm-up + bootstrap loop)
+├── inference/
+│   ├── detector.py        D4Detector / scoring utilities
+│   ├── feature.py         D4FeatureExtractor (frame assembly)
+│   └── benchmark.py       D4BenchmarkDiscriminator
+├── train_d4.py            CLI entry (cached-image trainer)
 ├── visualize.py           PDF + video renderer with (r+, r-, A) panels
 ├── tests/
 │   ├── test_adaln.py
@@ -46,8 +51,18 @@ WARM_UP_EPOCHS=4 BOOTSTRAP_EPOCHS=20 TASKS="PickPlaceBread" \
   bash robosuite/discriminator/d4disc/scripts/train_d4.sh
 ```
 
-Outputs to `checkpoints/d4disc/dynamics/<RUN_NAME>/d4_dynamics.pt`. WandB runs
-offline under `project=d4disc`, entity from `WANDB_NAME` env.
+Outputs to `checkpoints/d4disc/dynamics/<RUN_NAME>/d4_dynamics.pt` by default.
+WandB runs offline under `project=d4disc`, entity from `WANDB_NAME` env.
+
+If you prefer calling Python directly (same flags as the script):
+
+```bash
+/home/dodo/miniconda3/envs/daggar/bin/python -m robosuite.discriminator.d4disc.train_d4 \
+  --preprocessed-cache-root data/.lpb_score_preprocessed_cache \
+  --rollout-paths data/PickPlaceBread/success_rollout \
+  --fail-paths data/PickPlaceBread/fail_rollout \
+  --save-dir checkpoints/d4disc/dynamics/debug_run
+```
 
 ## Benchmark
 
@@ -79,7 +94,7 @@ D4_CKPT=checkpoints/d4disc/dynamics/<RUN>/d4_dynamics.pt TASK=PickPlaceBread \
 
 ## Stability invariants (plan §7)
 
-- AdaLN heads are zero-init; at step 0 the predictor is c-invariant.
+- AdaLN heads are zero-initialized; at step 0 the predictor is c-invariant.
 - Phase A (K_warm=8 by default): fail_raw samples never routed to `c=-`.
 - Phase B: advantage gate runs on EMA weights; gamma is EMA-smoothed;
   `alpha_k` is capped by `alpha_cap_rate / held_out_r_plus` to enforce
@@ -88,7 +103,7 @@ D4_CKPT=checkpoints/d4disc/dynamics/<RUN>/d4_dynamics.pt TASK=PickPlaceBread \
 - Benchmark discriminator loads `ema_state_dict` (not raw weights).
 - Inference clamps `omega` to 2.0 (plan §9.3 CFG divergence).
 
-## Symmetric fixed-point failure mode (run d4dyn_20260422_050952)
+## Symmetric fixed-point failure mode (run `d4dyn_20260422_050952`)
 
 The first full run landed in a `gamma=0.5` **symmetric fixed point** and
 benchmarked at random (AUROC≈0.50). Symptoms:
@@ -114,15 +129,15 @@ same data → they converge to the same function → `A` stays 0 → closed loop
    two bootstrap epochs after warm-start so `f(-)` has time to differentiate
    before the gate takes over. Otherwise the first gate call (with
    `f(+)≈f(-)` still) would immediately reset γ to 0.5.
-3. **`alpha_cap_rate: 1.0 → 5.0`** (python + shell default): gives α real
-   dynamic range so γ can sharpen once `separation_gap` grows.
-4. **`adaln_init_std: 0.0 → 0.02`** (shell default, class default still
-   0.0 for backward compat): small non-zero init on AdaLN modulation heads
+3. **`alpha_cap_rate: 1.0 → 5.0`** (shell default): gives α real dynamic range
+   so γ can sharpen once `separation_gap` grows.
+4. **`adaln_init_std: 0.0 → ~0.05`** (shell default; class default may remain
+   0.0 for backward compatibility): small non-zero initialization on AdaLN modulation heads
    so `f(+) ≠ f(-)` structurally from step 0. This addresses the root
-   cause — zero-init gates grow only through gradient and fail data alone
+   cause — zero-initialized gates grow only through gradient and fail data alone
    is a weak training signal for c=-. At std=0.02 the initial
    `conditional_delta` is already comparable to what 40 epochs of
-   zero-init training reached in the failed run.
+   zero-initialized training reached in the failed run.
 5. **γ quantile logging** (q05/q25/q50/q75/q95 per bootstrap epoch) — lets
    you spot symmetric collapse in the first few epochs instead of 40.
 
@@ -148,4 +163,4 @@ same data → they converge to the same function → `A` stays 0 → closed loop
 | `F3_WARM_START_MAX_CLEAN` | `--f3-warm-start-max-clean` | 100000 | subsample clean bank |
 | `GATE_FREEZE_EPOCHS` | `--gate-freeze-epochs` | 2 | hold γ after warm-start |
 | `ALPHA_CAP_RATE` | `--alpha-cap-rate` | 5.0 | `α_k * held_out_r+ ≤ cap` |
-| `ADALN_INIT_STD` | `--adaln-init-std` | 0.02 | AdaLN mod init (0 = AdaLN-Zero) |
+| `ADALN_INIT_STD` | `--adaln-init-std` | 0.05 | AdaLN modulation initialization (0 = AdaLN-Zero) |

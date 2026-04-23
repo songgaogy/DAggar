@@ -1,15 +1,19 @@
-"""CLI entry point for training the D4-Disc conditional dynamics critic.
+"""Train a D4-Disc dynamics/critic model from a preprocessed cache.
 
-Example (from repo root):
-    python -m robosuite.discriminator.d4disc.train_d4 \
-        --policy-ckpt checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_*.pt \
-        --expert-paths data/PickPlaceBread/expert \
-        --rollout-paths data/PickPlaceBread/success_rollout \
-        --fail-paths data/PickPlaceBread/fail_rollout \
-        --warm-up-epochs 8 --bootstrap-epochs 40 \
-        --save-dir checkpoints/d4disc/dynamics
+This script is a thin CLI wrapper around the core training components under
+``robosuite.discriminator.d4disc``:
 
-Prefer ``scripts/train_d4.sh`` for the canonical entry.
+- ``PreprocessedCacheReader`` + ``LatentFlowDynamicsDatasetD4`` load trajectories
+  that have already been converted into a compact on-disk cache (images, actions,
+  proprio, and latents / flow targets as applicable).
+- ``Encoder`` optionally loads / freezes an image encoder used to produce latents.
+- ``ConditionalDynamicsPredictor`` is the AdaLN-conditioned transformer backbone
+  trained with a two-phase schedule (warm-up, then bootstrap).
+- ``D4Trainer`` executes training, evaluation probes, EMA updates, and checkpointing.
+
+The goal is reproducible training from cached data: point this at a cache root
+and one or more trajectory lists (expert/rollout/fail), and it will train and
+save a model checkpoint under ``--save-dir``.
 """
 
 from __future__ import annotations
@@ -20,28 +24,47 @@ from datetime import datetime
 
 import torch
 
-from robosuite.discriminator.d3disc.encoder import FlowMultiEncoderWrapper
-
-from .dataset import LatentFlowDynamicsDatasetD4
-from .model import ConditionalDynamicsPredictor
-from .schedule import D4Schedule
-from .trainer import D4Trainer, D4TrainerConfig
+from .data import LatentFlowDynamicsDatasetD4, PreprocessedCacheReader
+from .models import ConditionalDynamicsPredictor, Encoder
+from .training import D4Schedule, D4Trainer, D4TrainerConfig
 
 
 def _now_tag() -> str:
+    """Return a filesystem-friendly timestamp tag (local time)."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for D4-Disc training.
+
+    The flags are grouped roughly by:
+    - data/cache selection
+    - encoder warm start / freezing
+    - predictor architecture
+    - training schedule and optimization
+    - stability knobs (EMA, clamps, held-out split)
+    - logging / checkpointing
+    """
     p = argparse.ArgumentParser()
-    p.add_argument("--policy-ckpt", required=True)
-    p.add_argument("--cache-root", type=str, default="data/.lpb_score_cache")
+    p.add_argument("--preprocessed-cache-root", type=str, default="data/.lpb_score_preprocessed_cache")
     p.add_argument("--expert-paths", nargs="*", default=[])
     p.add_argument("--rollout-paths", nargs="*", default=[])
     p.add_argument("--fail-paths", nargs="*", default=[])
     p.add_argument("--proprio-indices", type=int, nargs="*", default=None)
     p.add_argument("--horizon", type=int, default=1)
     p.add_argument("--max-trajectories-per-kind", type=int, default=0)
+    p.add_argument("--image-size", type=int, default=128)
+
+    p.add_argument("--encoder-checkpoint", type=str, default="")
+    enc_pre = p.add_mutually_exclusive_group()
+    enc_pre.add_argument("--encoder-pretrained", dest="encoder_pretrained", action="store_true")
+    enc_pre.add_argument("--no-encoder-pretrained", dest="encoder_pretrained", action="store_false")
+    p.set_defaults(encoder_pretrained=False)
+    enc_frz = p.add_mutually_exclusive_group()
+    enc_frz.add_argument("--encoder-freeze", dest="encoder_freeze", action="store_true")
+    enc_frz.add_argument("--no-encoder-freeze", dest="encoder_freeze", action="store_false")
+    p.set_defaults(encoder_freeze=False)
+    p.add_argument("--encoder-lr-mult", type=float, default=0.1)
 
     # Architecture
     p.add_argument("--d-model", type=int, default=512)
@@ -50,11 +73,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--max-action-horizon", type=int, default=32)
     p.add_argument("--d-cond", type=int, default=64)
-    p.add_argument("--adaln-init-std", type=float, default=0.0,
-                   help="Std of Gaussian init for AdaLN modulation heads. 0 => DiT "
-                        "AdaLN-Zero (identity at step 0, safe but slow to grow c=- "
-                        "branch). >0 (e.g. 0.02) immediately breaks f(+)=f(-) "
-                        "degeneracy — use if gamma stays stuck at 0.5 despite warm-start.")
+    p.add_argument("--adaln-init-std", type=float, default=0.0)
 
     # Two-phase schedule
     p.add_argument("--warm-up-epochs", type=int, default=8)
@@ -72,8 +91,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sigma-sq", type=float, default=0.5)
     p.add_argument("--use-bfloat16", action="store_true")
 
-    # CFG
-    p.add_argument("--p-cond-drop", type=float, default=0.1)
+    # Branch routing
     p.add_argument("--min-batch-balance", type=float, default=0.15)
 
     # Schedule knobs
@@ -88,26 +106,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gamma-clamp", type=float, default=1e-3)
     p.add_argument("--held-out-ratio", type=float, default=0.05)
 
-    # F3-based gamma warm-start (breaks gamma=0.5 symmetric fixed point)
+    # Warm-start
     wm = p.add_mutually_exclusive_group()
     wm.add_argument("--f3-warm-start", dest="f3_warm_start", action="store_true")
     wm.add_argument("--no-f3-warm-start", dest="f3_warm_start", action="store_false")
     p.set_defaults(f3_warm_start=True)
     p.add_argument("--f3-warm-start-k", type=int, default=1)
     p.add_argument("--f3-warm-start-max-clean", type=int, default=100_000)
-    p.add_argument("--warm-start-mode", type=str, default="rank",
-                   choices=["rank", "sigmoid"],
-                   help="Warm-start γ calibration: 'rank' (default, uniform "
-                        "quantile) or 'sigmoid' (auto β/κ on fail→clean d²). "
-                        "The old D3 sigmoid-on-clean-self calibration saturated "
-                        "every sample at γ=0.999 and was removed.")
-    p.add_argument("--gate-freeze-epochs", type=int, default=2,
-                   help="Skip advantage-gate updates for the first N bootstrap "
-                        "epochs after warm-start (lets f(-) differentiate).")
-    p.add_argument("--skip-bootstrap", action="store_true",
-                   help="Skip Phase B entirely: train f(+) in Phase A, warm-start "
-                        "gamma, save checkpoint, exit. Use with OMEGA=0 at "
-                        "benchmark time for the pos-branch-only baseline.")
+    p.add_argument("--warm-start-mode", type=str, default="rank", choices=["rank", "sigmoid"])
+    p.add_argument("--gate-freeze-epochs", type=int, default=2)
+    p.add_argument("--skip-bootstrap", action="store_true")
 
     # Logging
     p.add_argument("--log-every", type=int, default=50)
@@ -124,21 +132,29 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """CLI main.
+
+    Wires dataset + model + trainer, then runs training and writes a checkpoint.
+    """
     args = _parse_args()
 
     seed = int(args.seed)
+    # Seed torch RNGs for reproducibility. (Data shuffling and some CUDA kernels
+    # may still be nondeterministic depending on your environment.)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    encoder = FlowMultiEncoderWrapper(
-        policy_ckpt_path=str(args.policy_ckpt),
-        cache_root=str(args.cache_root),
-        device=str(args.device),
+    # Build a cache reader that knows how to locate and decode cached episodes.
+    cache_reader = PreprocessedCacheReader(
+        cache_root=str(args.preprocessed_cache_root),
+        image_size=int(args.image_size),
+        camera_index=0,
     )
-
+    # Dataset aggregates trajectories from the provided lists and exposes
+    # consistent tensor shapes (latent/proprio/action) for training.
     dataset = LatentFlowDynamicsDatasetD4(
-        encoder=encoder,
+        cache_reader=cache_reader,
         expert_paths=list(args.expert_paths),
         rollout_paths=list(args.rollout_paths),
         fail_rollout_paths=list(args.fail_paths),
@@ -149,6 +165,7 @@ def main() -> None:
             if int(args.max_trajectories_per_kind) <= 0
             else int(args.max_trajectories_per_kind)
         ),
+        image_size=int(args.image_size),
     )
     print(
         f"[d4_train] dataset size={len(dataset)}  "
@@ -159,18 +176,24 @@ def main() -> None:
         f"latent_dim={dataset.latent_dim}"
     )
 
-    if int(args.num_workers) > 0 and dataset.encoder.device.type == "cuda":
-        n_new = dataset.materialize_missing_latent_caches()
-        if n_new > 0:
-            print(f"[d4_train] materialized {n_new} missing latent cache(s)")
+    # Materialize / warm up any on-disk indices so the first epoch does not pay
+    # the cache discovery cost.
+    n_demos = dataset.preload_preprocessed()
+    print(f"[d4_train] preloaded cached demos for {n_demos} trajectory(s)")
 
-    # Preload per-demo states/actions into RAM so __getitem__ never opens
-    # hdf5 (was the dominant per-sample cost — 1M+ opens/epoch starved the GPU).
-    n_demos = dataset.preload_states_actions()
-    print(f"[d4_train] preloaded states/actions for {n_demos} demo(s)")
+    encoder_checkpoint = str(args.encoder_checkpoint).strip() or None
+    encoder = Encoder(
+        checkpoint_path=encoder_checkpoint,
+        # If a checkpoint is provided, treat it as the source of truth. Otherwise,
+        # "pretrained" controls whether to initialize from the default pretrained
+        # weights (if implemented by the Encoder).
+        pretrained=(bool(args.encoder_pretrained) if encoder_checkpoint is None else False),
+        freeze=bool(args.encoder_freeze),
+        normalize_input=True,
+    )
 
     predictor = ConditionalDynamicsPredictor(
-        latent_dim=dataset.latent_dim,
+        latent_dim=int(encoder.latent_dim),
         proprio_dim=dataset.proprio_dim,
         action_dim=dataset.action_dim,
         d_model=int(args.d_model),
@@ -182,6 +205,7 @@ def main() -> None:
         adaln_init_std=float(args.adaln_init_std),
     )
 
+    # Schedule controls phase mixing / importance weights during training.
     schedule = D4Schedule(
         alpha_exponent=float(args.alpha_exponent),
         alpha_cap_rate=float(args.alpha_cap_rate),
@@ -189,14 +213,8 @@ def main() -> None:
         eta_ramp_epochs=int(args.eta_ramp_epochs),
     )
 
-    trainer_cfg_kwargs = dict(
-        f3_warm_start=bool(args.f3_warm_start),
-        f3_warm_start_k=int(args.f3_warm_start_k),
-        f3_warm_start_max_clean=int(args.f3_warm_start_max_clean),
-        warm_start_mode=str(args.warm_start_mode),
-        gate_freeze_epochs=int(args.gate_freeze_epochs),
-        skip_bootstrap=bool(args.skip_bootstrap),
-    )
+    # TrainerConfig is a single source of truth for all optimization and
+    # stability knobs (EMA, clamps, warm start behavior, logging cadence, etc.).
     trainer_cfg = D4TrainerConfig(
         warm_up_epochs=int(args.warm_up_epochs),
         bootstrap_epochs=int(args.bootstrap_epochs),
@@ -205,7 +223,8 @@ def main() -> None:
         grad_clip_norm=float(args.grad_clip_norm),
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
-        p_cond_drop=float(args.p_cond_drop),
+        encoder_freeze=bool(args.encoder_freeze),
+        encoder_lr_mult=float(args.encoder_lr_mult),
         min_batch_balance=float(args.min_batch_balance),
         schedule=schedule,
         ema_decay_model=float(args.ema_decay),
@@ -222,11 +241,20 @@ def main() -> None:
         wandb_project=str(args.wandb_project),
         wandb_mode=str(args.wandb_mode),
         disable_wandb=bool(args.disable_wandb),
-        **trainer_cfg_kwargs,
+        probe_batch_size=64,
+        f3_warm_start=bool(args.f3_warm_start),
+        f3_warm_start_k=int(args.f3_warm_start_k),
+        f3_warm_start_max_clean=int(args.f3_warm_start_max_clean),
+        warm_start_mode=str(args.warm_start_mode),
+        gate_freeze_epochs=int(args.gate_freeze_epochs),
+        skip_bootstrap=bool(args.skip_bootstrap),
+        horizon=int(args.horizon),
+        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
     )
 
     trainer = D4Trainer(
         predictor=predictor,
+        encoder=encoder,
         dataset=dataset,
         config=trainer_cfg,
         device=str(args.device),
@@ -236,7 +264,8 @@ def main() -> None:
     os.makedirs(save_dir, exist_ok=True)
     save_name = str(args.save_name).strip() or f"d4_dynamics_{_now_tag()}.pt"
     save_path = os.path.join(save_dir, save_name)
-
+    # `save_freq` governs periodic snapshots; `save_path` is the final (or latest)
+    # checkpoint written by the trainer.
     trainer.run(save_path=save_path, save_freq=int(args.save_freq))
 
 

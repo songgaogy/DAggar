@@ -70,6 +70,11 @@ class LatentFlowDynamicsDataset(Dataset):
 
     Latents are read via ``FlowMultiEncoderWrapper.load_or_encode_demo`` so the
     on-disk cache is reused byte-exactly (and only populated on miss).
+
+    ``max_trajectories_per_kind`` caps the number of trajectories kept
+    **per task per kind** (kind = expert vs rollout). A single global cap
+    across all files causes the first-alphabetical task to exhaust the quota,
+    producing a single-task dataset despite multi-task inputs.
     """
 
     def __init__(
@@ -113,6 +118,14 @@ class LatentFlowDynamicsDataset(Dataset):
         # thousand demos x ~400 frames x 256 dims = O(100 MB) which is fine.
         self._latent_cache: Dict[str, np.ndarray] = {}
 
+        # Per-demo states + actions cache, keyed by (file_path, demo_key).
+        # Opening the hdf5 on EVERY __getitem__ was the dataloader bottleneck
+        # (1M+ samples × h5py.File() open/close → GPU starves). Preloaded once
+        # after scan; ~700 MB RAM for 1M transitions (states: 71 × 4 B,
+        # actions: horizon × 7 × 4 B per transition).
+        self._states_cache: Dict[Tuple[str, str], np.ndarray] = {}
+        self._actions_cache: Dict[Tuple[str, str], np.ndarray] = {}
+
         self._scan_files(expert_files, is_expert=True, max_traj=max_traj)
         self._scan_files(rollout_files, is_expert=False, max_traj=max_traj)
 
@@ -124,14 +137,22 @@ class LatentFlowDynamicsDataset(Dataset):
     # ------------------------------------------------------------------ #
 
     def _scan_files(self, files: Sequence[str], is_expert: bool, max_traj: Optional[int]) -> None:
-        traj_count = 0
+        # max_traj is per-task (and per-kind, via the is_expert split). A global
+        # counter would let the first-alphabetical task's files exhaust the quota
+        # before any other task is scanned, producing a single-task dataset.
+        task_counts: Dict[str, int] = {}
+        total = 0
         for fp in files:
             task_name = _infer_task_name(fp)
+            if max_traj is not None and task_counts.get(task_name, 0) >= max_traj:
+                continue
             try:
                 with h5py.File(fp, "r") as f:
                     if "demos" not in f:
                         continue
                     for demo_key in sorted(f["demos"].keys()):
+                        if max_traj is not None and task_counts.get(task_name, 0) >= max_traj:
+                            break
                         demo = f["demos"][demo_key]
                         if "states" not in demo or "actions" not in demo:
                             continue
@@ -182,18 +203,15 @@ class LatentFlowDynamicsDataset(Dataset):
                                 )
                             )
                             self._sample_is_expert.append(is_expert)
-                        traj_count += 1
-                        if max_traj is not None and traj_count >= max_traj:
-                            break
-                    if max_traj is not None and traj_count >= max_traj:
-                        break
+                        task_counts[task_name] = task_counts.get(task_name, 0) + 1
+                        total += 1
             except OSError as exc:
                 print(f"[d3_disc][dataset] skip {fp}: {exc}")
 
         if is_expert:
-            self._num_expert_traj += traj_count
+            self._num_expert_traj += total
         else:
-            self._num_rollout_traj += traj_count
+            self._num_rollout_traj += total
 
     # ------------------------------------------------------------------ #
     # Properties                                                         #
@@ -282,6 +300,36 @@ class LatentFlowDynamicsDataset(Dataset):
         pad = np.zeros((target - d,), dtype=state.dtype)
         return np.concatenate([state, pad], axis=0)
 
+    def _get_states_actions(self, ref: _TransitionRef) -> Tuple[np.ndarray, np.ndarray]:
+        key = (ref.file_path, ref.demo_key)
+        s = self._states_cache.get(key)
+        a = self._actions_cache.get(key)
+        if s is not None and a is not None:
+            return s, a
+        with h5py.File(ref.file_path, "r") as f:
+            demo = f["demos"][ref.demo_key]
+            s = np.asarray(demo["states"][:], dtype=np.float32)
+            a = np.asarray(demo["actions"][:], dtype=np.float32)
+        self._states_cache[key] = s
+        self._actions_cache[key] = a
+        return s, a
+
+    def preload_states_actions(self) -> int:
+        """Warm the per-demo states/actions cache from disk.
+
+        Call before constructing the DataLoader so worker processes inherit
+        the populated dict via copy-on-write (Linux fork). Skips the per-
+        sample hdf5 open that was dominating __getitem__ cost.
+        """
+        seen: set[Tuple[str, str]] = set()
+        for ref in self._refs:
+            key = (ref.file_path, ref.demo_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._get_states_actions(ref)
+        return len(seen)
+
     def _get_latents(self, ref: _TransitionRef) -> np.ndarray:
         cached = self._latent_cache.get(ref.cache_path)
         if cached is not None:
@@ -313,17 +361,15 @@ class LatentFlowDynamicsDataset(Dataset):
         z_t = latents[t0]
         z_tp = latents[th]
 
-        with h5py.File(ref.file_path, "r") as f:
-            demo = f["demos"][ref.demo_key]
-            s_t = np.asarray(demo["states"][t0], dtype=np.float32)
-            s_tp = np.asarray(demo["states"][th], dtype=np.float32)
-            a_seq = np.asarray(demo["actions"][t0:th], dtype=np.float32)   # (H, A)
-            # Pad action sequence if HDF5 happened to be shorter.
-            if a_seq.shape[0] < ref.horizon:
-                pad = np.repeat(a_seq[-1:] if a_seq.shape[0] > 0 else
-                                np.zeros((1, self.action_dim), dtype=np.float32),
-                                ref.horizon - a_seq.shape[0], axis=0)
-                a_seq = np.concatenate([a_seq, pad], axis=0)
+        states_arr, actions_arr = self._get_states_actions(ref)
+        s_t = states_arr[t0]
+        s_tp = states_arr[th]
+        a_seq = actions_arr[t0:th]
+        if a_seq.shape[0] < ref.horizon:
+            pad = np.repeat(a_seq[-1:] if a_seq.shape[0] > 0 else
+                            np.zeros((1, self.action_dim), dtype=np.float32),
+                            ref.horizon - a_seq.shape[0], axis=0)
+            a_seq = np.concatenate([a_seq, pad], axis=0)
 
         s_t = self._maybe_slice_proprio(s_t)
         s_tp = self._maybe_slice_proprio(s_tp)

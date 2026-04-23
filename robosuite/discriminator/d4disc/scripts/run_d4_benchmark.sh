@@ -1,25 +1,13 @@
 #!/usr/bin/env bash
-# D4-Disc benchmark entry (fit + evaluate in one pass).
-# Run from repo root:
-#   bash robosuite/discriminator/d4disc/scripts/run_d4_benchmark.sh
-# Overrides:
-#   OMEGA=0.5 D4_CKPT=/abs/d4_dynamics.pt \
-#     bash robosuite/discriminator/d4disc/scripts/run_d4_benchmark.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
-POLICY_CKPT="${POLICY_CKPT:-${REPO_ROOT}/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-CACHE_ROOT="${CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
+PREPROCESSED_CACHE_ROOT="${PREPROCESSED_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
 
 D4_CKPT="${D4_CKPT:-checkpoints/d4disc/dynamics/d4dyn_20260422_085802/d4_dynamics_Aep0010.pt}"
-
-if [[ ! -f "${POLICY_CKPT}" ]]; then
-    echo "[d4_disc] ERROR: POLICY_CKPT not found: ${POLICY_CKPT}" >&2
-    exit 1
-fi
 if [[ ! -f "${D4_CKPT}" ]]; then
     echo "[d4_disc] ERROR: D4_CKPT not found: ${D4_CKPT}" >&2
     exit 1
@@ -33,7 +21,7 @@ SUCC_NUM="${SUCC_NUM:-200}"
 FAIL_NUM="${FAIL_NUM:-100}"
 
 OMEGA="${OMEGA:-0}"
-SIGMA_SQ="${SIGMA_SQ:-}"          # empty => inherit from ckpt
+SIGMA_SQ="${SIGMA_SQ:-}"
 HORIZON="${HORIZON:-1}"
 DELTA="${DELTA:-10.0}"
 LAMBDA_MODE="${LAMBDA_MODE:-mean}"
@@ -74,26 +62,25 @@ if [[ "${QUIET_FIT:-0}" == "1" ]]; then
 fi
 
 "${PYTHON_BIN}" -m data.utils.benchmark.examples.run_d4 \
-    --policy-ckpt          "${POLICY_CKPT}" \
-    --d4-ckpt              "${D4_CKPT}" \
-    --cache-root           "${CACHE_ROOT}" \
-    --fail-root            "${FAIL_ROOT}" \
-    --success-root         "${SUCCESS_ROOT}" \
-    --tasks                ${TASKS} \
-    --save-json            "${SAVE_JSON}" \
-    --device               "${DEVICE}" \
-    --encoder-batch-size   "${ENCODER_BATCH_SIZE}" \
-    --image-size           "${IMAGE_SIZE}" \
-    --omega                "${OMEGA}" \
-    --horizon              "${HORIZON}" \
-    --delta                "${DELTA}" \
-    --lambda-mode          "${LAMBDA_MODE}" \
-    --lambda-window-size   "${LAMBDA_WINDOW_SIZE}" \
-    --traj-score-aggregator "${TRAJ_SCORE_AGGREGATOR}" \
-    --traj-score-topk       "${TRAJ_SCORE_TOPK}" \
-    --calib-fraction       "${CALIB_FRACTION}" \
-    --scoring-batch-size   "${SCORING_BATCH_SIZE}" \
-    --seed                 "${SEED}" \
+    --d4-ckpt                "${D4_CKPT}" \
+    --preprocessed-cache-root "${PREPROCESSED_CACHE_ROOT}" \
+    --fail-root              "${FAIL_ROOT}" \
+    --success-root           "${SUCCESS_ROOT}" \
+    --tasks                  ${TASKS} \
+    --save-json              "${SAVE_JSON}" \
+    --device                 "${DEVICE}" \
+    --encoder-batch-size     "${ENCODER_BATCH_SIZE}" \
+    --image-size             "${IMAGE_SIZE}" \
+    --omega                  "${OMEGA}" \
+    --horizon                "${HORIZON}" \
+    --delta                  "${DELTA}" \
+    --lambda-mode            "${LAMBDA_MODE}" \
+    --lambda-window-size     "${LAMBDA_WINDOW_SIZE}" \
+    --traj-score-aggregator  "${TRAJ_SCORE_AGGREGATOR}" \
+    --traj-score-topk        "${TRAJ_SCORE_TOPK}" \
+    --calib-fraction         "${CALIB_FRACTION}" \
+    --scoring-batch-size     "${SCORING_BATCH_SIZE}" \
+    --seed                   "${SEED}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 

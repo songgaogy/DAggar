@@ -1,10 +1,10 @@
-"""ConditionalDynamicsPredictor: LPB-backbone + AdaLN-Zero + (+, -, null) token.
+"""ConditionalDynamicsPredictor: LPB-backbone + AdaLN-Zero + (+, -) token.
 
 Input / output shapes match ``lpb.model.DynamicsPredictor`` so the existing
 dataset schema and training loop carry over. The only extra input is
 ``cond_idx: (B,) long`` selecting the per-sample condition token. The network
 is zero-initialized in its AdaLN heads, so at step 0 the output is identical
-for all three condition values — a property relied on by Phase A of the
+for both condition values — a property relied on by Phase A of the
 training loop and by the unit test in ``tests/test_adaln.py``.
 """
 
@@ -145,6 +145,7 @@ class ConditionalDynamicsPredictor(nn.Module):
         x = x + self.pos_embedding[:, :seq_len, :]
         x = self.drop(x)
 
+        # Condition into attention
         mask = self._causal_mask(seq_len, x.device)
         for blk in self.blocks:
             x = blk(x, cond=cond, attn_mask=mask)

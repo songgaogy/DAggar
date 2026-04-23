@@ -8,8 +8,8 @@ extension of the D3 schema).
 
 Usage:
     python -m robosuite.discriminator.d4disc.visualize \
-        --policy-ckpt /abs/flow_multi.pt \
         --d4-ckpt    /abs/d4_dynamics.pt \
+        --preprocessed-cache-root /abs/data/.lpb_score_preprocessed_cache \
         --fail-root  /abs/data/utils/fail_rollout \
         --success-root /abs/data/utils/success_rollout \
         --task PickPlaceBread --num-trajs 4 --omega 0.5 \
@@ -38,7 +38,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from data.utils.benchmark import BenchmarkTrajectory, FailureBenchmark
 
-from .d4_benchmark import D4BenchmarkDiscriminator
+from .inference.benchmark import D4BenchmarkDiscriminator
 
 
 def _pad_to_even(img: np.ndarray) -> np.ndarray:
@@ -261,8 +261,8 @@ class D4Visualizer:
 
             lines = [
                 f"discriminator: {self.discriminator.name}",
-                f"policy_ckpt: {summary.get('policy_ckpt_path', 'n/a')}",
                 f"d4_ckpt:     {summary.get('d4_ckpt_path', 'n/a')}",
+                f"preprocessed_cache_root: {summary.get('preprocessed_cache_root', 'n/a')}",
                 f"omega: {summary.get('omega', 'n/a')}   "
                 f"sigma_sq: {summary.get('sigma_sq', 'n/a')}",
                 f"lambda_mode: {summary.get('lambda_mode', 'n/a')}   "
@@ -411,7 +411,6 @@ class D4Visualizer:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy-ckpt", required=True)
     parser.add_argument("--d4-ckpt", required=True)
     parser.add_argument("--fail-root", required=True)
     parser.add_argument("--success-root", required=True)
@@ -426,7 +425,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encoder-batch-size", type=int, default=256)
     parser.add_argument("--image-size", type=int, default=128)
-    parser.add_argument("--cache-root", type=str, default="data/.lpb_score_cache")
+    parser.add_argument("--preprocessed-cache-root", type=str, default="data/.lpb_score_preprocessed_cache")
     parser.add_argument("--camera-name", type=str, default="agentview")
 
     parser.add_argument("--omega", type=float, default=0.5)
@@ -468,9 +467,8 @@ def main() -> None:
     print(f"[viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}")
 
     discriminator = D4BenchmarkDiscriminator(
-        policy_ckpt_path=str(args.policy_ckpt),
         d4_ckpt_path=str(args.d4_ckpt),
-        cache_root=str(args.cache_root),
+        preprocessed_cache_root=str(args.preprocessed_cache_root),
         device=str(args.device),
         encoder_batch_size=int(args.encoder_batch_size),
         image_size=int(args.image_size),

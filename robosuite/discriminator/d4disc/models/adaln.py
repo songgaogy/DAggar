@@ -4,10 +4,14 @@ Adopts the DiT AdaLN-Zero block (Peebles & Xie, 2023) as the per-layer
 conditioning primitive on top of the LPB decoder backbone. The load-bearing
 stability property is the ``zero-init`` of every ``AdaLNModulation.linear``
 head: at step 0 the block collapses to identity regardless of the condition
-token ``c in {+, -, null}``, so a freshly-instantiated conditional predictor
+token ``c in {+, -}``, so a freshly-instantiated conditional predictor
 behaves as an unconditional network. This is what makes Phase A training
-(c in {+, null} only) numerically safe and what keeps CFG well-defined at
-inference.
+(c=+ only) numerically safe.
+
+Conventions:
+- ``x`` is a token sequence of shape ``(B, L, D)``.
+- ``cond`` is a per-example conditioning vector of shape ``(B, d_cond)``, typically
+  produced by a 2-token embedder with indices in ``{+, -}``.
 """
 
 from __future__ import annotations
@@ -19,21 +23,30 @@ import torch.nn as nn
 
 
 class ConditionEmbedder(nn.Module):
-    """3-token embedding for c in {+, -, null}.
+    """2-token embedding for c in {+, -}.
 
     Constants match the routing table in ``filter.py`` / ``trainer.py``:
         COND_PLUS  = 0
         COND_MINUS = 1
-        COND_NULL  = 2
+
+    Args:
+        d_cond: Condition embedding dimension.
+
+    Input:
+        cond_idx: Integer tensor of shape ``(B,)`` or ``(B, 1)`` with values in
+            ``{0, 1}``.
+
+    Output:
+        Condition embedding of shape ``(B, d_cond)`` (or broadcast-compatible
+        if an extra singleton dimension is present in the input).
     """
 
     COND_PLUS: int = 0
     COND_MINUS: int = 1
-    COND_NULL: int = 2
 
     def __init__(self, d_cond: int = 64) -> None:
         super().__init__()
-        self.embed = nn.Embedding(3, d_cond)
+        self.embed = nn.Embedding(2, d_cond)
         nn.init.normal_(self.embed.weight, std=0.02)
         self.act = nn.SiLU()
         self.d_cond = int(d_cond)
@@ -53,6 +66,12 @@ class AdaLNModulation(nn.Module):
     that c=+ and c=- immediately produce different (shift, scale, gate)
     vectors. Useful for escaping the symmetric fixed point (A=0, gamma=0.5)
     when fail data alone cannot grow the gate fast enough during bootstrap.
+
+    Given a condition vector ``cond`` of shape ``(B, d_cond)``, returns three
+    tensors of shape ``(B, d_model)``:
+    - ``shift``: additive term applied after normalization
+    - ``scale``: multiplicative term applied after normalization (as 1 + scale)
+    - ``gate``: residual gate applied to the sub-block output
     """
 
     def __init__(self, d_cond: int, d_model: int, init_std: float = 0.0) -> None:
@@ -76,6 +95,11 @@ class AdaLNDecoderBlock(nn.Module):
     Keeps pre-norm residual structure of the LPB backbone; swaps affine part of
     LayerNorm for (shift, scale) derived from the condition token, and gates
     each residual contribution by a zero-init gate vector.
+
+    Notes:
+        - ``attn_mask`` follows PyTorch ``nn.MultiheadAttention`` semantics for
+          ``attn_mask`` with ``batch_first=True``. Keep the dtype/shape consistent
+          with the rest of the backbone (e.g., causal masks).
     """
 
     def __init__(
@@ -113,7 +137,16 @@ class AdaLNDecoderBlock(nn.Module):
         cond: torch.Tensor,
         attn_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # x: (B, L, D)   cond: (B, d_cond)
+        """Apply one conditioned transformer decoder block.
+
+        Args:
+            x: Token sequence of shape ``(B, L, D)``.
+            cond: Conditioning vector of shape ``(B, d_cond)``.
+            attn_mask: Attention mask passed through to multi-head attention.
+
+        Returns:
+            Updated token sequence of shape ``(B, L, D)``.
+        """
         shift_a, scale_a, gate_a = self.mod_attn(cond)
         shift_m, scale_m, gate_m = self.mod_mlp(cond)
 
