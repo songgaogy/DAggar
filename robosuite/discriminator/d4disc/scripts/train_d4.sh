@@ -104,6 +104,14 @@ ADVANTAGE_KNN_BANK_SIZE="${ADVANTAGE_KNN_BANK_SIZE:-100000}"
 ADVANTAGE_KNN_CHUNK_SIZE="${ADVANTAGE_KNN_CHUNK_SIZE:-8192}"
 ADVANTAGE_KNN_K="${ADVANTAGE_KNN_K:-1}"
 
+# Phase-B M-step repel loss. Pushes c=- branch away from expert bank B_+.
+# Off by default; recommended first try REPEL_WEIGHT=0.1.
+REPEL_WEIGHT="${REPEL_WEIGHT:-0.0}"
+REPEL_MARGIN="${REPEL_MARGIN:--1.0}"
+REPEL_MARGIN_PERCENTILE="${REPEL_MARGIN_PERCENTILE:-0.5}"
+REPEL_ON_PHASE_A="${REPEL_ON_PHASE_A:-0}"
+REPEL_WARMUP_EPOCHS="${REPEL_WARMUP_EPOCHS:-0}"
+
 # EMA + stability: EMA weights are used both for the advantage gate and for the
 # inference-time checkpoint payload.
 EMA_DECAY="${EMA_DECAY:-0.999}"                         # predictor weight EMA decay
@@ -172,6 +180,13 @@ EXTRA_ARGS+=(--advantage-mode "${ADVANTAGE_MODE}")
 EXTRA_ARGS+=(--advantage-knn-bank-size "${ADVANTAGE_KNN_BANK_SIZE}")
 EXTRA_ARGS+=(--advantage-knn-chunk-size "${ADVANTAGE_KNN_CHUNK_SIZE}")
 EXTRA_ARGS+=(--advantage-knn-k "${ADVANTAGE_KNN_K}")
+EXTRA_ARGS+=(--repel-weight "${REPEL_WEIGHT}")
+EXTRA_ARGS+=(--repel-margin "${REPEL_MARGIN}")
+EXTRA_ARGS+=(--repel-margin-percentile "${REPEL_MARGIN_PERCENTILE}")
+EXTRA_ARGS+=(--repel-warmup-epochs "${REPEL_WARMUP_EPOCHS}")
+if [[ "${REPEL_ON_PHASE_A}" == "1" ]]; then
+    EXTRA_ARGS+=(--repel-on-phase-a)
+fi
 if [[ "${SKIP_BOOTSTRAP}" == "1" ]]; then
     EXTRA_ARGS+=(--skip-bootstrap)
 fi

@@ -121,6 +121,7 @@ def test_advantage_gate_routes_by_advantage_sign() -> None:
         batch_size=16,
         num_workers=0,
         ema_alpha=0.0,
+        advantage_mode="residual",
     )
 
     gamma = ds.gamma_buffer.numpy()

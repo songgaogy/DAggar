@@ -11,6 +11,19 @@ from torchvision import models
 class Encoder(nn.Module):
     """
     ResNet-18 visual encoder h_theta that outputs a single latent token per image.
+
+    Input:
+        image: (B, 3, H, W) tensor. Accepts uint8 [0,255] or float in [0,1].
+
+    Output:
+        z: (B, 512) pooled feature vector (global average pooled ResNet-18 conv5).
+
+    Notes:
+        - `normalize_input=True` applies ImageNet mean/std normalization after
+          converting to float in [0,1].
+        - `checkpoint_path` is intended for loading *external* ResNet-18 weights
+          with varying wrapper conventions (e.g. `module.` / `model.` prefixes).
+          Only the backbone (non-fc) parameters are used.
     """
 
     def __init__(
@@ -48,6 +61,12 @@ class Encoder(nn.Module):
             self.freeze()
 
     def _load_external_checkpoint(self, checkpoint_path: str) -> None:
+        """Load a ResNet-18 checkpoint with loose key-matching heuristics.
+
+        The loader accepts common training wrappers (e.g. `state_dict`, `model`)
+        and strips known prefixes. It validates that all backbone (non-fc)
+        parameters are present and that there are no unexpected keys.
+        """
         state = torch.load(checkpoint_path, map_location="cpu")
         full = models.resnet18(weights=None)
         full_state_keys = set(full.state_dict().keys())
@@ -114,14 +133,17 @@ class Encoder(nn.Module):
                     queue.append(cls._strip_prefix(cur, prefix))
 
     def freeze(self) -> None:
+        """Disable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze(self) -> None:
+        """Enable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = True
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode a batch of images into 512-d latents."""
         if image.ndim != 4:
             raise ValueError(f"Expected image shape (B,3,H,W), got {tuple(image.shape)}")
         x = image.float()

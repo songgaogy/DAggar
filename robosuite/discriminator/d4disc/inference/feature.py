@@ -1,4 +1,13 @@
-"""Inference-time feature assembly using cached images + LPB encoder."""
+"""Inference-time feature assembly using cached images + D4 encoder/predictor.
+
+There are two inference pipelines in D4-Disc:
+    1) CFG scoring (D4Detector): needs per-timestep `(z_t, z_{t+h}, s_t, a_{t:t+h})`.
+    2) LPB-parity KNN scoring: uses only the predictor's input projections to
+       form a per-timestep feature vector compatible with LPB's KNN discriminator.
+
+This file materializes the common `D4Frames` container from the preprocessed
+cache reader and a frozen `Encoder`.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +25,15 @@ from ..models.encoder import Encoder
 
 @dataclass
 class D4Frames:
+    """Per-timestep tensors used by the detector / KNN adaptor.
+
+    Shapes:
+        z_current: (T, latent_dim)
+        z_target:  (T, latent_dim)   where z_target[t] = z_current[min(t+h, T-1)]
+        proprio:   (T, proprio_dim)
+        action_chunks: (T, h, action_dim)  padded by repeating the last action
+        length: int (T)
+    """
     z_current: torch.Tensor
     z_target: torch.Tensor
     proprio: torch.Tensor
@@ -69,6 +87,11 @@ class D4FeatureExtractor:
         return np.concatenate([arr, pad], axis=1)
 
     def _action_chunks(self, actions: np.ndarray, t_len: int, horizon: int) -> np.ndarray:
+        """Build per-timestep fixed-horizon action chunks.
+
+        Output is (T, h, A) where the tail is padded by repeating the last
+        available action.
+        """
         actions = np.asarray(actions[:t_len], dtype=np.float32)
         if actions.shape[1] < self.action_dim:
             pad = np.zeros((actions.shape[0], self.action_dim - actions.shape[1]), dtype=np.float32)
@@ -94,6 +117,7 @@ class D4FeatureExtractor:
         return out
 
     def _target_latents(self, latents: np.ndarray, horizon: int) -> np.ndarray:
+        """Shift z_t by +h to produce z_{t+h} targets (with terminal padding)."""
         out = np.empty_like(latents)
         T = int(latents.shape[0])
         for t in range(T):
@@ -102,6 +126,7 @@ class D4FeatureExtractor:
 
     @torch.no_grad()
     def _encode_images(self, images_chw: np.ndarray) -> np.ndarray:
+        """Encode cached uint8 images (T,3,H,W) into latents (T,latent_dim)."""
         self.encoder.eval()
         self.encoder.to(self.device)
         image_tensor = torch.from_numpy(np.ascontiguousarray(images_chw))
@@ -122,6 +147,12 @@ class D4FeatureExtractor:
         trajectory_length: Optional[int] = None,
         horizon: int = 1,
     ) -> D4Frames:
+        """Extract `D4Frames` for a single cached demo.
+
+        Args:
+            horizon: The transition horizon h. This determines both the action
+                chunk length and the target latent shift.
+        """
         demo = self.cache_reader.load(task_name, source_file_path, source_demo_key)
         limits = [int(demo.length)]
         if trajectory_length is not None:
@@ -198,6 +229,11 @@ class D4LPBFeatureExtractor:
 
     @torch.no_grad()
     def encode_frames(self, frames: D4Frames) -> torch.Tensor:
+        """Return an LPB-style feature for each timestep.
+
+        Feature:
+            concat([obs_proj(z_t), proprio_proj(s_t), mean_h action_proj(a_{t:t+h})])
+        """
         T = int(frames.length)
         d_model = int(self.predictor.d_model)
         out = torch.empty((T, 3 * d_model), dtype=torch.float32)

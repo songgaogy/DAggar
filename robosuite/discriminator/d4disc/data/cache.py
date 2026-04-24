@@ -1,3 +1,24 @@
+"""Preprocessed cache reader for D4-Disc.
+
+This module provides a light-weight IO layer over an on-disk `.npz` cache
+produced by the legacy LPB/D3 preprocessing pipeline. D4-Disc training and
+inference consume only the cached tensors, not the original HDF5 demos.
+
+Cache file schema (legacy `lpb_score_preprocessed_v2`):
+    - `images_chw`: uint8 or float array of shape (T, V, 3, H, W)
+        T: episode length, V: number of cameras/views. We select one view via
+        `camera_index` and expose images as (T, 3, H, W).
+    - `proprio`: float array of shape (T, P)
+    - `actions`: float array of shape (T, A)
+
+Notes:
+    - This reader is intentionally conservative: it validates shapes, clamps
+      image dtype/range to uint8, and memoizes decoded episodes in-memory to
+      avoid repeated disk reads during dataset indexing.
+    - Cache keys include a global token + task metadata + demo identity + source
+      file mtime so stale cache entries are automatically invalidated.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -51,6 +72,14 @@ def _resolve_checkpoint_task_name(task_name: str) -> str:
 
 @dataclass(frozen=True)
 class PreprocessedDemo:
+    """A single cached episode decoded from disk.
+
+    Attributes:
+        images_chw: (T, 3, H, W) uint8 images for the selected camera.
+        proprio: (T, P) float32 proprioceptive state.
+        actions: (T, A) float32 actions.
+        length: Effective trajectory length after aligning modalities.
+    """
     images_chw: np.ndarray
     proprio: np.ndarray
     actions: np.ndarray
@@ -80,9 +109,18 @@ class PreprocessedCacheReader:
                 _LEGACY_PROP_STD_SHA1,
             ]
         )
+        # In-process memoization keyed by cache path. This is safe because cache
+        # files are immutable for a fixed preprocessing token.
         self._memo: Dict[str, PreprocessedDemo] = {}
 
     def cache_key(self, task: str, file_path: str, demo_key: str) -> str:
+        """Return a stable hash key for a demo's cached `.npz`.
+
+        The key ties together:
+            - preprocessing version + image size + camera list + normalization stats
+            - task metadata fingerprint (legacy compat)
+            - absolute source file path + demo key + source file mtime
+        """
         if self.cache_key_fn is not None:
             return str(self.cache_key_fn(str(task), str(file_path), str(demo_key)))
         ckpt_task = _resolve_checkpoint_task_name(str(task))
@@ -107,6 +145,7 @@ class PreprocessedCacheReader:
         return os.path.isfile(self.cache_path(task, file_path, demo_key))
 
     def load(self, task: str, file_path: str, demo_key: str) -> PreprocessedDemo:
+        """Load (and memoize) a cached episode for `(task, file_path, demo_key)`."""
         path = self.cache_path(task, file_path, demo_key)
         cached = self._memo.get(path)
         if cached is not None:
@@ -114,6 +153,7 @@ class PreprocessedCacheReader:
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
 
+        # The `.npz` is expected to hold three arrays: images_chw, proprio, actions.
         with np.load(path) as data:
             images = np.asarray(data["images_chw"])
             proprio = np.asarray(data["proprio"], dtype=np.float32)
@@ -126,6 +166,7 @@ class PreprocessedCacheReader:
                 f"camera_index={self.camera_index} out of range for cached cameras={images.shape[1]}"
             )
 
+        # Select a single camera and ensure contiguous (T, 3, H, W).
         cam = np.ascontiguousarray(images[:, self.camera_index])
         if cam.dtype != np.uint8:
             if np.issubdtype(cam.dtype, np.floating):
@@ -136,6 +177,7 @@ class PreprocessedCacheReader:
             else:
                 cam = cam.astype(np.uint8)
 
+        # Modalities occasionally mismatch by 1 frame; use the safe aligned prefix.
         length = min(int(cam.shape[0]), int(proprio.shape[0]), int(actions.shape[0]))
         demo = PreprocessedDemo(
             images_chw=np.ascontiguousarray(cam[:length]),

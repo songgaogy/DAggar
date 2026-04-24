@@ -69,6 +69,18 @@ class D4BenchmarkDiscriminator:
         knn_chunk_size: int = 8192,
         knn_normalize_feature: bool = True,
     ) -> None:
+        """Load a D4 checkpoint and expose a `FailureBenchmark` discriminator API.
+
+        Modes:
+            - score_mode in {"rel","abs"}: use `D4Detector` (CFG scoring) and
+              conformal calibration tau via held-out success trajectories.
+            - score_mode == "knn": bypass CFG and instead run LPB-style adaptive
+              KNN on features extracted from the D4 predictor's input projections.
+
+        Important:
+            - For stable inference we always load `ema_state_dict` (not raw weights).
+            - The checkpoint is expected to be the 512-d LPB-parity refactor.
+        """
         if not (0.0 < float(calib_fraction) < 1.0):
             raise ValueError(f"calib_fraction must be in (0,1), got {calib_fraction}")
         if str(score_mode) not in _VALID_SCORE_MODES:
@@ -122,6 +134,7 @@ class D4BenchmarkDiscriminator:
             param.requires_grad = False
 
         self.predictor = ConditionalDynamicsPredictor(**arch_args)
+        # Inference always uses EMA weights for stability and best validation metrics.
         self.predictor.load_state_dict(payload["ema_state_dict"], strict=True)
         self.predictor.eval()
         for param in self.predictor.parameters():
@@ -257,6 +270,12 @@ class D4BenchmarkDiscriminator:
         return frames
 
     def fit_on_benchmark(self, trajectories: list[BenchmarkTrajectory]) -> None:
+        """Fit per-task (or pooled) conformal thresholds on success trajectories.
+
+        Calibration splits each task's success trajectories into:
+            - bank set: used to build the "expert" reference (KNN mode only)
+            - calibration set: used to pick tau at the `delta` percentile
+        """
         succ_per_task: dict[str, list[BenchmarkTrajectory]] = {}
         fail_per_task: dict[str, list[BenchmarkTrajectory]] = {}
         for traj in trajectories:
@@ -378,6 +397,7 @@ class D4BenchmarkDiscriminator:
                 print(f"[d4_disc][fit] shared tau={tau:.6f} across {len(tasks_seen)} tasks")
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
+        """Score one trajectory and return per-frame predictions + aux diagnostics."""
         task = str(trajectory.task_name)
         T = int(trajectory.num_frames)
 

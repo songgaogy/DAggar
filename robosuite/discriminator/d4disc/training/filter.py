@@ -1,4 +1,20 @@
-"""Advantage-gate update for the image-based D4 pipeline."""
+"""Advantage-gate update for the image-based D4 pipeline.
+
+This module implements the Phase-B "gate" (outer-loop) update that maintains
+the per-fail-sample routing probabilities gamma_i stored in the Dataset.
+
+Given a conditional predictor f(·|c) and a fail transition i, we compute:
+    r_+(i), r_-(i)   (branch-specific scores)
+    A(i) = (r_-(i) - r_+(i)) / (2 * sigma_sq)   (advantage, scaled)
+    gamma_i <- sigmoid(alpha_k * ( -A(i) - kappa_k ))
+
+Intuition:
+    - If the (-) branch looks worse than the (+) branch on sample i, then A>0
+      and gamma decreases (route more mass to +).
+    - If the (-) branch looks better, A<0 and gamma increases (route more mass to -).
+
+The gate is always run with EMA model weights in the trainer for stability.
+"""
 
 from __future__ import annotations
 
@@ -125,7 +141,10 @@ def compute_advantage_gate(
     knn_k: int = 1,
     knn_chunk_size: int = 8192,
 ) -> Dict[str, float]:
-    """Compute per-sample advantage A = (r_minus - r_plus) / 2σ² and update γ.
+    """Compute per-sample advantage and update gamma for fail samples.
+
+    The update is applied only to `dataset.fail_indices()`; clean positives
+    retain their default gamma values but are never routed via gamma.
 
     advantage_mode:
         "residual": r_c = ||f(c) - z_target||² (raw next-latent MSE;
@@ -139,7 +158,7 @@ def compute_advantage_gate(
             distribution. Matches the inference-time score_mode='knn'
             paradigm (LPB-parity density estimation).
 
-    ``expert_z_bank`` must be provided (and pre-encoded) when
+    `expert_z_bank` must be provided (and pre-encoded) when
     ``advantage_mode='knn'``; typically built once per Phase-B loop by
     ``build_expert_target_bank``.
     """
@@ -219,6 +238,8 @@ def compute_advantage_gate(
             # KNN: score each prediction against the expert target-latent bank.
             r_plus = knn_sqdist(pred_plus, bank_dev, k=int(knn_k), chunk_size=int(knn_chunk_size))
             r_minus = knn_sqdist(pred_minus, bank_dev, k=int(knn_k), chunk_size=int(knn_chunk_size))
+        # Advantage A := (r_- - r_+) / (2 sigma^2).
+        # Gamma update uses sigmoid(alpha_k * ( -A - kappa_k )).
         advantage = (r_minus - r_plus) / two_sigma_sq
         gamma_new = torch.sigmoid(float(alpha_k) * (-advantage - float(kappa_k)))
 

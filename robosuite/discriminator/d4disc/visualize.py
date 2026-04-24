@@ -100,6 +100,8 @@ def _overlay_hud(
     ]
     colors = [(255, 255, 255, 255), (255, 255, 255, 255)]
     if r_minus is not None:
+        # Advantage is displayed in the *same* units as r+/r- here (no sigma scaling):
+        # A := r_- - r_+. This is a visualization-only diagnostic.
         lines.append(f"r+={r_plus:.3f}  r-={r_minus:.3f}  A={(r_minus - (r_plus or 0.0)):.3f}")
         colors.append((200, 200, 255, 255))
     else:
@@ -156,6 +158,8 @@ class D4Visualizer:
         return float("nan") if tau is None else float(tau)
 
     def _score_trajectory(self, traj: BenchmarkTrajectory) -> PerTrajectoryViz:
+        # `aux` is produced by `D4BenchmarkDiscriminator` and contains padded
+        # per-frame residual diagnostics when available.
         out = self.discriminator.score_trajectory(traj)
         gt_mask = traj.load_failure_mask()
         first_gt = traj.first_gt_failure_frame()
@@ -190,6 +194,8 @@ class D4Visualizer:
         out_path: str,
     ) -> None:
         images_by_cam = traj.load_images(cameras=[self.camera_name])
+        # Benchmark trajectories store images in (T, H, W, C); we flip vertically
+        # to match the conventions used in the D3 visualizer.
         frames = np.asarray(images_by_cam[self.camera_name], dtype=np.uint8)
         frames = frames[:, ::-1, :, :]
         T = min(int(frames.shape[0]), int(viz.num_frames))
@@ -337,6 +343,7 @@ class D4Visualizer:
         ul.append("GT failure segment")
         ax_top.legend(uh, ul, loc="upper left", fontsize=8, framealpha=0.85)
 
+        # r+/r- are raw squared residuals (not divided by 2*sigma^2).
         ax_mid.plot(t, viz.r_plus, color="#2ca02c", lw=1.2, label="r+ (|f(+) - z_t+h|^2)")
         if has_neg:
             ax_mid.plot(t, viz.r_minus, color="#d62728", lw=1.2, label="r-")

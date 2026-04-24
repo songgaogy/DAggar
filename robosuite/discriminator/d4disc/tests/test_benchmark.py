@@ -48,6 +48,7 @@ def test_benchmark_loads_new_512d_checkpoint(tmp_path: Path) -> None:
         device="cpu",
         encoder_pretrained=False,
         encoder_freeze=True,
+        score_mode="rel",
     )
     assert discriminator.arch_args["latent_dim"] == 512
     discriminator.close()
@@ -85,6 +86,7 @@ def test_benchmark_uses_aggregated_lambda_for_predictions(tmp_path: Path) -> Non
         device="cpu",
         encoder_pretrained=False,
         encoder_freeze=True,
+        score_mode="rel",
     )
 
     class _FakeDetector:
@@ -153,6 +155,7 @@ def test_benchmark_filters_trajectories_without_cache(tmp_path: Path) -> None:
         device="cpu",
         encoder_pretrained=False,
         encoder_freeze=True,
+        score_mode="rel",
     )
     discriminator.cache_reader.exists = lambda task, file_path, demo_key: file_path != "missing.hdf5"
 

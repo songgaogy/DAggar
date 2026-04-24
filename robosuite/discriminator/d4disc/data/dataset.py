@@ -1,3 +1,27 @@
+"""Dataset for D4-Disc training from a preprocessed cache.
+
+The dataset enumerates *transitions* rather than episodes. Each item is a
+single (t -> t+h) transition referenced by `(file_path, demo_key, t, horizon)`,
+and is backed by a cached `.npz` episode (see `data/cache.py`).
+
+Returned sample dict (keys consumed by `training/trainer.py`):
+    - current_image: uint8 tensor (3, H, W)  (CHW)
+    - target_image:  uint8 tensor (3, H, W)
+    - current_proprio: float tensor (P,)
+    - target_proprio:  float tensor (P,)
+    - action_sequence: float tensor (H, A)  (padded by repeating last action)
+    - is_fail_raw: bool tensor ()  (only true for fail-rollout transitions)
+    - gamma: float tensor ()  (routing prob for fail samples; ignored for clean)
+    - sample_idx: long tensor ()  (index into this Dataset; stable within a run)
+    - is_expert: int64 tensor ()  (1 for expert, 0 otherwise)
+
+Notes:
+    - `gamma_buffer` is updated in-place by the Phase-B gate (E-step style).
+      It is stored on CPU and copied into each batch as a scalar.
+    - Proprio dimensions are normalized across tasks by either selecting
+      explicit indices or padding/truncation to the maximum seen.
+"""
+
 from __future__ import annotations
 
 import glob
@@ -21,6 +45,7 @@ except ImportError:
 
 @dataclass(frozen=True)
 class _TransitionRef:
+    """Pointer to a single transition inside a cached episode."""
     file_path: str
     demo_key: str
     task_name: str
@@ -116,6 +141,8 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         if not self._refs:
             raise RuntimeError("No cached transitions found for the provided inputs.")
 
+        # Per-sample fail flag and routing probability gamma.
+        # gamma is only meaningful for fail samples; for clean positives it is ignored.
         self._is_fail_raw = torch.tensor([ref.is_fail_raw for ref in self._refs], dtype=torch.bool)
         self.gamma_buffer = torch.full((len(self._refs),), 0.5, dtype=torch.float32)
         self._print_coverage()
@@ -245,6 +272,7 @@ class LatentFlowDynamicsDatasetD4(Dataset):
 
     @property
     def latent_dim(self) -> int:
+        # ResNet-18 backbone produces a 512-d pooled feature.
         return 512
 
     @property
@@ -296,6 +324,11 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         return demo
 
     def preload_preprocessed(self) -> int:
+        """Warm up the in-process demo cache.
+
+        This avoids paying cache discovery + disk IO during the first training
+        epoch when multiple workers index into the dataset.
+        """
         loaded = 0
         seen = set()
         unique_keys: List[Tuple[str, str, str]] = []
@@ -312,6 +345,7 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         return int(loaded)
 
     def _maybe_slice_proprio(self, proprio: np.ndarray) -> np.ndarray:
+        """Select or pad/truncate proprio to a fixed dimensionality."""
         if self.proprio_indices is not None:
             return proprio[self.proprio_indices]
         target = int(self._proprio_dim) if self._proprio_dim is not None else int(proprio.shape[0])
@@ -324,6 +358,11 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         return np.concatenate([proprio, pad], axis=0)
 
     def _slice_action_sequence(self, actions: np.ndarray, t0: int) -> np.ndarray:
+        """Return an (H, A) action chunk aligned to transition start t0.
+
+        The chunk is padded to horizon by repeating the last action so that the
+        model always sees a fixed-length action sequence.
+        """
         end = min(int(actions.shape[0]), int(t0 + self.horizon))
         chunk = np.asarray(actions[t0:end], dtype=np.float32)
         if chunk.shape[0] == 0:
@@ -346,6 +385,14 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         ema_alpha: float = 0.5,
         clamp_eps: float = 1e-3,
     ) -> None:
+        """EMA-update `gamma_buffer` at the given dataset indices.
+
+        Args:
+            indices: 1D tensor of dataset indices (into this Dataset, not per-episode t).
+            new_gamma: 1D tensor of same length with proposed gamma values in [0,1].
+            ema_alpha: Mixing coefficient. `1.0` keeps old values, `0.0` overwrites.
+            clamp_eps: Clamp gamma into [eps, 1-eps] for numerical stability.
+        """
         idx = indices.detach().cpu().long().view(-1)
         ng = new_gamma.detach().cpu().float().view(-1)
         if idx.numel() != ng.numel():
@@ -360,6 +407,7 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         return self._is_fail_raw.nonzero(as_tuple=False).squeeze(-1)
 
     def __getitem__(self, index: int) -> dict:
+        """Materialize one transition sample (CPU tensors)."""
         ref = self._refs[index]
         demo = self._load_demo(ref)
         t0 = int(ref.t)
@@ -381,5 +429,6 @@ class LatentFlowDynamicsDatasetD4(Dataset):
             "is_expert": torch.tensor(1 if ref.is_expert else 0, dtype=torch.int64),
             "sample_idx": torch.tensor(int(index), dtype=torch.long),
             "is_fail_raw": torch.tensor(bool(ref.is_fail_raw), dtype=torch.bool),
+            # Scalar gamma is read by the trainer to route fail samples to +/- branches.
             "gamma": torch.tensor(float(self.gamma_buffer[index].item()), dtype=torch.float32),
         }

@@ -131,6 +131,35 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--advantage-knn-bank-size", type=int, default=100_000)
     p.add_argument("--advantage-knn-chunk-size", type=int, default=8192)
     p.add_argument("--advantage-knn-k", type=int, default=1)
+    p.add_argument(
+        "--repel-weight",
+        type=float,
+        default=0.0,
+        help="Phase-B M-step repel loss weight (lambda_rep). 0 disables.",
+    )
+    p.add_argument(
+        "--repel-margin",
+        type=float,
+        default=-1.0,
+        help="Hinge margin m in L_repel. <0 => auto from d^2(fail z_t, B_+) quantile.",
+    )
+    p.add_argument(
+        "--repel-margin-percentile",
+        type=float,
+        default=0.5,
+        help="Quantile used for auto margin (default 0.5 = median).",
+    )
+    p.add_argument(
+        "--repel-on-phase-a",
+        action="store_true",
+        help="If set, also apply repel during Phase A (default: Phase B only).",
+    )
+    p.add_argument(
+        "--repel-warmup-epochs",
+        type=int,
+        default=0,
+        help="Number of Phase-B epochs to skip repel term at the start.",
+    )
 
     # Logging
     p.add_argument("--log-every", type=int, default=50)
@@ -154,8 +183,6 @@ def main() -> None:
     args = _parse_args()
 
     seed = int(args.seed)
-    # Seed torch RNGs for reproducibility. (Data shuffling and some CUDA kernels
-    # may still be nondeterministic depending on your environment.)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -166,8 +193,7 @@ def main() -> None:
         image_size=int(args.image_size),
         camera_index=0,
     )
-    # Dataset aggregates trajectories from the provided lists and exposes
-    # consistent tensor shapes (latent/proprio/action) for training.
+    # Dataset
     dataset = LatentFlowDynamicsDatasetD4(
         cache_reader=cache_reader,
         expert_paths=list(args.expert_paths),
@@ -191,17 +217,14 @@ def main() -> None:
         f"latent_dim={dataset.latent_dim}"
     )
 
-    # Materialize / warm up any on-disk indices so the first epoch does not pay
-    # the cache discovery cost.
+    # Materialize / warm up any on-disk indices so the first epoch does not pay the cache discovery cost.
     n_demos = dataset.preload_preprocessed()
     print(f"[d4_train] preloaded cached demos for {n_demos} trajectory(s)")
 
+    # here we found training from scratch works
     encoder_checkpoint = str(args.encoder_checkpoint).strip() or None
     encoder = Encoder(
         checkpoint_path=encoder_checkpoint,
-        # If a checkpoint is provided, treat it as the source of truth. Otherwise,
-        # "pretrained" controls whether to initialize from the default pretrained
-        # weights (if implemented by the Encoder).
         pretrained=(bool(args.encoder_pretrained) if encoder_checkpoint is None else False),
         freeze=bool(args.encoder_freeze),
         normalize_input=True,
@@ -267,6 +290,11 @@ def main() -> None:
         advantage_knn_bank_size=int(args.advantage_knn_bank_size),
         advantage_knn_chunk_size=int(args.advantage_knn_chunk_size),
         advantage_knn_k=int(args.advantage_knn_k),
+        repel_weight=float(args.repel_weight),
+        repel_margin=float(args.repel_margin),
+        repel_margin_percentile=float(args.repel_margin_percentile),
+        repel_on_phase_a=bool(args.repel_on_phase_a),
+        repel_warmup_epochs=int(args.repel_warmup_epochs),
         horizon=int(args.horizon),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
     )

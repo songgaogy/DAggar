@@ -30,6 +30,7 @@ class D4Health:
     eta_used: float = 0.0
     mean_r_plus: float = 0.0
     mean_r_minus: float = 0.0
+    repel_hinge_loss: float = 0.0
     step: int = 0
     epoch: int = 0
 
