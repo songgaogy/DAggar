@@ -20,6 +20,11 @@ Notes:
       It is stored on CPU and copied into each batch as a scalar.
     - Proprio dimensions are normalized across tasks by either selecting
       explicit indices or padding/truncation to the maximum seen.
+    - Trajectory subsampling caps are **per task** and **per kind**:
+      `max_expert_trajectories`, `max_success_rollout_trajectories`,
+      `max_fail_rollout_trajectories`. If a kind's HDF5 roots are non-empty, its cap
+      must be a positive int. The `train_d4.sh` entrypoint uses `0` to omit entire
+      kinds by not passing `--*-paths` (so the cap is not consulted).
 """
 
 from __future__ import annotations
@@ -84,6 +89,10 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         fail_rollout_paths: Optional[Sequence[str]] = None,
         horizon: int = 1,
         proprio_indices: Optional[Sequence[int]] = None,
+        max_expert_trajectories: Optional[int] = None,
+        max_success_rollout_trajectories: Optional[int] = None,
+        max_fail_rollout_trajectories: Optional[int] = None,
+        # Deprecated: applies the same cap to expert / success_rollout / fail_rollout.
         max_trajectories_per_kind: Optional[int] = None,
         image_size: int = 128,
     ) -> None:
@@ -106,9 +115,27 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         if not expert_files and not rollout_files and not fail_files:
             raise FileNotFoundError("No expert/rollout/fail HDF5 files found.")
 
-        self._max_traj_per_kind = (
-            None if max_trajectories_per_kind in (None, 0) else int(max_trajectories_per_kind)
-        )
+        legacy_cap = None if max_trajectories_per_kind in (None, 0) else int(max_trajectories_per_kind)
+        cap_expert = None if max_expert_trajectories is None else int(max_expert_trajectories)
+        cap_succ = None if max_success_rollout_trajectories is None else int(max_success_rollout_trajectories)
+        cap_fail = None if max_fail_rollout_trajectories is None else int(max_fail_rollout_trajectories)
+
+        if legacy_cap is not None and (cap_expert is not None or cap_succ is not None or cap_fail is not None):
+            raise ValueError(
+                "Pass either `max_trajectories_per_kind` (deprecated) OR the per-kind caps "
+                "(`max_expert_trajectories`, `max_success_rollout_trajectories`, "
+                "`max_fail_rollout_trajectories`), not both."
+            )
+        if legacy_cap is not None:
+            cap_expert = cap_succ = cap_fail = legacy_cap
+
+        if legacy_cap is None:
+            if expert_files and cap_expert is not None and int(cap_expert) <= 0:
+                raise ValueError("expert_paths is non-empty but max_expert_trajectories<=0.")
+            if rollout_files and cap_succ is not None and int(cap_succ) <= 0:
+                raise ValueError("rollout_paths is non-empty but max_success_rollout_trajectories<=0.")
+            if fail_files and cap_fail is not None and int(cap_fail) <= 0:
+                raise ValueError("fail_rollout_paths is non-empty but max_fail_rollout_trajectories<=0.")
 
         self._refs: List[_TransitionRef] = []
         self._sample_is_expert: List[bool] = []
@@ -117,25 +144,29 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         self._action_dim: Optional[int] = None
         self._proprio_dim: Optional[int] = None
         self._num_expert_traj = 0
-        self._num_rollout_traj = 0
+        self._num_success_rollout_traj = 0
+        self._num_fail_rollout_traj = 0
 
         self._scan_files(
             expert_files,
             data_type="expert",
             is_expert=True,
             is_fail_raw=False,
+            max_traj_per_task=cap_expert,
         )
         self._scan_files(
             rollout_files,
             data_type="success_rollout",
             is_expert=False,
             is_fail_raw=False,
+            max_traj_per_task=cap_succ,
         )
         self._scan_files(
             fail_files,
             data_type="fail_rollout",
             is_expert=False,
             is_fail_raw=True,
+            max_traj_per_task=cap_fail,
         )
 
         if not self._refs:
@@ -166,6 +197,7 @@ class LatentFlowDynamicsDatasetD4(Dataset):
         data_type: str,
         is_expert: bool,
         is_fail_raw: bool,
+        max_traj_per_task: Optional[int],
     ) -> None:
         task_counts: Dict[str, int] = {}
         kept = 0
@@ -189,8 +221,8 @@ class LatentFlowDynamicsDatasetD4(Dataset):
                             continue
                         bucket["cached"] += 1
 
-                        if self._max_traj_per_kind is not None:
-                            if task_counts.get(task_name, 0) >= self._max_traj_per_kind:
+                        if max_traj_per_task is not None:
+                            if task_counts.get(task_name, 0) >= int(max_traj_per_task):
                                 continue
 
                         with np.load(cache_path) as cached:
@@ -251,8 +283,10 @@ class LatentFlowDynamicsDatasetD4(Dataset):
 
         if is_expert:
             self._num_expert_traj += kept
+        elif is_fail_raw:
+            self._num_fail_rollout_traj += kept
         else:
-            self._num_rollout_traj += kept
+            self._num_success_rollout_traj += kept
 
     def _print_coverage(self) -> None:
         for task_name in sorted(self._coverage):
@@ -298,7 +332,16 @@ class LatentFlowDynamicsDatasetD4(Dataset):
 
     @property
     def num_rollout_trajectories(self) -> int:
-        return self._num_rollout_traj
+        # Kept name for backwards compatibility: counts success_rollout trajectories only.
+        return self._num_success_rollout_traj
+
+    @property
+    def num_success_rollout_trajectories(self) -> int:
+        return self._num_success_rollout_traj
+
+    @property
+    def num_fail_rollout_trajectories(self) -> int:
+        return self._num_fail_rollout_traj
 
     @property
     def is_fail_raw(self) -> torch.Tensor:

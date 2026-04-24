@@ -127,6 +127,7 @@ def test_dataset_filters_uncached_demos_up_front(tmp_path: Path) -> None:
         rollout_paths=[str(file_path.parent)],
         horizon=1,
         image_size=128,
+        max_success_rollout_trajectories=10_000,
     )
     assert len(dataset) == 3
     assert dataset.num_rollout_trajectories == 1
@@ -134,3 +135,41 @@ def test_dataset_filters_uncached_demos_up_front(tmp_path: Path) -> None:
     assert dataset.preload_preprocessed() == 1
     sample = dataset[0]
     assert sample["current_image"].dtype == torch.uint8
+
+
+def test_dataset_success_rollout_cap_is_per_kind_not_shared_with_expert(tmp_path: Path) -> None:
+    # Two cached success demos; cap success_rollout to 1 trajectory => only the first
+    # lexicographic demo key should contribute transitions.
+    succ_path = tmp_path / "data" / "PandaLift" / "success_rollout" / "demo.hdf5"
+    _write_demo_hdf5(succ_path, {"demo_a": 4, "demo_b": 4})
+
+    # Two cached expert demos; expert cap is unlimited (0) even though success cap is 1.
+    expert_path = tmp_path / "data" / "PandaLift" / "expert" / "demo.hdf5"
+    _write_demo_hdf5(expert_path, {"demo_x": 4, "demo_y": 4})
+
+    reader = PreprocessedCacheReader(cache_root=str(tmp_path / "cache"), image_size=128, camera_index=0)
+    images = np.zeros((4, 3, 3, 128, 128), dtype=np.uint8)
+    proprio = np.zeros((4, 4), dtype=np.float32)
+    actions = np.zeros((4, 2), dtype=np.float32)
+
+    for fp, key in (
+        (succ_path, "demo_a"),
+        (succ_path, "demo_b"),
+        (expert_path, "demo_x"),
+        (expert_path, "demo_y"),
+    ):
+        _write_cache(reader, task="PandaLift", file_path=fp, demo_key=key, images=images, proprio=proprio, actions=actions)
+
+    dataset = LatentFlowDynamicsDatasetD4(
+        cache_reader=reader,
+        expert_paths=[str(expert_path.parent)],
+        rollout_paths=[str(succ_path.parent)],
+        horizon=1,
+        image_size=128,
+        max_expert_trajectories=10_000,
+        max_success_rollout_trajectories=1,
+        max_fail_rollout_trajectories=10_000,
+    )
+    assert dataset.num_expert_trajectories == 2
+    assert dataset.num_rollout_trajectories == 1
+    assert len(dataset) == 9  # 2 experts * 3 + 1 success * 3

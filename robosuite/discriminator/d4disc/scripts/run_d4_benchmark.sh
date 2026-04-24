@@ -7,7 +7,7 @@ cd "${REPO_ROOT}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 PREPROCESSED_CACHE_ROOT="${PREPROCESSED_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
 
-D4_CKPT="checkpoints/d4disc/dynamics/d4_lpb_degraded/d4_dynamics_Aep0020.pt"
+D4_CKPT="checkpoints/d4disc/dynamics/d4_repel_v2-limited_data/d4_dynamics_Bep0020.pt"
 
 FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
 SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"

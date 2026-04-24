@@ -18,7 +18,7 @@ TASKS="PandaLift PandaPickPlaceCan PandaStack PickPlaceBread PickPlaceCereal Pic
 # ------------------------------
 # data
 EXPERT_NUM="${EXPERT_NUM:-0}"
-SUCC_NUM="${SUCC_NUM:-200}"
+SUCC_NUM="${SUCC_NUM:-100}"
 FAIL_NUM="${FAIL_NUM:-100}"
 
 WARM_UP_EPOCHS="${WARM_UP_EPOCHS:-10}"
@@ -27,6 +27,38 @@ BOOTSTRAP_EPOCHS="${BOOTSTRAP_EPOCHS:-40}"
 F3_WARM_START="${F3_WARM_START:-1}"          # 1: KNN-based gamma warm-start at end of Phase A (recommended)
 SKIP_BOOTSTRAP="${SKIP_BOOTSTRAP:-0}"        # 1: run Phase A only (pos-branch baseline; use omega=0 at eval)
 F3_WARM_START_K="${F3_WARM_START_K:-1}"                  # KNN order (k=1 is 1-NN)
+
+# Phase-B advantage gate.
+#   "knn"      (default): score each conditional prediction against an expert
+#                         z_{t+h} bank; advantage = log p_+ - log p_-. Matches
+#                         inference-time score_mode=knn. Removes the motion-
+#                         magnitude confound of raw residual scoring.
+#   "residual"          : legacy ||f(c) - z_target||² (d4disc_0423.md §5).
+ADVANTAGE_MODE="${ADVANTAGE_MODE:-knn}"
+ADVANTAGE_KNN_BANK_SIZE="${ADVANTAGE_KNN_BANK_SIZE:-100000}"
+ADVANTAGE_KNN_CHUNK_SIZE="${ADVANTAGE_KNN_CHUNK_SIZE:-8192}"
+ADVANTAGE_KNN_K="${ADVANTAGE_KNN_K:-1}"
+
+# Phase-B M-step repel loss. Pushes c=- branch away from expert bank B_+.
+# Off by default; recommended first try REPEL_WEIGHT=0.1.
+REPEL_WEIGHT="${REPEL_WEIGHT:-0.05}"
+REPEL_MARGIN="${REPEL_MARGIN:--1.0}"
+REPEL_MARGIN_PERCENTILE="${REPEL_MARGIN_PERCENTILE:-0.5}"
+REPEL_ON_PHASE_A="${REPEL_ON_PHASE_A:-0}"
+REPEL_WARMUP_EPOCHS="${REPEL_WARMUP_EPOCHS:-3}"
+
+# Training hyperparameters
+DEVICE="${DEVICE:-cuda:1}"
+BATCH_SIZE="${BATCH_SIZE:-512}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
+LR="${LR:-3e-4}"
+WD="${WD:-1e-4}"
+GRAD_CLIP="${GRAD_CLIP:-1.0}"
+PROPRIO_LOSS_WEIGHT="${PROPRIO_LOSS_WEIGHT:-0.1}"
+LATENT_LOSS_WEIGHT="${LATENT_LOSS_WEIGHT:-1.0}"
+SIGMA_SQ="${SIGMA_SQ:-0.5}"
+USE_BF16="${USE_BF16:-0}"
+LOG_EVERY="${LOG_EVERY:-50}"
 # ------------------------------
 
 EXPERT_PATHS=()
@@ -36,12 +68,12 @@ for task in ${TASKS}; do
     ep="${REPO_ROOT}/data/${task}/expert"
     rp="${REPO_ROOT}/data/${task}/success_rollout"
     fp="${REPO_ROOT}/data/${task}/fail_rollout"
-    if [[ -d "${ep}" ]]; then EXPERT_PATHS+=("${ep}"); fi
-    if [[ -d "${rp}" ]]; then ROLLOUT_PATHS+=("${rp}"); fi
-    if [[ -d "${fp}" ]]; then FAIL_PATHS+=("${fp}"); fi
+    if [[ "${EXPERT_NUM}" -gt 0 && -d "${ep}" ]]; then EXPERT_PATHS+=("${ep}"); fi
+    if [[ "${SUCC_NUM}" -gt 0 && -d "${rp}" ]]; then ROLLOUT_PATHS+=("${rp}"); fi
+    if [[ "${FAIL_NUM}" -gt 0 && -d "${fp}" ]]; then FAIL_PATHS+=("${fp}"); fi
 done
 if [[ ${#EXPERT_PATHS[@]} -eq 0 && ${#ROLLOUT_PATHS[@]} -eq 0 && ${#FAIL_PATHS[@]} -eq 0 ]]; then
-    echo "[d4_train] ERROR: no expert/success/fail rollout directories found for TASKS=${TASKS}" >&2
+    echo "[d4_train] ERROR: no data roots selected (check EXPERT_NUM/SUCC_NUM/FAIL_NUM and TASKS=${TASKS})" >&2
     exit 1
 fi
 
@@ -67,18 +99,6 @@ MAX_ACTION_HORIZON="${MAX_ACTION_HORIZON:-32}"
 D_COND="${D_COND:-64}"
 ADALN_INIT_STD="${ADALN_INIT_STD:-0.05}"
 
-DEVICE="${DEVICE:-cuda}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-LR="${LR:-3e-4}"
-WD="${WD:-1e-4}"
-GRAD_CLIP="${GRAD_CLIP:-1.0}"
-PROPRIO_LOSS_WEIGHT="${PROPRIO_LOSS_WEIGHT:-0.1}"
-LATENT_LOSS_WEIGHT="${LATENT_LOSS_WEIGHT:-1.0}"
-SIGMA_SQ="${SIGMA_SQ:-0.5}"
-USE_BF16="${USE_BF16:-0}"
-LOG_EVERY="${LOG_EVERY:-50}"
-
 MIN_BATCH_BALANCE="${MIN_BATCH_BALANCE:-0.15}"
 
 ALPHA_EXPONENT="${ALPHA_EXPONENT:-0.75}"
@@ -93,25 +113,6 @@ F3_WARM_START_MAX_CLEAN="${F3_WARM_START_MAX_CLEAN:-100000}"  # subsample clean 
 WARM_START_MODE="${WARM_START_MODE:-rank}"              # {'rank','sigmoid'} mapping d2 -> gamma
 GATE_FREEZE_EPOCHS="${GATE_FREEZE_EPOCHS:-4}"           # hold gamma fixed for first N bootstrap epochs
 
-# Phase-B advantage gate.
-#   "knn"      (default): score each conditional prediction against an expert
-#                         z_{t+h} bank; advantage = log p_+ - log p_-. Matches
-#                         inference-time score_mode=knn. Removes the motion-
-#                         magnitude confound of raw residual scoring.
-#   "residual"          : legacy ||f(c) - z_target||² (d4disc_0423.md §5).
-ADVANTAGE_MODE="${ADVANTAGE_MODE:-knn}"
-ADVANTAGE_KNN_BANK_SIZE="${ADVANTAGE_KNN_BANK_SIZE:-100000}"
-ADVANTAGE_KNN_CHUNK_SIZE="${ADVANTAGE_KNN_CHUNK_SIZE:-8192}"
-ADVANTAGE_KNN_K="${ADVANTAGE_KNN_K:-1}"
-
-# Phase-B M-step repel loss. Pushes c=- branch away from expert bank B_+.
-# Off by default; recommended first try REPEL_WEIGHT=0.1.
-REPEL_WEIGHT="${REPEL_WEIGHT:-0.0}"
-REPEL_MARGIN="${REPEL_MARGIN:--1.0}"
-REPEL_MARGIN_PERCENTILE="${REPEL_MARGIN_PERCENTILE:-0.5}"
-REPEL_ON_PHASE_A="${REPEL_ON_PHASE_A:-0}"
-REPEL_WARMUP_EPOCHS="${REPEL_WARMUP_EPOCHS:-0}"
-
 # EMA + stability: EMA weights are used both for the advantage gate and for the
 # inference-time checkpoint payload.
 EMA_DECAY="${EMA_DECAY:-0.999}"                         # predictor weight EMA decay
@@ -121,16 +122,6 @@ HELD_OUT_RATIO="${HELD_OUT_RATIO:-0.05}"                # fraction of clean posi
 
 SEED="${SEED:-0}"
 
-MAX_TRAJ_PER_KIND="${MAX_TRAJ_PER_KIND:-0}"
-if [[ "${MAX_TRAJ_PER_KIND}" -le 0 ]]; then
-    if [[ "${EXPERT_NUM}" -gt 0 || "${SUCC_NUM}" -gt 0 || "${FAIL_NUM}" -gt 0 ]]; then
-        MAX_TRAJ_PER_KIND=0
-        for n in "${EXPERT_NUM}" "${SUCC_NUM}" "${FAIL_NUM}"; do
-            if [[ "${n}" -gt "${MAX_TRAJ_PER_KIND}" ]]; then MAX_TRAJ_PER_KIND="${n}"; fi
-        done
-    fi
-fi
-
 RUN_NAME="${RUN_NAME:-d4dyn_$(date +%Y%m%d_%H%M%S)}"
 SAVE_DIR="${SAVE_DIR:-${REPO_ROOT}/checkpoints/d4disc/dynamics/${RUN_NAME}}"
 SAVE_NAME="${SAVE_NAME:-d4_dynamics.pt}"
@@ -139,13 +130,20 @@ mkdir -p "${SAVE_DIR}"
 LOG_PATH="${LOG_PATH:-${SAVE_DIR}/train.log}"
 exec > >(tee -a "${LOG_PATH}") 2>&1
 echo "[d4_train] logging to ${LOG_PATH}"
+echo "[d4_train] per-task trajectory caps: expert=${EXPERT_NUM} success_rollout=${SUCC_NUM} fail_rollout=${FAIL_NUM} (0=disable kind)"
 
 EXTRA_ARGS=()
 if [[ -n "${PROPRIO_INDICES:-}" ]]; then
     EXTRA_ARGS+=(--proprio-indices ${PROPRIO_INDICES})
 fi
-if [[ "${MAX_TRAJ_PER_KIND}" -gt 0 ]]; then
-    EXTRA_ARGS+=(--max-trajectories-per-kind "${MAX_TRAJ_PER_KIND}")
+if [[ "${EXPERT_NUM}" -gt 0 ]]; then
+    EXTRA_ARGS+=(--max-expert-trajectories "${EXPERT_NUM}")
+fi
+if [[ "${SUCC_NUM}" -gt 0 ]]; then
+    EXTRA_ARGS+=(--max-success-rollout-trajectories "${SUCC_NUM}")
+fi
+if [[ "${FAIL_NUM}" -gt 0 ]]; then
+    EXTRA_ARGS+=(--max-fail-rollout-trajectories "${FAIL_NUM}")
 fi
 if [[ "${USE_BF16}" == "1" ]]; then
     EXTRA_ARGS+=(--use-bfloat16)

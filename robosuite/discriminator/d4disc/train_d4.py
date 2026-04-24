@@ -52,7 +52,33 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fail-paths", nargs="*", default=[])
     p.add_argument("--proprio-indices", type=int, nargs="*", default=None)
     p.add_argument("--horizon", type=int, default=1)
-    p.add_argument("--max-trajectories-per-kind", type=int, default=0)
+    p.add_argument(
+        "--max-expert-trajectories",
+        type=int,
+        default=None,
+        nargs="?",
+        help="Per-task cap on expert trajectories (only if `--expert-paths` is non-empty). Omit for unlimited.",
+    )
+    p.add_argument(
+        "--max-success-rollout-trajectories",
+        type=int,
+        default=None,
+        nargs="?",
+        help="Per-task cap on success_rollout trajectories (only if `--rollout-paths` is non-empty). Omit for unlimited.",
+    )
+    p.add_argument(
+        "--max-fail-rollout-trajectories",
+        type=int,
+        default=None,
+        nargs="?",
+        help="Per-task cap on fail_rollout trajectories (only if `--fail-paths` is non-empty). Omit for unlimited.",
+    )
+    p.add_argument(
+        "--max-trajectories-per-kind",
+        type=int,
+        default=0,
+        help="Deprecated: sets the same per-task cap for expert/success/fail. Prefer the per-kind flags.",
+    )
     p.add_argument("--image-size", type=int, default=128)
 
     p.add_argument("--encoder-checkpoint", type=str, default="")
@@ -194,6 +220,24 @@ def main() -> None:
         camera_index=0,
     )
     # Dataset
+    legacy_cap = int(args.max_trajectories_per_kind)
+    cap_expert = args.max_expert_trajectories
+    cap_succ = args.max_success_rollout_trajectories
+    cap_fail = args.max_fail_rollout_trajectories
+    if legacy_cap > 0 and (cap_expert is not None or cap_succ is not None or cap_fail is not None):
+        raise ValueError(
+            "Use either --max-trajectories-per-kind (deprecated) OR the per-kind caps "
+            "(--max-expert-trajectories / --max-success-rollout-trajectories / "
+            "--max-fail-rollout-trajectories), not both."
+        )
+
+    if cap_expert is not None and int(cap_expert) <= 0:
+        raise ValueError("--max-expert-trajectories must be > 0 when provided.")
+    if cap_succ is not None and int(cap_succ) <= 0:
+        raise ValueError("--max-success-rollout-trajectories must be > 0 when provided.")
+    if cap_fail is not None and int(cap_fail) <= 0:
+        raise ValueError("--max-fail-rollout-trajectories must be > 0 when provided.")
+
     dataset = LatentFlowDynamicsDatasetD4(
         cache_reader=cache_reader,
         expert_paths=list(args.expert_paths),
@@ -201,11 +245,10 @@ def main() -> None:
         fail_rollout_paths=list(args.fail_paths),
         horizon=int(args.horizon),
         proprio_indices=list(args.proprio_indices) if args.proprio_indices else None,
-        max_trajectories_per_kind=(
-            None
-            if int(args.max_trajectories_per_kind) <= 0
-            else int(args.max_trajectories_per_kind)
-        ),
+        max_expert_trajectories=cap_expert,
+        max_success_rollout_trajectories=cap_succ,
+        max_fail_rollout_trajectories=cap_fail,
+        max_trajectories_per_kind=None if legacy_cap <= 0 else legacy_cap,
         image_size=int(args.image_size),
     )
     print(
