@@ -1,0 +1,61 @@
+# Single-GPU HDF5-backed training entrypoint for the original LPB dynamics
+# model. Drop-in replacement for `conf/train.yaml` that uses HDF5 data.
+defaults:
+  - _self_
+  - env: hdf5
+  - action_encoder: proprio
+  - proprio_encoder: proprio
+  - predictor: vit
+
+hydra:
+  run:
+    dir: checkpoints/lpb_original/dynamics/${now:%Y.%m.%d}/${now:%H.%M.%S}_${env.name}
+
+training:
+  seed: 0
+  epochs: 50
+  batch_size: 64
+  save_every_x_epoch: 10
+  encoder_lr: 1e-7
+  predictor_lr: 5e-4
+  action_encoder_lr: 5e-4
+  num_workers: 4
+
+img_size: ${env.original_img_size}
+frameskip: 1               # robosuite HDF5 dumps store every action; default no skip
+
+# Dataset references via env.
+train_data_path: ${env.train_data_path}
+val_data_path: ${env.val_data_path}
+view_names: ${env.view_names}
+original_img_size: ${env.original_img_size}
+cropped_img_size: ${env.cropped_img_size}
+action_emb_dim: ${env.action_emb_dim}
+proprio_emb_dim: ${env.proprio_emb_dim}
+policy_ckpt_path: ${env.policy_ckpt_path}
+
+# General settings.
+use_layernorm: True
+use_crop: True
+abs_action: False
+normalize_action: True
+num_hist: 1
+num_pred: 1
+has_predictor: True
+use_pretrained_encoder: True
+encoder_ckpt_path: null
+predictor_ckpt_path: null
+
+# Optional proprio slice into HDF5 states (passed to HDF5DynamicsModelDataset).
+proprio_indices: null
+max_trajectories: null
+
+model:
+  _target_: dyn_model.models.visual_dyn_model.VisualDynamicsModel
+  image_size: ${img_size}
+  num_hist: ${num_hist}
+  num_pred: ${num_pred}
+  train_encoder: False
+  train_predictor: True
+
+debug: False
