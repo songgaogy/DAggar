@@ -17,7 +17,7 @@ from .feature import D4FeatureExtractor, D4Frames, D4LPBFeatureExtractor
 from robosuite.discriminator.lpb.knn_discriminator import AdaptiveKNNDiscriminator
 
 
-_VALID_SCORE_MODES = ("rel", "abs", "knn")
+_VALID_SCORE_MODES = ("rel", "abs", "knn", "cfg_knn")
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
@@ -165,8 +165,13 @@ class D4BenchmarkDiscriminator:
             encoder_batch_size=int(encoder_batch_size),
             device=self.device,
         )
+        # Cache scoring batch size for per-task cfg_knn detectors built at fit time.
+        self.scoring_batch_size = int(scoring_batch_size)
+
         # KNN path shares the D4Frames pipeline but bypasses the CFG detector;
         # in that mode D4Detector is not constructed (omega/sigma_sq unused).
+        # cfg_knn builds per-task D4Detectors at fit time (each owns its own
+        # expert bank), so we don't construct a shared detector here either.
         self.detector: Optional[D4Detector]
         self.lpb_feature_extractor: Optional[D4LPBFeatureExtractor]
         if self.score_mode == "knn":
@@ -178,6 +183,9 @@ class D4BenchmarkDiscriminator:
                 batch_size=int(scoring_batch_size),
                 normalize_feature=self.knn_normalize_feature,
             )
+        elif self.score_mode == "cfg_knn":
+            self.detector = None
+            self.lpb_feature_extractor = None
         else:
             self.detector = D4Detector(
                 self.predictor,
@@ -198,6 +206,8 @@ class D4BenchmarkDiscriminator:
         # KNN per-task detector + per-trajectory feature cache.
         self._knn_per_task: dict[str, AdaptiveKNNDiscriminator] = {}
         self._knn_feature_cache: dict[tuple[str, str], torch.Tensor] = {}
+        # cfg_knn per-task detectors (each owns its own expert bank).
+        self._cfg_knn_detector_per_task: dict[str, D4Detector] = {}
 
     def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str]:
         return (str(trajectory.file_path), str(trajectory.demo_path))
@@ -352,6 +362,64 @@ class D4BenchmarkDiscriminator:
                     )
             return
 
+        if self.score_mode == "cfg_knn":
+            if not self.per_task_calibration:
+                raise ValueError(
+                    "score_mode='cfg_knn' requires per_task_calibration=True "
+                    "(each task owns its own expert next-latent bank)."
+                )
+            for task in tasks_seen:
+                bank_list = bank_succ_per_task.get(task, [])
+                calib_list = calib_succ_per_task.get(task, [])
+                if not bank_list or not calib_list:
+                    if self.verbose_fit:
+                        print(f"[d4_disc][fit] task={task} SKIP cfg_knn — insufficient success trajectories")
+                    continue
+                bank_frames = [self._frames(t) for t in bank_list]
+                # Expert bank: concat z_target over bank-success trajectories
+                # (exactly the anchor distribution Phase-B KNN advantage gate uses).
+                bank = torch.cat([fr.z_target.to(torch.float32) for fr in bank_frames], dim=0)
+                detector = D4Detector(
+                    self.predictor,
+                    omega=self.omega,
+                    sigma_sq=self.sigma_sq,
+                    delta=self.delta,
+                    lambda_mode=self.lambda_mode,
+                    lambda_window_size=self.lambda_window_size,
+                    device=self.device,
+                    batch_size=self.scoring_batch_size,
+                    score_mode="cfg_knn",
+                    expert_bank=bank,
+                    knn_chunk_size=self.knn_chunk_size,
+                )
+                calib_frames = [self._frames(t) for t in calib_list]
+                tau = detector.calibrate(calib_frames)
+                self._cfg_knn_detector_per_task[task] = detector
+                self._tau_per_task[task] = float(tau)
+                bank_steps = int(bank.shape[0])
+                calib_steps = int(sum(int(f.length) for f in calib_frames))
+                self._calibration_stats[task] = {
+                    "num_success_trajectories": int(len(succ_per_task.get(task, []))),
+                    "num_bank_trajectories": int(len(bank_list)),
+                    "num_calib_trajectories": int(len(calib_list)),
+                    "num_fail_trajectories": int(len(fail_per_task.get(task, []))),
+                    "num_bank_steps": bank_steps,
+                    "num_calib_steps": calib_steps,
+                    "threshold": float(tau),
+                    "omega": self.omega,
+                    "sigma_sq": self.sigma_sq,
+                    "delta": self.delta,
+                    "score_mode": "cfg_knn",
+                }
+                if self.verbose_fit:
+                    print(
+                        f"[d4_disc][fit] task={task} mode=cfg_knn omega={self.omega} "
+                        f"bank_trajs={len(bank_list)} ({bank_steps} steps)  "
+                        f"calib_trajs={len(calib_list)} ({calib_steps} steps)  "
+                        f"tau={tau:.6f}"
+                    )
+            return
+
         if self.per_task_calibration:
             for task in tasks_seen:
                 calib_list = calib_succ_per_task.get(task, [])
@@ -442,9 +510,18 @@ class D4BenchmarkDiscriminator:
         if tau is None:
             raise KeyError(f"Task {task!r} not calibrated. Available: {sorted(self._tau_per_task)}")
 
-        assert self.detector is not None
+        if self.score_mode == "cfg_knn":
+            detector = self._cfg_knn_detector_per_task.get(task)
+            if detector is None:
+                raise KeyError(
+                    f"Task {task!r} not calibrated (cfg_knn). "
+                    f"Available: {sorted(self._cfg_knn_detector_per_task)}"
+                )
+        else:
+            assert self.detector is not None
+            detector = self.detector
         frames = self._frames(trajectory)
-        result = self.detector.score(frames, tau=float(tau))
+        result = detector.score(frames, tau=float(tau))
 
         T = int(trajectory.num_frames)
         step_scores = _pad_to_length(result.lambda_values, T, dtype=np.float32)

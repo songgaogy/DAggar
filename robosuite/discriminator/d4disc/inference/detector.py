@@ -28,6 +28,7 @@ from robosuite.discriminator.d3disc.detector import (
     _percentile,
     _resolve_device,
 )
+from robosuite.discriminator.d3disc.filter import knn_sqdist
 
 from ..models.adaln import ConditionEmbedder
 from ..models.dynamics import ConditionalDynamicsPredictor
@@ -35,7 +36,7 @@ from .feature import D4Frames
 
 
 _OMEGA_MAX = 2.0
-_VALID_SCORE_MODES = ("rel", "abs")
+_VALID_SCORE_MODES = ("rel", "abs", "cfg_knn")
 
 
 @dataclass
@@ -62,6 +63,15 @@ class D4Detector:
         "abs": matches d4disc_0423.md §8.2 verbatim: lambda_t = ||f_omega - z_target||^2 / (2 sigma^2).
             Useful as a reference/ablation. Prefer "rel" unless the predictor has
             learned transitions to near-zero abs error (post full Phase-B).
+        "cfg_knn": lambda_t = min_{b in B_expert} ||f_omega - b||^2 / (2 sigma^2).
+            Anchor is the expert next-latent bank (same anchor as Phase-B's KNN
+            advantage gate). Requires `expert_bank` to be provided. Robust to
+            f_minus landing off-manifold in a random direction (e.g. after the
+            M-step repel loss) because the nearest-bank min absorbs the
+            direction; f_plus's pull toward the manifold dominates for ID
+            samples. This is the only score mode that (a) exercises the
+            conditional decoder (unlike `knn` which bypasses it) and (b) is
+            numerically robust to f_minus having no direction constraint.
     """
 
     def __init__(
@@ -76,6 +86,8 @@ class D4Detector:
         device: str = "cuda",
         batch_size: int = 512,
         score_mode: str = "rel",
+        expert_bank: Optional[torch.Tensor] = None,
+        knn_chunk_size: int = 8192,
     ) -> None:
         if float(omega) < 0.0:
             raise ValueError(f"omega must be >= 0, got {omega}")
@@ -97,8 +109,16 @@ class D4Detector:
         self.score_mode = str(score_mode)
         self.device = _resolve_device(device)
         self.batch_size = int(batch_size)
+        self.knn_chunk_size = int(knn_chunk_size)
         self.predictor.to(self.device)
         self.predictor.eval()
+
+        if self.score_mode == "cfg_knn":
+            if expert_bank is None or expert_bank.numel() == 0:
+                raise ValueError("score_mode='cfg_knn' requires non-empty expert_bank")
+            self.expert_bank = expert_bank.to(self.device, dtype=torch.float32)
+        else:
+            self.expert_bank = None
 
     # ------------------------------------------------------------------ #
     # Scoring                                                            #
@@ -131,11 +151,15 @@ class D4Detector:
             f_plus = out_p["pred_latent"]
             f_minus = out_m["pred_latent"]
             f_omega = (1.0 + self.omega) * f_plus - self.omega * f_minus
-            lam = ((f_omega - tgt) ** 2).sum(dim=-1) / two_sigma_sq
-            if self.score_mode == "rel":
-                # Remove motion-magnitude confound; see class docstring.
-                id_err = ((obs - tgt) ** 2).sum(dim=-1) / two_sigma_sq
-                lam = lam - id_err
+            if self.score_mode == "cfg_knn":
+                # Anchor f_omega against the expert next-latent bank.
+                lam = knn_sqdist(f_omega, self.expert_bank, k=1, chunk_size=self.knn_chunk_size) / two_sigma_sq
+            else:
+                lam = ((f_omega - tgt) ** 2).sum(dim=-1) / two_sigma_sq
+                if self.score_mode == "rel":
+                    # Remove motion-magnitude confound; see class docstring.
+                    id_err = ((obs - tgt) ** 2).sum(dim=-1) / two_sigma_sq
+                    lam = lam - id_err
             r_plus = ((f_plus - tgt) ** 2).sum(dim=-1)
             r_minus = ((f_minus - tgt) ** 2).sum(dim=-1)
             advantage = (r_minus - r_plus) / two_sigma_sq
