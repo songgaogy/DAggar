@@ -85,6 +85,11 @@ EXTRA_OVERRIDES+=("env.tasks=${TASKS_OVERRIDE}")
 if [[ "${MAX_TRAJECTORIES_PER_TASK}" != "0" ]]; then
     EXTRA_OVERRIDES+=("max_trajectories=${MAX_TRAJECTORIES_PER_TASK}")
 fi
+
+# Keep repo root clean: write outputs under outputs/ and chdir into run dir.
+EXTRA_OVERRIDES+=('hydra.run.dir=outputs/lpb_original/${now:%Y%m%d_%H%M%S}')
+EXTRA_OVERRIDES+=('hydra.job.chdir=true')
+
 EXTRA_OVERRIDES+=("$@")
 
 "${PYTHON_BIN}" -m robosuite.discriminator.lpb_original.train \
