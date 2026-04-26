@@ -118,7 +118,7 @@ logging:
   use_wandb: true
   wandb_mode: "offline"
   log_interval: 10
-  checkpoint_interval: 1000
+  checkpoint_interval: 5000
 
 hydra:
   run:

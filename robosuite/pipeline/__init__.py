@@ -1,4 +1,6 @@
 from .algorithms import (
+    AWRAgent,
+    AWRTrainer,
     EncoderConfig,
     FlowDaggerAgent,
     FlowDaggerTrainer,
@@ -34,6 +36,8 @@ __all__ = [
     "BaseOnlineDiscriminator",
     "BasePolicyRuntime",
     "DummyPolicyRuntime",
+    "AWRAgent",
+    "AWRTrainer",
     "EncoderConfig",
     "FlowDaggerAgent",
     "FlowDaggerTrainer",

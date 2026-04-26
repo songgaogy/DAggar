@@ -1,3 +1,4 @@
+from .awr import AWRAgent, AWRTrainer
 from .flow_dagger import FlowDaggerAgent, FlowDaggerTrainer
 from .hil_serl import HILSERLAgent, HILSERLSAC, HILSERLTrainer
 from .hg_dagger import BCConfig, HGDaggerAgent, HGDaggerTrainer
@@ -13,6 +14,8 @@ from robosuite.pipeline.utils import HILSERLReplayBuffer, load_demo_paths, load_
 
 __all__ = [
     "BCConfig",
+    "AWRAgent",
+    "AWRTrainer",
     "EncoderConfig",
     "FlowDaggerAgent",
     "FlowDaggerTrainer",

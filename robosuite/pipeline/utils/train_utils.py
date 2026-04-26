@@ -452,6 +452,9 @@ class TeeStream:
     def write(self, data: str) -> int:
         for stream in self._streams:
             stream.write(data)
+        if data and ("\n" in data or "\r" in data):
+            for stream in self._streams:
+                stream.flush()
         return len(data)
 
     def flush(self) -> None:
