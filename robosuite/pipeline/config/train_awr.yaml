@@ -270,6 +270,7 @@ runtime:
   fps_log_interval: 1.0
   async_updates: true
   online_updates_enabled: true
+  discriminator_reward_enabled: true
   num_train_step: 300
   train_episode_max_steps: 300
   eval_episode_max_steps: 300

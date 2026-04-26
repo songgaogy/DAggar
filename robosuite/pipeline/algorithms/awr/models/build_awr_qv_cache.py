@@ -37,7 +37,7 @@ from robosuite.pipeline.utils.train_utils import resolve_demo_task_name
 print = partial(builtins.print, flush=True)
 
 
-@hydra.main(version_base="1.2", config_path="./config", config_name="train_awr")
+@hydra.main(version_base="1.2", config_path="../../../config", config_name="train_awr")
 def main(cfg: DictConfig) -> None:
     maybe_set_seed(getattr(cfg, "seed", None))
     torch.set_float32_matmul_precision("high")
@@ -104,7 +104,10 @@ def main(cfg: DictConfig) -> None:
         algorithm_cfg["task_name"] = task_name
         awr_cfg = algorithm_cfg.setdefault("awr", {})
         awr_cfg.setdefault("image_size", int(cfg.env.img_height))
-        awr_cfg["reward_from_discriminator"] = bool(getattr(cfg.discriminator, "enabled", False))
+        discriminator_reward_enabled = bool(getattr(cfg.runtime, "discriminator_reward_enabled", True)) and bool(
+            getattr(cfg.discriminator, "enabled", False)
+        )
+        awr_cfg["reward_from_discriminator"] = bool(discriminator_reward_enabled)
         if bool(getattr(cfg.runtime, "use_init_checkpoint_model", True)) and init_payload is not None:
             if "model_cfg" in init_payload:
                 awr_cfg["model"] = init_payload["model_cfg"]

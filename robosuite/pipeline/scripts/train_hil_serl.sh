@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
-ENVIRONMENT="Lift"
-DEMO_TASK_NAME="PandaLift"  # demo data
+ENVIRONMENT="PickPlaceCereal"
+DEMO_TASK_NAME="PickPlaceCereal"  # demo data
 NUM_TRAJECTORIES=20
 INTERACTIVE=true
 VIEWER_ENABLED=true

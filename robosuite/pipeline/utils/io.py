@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import shutil
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -44,8 +45,12 @@ def deserialize_transition(payload: dict[str, Any]) -> Transition:
 
 
 def save_transition_shard(path: str | Path, transitions: Sequence[Transition]) -> None:
+    path = Path(path)
     payload = [serialize_transition(transition) for transition in transitions]
-    torch.save(payload, Path(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_transition_shard(path: str | Path) -> list[Transition]:
@@ -125,11 +130,20 @@ def load_demo_paths(
                     cache_stem = f"{cache_stem}_first_{len(selected_demo_names):05d}"
                 cache_path = cache_root / f"{cache_stem}.pt"
                 if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
-                    _mirror_cache_file(cache_path, mirror_cache_dir)
-                    transitions.extend(load_transition_shard(cache_path))
-                    if remaining_trajectories is not None:
-                        remaining_trajectories -= len(selected_demo_names)
-                    continue
+                    try:
+                        cached_transitions = load_transition_shard(cache_path)
+                    except (EOFError, RuntimeError, OSError, ValueError, pickle.UnpicklingError) as exc:
+                        print(f"[WARN] Ignoring invalid transition cache {cache_path}: {exc}")
+                        try:
+                            cache_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        _mirror_cache_file(cache_path, mirror_cache_dir)
+                        transitions.extend(cached_transitions)
+                        if remaining_trajectories is not None:
+                            remaining_trajectories -= len(selected_demo_names)
+                        continue
             converted = hdf5_loader(path, demo_names=selected_demo_names)
             transitions.extend(converted)
             if cache_path is not None:

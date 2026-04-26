@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-20000}"
 EXPERT_NUM_TRAJ="${EXPERT_NUM_TRAJ:-20}"
 SUCCESS_NUM_TRAJ="${SUCCESS_NUM_TRAJ:-180}"
@@ -40,7 +40,7 @@ for spec in "${TASK_SPECS[@]}"; do
   fi
 
   echo "[build_awr_qv_cache] env=${ENVIRONMENT} task=${DEMO_TASK_NAME}"
-  "${PYTHON_BIN}" -m robosuite.pipeline.build_awr_qv_cache \
+  "${PYTHON_BIN}" -m robosuite.pipeline.algorithms.awr.models.build_awr_qv_cache \
     env.environment="${ENVIRONMENT}" \
     data.task_name="${DEMO_TASK_NAME}" \
     data.expert_num_trajectories="${EXPERT_NUM_TRAJ}" \
@@ -48,6 +48,7 @@ for spec in "${TASK_SPECS[@]}"; do
     data.fail_num_trajectories="${FAIL_NUM_TRAJ}" \
     runtime.init_checkpoint="${INIT_CHECKPOINT}" \
     runtime.qv_cache.force_rebuild="${FORCE_REBUILD}" \
+    runtime.discriminator_reward_enabled=false \
     algorithm.trainer.value_warmup_steps="${VALUE_WARMUP_STEPS}" \
     algorithm.awr.device="${LEARNER_DEVICE}" \
     algorithm.awr.inference_device="${INFERENCE_DEVICE}" \

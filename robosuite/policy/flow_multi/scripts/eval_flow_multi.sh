@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export MUJOCO_GL=egl
 
 # eval each task
@@ -10,11 +10,12 @@ export MUJOCO_GL=egl
 #   eval.max_steps=500 \
 #   eval.succ_rate=true
 
+# run 50 times
 python /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_multi/eval_flow.py \
   eval.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt" \
-  eval.task_name='["Stack"]' \
-  eval.video_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/video/ep100-stack" \
-  eval.episodes=5 \
-  eval.max_steps=500 \
+  eval.task_name='["PickPlaceBread"]' \
+  eval.video_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/video/ep100-PickPlaceBread" \
+  eval.episodes=0 \
+  eval.max_steps=400 \
   eval.succ_rate=true \
   eval.n_ode_steps=10

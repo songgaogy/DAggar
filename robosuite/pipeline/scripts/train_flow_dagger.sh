@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
-ENVIRONMENT="Stack"
-DEMO_TASK_NAME="PandaStack"
+ENVIRONMENT="PickPlaceBread"
+DEMO_TASK_NAME="PickPlaceBread"
 NUM_TRAJECTORIES=20
 FLOW_DAGGER_MODE="train"    # eval or train
 

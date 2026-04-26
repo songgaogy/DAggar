@@ -554,13 +554,16 @@ def main(cfg: DictConfig) -> None:
     action_low, action_high = main_env.action_spec
     action_low = np.asarray(action_low, dtype=np.float32)
     action_high = np.asarray(action_high, dtype=np.float32)
+    discriminator_reward_enabled = bool(getattr(cfg.runtime, "discriminator_reward_enabled", True)) and bool(
+        getattr(cfg.discriminator, "enabled", False)
+    )
     algorithm_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
     if isinstance(algorithm_cfg, dict):
         algorithm_cfg["camera_names"] = list(policy_camera_names)
         algorithm_cfg["task_name"] = task_name
         awr_cfg = algorithm_cfg.setdefault("awr", {})
         awr_cfg.setdefault("image_size", int(cfg.env.img_height))
-        awr_cfg["reward_from_discriminator"] = bool(getattr(cfg.discriminator, "enabled", False))
+        awr_cfg["reward_from_discriminator"] = bool(discriminator_reward_enabled)
         if bool(getattr(cfg.runtime, "use_init_checkpoint_model", True)) and init_payload is not None:
             if "model_cfg" in init_payload:
                 awr_cfg["model"] = init_payload["model_cfg"]
@@ -741,6 +744,8 @@ def main(cfg: DictConfig) -> None:
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
             "buffer_dir": str(checkpoint_dir / "buffers"),
+            "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
+            "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
         },
     )
 
@@ -883,9 +888,11 @@ def main(cfg: DictConfig) -> None:
     policy_worker = AWRPolicyWorker(agent)
     policy_worker.start()
     discriminator_worker = None
-    if bool(getattr(cfg.discriminator, "enabled", False)):
+    if discriminator_reward_enabled:
         discriminator_worker = AWRDiscriminatorWorker(cfg.discriminator, task_name=task_name)
         discriminator_worker.start()
+    else:
+        print("[INFO] Discriminator reward is disabled. LPB discriminator worker will not be started.")
 
     requested_value_warmup_steps = max(0, int(cfg.algorithm.trainer.value_warmup_steps))
     if loaded_checkpoint is None and start_step == 0:
@@ -1200,6 +1207,7 @@ def main(cfg: DictConfig) -> None:
         last_fps_log_time = now
 
     def request_checkpoint_save(step: int, tag: str | None = None) -> None:
+        buffer_writer.flush(timeout=120.0)
         checkpoint_extra = {
             "global_step": int(step),
             "episode_index": int(episode_index),
@@ -1221,11 +1229,11 @@ def main(cfg: DictConfig) -> None:
             )
         checkpoint_writer.request_save(
             paths=[checkpoint_path(checkpoint_dir, "latest")],
-            include_buffers=True,
+            include_buffers=False,
             extra=checkpoint_extra,
             metadata={"step": int(step)},
         )
-        print(f"[ckpt] step={step} latest_with_buffers=true")
+        print(f"[ckpt] step={step} latest_with_buffers=false")
 
     if bool(cfg.intervention.enabled):
         device = build_device(env, cfg.intervention)
@@ -1577,9 +1585,10 @@ def main(cfg: DictConfig) -> None:
             if flushed_metrics:
                 maybe_print_publish_events(flushed_metrics)
         maybe_report_runtime(last_step if last_step >= 0 else 0)
+        buffer_writer.flush(timeout=120.0)
         checkpoint_writer.request_save(
             paths=[checkpoint_path(checkpoint_dir, "latest")],
-            include_buffers=True,
+            include_buffers=False,
             extra={
                 "global_step": int(last_step),
                 "episode_index": int(episode_index),
@@ -1589,7 +1598,6 @@ def main(cfg: DictConfig) -> None:
             metadata={"step": int(last_step)},
         )
         checkpoint_writer.flush(timeout=300.0)
-        buffer_writer.flush(timeout=120.0)
         runtime_logger.log(
             {
                 "event": "run_end",
@@ -1621,6 +1629,8 @@ def main(cfg: DictConfig) -> None:
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
                 "buffer_dir": str(checkpoint_dir / "buffers"),
+                "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
+                "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
                 "qv_cache_path": str(qv_cache_path),
                 "last_step": int(last_step),
                 "episode_index": int(episode_index),

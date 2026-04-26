@@ -3,10 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
-ENV_NAME="Stack"
+ENV_NAME="PickPlaceBread"
 TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/flow-DAgger/flow_dagger_Stack_2026-03-31_22-07-09/checkpoints/step_00010000_updates_00010000_ep_00049.pt"
-EPISODES=20
+CHECKPOINT="outputs/flow-DAgger/flow_dagger_PickPlaceBread_2026-04-26_20-43-06/checkpoints/step_00010000_updates_00009711_ep_00040.pt"
+EPISODES=50
 EVAL_EPISODE_MAX_STEPS=700
 VIDEO_OUTPUT="true"
 VIDEO_IMAGE_SIZE=512
