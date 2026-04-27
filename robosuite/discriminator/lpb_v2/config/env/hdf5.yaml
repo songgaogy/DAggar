@@ -1,0 +1,35 @@
+# HDF5 env config for LPB v2 dynamics training on user's robosuite data.
+# Override paths and dimensions via Hydra CLI or by sourcing the bash script.
+name: hdf5
+dataset_class: robosuite.discriminator.lpb_v2.data.HDF5DynamicsModelDataset
+
+# HDF5 paths (file or directory containing *.hdf5).
+train_data_path: ???   # required override, e.g. /abs/path/data/utils/success_rollout/PickPlaceCan
+val_data_path: ${env.train_data_path}
+
+view_names: ['agentview']
+encoder_type: 'resnet'
+return_rewards: false
+
+# Action / proprio dimensions (must match HDF5 contents).
+action_dim: 7
+proprio_dim: 9    # number of state indices used for proprio (set proprio_indices to slice raw states)
+
+# Image dimensions.
+original_img_size: 140
+cropped_img_size: 128
+
+# Embedding dims.
+action_emb_dim: 105      # = action_dim * frameskip; override if frameskip != 15
+proprio_emb_dim: 32
+
+# Kept for old CLI/config compatibility. lpb_v2 requires this to stay null.
+policy_ckpt_path: null
+
+# Optional: cache fully-materialized arrays to disk for faster restarts.
+use_cache: true
+cache_dir: data/.lpb_score_preprocessed_cache
+
+# shape_obs is consumed by Robomimic/Libero datasets only; HDF5 dataset ignores it
+# but keep the key for cross-config compatibility.
+shape_obs: null
