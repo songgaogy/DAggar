@@ -1,18 +1,21 @@
 """FAILDetectMonitor: core monitor for the logpZO variant of FAIL-Detect.
 
 Stage 1 — density estimation: fit a normalizing flow on success-state features.
-Stage 2 — threshold calibration: Conformal Prediction quantile over success
-          step-level scores, giving a strict failure threshold tau.
+Stage 2 — threshold calibration: time-varying Conformal Prediction band over
+          success step-level scores (functional CP, Diquigiovanni 2024 [14]),
+          giving a per-step failure threshold eta_t (paper Sec. IV-B).
 
-Trigger rule at runtime: flag OOD if score(s_t) > tau, where
-    score(s) = - log p_Z(f^{-1}(s))   (higher => more anomalous)
+Trigger rule at runtime: flag OOD if score(s_t) > eta_t, where
+    score(s)   = - log p_Z(f^{-1}(s))                 (higher => more anomalous)
+    eta_t      = mu_t + eta * sigma_t                 (one-sided upper band)
+    eta        = ceil((N+1)(1-alpha))/N quantile of   r_i = max_t (s_i_t - mu_t)/sigma_t
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -70,6 +73,13 @@ class FAILDetectMonitor:
         self._calibration_scores: Optional[np.ndarray] = None
         self._alpha: Optional[float] = None
         self._fit_stats: Optional[FitStats] = None
+
+        # Functional CP band (paper Sec. IV-B, Eq. eta_t = mu_t + eta * sigma_t).
+        self._mu_t: Optional[np.ndarray] = None
+        self._sigma_t: Optional[np.ndarray] = None
+        self._eta: Optional[float] = None
+        self._cp_band_calib_T: Optional[int] = None
+        self._cp_band_num_calib: Optional[int] = None
 
     # ------------------------------------------------------------------ #
     # Stage 1: density estimation                                        #
@@ -211,6 +221,96 @@ class FAILDetectMonitor:
         return self._threshold
 
     # ------------------------------------------------------------------ #
+    # Stage 2 (paper-faithful): functional CP band, time-varying eta_t   #
+    # ------------------------------------------------------------------ #
+
+    def calibrate_functional_cp_band(
+        self,
+        per_trajectory_features: Sequence[np.ndarray],
+        *,
+        alpha: float = 0.1,
+        sigma_floor: float = 1e-3,
+    ) -> None:
+        """Time-varying one-sided CP band over success calibration trajectories.
+
+        Implements FAIL-Detect Sec. IV-B (Diquigiovanni 2024 functional CP):
+            mu_t   = mean_i s_i_t                                  per-step mean
+            sigma_t= std_i s_i_t + sigma_floor                     per-step modulation
+            r_i    = max_t (s_i_t - mu_t) / sigma_t                one-sided nonconformity
+            eta    = ceil((N+1)(1-alpha))/N quantile of {r_i}      conformal multiplier
+            eta_t  = mu_t + eta * sigma_t                          upper band
+
+        Variable-length trajectories are right-padded with their final value to
+        the longest calibration length; tests longer than that reuse the last
+        eta_t (Sec. IV-B uses identically-shaped rollouts).
+        """
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+        if len(per_trajectory_features) < 2:
+            raise ValueError(
+                f"functional CP needs >=2 calibration trajectories, got {len(per_trajectory_features)}"
+            )
+
+        per_traj_scores: list[np.ndarray] = []
+        max_T = 0
+        for feats in per_trajectory_features:
+            arr = np.asarray(feats, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != self.feature_dim:
+                raise ValueError(
+                    f"calibration features must be (T, {self.feature_dim}); got {arr.shape}"
+                )
+            if arr.shape[0] <= 0:
+                raise ValueError("calibration trajectory is empty")
+            s = self.score_features(arr).astype(np.float64)
+            per_traj_scores.append(s)
+            if int(s.shape[0]) > max_T:
+                max_T = int(s.shape[0])
+
+        N = len(per_traj_scores)
+        padded = np.empty((N, max_T), dtype=np.float64)
+        for i, s in enumerate(per_traj_scores):
+            T_i = int(s.shape[0])
+            padded[i, :T_i] = s
+            if T_i < max_T:
+                padded[i, T_i:] = s[-1]
+
+        mu_t = padded.mean(axis=0)
+        sigma_t = padded.std(axis=0) + float(sigma_floor)
+
+        deviations = (padded - mu_t[None, :]) / sigma_t[None, :]
+        r = deviations.max(axis=1)  # (N,) one-sided trajectory-level nonconformity
+
+        k = int(math.ceil((N + 1) * (1.0 - float(alpha))))
+        k = max(1, min(N, k))
+        eta = float(np.partition(r, k - 1)[k - 1])
+
+        self._alpha = float(alpha)
+        self._mu_t = mu_t.astype(np.float64)
+        self._sigma_t = sigma_t.astype(np.float64)
+        self._eta = float(eta)
+        self._cp_band_calib_T = int(max_T)
+        self._cp_band_num_calib = int(N)
+        # Flatten padded scores for summary stats only.
+        self._calibration_scores = padded.reshape(-1).astype(np.float64)
+        # Mirror the band-mean to the legacy scalar slot so older callers still
+        # see "a threshold" and stats remain populated.
+        self._threshold = float((mu_t + eta * sigma_t).mean())
+
+    def threshold_per_step(self, num_steps: int) -> np.ndarray:
+        """Return eta_t over `num_steps` frames; extends with the last band value."""
+        if self._mu_t is None or self._sigma_t is None or self._eta is None:
+            raise RuntimeError(
+                "functional CP band not calibrated; call calibrate_functional_cp_band first"
+            )
+        band = self._mu_t + self._eta * self._sigma_t
+        if int(num_steps) <= int(band.shape[0]):
+            return band[: int(num_steps)].astype(np.float64).copy()
+        out = np.empty(int(num_steps), dtype=np.float64)
+        out[: int(band.shape[0])] = band
+        out[int(band.shape[0]) :] = band[-1]
+        return out
+
+    # ------------------------------------------------------------------ #
     # Inference                                                          #
     # ------------------------------------------------------------------ #
 
@@ -259,7 +359,7 @@ class FAILDetectMonitor:
         if self._calibration_scores is None or self._threshold is None or self._alpha is None:
             return {}
         s = self._calibration_scores
-        return {
+        out = {
             "alpha": float(self._alpha),
             "threshold": float(self._threshold),
             "num_calibration": int(s.shape[0]),
@@ -268,3 +368,14 @@ class FAILDetectMonitor:
             "calib_score_min": float(np.min(s)),
             "calib_score_max": float(np.max(s)),
         }
+        if self._eta is not None and self._mu_t is not None and self._sigma_t is not None:
+            band = self._mu_t + self._eta * self._sigma_t
+            out.update({
+                "cp_band_eta": float(self._eta),
+                "cp_band_T": int(self._cp_band_calib_T or 0),
+                "cp_band_num_calib_trajs": int(self._cp_band_num_calib or 0),
+                "cp_band_threshold_mean": float(band.mean()),
+                "cp_band_threshold_min": float(band.min()),
+                "cp_band_threshold_max": float(band.max()),
+            })
+        return out

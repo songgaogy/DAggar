@@ -10,7 +10,7 @@ from typing import Optional
 
 import numpy as np
 
-from data.utils.benchmark import BenchmarkTrajectory, DiscriminatorOutput
+from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
 from robosuite.discriminator.float.float_dino_encoder import (
     DEFAULT_IMAGE_SIZE,
@@ -75,10 +75,9 @@ class LogpZOBenchmarkDiscriminator:
         self.verbose_fit = bool(verbose_fit)
 
         self._monitors_per_task: dict[str, FAILDetectMonitor] = {}
-        self._thresholds_per_task: dict[str, float] = {}
         self._calibration_stats: dict[str, dict] = {}
 
-        # Cache DINOv2 embeddings keyed by (file_path, demo_path) to avoid
+        # Cache DINOv2 embeddings keyed by source/cache path to avoid
         # re-encoding success trajectories that are also scored later.
         self._embedding_cache: dict[tuple[str, str], np.ndarray] = {}
 
@@ -87,7 +86,11 @@ class LogpZOBenchmarkDiscriminator:
     # ------------------------------------------------------------------ #
 
     def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str]:
-        return (str(trajectory.file_path), str(trajectory.demo_path))
+        group_key = getattr(trajectory, "demo_path", None)
+        if group_key is None:
+            group_key = getattr(trajectory, "episode_path", "")
+        cache_key = getattr(trajectory, "cache_npz_path", "")
+        return (str(getattr(trajectory, "file_path", "")), str(cache_key or group_key))
 
     def _encode_trajectory(self, trajectory: BenchmarkTrajectory) -> np.ndarray:
         key = self._trajectory_key(trajectory)
@@ -134,7 +137,7 @@ class LogpZOBenchmarkDiscriminator:
         if not task_to_success:
             raise RuntimeError(
                 "logpZO requires success trajectories per task. "
-                "Provide --success-root/<task>/video_manifest.jsonl entries."
+                "Provide success trajectories or a real-world cache with success entries."
             )
 
         for task, succ_list in task_to_success.items():
@@ -156,15 +159,16 @@ class LogpZOBenchmarkDiscriminator:
             train_feats = np.concatenate(
                 [self._encode_trajectory(t) for t in train_trajs], axis=0
             ).astype(np.float32)
-            calib_feats = np.concatenate(
-                [self._encode_trajectory(t) for t in calib_trajs], axis=0
-            ).astype(np.float32)
+            calib_feats_per_traj: list[np.ndarray] = [
+                self._encode_trajectory(t).astype(np.float32) for t in calib_trajs
+            ]
+            num_calib_frames = int(sum(int(f.shape[0]) for f in calib_feats_per_traj))
 
             if self.verbose_fit:
                 print(
                     f"[logpZO][fit] task={task} "
                     f"train_trajs={len(train_trajs)} ({int(train_feats.shape[0])} frames)  "
-                    f"calib_trajs={len(calib_trajs)} ({int(calib_feats.shape[0])} frames)  "
+                    f"calib_trajs={len(calib_trajs)} ({num_calib_frames} frames)  "
                     f"dim={int(train_feats.shape[1])}"
                 )
 
@@ -186,16 +190,16 @@ class LogpZOBenchmarkDiscriminator:
                 seed=self.seed,
                 verbose=self.verbose_fit,
             )
-            tau = monitor.calibrate_conformal_threshold(calib_feats, alpha=self.alpha)
+            # Paper Sec. IV-B: time-varying CP band over success calibration trajectories.
+            monitor.calibrate_functional_cp_band(calib_feats_per_traj, alpha=self.alpha)
 
             self._monitors_per_task[task] = monitor
-            self._thresholds_per_task[task] = float(tau)
             self._calibration_stats[task] = {
                 "num_success_trajectories": int(len(succ_list)),
                 "num_train_trajectories": int(len(train_trajs)),
                 "num_calib_trajectories": int(len(calib_trajs)),
                 "num_train_frames": int(train_feats.shape[0]),
-                "num_calib_frames": int(calib_feats.shape[0]),
+                "num_calib_frames": num_calib_frames,
                 "fit_epochs": int(fit_stats.epochs),
                 "final_train_nll": float(fit_stats.final_train_nll),
                 "best_val_nll": float(fit_stats.best_val_nll),
@@ -210,7 +214,6 @@ class LogpZOBenchmarkDiscriminator:
                 f"Task {task!r} is not calibrated. Available: "
                 f"{sorted(self._monitors_per_task)}"
             )
-        threshold = float(self._thresholds_per_task[task])
 
         emb = self._encode_trajectory(trajectory)
         T = int(emb.shape[0])
@@ -220,14 +223,18 @@ class LogpZOBenchmarkDiscriminator:
                 f"score length mismatch: got {step_scores.shape[0]}, expected {T}"
             )
 
-        predictions = (step_scores > threshold).astype(np.int64)
+        # Paper Sec. IV-B: time-varying threshold eta_t = mu_t + eta * sigma_t.
+        eta_t = monitor.threshold_per_step(T).astype(np.float32)
+        predictions = (step_scores > eta_t).astype(np.int64)
         positive = np.where(predictions == 1)[0]
         first_failure_frame = int(positive[0]) if positive.size > 0 else None
 
         aux = {
             "task": task,
-            "threshold": float(threshold),
             "alpha": float(self.alpha),
+            "threshold_per_step_mean": float(eta_t.mean()),
+            "threshold_per_step_min": float(eta_t.min()),
+            "threshold_per_step_max": float(eta_t.max()),
             "camera_name": str(self.camera_name),
             "encoder": self.encoder.hub_model,
             "image_size": int(self.encoder.image_size),
