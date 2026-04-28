@@ -24,7 +24,7 @@ mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="checkpoints/lpb_v2/dynamics/agilex_train-20260427_093626/checkpoints/model_29.pth"
+MODEL_CKPT="checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[real_world][lpb_v2] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
@@ -41,7 +41,7 @@ DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
 VISUAL_WEIGHT="${VISUAL_WEIGHT:-1.0}"
 PROPRIO_WEIGHT="${PROPRIO_WEIGHT:-2.0}"
-ACTION_WEIGHT="${ACTION_WEIGHT:-1.0}"
+ACTION_WEIGHT="${ACTION_WEIGHT:-0.0}"
 DELTA="${DELTA:-10.0}"
 KNN_CHUNK_SIZE="${KNN_CHUNK_SIZE:-2048}"
 KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-encoder}"

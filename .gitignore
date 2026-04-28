@@ -143,4 +143,4 @@ error.txt
 !robosuite/discriminator/lpb_v2/config/env/
 !robosuite/discriminator/lpb_v2/config/env/**
 !robosuite/discriminator/lpb_v2/data/
-!robosuite/discriminator/lpb_v2/data/**
+!robosuite/discriminator/lpb_v2/data/*.py
