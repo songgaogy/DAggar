@@ -1,5 +1,5 @@
 python /home/dodo/Documents/DAggar/robosuite/robosuite/scripts/collect_human_demonstrations.py \
-    --directory /home/dodo/Documents/DAggar/robosuite/data/PandaLift \
+    --directory /home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/suboptimal \
     --robots Panda \
-    --environment Lift \
+    --environment PickPlaceCereal \
     --device spacemouse
