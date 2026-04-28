@@ -52,6 +52,7 @@ class LPBV2BenchmarkDiscriminator:
         camera_to_view: Optional[Dict[str, str]] = None,
         visual_weight: float = 1.0,
         proprio_weight: float = 2.0,
+        action_weight: float = 1.0,
         delta: float = 10.0,
         knn_chunk_size: int = 2048,
         calib_fraction: float = 0.2,
@@ -68,6 +69,7 @@ class LPBV2BenchmarkDiscriminator:
         self.camera_to_view = dict(camera_to_view) if camera_to_view else None
         self.visual_weight = float(visual_weight)
         self.proprio_weight = float(proprio_weight)
+        self.action_weight = float(action_weight)
         self.delta = float(delta)
         self.knn_chunk_size = int(knn_chunk_size)
         self.calib_fraction = float(calib_fraction)
@@ -131,12 +133,13 @@ class LPBV2BenchmarkDiscriminator:
         cameras_needed = [self._resolve_camera(v) for v in view_names]
         images_by_cam = trajectory.load_images(cameras=cameras_needed)
         states = np.asarray(trajectory.load_states(), dtype=np.float32)
+        actions = np.asarray(trajectory.load_actions(), dtype=np.float32)
 
         # IMPORTANT: benchmark trajectories can have minor length mismatches across
-        # (states, per-camera images). We always truncate to the shortest so each
+        # (states, actions, per-camera images). We always truncate to the shortest so each
         # encoded feature corresponds to a real frame for all modalities.
         cam_lens = [int(images_by_cam[c].shape[0]) for c in cameras_needed]
-        T = int(min([states.shape[0]] + cam_lens))
+        T = int(min([states.shape[0], actions.shape[0]] + cam_lens))
         if T <= 0:
             raise ValueError(f"Empty trajectory: {trajectory.describe()}")
 
@@ -150,6 +153,7 @@ class LPBV2BenchmarkDiscriminator:
 
         # Proprio slicing/padding must match the training-time proprio encoder input.
         prop = self._slice_proprio(states[:T], target_dim=target_proprio_dim)
+        act = self.encoder.prepare_actions(actions[:T], t_len=T)
 
         # Pre-build per-view image arrays (T, 3, H, W) at original_img_size,
         # converted to float in [0, 1].
@@ -183,9 +187,10 @@ class LPBV2BenchmarkDiscriminator:
                 v: torch.from_numpy(per_view_chw[v][start:end]) for v in view_names
             }
             batch_prop = torch.from_numpy(prop[start:end])
-            # encode_batch returns (B, visual_emb_total + proprio_emb) with the same
+            batch_act = torch.from_numpy(act[start:end])
+            # encode_batch returns (B, visual_emb_total + proprio_emb + action_emb) with the same
             # normalization/cropping used during dynamics training.
-            f = self.encoder.encode_batch(batch_imgs, batch_prop)
+            f = self.encoder.encode_batch(batch_imgs, batch_prop, batch_act)
             feats.append(f.detach().cpu())
 
         out = torch.cat(feats, dim=0)
@@ -237,6 +242,7 @@ class LPBV2BenchmarkDiscriminator:
 
             visual_dim = int(self.encoder.visual_emb_dim_total)
             proprio_dim = int(self.encoder.proprio_emb_dim)
+            action_dim = int(self.encoder.action_emb_dim)
             feat_dim = int(bank_feats[0].shape[1])
 
             if self.verbose_fit:
@@ -244,14 +250,16 @@ class LPBV2BenchmarkDiscriminator:
                     f"[lpb_v2][fit] task={task} "
                     f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
                     f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
-                    f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim})"
+                    f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
                 )
 
             det = LPBV2KNN(
                 visual_dim=visual_dim,
                 proprio_dim=proprio_dim,
+                action_dim=action_dim,
                 visual_weight=self.visual_weight,
                 proprio_weight=self.proprio_weight,
+                action_weight=self.action_weight,
                 delta=self.delta,
                 chunk_size=self.knn_chunk_size,
                 device=self.device,
@@ -269,6 +277,8 @@ class LPBV2BenchmarkDiscriminator:
                 "feat_dim": feat_dim,
                 "visual_dim": visual_dim,
                 "proprio_dim": proprio_dim,
+                "action_dim": action_dim,
+                "action_weight": float(self.action_weight),
             }
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:

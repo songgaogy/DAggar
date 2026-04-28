@@ -2,8 +2,9 @@
 
 Mirrors `tmp/lpb-main/dyn_model/planner_libero.py:compute_nn_reward` exactly:
 
-  feature_t  = [encoder(o_t) ; proprio_encoder(s_t)]
-               then per-dim weighting: visual * visual_weight, proprio * proprio_weight
+  feature_t  = [encoder(o_t) ; proprio_encoder(s_t) ; action_encoder(a_t)]
+               then per-dim weighting: visual * visual_weight,
+               proprio * proprio_weight, action * action_weight
   score_t    = -min_{j} ||feature_t - bank_j||_2     (non-squared L2, k=1)
 
 For the benchmark we add a thin classification layer on top of `score_t`:
@@ -268,7 +269,15 @@ class LPBV2Encoder:
         self.cropped_img_size: int = int(self.cfg.env.cropped_img_size)
         self.use_crop: bool = bool(getattr(self.cfg, "use_crop", True))
         self.proprio_emb_dim: int = int(self.cfg.env.proprio_emb_dim)
+        self.action_emb_dim: int = int(self.cfg.env.action_emb_dim)
         self.visual_emb_dim_total: int = int(self.model.encoder.emb_dim) * len(self.view_names)
+        self.frameskip: int = int(getattr(self.cfg, "frameskip", 1))
+        self.action_dim_per_step: int = int(
+            getattr(self.cfg, "action_dim_per_step", getattr(self.cfg.env, "action_dim", 7))
+        )
+        self.action_input_dim: int = int(
+            getattr(self.model.action_encoder, "in_chans", self.action_dim_per_step * self.frameskip)
+        )
 
         if self.use_crop:
             from robosuite.discriminator.lpb_v2.data.img_transforms import get_eval_crop_transform_resnet
@@ -279,17 +288,47 @@ class LPBV2Encoder:
         else:
             self.img_transform = lambda x: x
 
+    def prepare_actions(self, actions: np.ndarray, t_len: int) -> np.ndarray:
+        """Build flattened action windows matching the train-time action encoder input."""
+        act = np.asarray(actions[:t_len], dtype=np.float32)
+        if act.ndim == 1:
+            act = act.reshape(-1, 1)
+        if act.shape[1] < self.action_dim_per_step:
+            pad = np.zeros((act.shape[0], self.action_dim_per_step - act.shape[1]), dtype=np.float32)
+            act = np.concatenate([act, pad], axis=1)
+        elif act.shape[1] > self.action_dim_per_step:
+            act = act[:, : self.action_dim_per_step]
+
+        out = np.zeros((int(t_len), self.frameskip, self.action_dim_per_step), dtype=np.float32)
+        for t in range(int(t_len)):
+            end = min(int(t_len), t + self.frameskip)
+            chunk = act[t:end]
+            out[t, : chunk.shape[0]] = chunk
+            if chunk.shape[0] < self.frameskip:
+                pad_value = chunk[-1] if chunk.shape[0] > 0 else np.zeros((self.action_dim_per_step,), dtype=np.float32)
+                out[t, chunk.shape[0] :] = pad_value
+
+        flat = out.reshape(int(t_len), -1)
+        if flat.shape[1] < self.action_input_dim:
+            pad = np.zeros((flat.shape[0], self.action_input_dim - flat.shape[1]), dtype=np.float32)
+            flat = np.concatenate([flat, pad], axis=1)
+        elif flat.shape[1] > self.action_input_dim:
+            flat = flat[:, : self.action_input_dim]
+        return flat.astype(np.float32, copy=False)
+
     @torch.no_grad()
     def encode_batch(
         self,
         images_per_view: Dict[str, torch.Tensor],
         proprio: torch.Tensor,
+        actions: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode a batch of (visual, proprio) timesteps into (B, visual_emb + proprio_emb).
+        """Encode a batch of (visual, proprio, action) timesteps.
 
         Args:
             images_per_view[view]: (B, 3, H, W) float tensor in [0, 1]; H=W=original_img_size.
             proprio: (B, proprio_dim) float tensor (same layout as the train-time concat).
+            actions: (B, action_dim * frameskip) raw action windows.
         """
         B = next(iter(images_per_view.values())).shape[0]
 
@@ -313,7 +352,15 @@ class LPBV2Encoder:
             v = v.reshape(v.shape[0], -1)
         if p.dim() > 2:
             p = p.reshape(p.shape[0], -1)
-        return torch.cat([v, p], dim=-1)
+
+        action_in = actions.to(self.device, dtype=torch.float32, non_blocking=True)
+        action_in = action_in.view(B, self.frameskip, self.action_dim_per_step)
+        action_in = self.normalizer["act"].normalize(action_in)
+        action_in = action_in.reshape(B, 1, self.action_input_dim)
+        a = self.model.encode_act(action_in).squeeze(1)
+        if a.dim() > 2:
+            a = a.reshape(a.shape[0], -1)
+        return torch.cat([v, p, a], dim=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -334,8 +381,10 @@ class LPBV2KNN:
         self,
         visual_dim: int,
         proprio_dim: int,
+        action_dim: int,
         visual_weight: float = 1.0,
         proprio_weight: float = 2.0,
+        action_weight: float = 1.0,
         delta: float = 10.0,
         chunk_size: int = 2048,
         device: str = "cuda",
@@ -344,8 +393,10 @@ class LPBV2KNN:
             raise ValueError(f"delta must be in [0, 100], got {delta}")
         self.visual_dim = int(visual_dim)
         self.proprio_dim = int(proprio_dim)
+        self.action_dim = int(action_dim)
         self.visual_weight = float(visual_weight)
         self.proprio_weight = float(proprio_weight)
+        self.action_weight = float(action_weight)
         self.delta = float(delta)
         self.chunk_size = int(chunk_size)
         self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -356,13 +407,14 @@ class LPBV2KNN:
         self._calib_min_dists: Optional[np.ndarray] = None
 
     def _make_weights(self) -> torch.Tensor:
-        # Per-dim weight vector replicating original LPB:
-        #   weights = [visual_weight] * visual_dim ++ [proprio_weight] * proprio_dim
+        # Per-dim weight vector:
+        #   [visual_weight] * visual_dim ++ [proprio_weight] * proprio_dim ++ [action_weight] * action_dim
         if self._weights is not None:
             return self._weights
         w = torch.cat([
             torch.full((self.visual_dim,), self.visual_weight, device=self.device, dtype=torch.float32),
             torch.full((self.proprio_dim,), self.proprio_weight, device=self.device, dtype=torch.float32),
+            torch.full((self.action_dim,), self.action_weight, device=self.device, dtype=torch.float32),
         ])
         self._weights = w
         return w
@@ -372,7 +424,7 @@ class LPBV2KNN:
         if feats.shape[-1] != w.shape[0]:
             raise ValueError(
                 f"feature dim mismatch: feat.shape[-1]={feats.shape[-1]}, "
-                f"expected visual_dim+proprio_dim={w.shape[0]}"
+                f"expected visual_dim+proprio_dim+action_dim={w.shape[0]}"
             )
         # Weighting is equivalent to a diagonal Mahalanobis metric with fixed per-block scales.
         # We apply it to both bank and queries so `torch.cdist` still computes standard L2.

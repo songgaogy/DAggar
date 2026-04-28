@@ -41,6 +41,7 @@ DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
 VISUAL_WEIGHT="${VISUAL_WEIGHT:-1.0}"
 PROPRIO_WEIGHT="${PROPRIO_WEIGHT:-2.0}"
+ACTION_WEIGHT="${ACTION_WEIGHT:-1.0}"
 DELTA="${DELTA:-10.0}"
 KNN_CHUNK_SIZE="${KNN_CHUNK_SIZE:-2048}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
@@ -81,6 +82,7 @@ fi
     --encode-batch-size   "${ENCODE_BATCH_SIZE}" \
     --visual-weight       "${VISUAL_WEIGHT}" \
     --proprio-weight      "${PROPRIO_WEIGHT}" \
+    --action-weight       "${ACTION_WEIGHT}" \
     --delta               "${DELTA}" \
     --knn-chunk-size      "${KNN_CHUNK_SIZE}" \
     --calib-fraction      "${CALIB_FRACTION}" \

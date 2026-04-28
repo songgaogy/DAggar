@@ -44,6 +44,7 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
+    parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=10.0,
                         help="Percentile-based false-alarm budget (0-100).")
     parser.add_argument("--knn-chunk-size", type=int, default=2048)
@@ -96,6 +97,7 @@ def main() -> None:
         camera_to_view=_parse_camera_to_view(args.camera_to_view),
         visual_weight=float(args.visual_weight),
         proprio_weight=float(args.proprio_weight),
+        action_weight=float(args.action_weight),
         delta=float(args.delta),
         knn_chunk_size=int(args.knn_chunk_size),
         calib_fraction=float(args.calib_fraction),
