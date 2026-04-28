@@ -13,7 +13,7 @@ from typing import Optional
 
 import numpy as np
 
-from data.utils.benchmark import BenchmarkTrajectory, DiscriminatorOutput
+from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
 from .float_core import FLOATComputer, IdentityEncoder, Trajectory
 from .float_dino_encoder import DEFAULT_IMAGE_SIZE, DinoV2ImageEncoder
@@ -62,7 +62,7 @@ class FloatBenchmarkDiscriminator:
         self._expert_keys_per_task: dict[str, list[tuple[str, str]]] = {}
         self._calibration_stats: dict[str, dict] = {}
 
-        # Embedding cache keyed by (file_path, demo_path).
+        # Embedding cache keyed by source path and group/cache identity.
         self._embedding_cache: dict[tuple[str, str], np.ndarray] = {}
 
     # ------------------------------------------------------------------ #
@@ -70,7 +70,11 @@ class FloatBenchmarkDiscriminator:
     # ------------------------------------------------------------------ #
 
     def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str]:
-        return (str(trajectory.file_path), str(trajectory.demo_path))
+        group_key = getattr(trajectory, "demo_path", None)
+        if group_key is None:
+            group_key = getattr(trajectory, "episode_path", "")
+        cache_key = getattr(trajectory, "cache_npz_path", "")
+        return (str(getattr(trajectory, "file_path", "")), str(cache_key or group_key))
 
     def _encode_trajectory(self, trajectory: BenchmarkTrajectory) -> np.ndarray:
         key = self._trajectory_key(trajectory)

@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import glob
+import hashlib
 import json
 import os
 from typing import Optional
 
 import h5py
+import numpy as np
 
 from .trajectory import RobosuiteBenchmarkTrajectory
 
 
 FAIL_OUT_HDF5_NAMES = ("out.hdf5", "out_2.hdf5")
 SUCCESS_MANIFEST_NAME = "video_manifest.jsonl"
+DEFAULT_CACHE_CAMERA_NAMES = ("agentview", "birdview", "frontview")
 
 
 def _task_filter_to_benchmark_dir_names(tasks: Optional[list[str]]) -> Optional[set[str]]:
@@ -45,6 +49,71 @@ def _probe_source_demo(
         obs = g["observations"]
         cams = tuple(sorted(obs.keys()))
     return num_frames, cams
+
+
+def _action_fingerprint(actions: np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(actions, dtype=np.float32))
+    h = hashlib.sha1()
+    h.update(str(tuple(arr.shape)).encode("utf-8"))
+    h.update(arr.tobytes())
+    return h.hexdigest()
+
+
+def _infer_data_type(file_path: str) -> Optional[str]:
+    path = str(file_path)
+    if "/expert/" in path:
+        return "expert"
+    if "/success_rollout/" in path:
+        return "success"
+    if "/fail_rollout/" in path:
+        return "fail"
+    return None
+
+
+def _metadata_scalar(data: np.lib.npyio.NpzFile, key: str, default: str = "") -> str:
+    if key not in data:
+        return default
+    value = data[key]
+    if value.shape == ():
+        return str(value.item())
+    return str(value.tolist())
+
+
+def _build_metadata_type_lookup(metadata_cache_root: str) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    if not metadata_cache_root or not os.path.isdir(metadata_cache_root):
+        return out
+
+    for dir_name in sorted(os.listdir(metadata_cache_root)):
+        task_dir = os.path.join(metadata_cache_root, dir_name)
+        if not os.path.isdir(task_dir):
+            continue
+        benchmark_task = _rollout_subdir_to_benchmark_task_key(dir_name)
+        for npz_path in sorted(glob.glob(os.path.join(task_dir, "*.npz"))):
+            try:
+                with np.load(npz_path, allow_pickle=True) as data:
+                    if "actions" not in data or "file_path" not in data:
+                        continue
+                    data_type = _infer_data_type(_metadata_scalar(data, "file_path"))
+                    if data_type is None:
+                        continue
+                    fp = _action_fingerprint(data["actions"])
+                    out.setdefault(str(dir_name), {})[fp] = data_type
+                    out.setdefault(str(benchmark_task), {})[fp] = data_type
+            except Exception:
+                continue
+    return out
+
+
+def _cache_camera_names(
+    num_views: int,
+    cache_camera_names: Optional[tuple[str, ...]],
+) -> tuple[str, ...]:
+    names = tuple(cache_camera_names or DEFAULT_CACHE_CAMERA_NAMES)
+    if len(names) >= int(num_views):
+        return names[: int(num_views)]
+    extra = tuple(f"view_{i}" for i in range(len(names), int(num_views)))
+    return names + extra
 
 
 def _discover_fail_hdf5_paths(task_dir: str) -> list[str]:
@@ -164,6 +233,98 @@ def _discover_success(
     return out
 
 
+def _discover_cached_success(
+    success_cache_root: str,
+    metadata_cache_root: str,
+    task_dir_allow: Optional[set[str]],
+    max_success_per_task: Optional[int],
+    cache_camera_names: Optional[tuple[str, ...]],
+) -> list[RobosuiteBenchmarkTrajectory]:
+    out: list[RobosuiteBenchmarkTrajectory] = []
+    if not os.path.isdir(success_cache_root):
+        return out
+    type_lookup = _build_metadata_type_lookup(metadata_cache_root)
+    if not type_lookup:
+        print(
+            f"[benchmark] no metadata type lookup built from {metadata_cache_root}; "
+            "cannot discover cached success trajectories"
+        )
+        return out
+
+    for dir_name in sorted(os.listdir(success_cache_root)):
+        task_dir = os.path.join(success_cache_root, dir_name)
+        if not os.path.isdir(task_dir):
+            continue
+        benchmark_task = _rollout_subdir_to_benchmark_task_key(dir_name)
+        if task_dir_allow is not None and benchmark_task not in task_dir_allow:
+            continue
+
+        remaining = None if max_success_per_task is None else int(max_success_per_task)
+        skipped_unknown = 0
+        skipped_non_success = 0
+        for cache_path in sorted(glob.glob(os.path.join(task_dir, "*.npz"))):
+            if remaining is not None and remaining <= 0:
+                break
+            try:
+                with np.load(cache_path, allow_pickle=False) as data:
+                    images = data["images_chw"]
+                    proprio = data["proprio"]
+                    actions = data["actions"]
+                    fp = _action_fingerprint(actions)
+                    data_type = (
+                        type_lookup.get(str(dir_name), {}).get(fp)
+                        or type_lookup.get(str(benchmark_task), {}).get(fp)
+                    )
+                    if data_type is None:
+                        skipped_unknown += 1
+                        continue
+                    if data_type != "success":
+                        skipped_non_success += 1
+                        continue
+                    num_frames = int(
+                        min(
+                            int(images.shape[0]),
+                            int(proprio.shape[0]),
+                            int(actions.shape[0]),
+                        )
+                    )
+                    cams = _cache_camera_names(int(images.shape[1]), cache_camera_names)
+            except Exception as exc:
+                print(f"[benchmark] skip cached success {cache_path}: {exc}")
+                continue
+            if num_frames <= 0:
+                continue
+            out.append(
+                RobosuiteBenchmarkTrajectory(
+                    task_name=benchmark_task,
+                    num_frames=num_frames,
+                    is_failure=False,
+                    video_id=os.path.splitext(os.path.basename(cache_path))[0],
+                    file_path=cache_path,
+                    demo_path="",
+                    available_cameras=cams,
+                    failure_segments=[],
+                    source_hdf5_path="",
+                    source_demo_key="",
+                    cache_npz_path=cache_path,
+                )
+            )
+            if remaining is not None:
+                remaining -= 1
+
+        if skipped_unknown > 0:
+            print(
+                f"[benchmark] cached success discovery task={dir_name}: "
+                f"skipped_unknown_type={skipped_unknown}"
+            )
+        if skipped_non_success > 0:
+            print(
+                f"[benchmark] cached success discovery task={dir_name}: "
+                f"skipped_non_success={skipped_non_success}"
+            )
+    return out
+
+
 def _hdf5_has_root(path: str, root_name: str) -> bool:
     with h5py.File(path, "r") as f:
         return root_name in f
@@ -175,9 +336,21 @@ def discover_trajectories(
     tasks: Optional[list[str]] = None,
     max_fail_per_task: Optional[int] = None,
     max_success_per_task: Optional[int] = None,
+    success_cache_root: Optional[str] = None,
+    metadata_cache_root: Optional[str] = None,
+    cache_camera_names: Optional[tuple[str, ...]] = None,
 ) -> list[RobosuiteBenchmarkTrajectory]:
     """Enumerate available robosuite benchmark trajectories without loading frames."""
     task_dir_allow = _task_filter_to_benchmark_dir_names(tasks)
     failed = _discover_fail_labeled(fail_labeled_root, task_dir_allow, max_fail_per_task)
-    success = _discover_success(success_root, task_dir_allow, max_success_per_task)
+    if success_cache_root:
+        success = _discover_cached_success(
+            success_cache_root=str(success_cache_root),
+            metadata_cache_root=str(metadata_cache_root or ""),
+            task_dir_allow=task_dir_allow,
+            max_success_per_task=max_success_per_task,
+            cache_camera_names=cache_camera_names,
+        )
+    else:
+        success = _discover_success(success_root, task_dir_allow, max_success_per_task)
     return failed + success

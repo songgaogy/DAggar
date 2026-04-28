@@ -225,6 +225,12 @@ class LPBV2Encoder:
                     kwargs["cache_root"] = to_absolute_path(str(getattr(env, "cache_root")))
                 if hasattr(env, "tasks") and getattr(env, "tasks") is not None:
                     kwargs["tasks"] = list(getattr(env, "tasks"))
+                if hasattr(env, "train_sources") and getattr(env, "train_sources") is not None:
+                    kwargs["train_sources"] = list(getattr(env, "train_sources"))
+                if hasattr(env, "camera_to_view") and getattr(env, "camera_to_view") is not None:
+                    kwargs["camera_to_view"] = OmegaConf.to_container(
+                        getattr(env, "camera_to_view"), resolve=True
+                    )
                 if hasattr(env, "max_cached_episodes") and getattr(env, "max_cached_episodes") is not None:
                     kwargs["max_cached_episodes"] = int(getattr(env, "max_cached_episodes"))
                 if hasattr(env, "load_all_into_ram"):
@@ -237,6 +243,10 @@ class LPBV2Encoder:
                     kwargs["num_success"] = int(getattr(env, "num_success"))
                 if hasattr(env, "num_fail"):
                     kwargs["num_fail"] = int(getattr(env, "num_fail"))
+                if getattr(self.cfg, "proprio_indices", None):
+                    kwargs["proprio_indices"] = list(getattr(self.cfg, "proprio_indices"))
+                if getattr(self.cfg, "max_trajectories", None):
+                    kwargs["max_trajectories"] = int(getattr(self.cfg, "max_trajectories"))
 
                 ds = DatasetCls(**kwargs)
                 rebuilt = ds.get_normalizer()

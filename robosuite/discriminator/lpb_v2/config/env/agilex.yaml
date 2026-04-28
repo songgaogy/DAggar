@@ -1,0 +1,39 @@
+name: agilex
+dataset_class: robosuite.discriminator.lpb_v2.data.AgilexCacheDynamicsModelDataset
+
+# Raw array cache built by benchmark/real_world/scripts/build_cache.sh.
+cache_root: data/.agilex_train_cache
+tasks: ['candy_in_plate', 'duck_in_bowl', 'Micky_in_box', 'sausage_in_pot']
+
+# Train dynamics on nominal trajectories by default.
+train_sources: ['success']
+
+# Limit in-process episode cache to avoid OOM (per DataLoader worker).
+# Set to 0 to disable caching entirely.
+max_cached_episodes: 2
+load_all_into_ram: false
+
+# Legacy path aliases used when saving hydra.yaml for downstream tooling.
+train_data_path: ${env.cache_root}
+val_data_path: ${env.cache_root}
+
+# Agilex real-world camera/view defaults.
+view_names: ['cam_high']
+camera_to_view: null
+
+# Right-arm Agilex defaults: qpos[:, 7:14], action[:, 7:14].
+action_dim: 7
+proprio_dim: 7
+
+# Must match IMAGE_SIZE used by benchmark/real_world/scripts/build_cache.sh.
+original_img_size: 224
+cropped_img_size: 224
+
+# Embedding dims.
+action_emb_dim: 7
+proprio_emb_dim: 32
+
+# Kept for old CLI/config compatibility. lpb_v2 requires this to stay null.
+policy_ckpt_path: null
+
+shape_obs: null

@@ -72,6 +72,9 @@ fi
 if [[ "${QUIET_FIT:-0}" == "1" ]]; then
     EXTRA_ARGS+=(--quiet-fit)
 fi
+if [[ "${VERBOSE:-0}" != "1" ]]; then
+    EXTRA_ARGS+=(--quiet)
+fi
 if [[ -n "${PROPRIO_INDICES:-}" ]]; then
     EXTRA_ARGS+=(--proprio-indices ${PROPRIO_INDICES})
 fi

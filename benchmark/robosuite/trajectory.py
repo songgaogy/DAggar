@@ -10,6 +10,7 @@ Reads an HDF5 group laid out as:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -25,6 +26,19 @@ class RobosuiteBenchmarkTrajectory(BenchmarkTrajectory):
 
     file_path: str = ""
     demo_path: str = ""
+    cache_npz_path: str = ""
+
+    def _has_cache(self) -> bool:
+        return bool(self.cache_npz_path)
+
+    def _cache_array(self, name: str) -> np.ndarray:
+        if os.path.isdir(self.cache_npz_path):
+            return np.load(
+                os.path.join(self.cache_npz_path, f"{name}.npy"),
+                mmap_mode="r",
+            )
+        with np.load(self.cache_npz_path, allow_pickle=False) as data:
+            return data[name][:]
 
     def load_images(
         self,
@@ -38,6 +52,13 @@ class RobosuiteBenchmarkTrajectory(BenchmarkTrajectory):
                 f"available: {self.available_cameras}"
             )
         out: dict[str, np.ndarray] = {}
+        if self._has_cache():
+            images_chw = self._cache_array("images_chw")
+            cam_to_idx = {name: i for i, name in enumerate(self.available_cameras)}
+            for cam in req:
+                out[cam] = np.transpose(images_chw[:, cam_to_idx[cam]], (0, 2, 3, 1))
+            return out
+
         with h5py.File(self.file_path, "r") as f:
             obs = f[self.demo_path]["observations"]
             for cam in req:
@@ -45,21 +66,29 @@ class RobosuiteBenchmarkTrajectory(BenchmarkTrajectory):
         return out
 
     def load_states(self) -> np.ndarray:
+        if self._has_cache():
+            return np.asarray(self._cache_array("proprio"), dtype=np.float32)
         with h5py.File(self.file_path, "r") as f:
             return f[self.demo_path]["states"][:]
 
     def load_actions(self) -> np.ndarray:
+        if self._has_cache():
+            return np.asarray(self._cache_array("actions"), dtype=np.float32)
         with h5py.File(self.file_path, "r") as f:
             return f[self.demo_path]["actions"][:]
 
     def load_failure_mask(self) -> Optional[np.ndarray]:
         if not self.is_failure:
             return None
+        if self._has_cache():
+            return np.asarray(self._cache_array("failure_mask"), dtype=np.uint8)
         with h5py.File(self.file_path, "r") as f:
             return f[self.demo_path]["annotations"]["failure_frame_mask"][:]
 
     def load_failure_segment_index(self) -> Optional[np.ndarray]:
         if not self.is_failure:
             return None
+        if self._has_cache():
+            return np.asarray(self._cache_array("failure_segment_index"), dtype=np.int32)
         with h5py.File(self.file_path, "r") as f:
             return f[self.demo_path]["annotations"]["failure_segment_index"][:]

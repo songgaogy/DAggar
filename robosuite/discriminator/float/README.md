@@ -1,6 +1,6 @@
 # FLOAT in `robosuite/discriminator`
 
-FLOAT (Failure Detection with Optimal Transport) implemented against the shared failure-detector benchmark in `data/utils/benchmark/`, with a pretrained **DINOv2 ViT-B/14** image encoder for per-frame embeddings.
+FLOAT (Failure Detection with Optimal Transport) implemented against the shared failure-detector benchmark, with a pretrained **DINOv2 ViT-B/14** image encoder for per-frame embeddings. The adapter supports both the legacy robosuite/data-utils benchmark path and the real-world Agilex benchmark path.
 
 ## Algorithm
 
@@ -20,9 +20,10 @@ Per-task threshold is calibrated **leave-one-out** over the success bank so a su
 
 - `float_core.py` — OT primitives (`sinkhorn`, `cosine_cost_matrix`) and `FLOATComputer`, `ThresholdCalibrator`, `OnlineDetector`. Matches the paper spec directly.
 - `float_dino_encoder.py` — `DinoV2ImageEncoder`, a thin wrapper around `torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')` returning `(T, 768)` CLS embeddings from `(T, H, W, 3) uint8` images.
-- `float_benchmark.py` — `FloatBenchmarkDiscriminator`, implements the `data.utils.benchmark.discriminator.Discriminator` protocol. Calibrates one FLOAT computer + threshold per task and caches embeddings per trajectory.
+- `float_benchmark.py` — `FloatBenchmarkDiscriminator`, implements the shared benchmark discriminator protocol. Calibrates one FLOAT computer + threshold per task and caches embeddings per trajectory.
 - `float_data.py` / `float_eval.py` — retained for `robosuite.discriminator.lpb.*` which still depends on them. Not used by the FLOAT benchmark path.
-- `scripts/run_float_benchmark.sh` — bash entry point that runs the adapter and writes a `benchmark.json` conforming to `data/utils/benchmark/protocol.md`.
+- `scripts/run_float_benchmark.sh` — robosuite/data-utils bash entry point.
+- `scripts/run_float_real_world_benchmark.sh` — real-world Agilex bash entry point.
 
 ## Quick start
 
@@ -62,9 +63,42 @@ MAX_FAIL_PER_TASK=2 MAX_SUCCESS_PER_TASK=3 \
 bash robosuite/discriminator/float/scripts/run_float_benchmark.sh
 ```
 
+## Real-world Agilex benchmark
+
+```bash
+conda activate daggar
+bash robosuite/discriminator/float/scripts/run_float_real_world_benchmark.sh
+```
+
+Output lands at `checkpoints/float/real_world_eval/run_<timestamp>/benchmark.json`.
+
+The real-world entry uses `benchmark.real_world.FailureBenchmark`, defaults to `CAMERA_NAME=cam_high`, and uses the optional cache at `data/.agilex_train_cache` when it exists. FLOAT provides its own calibrated binary predictions, so the entry evaluates with `EvalConfig(step_binarize_strategy="provided")`.
+
+Common real-world overrides:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TASKS` | `candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot` | Agilex task filter |
+| `FAIL_ROOT` | `data/agilex/failure_annotations/out_by_task` | Annotated failure HDF5 root |
+| `SUCCESS_ROOT` | `data/agilex` | Success rollout root |
+| `CACHE_ROOT` | `data/.agilex_train_cache` | Optional cached array root |
+| `USE_CACHE` | `1` | Use cache if `CACHE_ROOT` exists |
+| `CAMERA_NAME` | `cam_high` | Camera stream used for embeddings |
+| `PROPRIO_FIELD` | `qpos` | Agilex proprio observation field |
+| `PROPRIO_START`, `PROPRIO_STOP` | `7`, `14` | Proprio slice |
+| `ACTION_START`, `ACTION_STOP` | `7`, `13` | Action slice |
+
+Example Agilex smoke run:
+
+```bash
+TASKS="candy_in_plate" \
+MAX_FAIL_PER_TASK=1 MAX_SUCCESS_PER_TASK=2 \
+bash robosuite/discriminator/float/scripts/run_float_real_world_benchmark.sh
+```
+
 ## Output schema
 
-`benchmark.json` follows `data/utils/benchmark/protocol.md`:
+`benchmark.json` follows the shared benchmark result schema:
 
 - `discriminator_name == "float_dinov2"`
 - `trajectory_level`, `trajectory_level_per_task`

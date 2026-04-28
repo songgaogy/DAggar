@@ -76,6 +76,10 @@ def _instantiate_dataset(cfg: DictConfig, train: bool):
         kwargs["cache_root"] = hydra.utils.to_absolute_path(str(cfg.env.cache_root))
     if "tasks" in cfg.env and cfg.env.tasks is not None:
         kwargs["tasks"] = list(cfg.env.tasks)
+    if "train_sources" in cfg.env and cfg.env.train_sources is not None:
+        kwargs["train_sources"] = list(cfg.env.train_sources)
+    if "camera_to_view" in cfg.env and cfg.env.camera_to_view is not None:
+        kwargs["camera_to_view"] = OmegaConf.to_container(cfg.env.camera_to_view, resolve=True)
     if "max_cached_episodes" in cfg.env and cfg.env.max_cached_episodes is not None:
         kwargs["max_cached_episodes"] = int(cfg.env.max_cached_episodes)
     if "load_all_into_ram" in cfg.env:

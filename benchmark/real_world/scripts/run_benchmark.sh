@@ -30,9 +30,9 @@ mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-# Right-arm slicing (action 6-D, proprio 7-D).
+# Right-arm slicing (action 7-D, proprio 7-D).
 ACTION_START="${ACTION_START:-7}"
-ACTION_STOP="${ACTION_STOP:-13}"
+ACTION_STOP="${ACTION_STOP:-14}"
 PROPRIO_FIELD="${PROPRIO_FIELD:-qpos}"
 PROPRIO_START="${PROPRIO_START:-7}"
 PROPRIO_STOP="${PROPRIO_STOP:-14}"

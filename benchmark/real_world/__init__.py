@@ -4,7 +4,7 @@ The Agilex annotated-failure dataset uses a different HDF5 layout from
 robosuite (per-episode groups under ``episodes/<split>/<episode_N>``,
 images under ``observations/images/<cam>``, action shape ``(T, 14)``).
 Default behaviour for the LPB-style pipeline:
-    * ``load_actions``  -> ``action[:, 7:13]``  (right arm 6-DoF, no gripper).
+    * ``load_actions``  -> ``action[:, 7:14]``  (right arm 7-D).
     * ``load_states``   -> ``observations/qpos[:, 7:14]`` (right arm 7-D).
     * default camera    -> ``cam_high``.
 """
@@ -18,7 +18,7 @@ from benchmark.core import (
 from benchmark.core.benchmark import FailureBenchmark as _CoreFailureBenchmark
 
 from .trajectory import AgilexBenchmarkTrajectory
-from .loader import discover_agilex_trajectories
+from .loader import discover_agilex_trajectories, discover_cached_agilex_trajectories
 
 
 # Public alias for parity with benchmark.robosuite.
@@ -37,7 +37,7 @@ class FailureBenchmark(_CoreFailureBenchmark):
         proprio_field / proprio_slice: how to extract per-step state from
             the observation group (default: ``qpos[:, 7:14]``).
         action_slice: which slots of the (T, 14) action vector to expose
-            via ``load_actions`` (default: right arm ``[:, 7:13]``).
+            via ``load_actions`` (default: right arm ``[:, 7:14]``).
     """
 
     def __init__(
@@ -48,31 +48,42 @@ class FailureBenchmark(_CoreFailureBenchmark):
         max_fail_per_task=None,
         max_success_per_task=None,
         *,
+        cache_root: str | None = None,
         proprio_field: str = "qpos",
         proprio_slice: slice = slice(7, 14),
-        action_slice: slice = slice(7, 13),
+        action_slice: slice = slice(7, 14),
     ) -> None:
         self.fail_labeled_root = str(fail_labeled_root)
         self.success_root = str(success_root)
+        self.cache_root = None if cache_root is None else str(cache_root)
         self.tasks = list(tasks) if tasks is not None else None
         self.max_fail_per_task = max_fail_per_task
         self.max_success_per_task = max_success_per_task
 
-        trajs = discover_agilex_trajectories(
-            fail_labeled_root=self.fail_labeled_root,
-            success_root=self.success_root,
-            tasks=self.tasks,
-            max_fail_per_task=self.max_fail_per_task,
-            max_success_per_task=self.max_success_per_task,
-            proprio_field=proprio_field,
-            proprio_slice=proprio_slice,
-            action_slice=action_slice,
-        )
+        if self.cache_root:
+            trajs = discover_cached_agilex_trajectories(
+                cache_root=self.cache_root,
+                tasks=self.tasks,
+                max_fail_per_task=self.max_fail_per_task,
+                max_success_per_task=self.max_success_per_task,
+            )
+        else:
+            trajs = discover_agilex_trajectories(
+                fail_labeled_root=self.fail_labeled_root,
+                success_root=self.success_root,
+                tasks=self.tasks,
+                max_fail_per_task=self.max_fail_per_task,
+                max_success_per_task=self.max_success_per_task,
+                proprio_field=proprio_field,
+                proprio_slice=proprio_slice,
+                action_slice=action_slice,
+            )
         super().__init__(
             trajectories=trajs,
             source_metadata={
                 "fail_labeled_root": self.fail_labeled_root,
                 "success_root": self.success_root,
+                "cache_root": self.cache_root,
                 "tasks": self.tasks,
                 "max_fail_per_task": self.max_fail_per_task,
                 "max_success_per_task": self.max_success_per_task,
@@ -92,4 +103,5 @@ __all__ = [
     "Discriminator",
     "DiscriminatorOutput",
     "discover_agilex_trajectories",
+    "discover_cached_agilex_trajectories",
 ]

@@ -65,7 +65,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--proprio-start", type=int, default=7)
     parser.add_argument("--proprio-stop", type=int, default=14)
     parser.add_argument("--action-start", type=int, default=7)
-    parser.add_argument("--action-stop", type=int, default=13)
+    parser.add_argument("--action-stop", type=int, default=14)
     parser.add_argument("--camera-name", type=str, default="cam_high",
                         help="Recorded in metadata only; the dummy discriminator "
                              "does not actually load images.")
