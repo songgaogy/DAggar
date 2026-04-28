@@ -32,7 +32,7 @@ LOAD_ALL_INTO_RAM=1
 NUM_EXPERT="${NUM_EXPERT:-0}"      # per task; -1 -> no cap, 0 -> use none
 NUM_SUCCESS="${NUM_SUCCESS:-100}"  # per task; -1 -> no cap, 0 -> use none
 NUM_FAIL="${NUM_FAIL:-0}"          # per task; -1 -> no cap, 0 -> use none
-TRAIN_ENCODER="${TRAIN_ENCODER:-1}"  # 1 -> finetune ResNet encoder
+TRAIN_ENCODER="${TRAIN_ENCODER:-0}"  # 1 -> finetune ResNet encoder
 
 # Build Hydra list literal for tasks: [a,b,c]
 TASKS_OVERRIDE="["
