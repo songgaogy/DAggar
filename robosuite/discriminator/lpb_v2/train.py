@@ -163,6 +163,7 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
         view_names=list(cfg.view_names),
         use_layernorm=cfg.use_layernorm,
         language_encoder=None,
+        action_loss_weight=OmegaConf.select(cfg, "action_loss_weight", default=0.0),
     )
     return model.to(device), encoder, proprio_encoder, action_encoder, predictor
 
@@ -196,6 +197,26 @@ def _save_ckpt(out_dir: Path, epoch: int, parts: dict) -> Path:
     fp = ckpt_dir / f"model_{epoch}.pth"
     torch.save(payload, fp)
     return fp
+
+
+def _accumulate_loss_components(sums: dict, components: dict) -> None:
+    for key, value in components.items():
+        if key == "loss":
+            continue
+        if torch.is_tensor(value):
+            sums[key] = sums.get(key, 0.0) + float(value.detach().item())
+        elif isinstance(value, (int, float)):
+            sums[key] = sums.get(key, 0.0) + float(value)
+
+
+def _format_loss_components(prefix: str, sums: dict, n_batches: int) -> str:
+    keys = ("z_loss", "z_visual_loss", "z_proprio_loss", "z_action_loss")
+    parts = []
+    denom = max(1, int(n_batches))
+    for key in keys:
+        if key in sums:
+            parts.append(f"{prefix}_{key}={sums[key] / denom:.5f}")
+    return " ".join(parts)
 
 
 @hydra.main(config_path="config", config_name="train", version_base=None)
@@ -266,29 +287,38 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(int(cfg.training.epochs)):
         model.train()
         epoch_loss = 0.0
+        train_comp_sums = {}
         n_batches = 0
         for batch in train_loader:
             obs, act = _normalize_batch(batch, normalizer, view_names, device)
             optimizer.zero_grad(set_to_none=True)
-            loss, _comp = model(obs, act)
+            loss, comp = model(obs, act)
             loss.backward()
             optimizer.step()
             epoch_loss += float(loss.item())
+            _accumulate_loss_components(train_comp_sums, comp)
             n_batches += 1
         avg_train = epoch_loss / max(1, n_batches)
 
         # Validation pass.
         model.eval()
         val_loss = 0.0
+        val_comp_sums = {}
         n_val = 0
         with torch.no_grad():
             for batch in valid_loader:
                 obs, act = _normalize_batch(batch, normalizer, view_names, device)
-                loss, _ = model(obs, act)
+                loss, comp = model(obs, act)
                 val_loss += float(loss.item())
+                _accumulate_loss_components(val_comp_sums, comp)
                 n_val += 1
         avg_val = val_loss / max(1, n_val)
-        log.info(f"epoch={epoch} train_loss={avg_train:.5f} val_loss={avg_val:.5f}")
+        train_comp_msg = _format_loss_components("train", train_comp_sums, n_batches)
+        val_comp_msg = _format_loss_components("val", val_comp_sums, n_val)
+        log.info(
+            f"epoch={epoch} train_loss={avg_train:.5f} val_loss={avg_val:.5f} "
+            f"{train_comp_msg} {val_comp_msg}"
+        )
 
         if (epoch + 1) % save_every == 0 or epoch == int(cfg.training.epochs) - 1:
             parts = {

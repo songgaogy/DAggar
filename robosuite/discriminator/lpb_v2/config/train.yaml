@@ -45,6 +45,7 @@ abs_action: False
 normalize_action: True
 num_hist: 1
 num_pred: 1
+action_loss_weight: 1.0
 has_predictor: True
 use_pretrained_encoder: True
 encoder_ckpt_path: null

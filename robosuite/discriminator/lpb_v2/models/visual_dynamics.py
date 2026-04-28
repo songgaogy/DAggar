@@ -20,6 +20,7 @@ class VisualDynamicsModel(nn.Module):
         view_names=['view1'],
         use_layernorm=True,
         language_encoder=None,
+        action_loss_weight=0.0,
     ):
         super().__init__()
         self.num_hist = num_hist
@@ -34,12 +35,14 @@ class VisualDynamicsModel(nn.Module):
         self.language_encoder = language_encoder
         self.proprio_dim = proprio_dim
         self.action_dim = action_dim
+        self.action_loss_weight = float(action_loss_weight)
         self.emb_dim = self.encoder.emb_dim * len(self.view_names) + (self.action_dim + self.proprio_dim)
 
         print(f"proprio encoder: {proprio_encoder}")
         print(f"action encoder: {action_encoder}")
         print(f"proprio_dim: {proprio_dim}, after repeat: {self.proprio_dim}")
         print(f"action_dim: {action_dim}, after repeat: {self.action_dim}")
+        print(f"action_loss_weight: {self.action_loss_weight}")
         print(f"emb_dim: {self.emb_dim}")
         print(f'image_size: {image_size}')
 
@@ -190,13 +193,17 @@ class VisualDynamicsModel(nn.Module):
             z_pred[:, :, :, :-self.action_dim], 
             z_tgt[:, :, :, :-self.action_dim].detach()
         )
-        # We do not regress the action embedding. Actions are treated as known inputs
-        # (conditioners), so the loss is computed on (visual + proprio [+ language]) only.
+        z_action_loss = self.emb_criterion(
+            z_pred[:, :, :, -self.action_dim:],
+            z_tgt[:, :, :, -self.action_dim:].detach()
+        )
 
-        loss = loss + z_loss
+        loss = loss + z_loss + self.action_loss_weight * z_action_loss
         loss_components["z_loss"] = z_loss
         loss_components["z_visual_loss"] = z_visual_loss
         loss_components["z_proprio_loss"] = z_proprio_loss
+        loss_components["z_action_loss"] = z_action_loss
+        loss_components["action_loss_weight"] = self.action_loss_weight
 
         loss_components["loss"] = loss
         return loss, loss_components
