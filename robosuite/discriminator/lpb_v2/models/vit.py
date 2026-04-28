@@ -97,6 +97,23 @@ class Transformer(nn.Module):
             x = ff(x) + x
 
         return self.norm(x)
+
+    def extract_layer(self, x, layer_index):
+        depth = len(self.layers)
+        idx = int(layer_index)
+        if idx == 0:
+            return x
+        if idx == -1:
+            return self.forward(x)
+        if idx < 0 or idx > depth:
+            raise ValueError(f"layer_index must be -1 or in [0, {depth}], got {layer_index}")
+
+        for i, (attn, ff) in enumerate(self.layers, start=1):
+            x = attn(x) + x
+            x = ff(x) + x
+            if i == idx:
+                return x
+        raise RuntimeError(f"Failed to extract transformer layer {layer_index}")
     
 class ViTPredictor(nn.Module):
     def __init__(self, *, num_patches, num_frames, dim, depth, heads, mlp_dim, pool='cls', dim_head=64, dropout=0., emb_dropout=0., visual_dim=1024, proprio_dim=16, action_dim=240):
@@ -129,3 +146,9 @@ class ViTPredictor(nn.Module):
         action_pred = self.action_head(x)
         x = torch.cat([visual_pred, proprio_pred, action_pred], dim=-1)
         return x
+
+    def extract_transformer_features(self, x, layer_index=-1):
+        b, n, _ = x.shape
+        x = x + self.pos_embedding[:, :n]
+        x = self.dropout(x)
+        return self.transformer.extract_layer(x, layer_index)

@@ -37,7 +37,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # You can override this via env var:
 #   MODEL_CKPT=/abs/path/checkpoints/lpb_v2/dynamics/<run_name-timestamp>/checkpoints/model_49.pth bash ...
-MODEL_CKPT="checkpoints/lpb_v2/dynamics/train-20260427_014122/checkpoints/model_9.pth"
+MODEL_CKPT="checkpoints/lpb_v2/dynamics/train-20260427_014122/checkpoints/model_49.pth"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[lpb_v2] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
@@ -49,6 +49,8 @@ VISUAL_WEIGHT="${VISUAL_WEIGHT:-1.0}"
 PROPRIO_WEIGHT="${PROPRIO_WEIGHT:-1.0}"     # required
 DELTA="${DELTA:-10.0}"
 KNN_CHUNK_SIZE="${KNN_CHUNK_SIZE:-2048}"
+KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-encoder}"     # transformer / encoder
+KNN_TRANSFORMER_LAYER="${KNN_TRANSFORMER_LAYER:--1}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
 
@@ -88,6 +90,8 @@ fi
     --proprio-weight      "${PROPRIO_WEIGHT}" \
     --delta               "${DELTA}" \
     --knn-chunk-size      "${KNN_CHUNK_SIZE}" \
+    --knn-feature-source  "${KNN_FEATURE_SOURCE}" \
+    --knn-transformer-layer "${KNN_TRANSFORMER_LAYER}" \
     --calib-fraction      "${CALIB_FRACTION}" \
     --seed                "${SEED}" \
     "${EXTRA_ARGS[@]}" \
