@@ -215,9 +215,8 @@ def main(cfg: DictConfig) -> None:
     # Hydra @main does not write hydra.yaml by default; do it ourselves so the
     # discriminator can pick the saved config up.
     train_ds = _instantiate_dataset(cfg, train=True)
-    valid_ds = _instantiate_dataset(cfg, train=False)
     log.info(
-        f"train: {len(train_ds)} samples, valid: {len(valid_ds)} samples; "
+        f"train: {len(train_ds)} samples; "
         f"proprio_dim={train_ds.proprio_dim}, action_dim={train_ds.action_dim}"
     )
 
@@ -250,10 +249,6 @@ def main(cfg: DictConfig) -> None:
         train_ds, batch_size=cfg.training.batch_size, shuffle=True,
         num_workers=cfg.training.num_workers, drop_last=True,
     )
-    valid_loader = DataLoader(
-        valid_ds, batch_size=cfg.training.batch_size, shuffle=False,
-        num_workers=cfg.training.num_workers, drop_last=False,
-    )
 
     model, encoder, proprio_encoder, action_encoder, predictor = _build_model(cfg, train_ds, device)
 
@@ -283,19 +278,7 @@ def main(cfg: DictConfig) -> None:
             epoch_loss += float(loss.item())
             n_batches += 1
         avg_train = epoch_loss / max(1, n_batches)
-
-        # Validation pass.
-        model.eval()
-        val_loss = 0.0
-        n_val = 0
-        with torch.no_grad():
-            for batch in valid_loader:
-                obs, act = _normalize_batch(batch, normalizer, view_names, device)
-                loss, _ = model(obs, act)
-                val_loss += float(loss.item())
-                n_val += 1
-        avg_val = val_loss / max(1, n_val)
-        log.info(f"epoch={epoch} train_loss={avg_train:.5f} val_loss={avg_val:.5f}")
+        log.info(f"epoch={epoch} train_loss={avg_train:.5f}")
 
         if (epoch + 1) % save_every == 0 or epoch == int(cfg.training.epochs) - 1:
             parts = {
