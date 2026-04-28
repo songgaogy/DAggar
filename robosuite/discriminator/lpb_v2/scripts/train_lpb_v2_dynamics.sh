@@ -32,7 +32,8 @@ LOAD_ALL_INTO_RAM=1
 NUM_EXPERT="${NUM_EXPERT:-0}"      # per task; -1 -> no cap, 0 -> use none
 NUM_SUCCESS="${NUM_SUCCESS:-100}"  # per task; -1 -> no cap, 0 -> use none
 NUM_FAIL="${NUM_FAIL:-0}"          # per task; -1 -> no cap, 0 -> use none
-TRAIN_ENCODER="${TRAIN_ENCODER:-0}"  # 1 -> finetune ResNet encoder
+TRAIN_ENCODER="${TRAIN_ENCODER:-0}"  # 1 -> finetune ResNet encoder (from ImageNet init)
+ENCODER_LR="${ENCODER_LR:-}"         # override training.encoder_lr; default = yaml (1.5e-4 = 30% of predictor_lr)
 
 # Build Hydra list literal for tasks: [a,b,c]
 TASKS_OVERRIDE="["
@@ -50,7 +51,7 @@ ACTION_EMB_DIM="${ACTION_EMB_DIM:-7}"
 PROPRIO_EMB_DIM="${PROPRIO_EMB_DIM:-32}"
 
 EPOCHS="${EPOCHS:-50}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
 FRAMESKIP="${FRAMESKIP:-1}"
 RUN_NAME="${RUN_NAME:-train}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
@@ -90,9 +91,12 @@ EXTRA_OVERRIDES+=("hydra.run.dir=${RUN_DIR}")
 EXTRA_OVERRIDES+=('hydra.job.chdir=true')
 
 if [[ "${TRAIN_ENCODER}" == "1" ]]; then
-    # Enable finetuning of the ResNet encoder.
+    # Finetune the ResNet encoder from ImageNet init (do NOT disable use_pretrained_encoder).
     EXTRA_OVERRIDES+=("model.train_encoder=true")
-    EXTRA_OVERRIDES+=("use_pretrained_encoder=false")
+    EXTRA_OVERRIDES+=("use_pretrained_encoder=true")
+fi
+if [[ -n "${ENCODER_LR}" ]]; then
+    EXTRA_OVERRIDES+=("training.encoder_lr=${ENCODER_LR}")
 fi
 
 EXTRA_OVERRIDES+=("$@")

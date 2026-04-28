@@ -106,15 +106,22 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
             "lpb_v2 does not support diffusion-policy policy_ckpt_path. "
             "Set env.policy_ckpt_path=null or use lpb_original."
         )
+    # `ResNetEncoder` already loads torchvision ImageNet ResNet18 weights internally.
+    # `cfg.use_pretrained_encoder` is kept for forward-compat but no longer freezes the
+    # encoder; freezing is decided solely by `cfg.model.train_encoder`.
     encoder = ResNetEncoder(policy_ckpt_path=None, view_names=list(cfg.view_names))
     if cfg.encoder_ckpt_path:
         ckpt = torch.load(cfg.encoder_ckpt_path, map_location=device)
         if "encoder" in ckpt:
             encoder.load_state_dict(ckpt["encoder"])
             log.info(f"Loaded encoder weights from {cfg.encoder_ckpt_path}")
-    if cfg.use_pretrained_encoder:
-        for p in encoder.parameters():
-            p.requires_grad = False
+    train_encoder_flag = bool(getattr(cfg.model, "train_encoder", False))
+    for p in encoder.parameters():
+        p.requires_grad = train_encoder_flag
+    log.info(
+        f"encoder: train={train_encoder_flag}, use_pretrained_encoder={bool(cfg.use_pretrained_encoder)}, "
+        f"encoder_ckpt_path={cfg.encoder_ckpt_path}"
+    )
 
     proprio_encoder = instantiate_local(
         cfg.proprio_encoder,
@@ -229,9 +236,8 @@ def main(cfg: DictConfig) -> None:
     # Hydra @main does not write hydra.yaml by default; do it ourselves so the
     # discriminator can pick the saved config up.
     train_ds = _instantiate_dataset(cfg, train=True)
-    valid_ds = _instantiate_dataset(cfg, train=False)
     log.info(
-        f"train: {len(train_ds)} samples, valid: {len(valid_ds)} samples; "
+        f"train: {len(train_ds)} samples; "
         f"proprio_dim={train_ds.proprio_dim}, action_dim={train_ds.action_dim}"
     )
 
@@ -264,10 +270,6 @@ def main(cfg: DictConfig) -> None:
         train_ds, batch_size=cfg.training.batch_size, shuffle=True,
         num_workers=cfg.training.num_workers, drop_last=True,
     )
-    valid_loader = DataLoader(
-        valid_ds, batch_size=cfg.training.batch_size, shuffle=False,
-        num_workers=cfg.training.num_workers, drop_last=False,
-    )
 
     model, encoder, proprio_encoder, action_encoder, predictor = _build_model(cfg, train_ds, device)
 
@@ -299,25 +301,9 @@ def main(cfg: DictConfig) -> None:
             _accumulate_loss_components(train_comp_sums, comp)
             n_batches += 1
         avg_train = epoch_loss / max(1, n_batches)
-
-        # Validation pass.
-        model.eval()
-        val_loss = 0.0
-        val_comp_sums = {}
-        n_val = 0
-        with torch.no_grad():
-            for batch in valid_loader:
-                obs, act = _normalize_batch(batch, normalizer, view_names, device)
-                loss, comp = model(obs, act)
-                val_loss += float(loss.item())
-                _accumulate_loss_components(val_comp_sums, comp)
-                n_val += 1
-        avg_val = val_loss / max(1, n_val)
         train_comp_msg = _format_loss_components("train", train_comp_sums, n_batches)
-        val_comp_msg = _format_loss_components("val", val_comp_sums, n_val)
         log.info(
-            f"epoch={epoch} train_loss={avg_train:.5f} val_loss={avg_val:.5f} "
-            f"{train_comp_msg} {val_comp_msg}"
+            f"epoch={epoch} train_loss={avg_train:.5f} {train_comp_msg}"
         )
 
         if (epoch + 1) % save_every == 0 or epoch == int(cfg.training.epochs) - 1:
