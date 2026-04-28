@@ -126,11 +126,12 @@ class AWRAgent:
         task_name = str(cfg_get(cfg, "task_name", "task"))
         task_prompt_map = cfg_get(awr_cfg, "task_prompt_map", None)
         resolved_device = str(device or cfg_get(awr_cfg, "device", cfg_get(cfg, "device", "cpu")))
+        action_horizon = int(cfg_get(awr_cfg, "action_horizon", 8))
         awr_config = AWRConfig(
             action_dim=action_dim,
             proprio_dim=proprio_dim,
-            action_horizon=int(cfg_get(awr_cfg, "action_horizon", 8)),
-            execute_horizon=int(cfg_get(awr_cfg, "execute_horizon", 1)),
+            action_horizon=action_horizon,
+            execute_horizon=int(cfg_get(awr_cfg, "execute_horizon", action_horizon)),
             image_size=int(cfg_get(awr_cfg, "image_size", 128)),
             actor_learning_rate=float(cfg_get(awr_cfg, "actor_learning_rate", 1e-4)),
             critic_learning_rate=float(cfg_get(awr_cfg, "critic_learning_rate", 3e-4)),
@@ -341,6 +342,7 @@ class AWRAgent:
         batch_size = int(batch_size or self.trainer_config.batch_size)
         return self.demo_buffer.sample_step_batch(
             batch_size=batch_size,
+            discount=float(self.awr_config.discount),
             proprio_mean=self.core.prop_mean,
             proprio_std=self.core.prop_std,
             device=self.core.device,
@@ -352,6 +354,7 @@ class AWRAgent:
         batch_size = int(batch_size or self.trainer_config.batch_size)
         return self.online_buffer.sample_step_batch(
             batch_size=batch_size,
+            discount=float(self.awr_config.discount),
             proprio_mean=self.core.prop_mean,
             proprio_std=self.core.prop_std,
             device=self.core.device,
@@ -379,7 +382,7 @@ class AWRAgent:
         if batch_size < 2:
             raise ValueError("AWR mixed critic batch size must be at least 2 for strict 1:1 sampling.")
         if self.demo_buffer.num_ready_steps() <= 0 or self.online_buffer.num_ready_steps() <= 0:
-            raise RuntimeError("AWR mixed critic updates require both demo and online ready steps.")
+            raise RuntimeError("AWR mixed critic updates require both demo and online ready sequences.")
         demo_batch_size = batch_size // 2
         online_batch_size = batch_size - demo_batch_size
         return AWRStepBatch.concat(

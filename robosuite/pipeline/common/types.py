@@ -125,6 +125,9 @@ class TrainerConfig:
     steps_per_update: int = 50
     random_steps: int = 0
     online_fraction: float = 0.5
+    # Hard cap on async learner queue. When the learner falls behind, extra
+    # update requests are dropped instead of accumulating an unbounded backlog.
+    max_pending_updates: int = 4
 
     def split_batch_sizes(self) -> tuple[int, int]:
         online_batch = int(round(self.batch_size * self.online_fraction))

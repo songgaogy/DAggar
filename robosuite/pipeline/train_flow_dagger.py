@@ -460,7 +460,8 @@ def load_hdf5_demos_into_flow_transitions(
                     camera_aliases=camera_aliases,
                 )
                 is_last_step = step_idx == len(actions) - 1
-                reward = 1.0 if successful and is_last_step else 0.0
+
+                reward = 0.0 if successful and is_last_step else -1.0
                 transitions.append(
                     Transition(
                         obs=obs_images,
@@ -470,8 +471,12 @@ def load_hdf5_demos_into_flow_transitions(
                         done=bool(is_last_step),
                         grasp_penalty=None,
                         is_intervention=bool(intervention_labels[step_idx]),
-                        info={"success": bool(successful), "demo_name": str(demo_name)},
-                        reward_source="offline_success" if successful else "offline_zero",
+                        info={
+                            "success": bool(successful),
+                            "demo_name": str(demo_name),
+                            "reward_convention": "sparse_success_-1_0",
+                        },
+                        reward_source="offline_sparse_success",
                         demo_source="offline_demo",
                     )
                 )

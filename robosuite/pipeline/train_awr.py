@@ -257,12 +257,16 @@ def build_qv_cache_metadata(
     task_data_name: str,
     policy_camera_names: list[str],
     init_checkpoint: Path | None,
+    awr_config: Any | None = None,
 ) -> dict[str, Any]:
     model_cfg = OmegaConf.to_container(cfg.algorithm.awr.model, resolve=True)
+    action_horizon = int(getattr(awr_config, "action_horizon", cfg.algorithm.awr.action_horizon))
+    execute_horizon = int(getattr(awr_config, "execute_horizon", cfg.algorithm.awr.execute_horizon))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "task_name": str(task_name),
         "task_data_name": str(task_data_name),
+        "reward_convention": "sparse_success_-1_0",
         "init_checkpoint": None if init_checkpoint is None else str(init_checkpoint.resolve()),
         "value_warmup_steps": int(cfg.algorithm.trainer.value_warmup_steps),
         "success_num_trajectories": _optional_int(cfg.data.success_num_trajectories),
@@ -273,6 +277,9 @@ def build_qv_cache_metadata(
         "control_freq": int(cfg.env.control_freq),
         "encoder_type": str(cfg.algorithm.encoder.encoder_type),
         "awr_signature": {
+            "q_chunk_critic": True,
+            "action_horizon": action_horizon,
+            "execute_horizon": execute_horizon,
             "image_size": int(cfg.algorithm.awr.image_size),
             "critic_learning_rate": float(cfg.algorithm.awr.critic_learning_rate),
             "weight_decay": float(cfg.algorithm.awr.weight_decay),
@@ -564,6 +571,12 @@ def main(cfg: DictConfig) -> None:
     discriminator_reward_enabled = bool(getattr(cfg.runtime, "discriminator_reward_enabled", True)) and bool(
         getattr(cfg.discriminator, "enabled", False)
     )
+    if discriminator_reward_enabled:
+        raise NotImplementedError(
+            "Discriminator shaping is currently not supported in this training script. "
+            "Please disable it by setting `discriminator.enabled=false` and/or "
+            "`runtime.discriminator_reward_enabled=false` (and keep `algorithm.awr.reward_from_discriminator=false`)."
+        )
     algorithm_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
     if isinstance(algorithm_cfg, dict):
         algorithm_cfg["camera_names"] = list(policy_camera_names)
@@ -577,8 +590,12 @@ def main(cfg: DictConfig) -> None:
             if "task_prompt_map" in init_payload:
                 awr_cfg["task_prompt_map"] = init_payload["task_prompt_map"]
             if init_payload.get("act_mean") is not None:
-                awr_cfg["action_horizon"] = int(np.asarray(init_payload["act_mean"]).shape[0])
-                awr_cfg.setdefault("execute_horizon", 1)
+                configured_horizon = int(getattr(cfg.algorithm.awr, "action_horizon", 8))
+                inferred_horizon = int(np.asarray(init_payload["act_mean"]).shape[0])
+                configured_execute = int(awr_cfg.get("execute_horizon", configured_horizon))
+                awr_cfg["action_horizon"] = inferred_horizon
+                if configured_execute == configured_horizon:
+                    awr_cfg["execute_horizon"] = inferred_horizon
         model_cfg = awr_cfg.setdefault("model", {})
         image_encoder_cfg = model_cfg.get("image_encoder", None)
         if isinstance(image_encoder_cfg, dict) and image_encoder_cfg.get("pretrained_path"):
@@ -877,6 +894,7 @@ def main(cfg: DictConfig) -> None:
         task_data_name=task_data_name,
         policy_camera_names=policy_camera_names,
         init_checkpoint=init_checkpoint,
+        awr_config=agent.awr_config,
     )
     qv_cache_loaded = False
     if loaded_checkpoint is None and qv_cache_enabled:
@@ -1380,6 +1398,8 @@ def main(cfg: DictConfig) -> None:
                 raw_next_obs, _, done, info = step_output
             if isinstance(info, dict) and grasp_penalty is not None:
                 info.setdefault("grasp_penalty", float(grasp_penalty))
+
+            # NOTE: here we use -1/0 reward
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
             next_obs = convert_env_camera_observation(
                 raw_next_obs,

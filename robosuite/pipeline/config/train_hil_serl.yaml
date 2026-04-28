@@ -45,14 +45,17 @@ algorithm:
     critic_lr: 3.0e-4
     alpha_lr: 3.0e-4
     init_temperature: 1.0e-2
-    target_entropy: null
+    # Lower target entropy => far less stochastic policy at execution.
+    # Continuous action dim is 6 here; -1.0 keeps a small amount of exploration.
+    target_entropy: -1.0
     auto_entropy_tuning: true
     backup_entropy: false
     reward_bias: 0.0
     critic_ensemble_size: 2
     critic_subsample_size: null
     log_std_min: -5.0
-    log_std_max: 2.0
+    # Cap pre-tanh std at e^0=1 so sampled actions stop bouncing to ±max.
+    log_std_max: 0.0
     device: "cuda:0"
     inference_device: "auto"
 
@@ -70,6 +73,8 @@ algorithm:
     steps_per_update: 50
     random_steps: 0
     online_fraction: 0.5
+    # Hard cap on async learner queue to keep the published policy fresh.
+    max_pending_updates: 4
 
 intervention:
   enabled: true

@@ -37,6 +37,7 @@ class HILSERLTrainer:
         self._async_pending_batch_size: int | None = None
         self._async_busy = False
         self._async_error: BaseException | None = None
+        self._async_dropped_updates = 0
 
     def bootstrap_demo_buffer(self, transitions: list[Transition], demo_source: str = "offline_demo") -> None:
         for transition in transitions:
@@ -149,9 +150,21 @@ class HILSERLTrainer:
         if current_step >= int(self.config.warmup_steps) and self.agent.ready_for_update(batch_size=batch_size):
             self.start_async_worker()
             with self._async_condition:
-                self._async_pending_updates += int(self.config.updates_per_step)
-                self._async_pending_batch_size = None if batch_size is None else int(batch_size)
-                self._async_condition.notify_all()
+                requested = int(self.config.updates_per_step)
+                # Cap the queue so a slow learner cannot accumulate an unbounded
+                # backlog. Excess requests are dropped (the env already moved on,
+                # so stale updates have low value).
+                max_pending = max(1, int(self.config.max_pending_updates))
+                in_flight = int(self._async_pending_updates) + (1 if self._async_busy else 0)
+                room = max(0, max_pending - in_flight)
+                accepted = min(requested, room)
+                dropped = requested - accepted
+                if accepted > 0:
+                    self._async_pending_updates += accepted
+                    self._async_pending_batch_size = None if batch_size is None else int(batch_size)
+                    self._async_condition.notify_all()
+                if dropped > 0:
+                    self._async_dropped_updates += dropped
         return self.drain_async_metrics()
 
     def start_async_worker(self) -> None:
@@ -166,6 +179,10 @@ class HILSERLTrainer:
     def pending_async_updates(self) -> int:
         with self._async_condition:
             return int(self._async_pending_updates) + int(self._async_busy)
+
+    def dropped_async_updates(self) -> int:
+        with self._async_condition:
+            return int(self._async_dropped_updates)
 
     def drain_async_metrics(self) -> list[dict[str, float]]:
         self._raise_async_error()

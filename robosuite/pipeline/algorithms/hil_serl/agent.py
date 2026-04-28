@@ -137,6 +137,7 @@ class HILSERLAgent:
             steps_per_update=int(cfg_get(trainer_cfg, "steps_per_update", 50)),
             random_steps=int(cfg_get(trainer_cfg, "random_steps", 0)),
             online_fraction=float(cfg_get(trainer_cfg, "online_fraction", 0.5)),
+            max_pending_updates=int(cfg_get(trainer_cfg, "max_pending_updates", 4)),
         )
         return cls(
             observation_example=observation_example,

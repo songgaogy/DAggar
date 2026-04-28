@@ -62,10 +62,10 @@ This script follows the official HIL-SERL design more closely:
 This integration does not use a reward classifier.
 
 Reward is:
-- `1.0` when robosuite reports success through `env._check_success()` or `info["success"]`
-- `0.0` otherwise
+- `0.0` when robosuite reports success through `env._check_success()` or `info["success"]`
+- `-1.0` otherwise
 
-This keeps the interface aligned with your request and still preserves the sparse-success HIL-SERL setup.
+This keeps the interface aligned with the robosuite sparse-success setup while using the requested `-1 / 0` reward scale.
 
 ## Demo requirement
 

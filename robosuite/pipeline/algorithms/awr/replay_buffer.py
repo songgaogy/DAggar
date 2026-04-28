@@ -290,7 +290,7 @@ class AWRReplayBuffer:
 
     def num_ready_steps(self) -> int:
         with self._lock:
-            return len(self._get_ready_step_indices_locked())
+            return len(self._get_valid_start_indices_locked())
 
     def sample_actor_batch(
         self,
@@ -310,6 +310,10 @@ class AWRReplayBuffer:
                 raise ValueError(f"{self.name} does not contain any valid actor sequences.")
             indices = np.random.randint(0, len(valid_starts), size=int(batch_size))
             start_indices = [valid_starts[int(index)] for index in indices]
+            # Actor training is sequence-based: we sample a contiguous window of length `action_horizon`.
+            #
+            # IMPORTANT: the buffer stores *single-step* transitions (one action per env step).
+            # The "action chunk" is constructed here by stacking consecutive `Transition.action`.
             transitions = [self._storage[start : start + self.action_horizon] for start in start_indices]
 
         image_batch = []
@@ -331,8 +335,12 @@ class AWRReplayBuffer:
                 image = _center_crop_resize(image, self.image_size)
                 images.append(np.transpose(image, (2, 0, 1)))
             image_batch.append(np.stack(images, axis=0))
+            # Condition the policy on the *start* state only (s_t). The model predicts an action
+            # sequence a_{t:t+H-1} from this state, so we do not stack a state sequence here.
             proprio_batch.append(np.asarray(obs["state"], dtype=np.float32))
+            # Build the action chunk a_{t:t+H-1} by stacking single-step actions from the window.
             action_batch.append(np.stack([np.asarray(item.action, dtype=np.float32) for item in sequence], axis=0))
+            # Convenience: the first action a_t is often useful for logging or sanity checks.
             first_action_batch.append(np.asarray(first.action, dtype=np.float32))
             info = first.info or {}
             awr_fields = get_transition_awr_fields(first)
@@ -344,6 +352,7 @@ class AWRReplayBuffer:
         image_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
         proprio_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(proprio_batch, axis=0)))
         action_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(action_batch, axis=0)))
+        raw_action_tensor = action_tensor.clone()
         first_action_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(first_action_batch, axis=0)))
         is_online_tensor = torch.full(
             (int(batch_size), 1),
@@ -373,6 +382,7 @@ class AWRReplayBuffer:
             image_obs=image_tensor,
             proprio=proprio_tensor,
             action_sequences=action_tensor,
+            raw_action_sequences=raw_action_tensor.float(),
             first_actions=first_action_tensor.float(),
             is_online=is_online_tensor,
             metadata={
@@ -392,6 +402,7 @@ class AWRReplayBuffer:
         self,
         batch_size: int,
         *,
+        discount: float,
         proprio_mean: np.ndarray | None = None,
         proprio_std: np.ndarray | None = None,
         device: torch.device | str | None = None,
@@ -399,12 +410,12 @@ class AWRReplayBuffer:
         buffer_role: str = "online",
     ) -> AWRStepBatch:
         with self._lock:
-            ready_indices = self._get_ready_step_indices_locked()
-            if len(ready_indices) == 0:
-                raise ValueError(f"{self.name} does not contain any ready critic steps.")
-            sampled = np.random.randint(0, len(ready_indices), size=int(batch_size))
-            transition_indices = [ready_indices[int(index)] for index in sampled]
-            transitions = [self._storage[index] for index in transition_indices]
+            valid_starts = self._get_valid_start_indices_locked()
+            if len(valid_starts) == 0:
+                raise ValueError(f"{self.name} does not contain any ready critic sequences.")
+            sampled = np.random.randint(0, len(valid_starts), size=int(batch_size))
+            start_indices = [valid_starts[int(index)] for index in sampled]
+            transitions = [self._storage[start : start + self.action_horizon] for start in start_indices]
 
         image_batch = []
         proprio_batch = []
@@ -417,9 +428,12 @@ class AWRReplayBuffer:
         episode_steps = []
         episode_namespaces = []
         reward_sources = []
-        for transition in transitions:
-            obs = transition.obs
-            next_obs = transition.next_obs
+        discount_powers = np.asarray([float(discount) ** offset for offset in range(self.action_horizon)], dtype=np.float32)
+        for sequence in transitions:
+            first = sequence[0]
+            last = sequence[-1]
+            obs = first.obs
+            next_obs = last.next_obs
             obs_images = []
             next_obs_images = []
             for camera_name in self.camera_names:
@@ -433,15 +447,18 @@ class AWRReplayBuffer:
             next_image_batch.append(np.stack(next_obs_images, axis=0))
             proprio_batch.append(np.asarray(obs["state"], dtype=np.float32))
             next_proprio_batch.append(np.asarray(next_obs["state"], dtype=np.float32))
-            action_batch.append(np.asarray(transition.action, dtype=np.float32))
-            awr_fields = get_transition_awr_fields(transition)
-            reward_batch.append(float(awr_fields["reward"]))
-            done_batch.append(float(bool(transition.done)))
-            info = transition.info or {}
+            action_batch.append(np.stack([np.asarray(item.action, dtype=np.float32) for item in sequence], axis=0))
+            sequence_rewards = np.asarray(
+                [float(get_transition_awr_fields(item)["reward"]) for item in sequence],
+                dtype=np.float32,
+            )
+            reward_batch.append(float(np.sum(sequence_rewards * discount_powers)))
+            done_batch.append(float(any(bool(item.done) for item in sequence)))
+            info = first.info or {}
             episode_ids.append(int(info.get("episode_index", -1)))
             episode_steps.append(int(info.get("episode_step", -1)))
             episode_namespaces.append(str(info.get("episode_namespace", "unknown")))
-            reward_sources.append(str(awr_fields["source"]))
+            reward_sources.append(str(get_transition_awr_fields(first)["source"]))
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
         next_image_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(next_image_batch, axis=0)))
@@ -478,12 +495,14 @@ class AWRReplayBuffer:
             dones=done_tensor,
             is_online=is_online_tensor,
             metadata={
-                "transition_indices": transition_indices,
+                "start_indices": start_indices,
                 "episode_ids": episode_ids,
                 "episode_steps": episode_steps,
                 "episode_namespaces": episode_namespaces,
                 "reward_sources": reward_sources,
                 "buffer_role": [str(buffer_role)] * int(batch_size),
+                "discount": float(discount),
+                "action_horizon": int(self.action_horizon),
             },
         )
         if device is not None:
@@ -759,6 +778,8 @@ class AWRReplayBuffer:
         first_namespace = first_info.get("episode_namespace", None)
         for offset in range(self.action_horizon):
             transition = self._storage[start + offset]
+            if not transition_is_ready_for_awr(transition):
+                return False
             info = transition.info or {}
             if offset < self.action_horizon - 1 and bool(transition.done):
                 return False

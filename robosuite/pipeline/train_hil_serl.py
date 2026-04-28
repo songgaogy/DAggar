@@ -573,15 +573,21 @@ def main(cfg: DictConfig) -> None:
             grasp_penalty = compute_grasp_penalty(env, env_action)
             step_output = env.step(env_action)
             if len(step_output) == 5:
-                raw_next_obs, _, done, truncated, info = step_output
-                done = bool(done or truncated)
+                raw_next_obs, _, terminated, truncated, info = step_output
+                terminated = bool(terminated)
+                truncated = bool(truncated)
             else:
-                raw_next_obs, _, done, info = step_output
+                raw_next_obs, _, terminated, info = step_output
+                terminated = bool(terminated)
+                truncated = False
             if isinstance(info, dict) and grasp_penalty is not None:
                 info.setdefault("grasp_penalty", float(grasp_penalty))
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
             next_obs = adapter.transform(raw_next_obs)
-            done = bool(done or success)
+            # Buffer `done` only marks true terminal states (success or env termination).
+            # Truncation must NOT zero out the bootstrap target_q.
+            done = bool(terminated or success)
+            episode_finished = bool(done or truncated)
             recorded_transition = trainer.record_transition(
                 obs=obs,
                 action=env_action,
@@ -642,7 +648,7 @@ def main(cfg: DictConfig) -> None:
                         )
                     )
 
-            if done:
+            if episode_finished:
                 episode_payload = {
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),

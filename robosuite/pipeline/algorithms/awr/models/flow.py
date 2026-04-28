@@ -82,6 +82,7 @@ class AWRFlowModel(nn.Module):
         model_cfg: dict[str, Any],
         proprio_dim: int,
         action_dim: int,
+        action_horizon: int,
         camera_names: list[str],
         critic_hidden_dims: tuple[int, ...],
     ) -> None:
@@ -106,8 +107,10 @@ class AWRFlowModel(nn.Module):
         self.flow_head = base_model.flow_head
 
         hidden_dims = tuple(int(dim) for dim in critic_hidden_dims)
-        self.q1 = _build_mlp(self.context_dim + self.action_dim, hidden_dims, 1)
-        self.q2 = _build_mlp(self.context_dim + self.action_dim, hidden_dims, 1)
+        self.action_horizon = int(action_horizon)
+        self.full_action_dim = self.action_dim * self.action_horizon
+        self.q1 = _build_mlp(self.context_dim + self.full_action_dim, hidden_dims, 1)
+        self.q2 = _build_mlp(self.context_dim + self.full_action_dim, hidden_dims, 1)
         self.value = _build_mlp(self.context_dim, hidden_dims, 1)
 
     def encode_multimodal_context(
@@ -174,6 +177,8 @@ class AWRFlowModel(nn.Module):
         context_features: torch.Tensor,
         actions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if actions.ndim > 2:
+            actions = actions.reshape(actions.shape[0], -1)
         critic_input = torch.cat([context_features, actions], dim=-1)
         return self.q1(critic_input), self.q2(critic_input)
 
@@ -201,6 +206,7 @@ class AWRFlowPolicy:
             model_cfg=self.model_cfg,
             proprio_dim=int(config.proprio_dim),
             action_dim=int(config.action_dim),
+            action_horizon=int(config.action_horizon),
             camera_names=self.camera_names,
             critic_hidden_dims=critic_hidden_dims,
         ).to(self.device)
@@ -282,12 +288,23 @@ class AWRFlowPolicy:
         self.reset_action_chunk()
 
     def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
+        """
+        Select a single env-step action while internally using an action "chunk".
+
+        The policy generates an action sequence of length `action_horizon`, but at runtime we only
+        execute one action per env step. We therefore cache the sampled sequence (`current_chunk`)
+        and consume it step-by-step.
+
+        `execute_horizon` controls how many consecutive env steps we take from the cached chunk
+        before forcing a re-sample. This lets us trade off compute (fewer model calls) vs. reactivity.
+        """
         execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
         if (
             self.current_chunk is None
             or self.step_in_chunk >= execute_horizon
             or self.step_in_chunk >= len(self.current_chunk)
         ):
+            # (Re)sample a fresh action sequence conditioned on the current observation.
             images = []
             for camera_name in self.camera_names:
                 image = np.asarray(obs[camera_name], dtype=np.uint8)
@@ -317,6 +334,7 @@ class AWRFlowPolicy:
             self.current_chunk = action_seq
             self.step_in_chunk = 0
 
+        # Execute the next action from the cached chunk.
         action = np.asarray(self.current_chunk[self.step_in_chunk], dtype=np.float32)
         self.step_in_chunk += 1
         return action
@@ -338,7 +356,8 @@ class AWRFlowPolicy:
                 language=language,
             )["task_scene_cond"].detach()
             target_v = self.model.forward_value_from_context(next_context)
-            target_q = batch.rewards + float(self.config.discount) * (1.0 - batch.dones) * target_v
+            bootstrap_discount = float(self.config.discount) ** int(self.config.action_horizon)
+            target_q = batch.rewards + bootstrap_discount * (1.0 - batch.dones) * target_v
 
         self.q_optimizer.zero_grad(set_to_none=True)
         q1_pred, q2_pred = self.model.forward_qs_from_context(current_context, batch.actions)
@@ -393,7 +412,7 @@ class AWRFlowPolicy:
             )
             with torch.no_grad():
                 context_features = context["task_scene_cond"].detach()
-                q1, q2 = self.model.forward_qs_from_context(context_features, batch.first_actions)
+                q1, q2 = self.model.forward_qs_from_context(context_features, batch.raw_action_sequences)
                 v = self.model.forward_value_from_context(context_features)
                 advantage = torch.minimum(q1, q2) - v
                 weights = torch.exp(advantage / max(float(self.config.beta), 1e-6))

@@ -27,7 +27,7 @@ algorithm:
 
   awr:
     action_horizon: 8
-    execute_horizon: 1
+    execute_horizon: ${algorithm.awr.action_horizon}    # follow the original Q-chunk implementation
     image_size: ${env.img_height}
     actor_learning_rate: 1.0e-4
     critic_learning_rate: 3.0e-4
@@ -39,7 +39,7 @@ algorithm:
     max_adv_weight: 100.0
     discount: 0.99
     expectile: 0.7
-    critic_hidden_dims: [512, 512]
+    critic_hidden_dims: [512, 256, 32]
     margin_scale_floor: 0.1
     success_reward_scale: 1.0
     discriminator_reward_scale: 1.0
@@ -133,7 +133,7 @@ algorithm:
     value_warmup_steps: 20000
 
 discriminator:
-  enabled: true
+  enabled: false
   type: "lpb_new"
   seed: ${seed}
 

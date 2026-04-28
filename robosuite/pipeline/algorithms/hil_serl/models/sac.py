@@ -372,9 +372,15 @@ class HILSERLSAC:
     def _update_actor(self, batch: ReplayBatch) -> dict[str, float]:
         features = self.encoder(batch.obs, stop_gradient=True)
         actions, log_probs = self.actor.sample(features, deterministic=False)
-        with torch.no_grad():
+        critic_requires_grad = [param.requires_grad for param in self.critic.parameters()]
+        for param in self.critic.parameters():
+            param.requires_grad_(False)
+        try:
             q_values = self.critic(features, actions).mean(dim=0)
-        actor_loss = (self.alpha.detach() * log_probs - q_values).mean()
+            actor_loss = (self.alpha.detach() * log_probs - q_values).mean()
+        finally:
+            for param, requires_grad in zip(self.critic.parameters(), critic_requires_grad):
+                param.requires_grad_(requires_grad)
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()

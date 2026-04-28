@@ -23,7 +23,7 @@ class AWRConfig:
     action_dim: int
     proprio_dim: int
     action_horizon: int = 8
-    execute_horizon: int = 1
+    execute_horizon: int = 8
     image_size: int = 128
     actor_learning_rate: float = 1e-4
     critic_learning_rate: float = 3e-4
@@ -64,6 +64,7 @@ class AWRActorBatch:
     image_obs: torch.Tensor
     proprio: torch.Tensor
     action_sequences: torch.Tensor
+    raw_action_sequences: torch.Tensor
     first_actions: torch.Tensor
     is_online: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -73,6 +74,7 @@ class AWRActorBatch:
             image_obs=self.image_obs.to(device),
             proprio=self.proprio.to(device),
             action_sequences=self.action_sequences.to(device),
+            raw_action_sequences=self.raw_action_sequences.to(device),
             first_actions=self.first_actions.to(device),
             is_online=self.is_online.to(device),
             metadata=self.metadata,
@@ -102,6 +104,7 @@ class AWRActorBatch:
             image_obs=torch.cat([batch.image_obs for batch in valid_batches], dim=0),
             proprio=torch.cat([batch.proprio for batch in valid_batches], dim=0),
             action_sequences=torch.cat([batch.action_sequences for batch in valid_batches], dim=0),
+            raw_action_sequences=torch.cat([batch.raw_action_sequences for batch in valid_batches], dim=0),
             first_actions=torch.cat([batch.first_actions for batch in valid_batches], dim=0),
             is_online=torch.cat([batch.is_online for batch in valid_batches], dim=0),
             metadata=metadata,

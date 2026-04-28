@@ -544,12 +544,13 @@ def build_device(env, device_cfg):
 
 
 def sparse_success_reward(env, info: Optional[dict[str, Any]] = None) -> tuple[float, bool]:
+    """NOTE: here we use -1/0 reward"""
     success = False
     if isinstance(info, dict) and "success" in info:
         success = bool(info["success"])
     if not success and hasattr(env, "_check_success"):
         success = bool(env._check_success())
-    return (1.0 if success else 0.0), success
+    return (0.0 if success else -1.0), success
 
 
 def load_hdf5_demos_into_transitions(

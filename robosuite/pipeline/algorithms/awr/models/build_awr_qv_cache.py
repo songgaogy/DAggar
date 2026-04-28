@@ -114,8 +114,12 @@ def main(cfg: DictConfig) -> None:
             if "task_prompt_map" in init_payload:
                 awr_cfg["task_prompt_map"] = init_payload["task_prompt_map"]
             if init_payload.get("act_mean") is not None:
-                awr_cfg["action_horizon"] = int(np.asarray(init_payload["act_mean"]).shape[0])
-                awr_cfg.setdefault("execute_horizon", 1)
+                configured_horizon = int(getattr(cfg.algorithm.awr, "action_horizon", 8))
+                inferred_horizon = int(np.asarray(init_payload["act_mean"]).shape[0])
+                configured_execute = int(awr_cfg.get("execute_horizon", configured_horizon))
+                awr_cfg["action_horizon"] = inferred_horizon
+                if configured_execute == configured_horizon:
+                    awr_cfg["execute_horizon"] = inferred_horizon
         model_cfg = awr_cfg.setdefault("model", {})
         image_encoder_cfg = model_cfg.get("image_encoder", None)
         if isinstance(image_encoder_cfg, dict) and image_encoder_cfg.get("pretrained_path"):
@@ -142,6 +146,7 @@ def main(cfg: DictConfig) -> None:
             task_data_name=task_data_name,
             policy_camera_names=policy_camera_names,
             init_checkpoint=init_checkpoint,
+            awr_config=agent.awr_config,
         )
         qv_cache_cfg = getattr(cfg.runtime, "qv_cache", None)
         qv_cache_enabled = bool(getattr(qv_cache_cfg, "enabled", True)) if qv_cache_cfg is not None else True
