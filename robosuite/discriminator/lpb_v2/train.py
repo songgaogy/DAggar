@@ -106,15 +106,22 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
             "lpb_v2 does not support diffusion-policy policy_ckpt_path. "
             "Set env.policy_ckpt_path=null or use lpb_original."
         )
+    # `ResNetEncoder` already loads torchvision ImageNet ResNet18 weights internally.
+    # `cfg.use_pretrained_encoder` is kept for forward-compat but no longer freezes the
+    # encoder; freezing is decided solely by `cfg.model.train_encoder`.
     encoder = ResNetEncoder(policy_ckpt_path=None, view_names=list(cfg.view_names))
     if cfg.encoder_ckpt_path:
         ckpt = torch.load(cfg.encoder_ckpt_path, map_location=device)
         if "encoder" in ckpt:
             encoder.load_state_dict(ckpt["encoder"])
             log.info(f"Loaded encoder weights from {cfg.encoder_ckpt_path}")
-    if cfg.use_pretrained_encoder:
-        for p in encoder.parameters():
-            p.requires_grad = False
+    train_encoder_flag = bool(getattr(cfg.model, "train_encoder", False))
+    for p in encoder.parameters():
+        p.requires_grad = train_encoder_flag
+    log.info(
+        f"encoder: train={train_encoder_flag}, use_pretrained_encoder={bool(cfg.use_pretrained_encoder)}, "
+        f"encoder_ckpt_path={cfg.encoder_ckpt_path}"
+    )
 
     proprio_encoder = instantiate_local(
         cfg.proprio_encoder,
