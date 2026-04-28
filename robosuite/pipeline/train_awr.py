@@ -26,6 +26,7 @@ from robosuite.pipeline.envs import (
     build_robosuite_env,
     choose_viewer_backend,
     compute_grasp_penalty,
+    load_hdf5_demos_into_transitions,
     make_checkpoint_directory,
     snapshot_env_state,
     sparse_success_reward,
@@ -390,7 +391,10 @@ def _build_transition_loader(
     state_extractor,
 ):
     def _loader(path, demo_names=None):
-        return load_hdf5_demos_into_flow_transitions(
+        # Keep flow-style observations (camera + proprio formatting) so they stay compatible
+        # with the AWR model + normalizers, but compute reward/done via env replay so that
+        # success can occur before the final padded step in fixed-length rollouts.
+        flow_transitions = load_hdf5_demos_into_flow_transitions(
             path,
             policy_camera_names=policy_camera_names,
             camera_aliases=camera_aliases,
@@ -402,6 +406,31 @@ def _build_transition_loader(
             demo_names=demo_names,
             state_extractor=state_extractor,
         )
+        if not flow_transitions:
+            return flow_transitions
+
+        env_transitions = load_hdf5_demos_into_transitions(
+            path,
+            camera_names=tuple(policy_camera_names),
+            img_height=int(img_height),
+            img_width=int(img_width),
+            proprio_keys=tuple(proprio_keys),
+            renderer=str(renderer),
+            control_freq=int(control_freq),
+            demo_names=None if demo_names is None else tuple(str(name) for name in demo_names),
+        )
+        if len(env_transitions) != len(flow_transitions):
+            raise RuntimeError(
+                "Offline demo env replay transitions length mismatch with flow transitions: "
+                f"{len(env_transitions)} vs {len(flow_transitions)} for {Path(path)}"
+            )
+
+        for flow_t, env_t in zip(flow_transitions, env_transitions):
+            flow_t.reward = float(env_t.reward)
+            flow_t.done = bool(env_t.done)
+            flow_t.reward_source = "env_success"
+
+        return flow_transitions
 
     return _loader
 

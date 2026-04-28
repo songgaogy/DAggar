@@ -22,6 +22,7 @@ from hydra.utils import to_absolute_path
 from robosuite.pipeline.algorithms.awr.replay_buffer import get_transition_awr_fields
 from robosuite.pipeline.common import Transition
 from robosuite.pipeline.factory import build_algorithm
+from robosuite.pipeline.envs.robosuite import load_hdf5_demos_into_transitions
 from robosuite.pipeline.train_flow_dagger import load_hdf5_demos_into_flow_transitions
 from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, parse_env_info
 
@@ -128,6 +129,10 @@ def load_demo_transitions(
     renderer: str,
     control_freq: int,
 ) -> list[Transition]:
+    # We keep the original flow loader to ensure observation / proprio formatting
+    # matches what the cached AWR model expects, but we override reward/done using
+    # env-replay sparse success signals so reward becomes 0 starting at the true
+    # success step (not only at the last step of a padded rollout).
     extractor = build_proprio_extractor(selected.hdf5_path)
     try:
         transitions = load_hdf5_demos_into_flow_transitions(
@@ -146,6 +151,31 @@ def load_demo_transitions(
         extractor.close()
     if not transitions:
         raise RuntimeError(f"Selected demo produced zero transitions: {selected.hdf5_path}::{selected.demo_key}")
+
+    # Compute env-based sparse success reward/done for the same demo and patch it in.
+    # NOTE: we only use reward/done scalars; obs/state from env replay may not match.
+    env_transitions = load_hdf5_demos_into_transitions(
+        selected.hdf5_path,
+        camera_names=tuple(camera_names),
+        img_height=int(image_size),
+        img_width=int(image_size),
+        proprio_keys=(),
+        renderer=str(renderer),
+        control_freq=int(control_freq),
+        demo_names=(str(selected.demo_key),),
+    )
+    if len(env_transitions) != len(transitions):
+        raise RuntimeError(
+            "Env replay transitions length mismatch with flow transitions: "
+            f"{len(env_transitions)} vs {len(transitions)} for {selected.hdf5_path}::{selected.demo_key}"
+        )
+    for idx, (flow_t, env_t) in enumerate(zip(transitions, env_transitions)):
+        _ = idx
+        flow_t.reward = float(env_t.reward)
+        flow_t.done = bool(env_t.done)
+        if isinstance(flow_t.info, dict):
+            flow_t.info["reward_source"] = "env_success"
+            flow_t.info["success_from_env_replay"] = True
     return transitions
 
 
