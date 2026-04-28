@@ -10,6 +10,7 @@
 set -euo pipefail
 
 export HYDRA_FULL_ERROR=1
+export CUDA_VISIBLE_DEVICES=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -31,6 +32,7 @@ LOAD_ALL_INTO_RAM=1
 NUM_EXPERT="${NUM_EXPERT:-0}"      # per task; -1 -> no cap, 0 -> use none
 NUM_SUCCESS="${NUM_SUCCESS:-100}"  # per task; -1 -> no cap, 0 -> use none
 NUM_FAIL="${NUM_FAIL:-0}"          # per task; -1 -> no cap, 0 -> use none
+TRAIN_ENCODER="${TRAIN_ENCODER:-1}"  # 1 -> finetune ResNet encoder
 
 # Build Hydra list literal for tasks: [a,b,c]
 TASKS_OVERRIDE="["
@@ -53,6 +55,7 @@ FRAMESKIP="${FRAMESKIP:-1}"
 RUN_NAME="${RUN_NAME:-train}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="./checkpoints/lpb_v2/dynamics/${RUN_NAME}-${TIMESTAMP}"
+
 
 EXTRA_OVERRIDES=()
 if [[ -n "${PROPRIO_INDICES:-}" ]]; then
@@ -85,6 +88,12 @@ fi
 EXTRA_OVERRIDES+=("run_name=${RUN_NAME}")
 EXTRA_OVERRIDES+=("hydra.run.dir=${RUN_DIR}")
 EXTRA_OVERRIDES+=('hydra.job.chdir=true')
+
+if [[ "${TRAIN_ENCODER}" == "1" ]]; then
+    # Enable finetuning of the ResNet encoder.
+    EXTRA_OVERRIDES+=("model.train_encoder=true")
+    EXTRA_OVERRIDES+=("use_pretrained_encoder=false")
+fi
 
 EXTRA_OVERRIDES+=("$@")
 
