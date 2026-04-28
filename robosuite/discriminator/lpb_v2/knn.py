@@ -117,8 +117,15 @@ class LPBV2Encoder:
         self,
         model_ckpt: str,
         device: str = "cuda",
+        feature_source: str = "encoder",
+        transformer_layer: int = -1,
     ) -> None:
         self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        feature_source = str(feature_source)
+        if feature_source not in {"encoder", "transformer"}:
+            raise ValueError(f"feature_source must be 'encoder' or 'transformer', got {feature_source!r}")
+        self.feature_source = feature_source
+        self.transformer_layer = int(transformer_layer)
 
         ckpt_path = Path(model_ckpt)
         if not ckpt_path.exists():
@@ -321,14 +328,17 @@ class LPBV2Encoder:
         self,
         images_per_view: Dict[str, torch.Tensor],
         proprio: torch.Tensor,
-        actions: torch.Tensor,
+        actions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Encode a batch of (visual, proprio, action) timesteps.
+        """Encode a batch of timesteps into the configured KNN feature space.
 
         Args:
             images_per_view[view]: (B, 3, H, W) float tensor in [0, 1]; H=W=original_img_size.
             proprio: (B, proprio_dim) float tensor (same layout as the train-time concat).
-            actions: (B, action_dim * frameskip) raw action windows.
+            actions:
+              - feature_source="encoder": required flattened action windows shaped (B, action_dim_per_step * frameskip)
+                (typically produced by `prepare_actions`).
+              - feature_source="transformer": required per-step actions shaped (B, action_dim_per_step).
         """
         B = next(iter(images_per_view.values())).shape[0]
 
@@ -346,6 +356,32 @@ class LPBV2Encoder:
 
         obs = {"visual": visual_in, "proprio": proprio_in}
         enc = self.model.encode_obs(obs)
+        if self.feature_source == "transformer":
+            if actions is None:
+                raise ValueError("actions are required when feature_source='transformer'")
+            action_in = actions.to(self.device, non_blocking=True)
+            if action_in.dim() == 2:
+                action_in = action_in.unsqueeze(1)  # (B, 1, A)
+            action_in = self.normalizer["act"].normalize(action_in)
+            act_emb = self.model.encode_act(action_in)
+            visual_emb = enc["visual"]
+            proprio_emb = enc["proprio"]
+            if visual_emb.dim() == 4:
+                num_patches = visual_emb.shape[2]
+                proprio_emb = proprio_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
+                act_emb = act_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
+            z = torch.cat([visual_emb, proprio_emb, act_emb], dim=-1)
+            if z.dim() == 4:
+                z = z.reshape(z.shape[0], z.shape[1] * z.shape[2], z.shape[3])
+            feat = self.model.predictor.extract_transformer_features(
+                z,
+                layer_index=self.transformer_layer,
+            )
+            return feat.reshape(feat.shape[0], -1)
+
+        if actions is None:
+            raise ValueError("actions are required when feature_source='encoder'")
+
         v = enc["visual"].squeeze(1) if enc["visual"].dim() == 3 else enc["visual"]
         p = enc["proprio"].squeeze(1) if enc["proprio"].dim() == 3 else enc["proprio"]
         if v.dim() > 2:

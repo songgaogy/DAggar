@@ -55,6 +55,8 @@ class LPBV2BenchmarkDiscriminator:
         action_weight: float = 1.0,
         delta: float = 10.0,
         knn_chunk_size: int = 2048,
+        feature_source: str = "encoder",
+        transformer_layer: int = -1,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
@@ -72,11 +74,18 @@ class LPBV2BenchmarkDiscriminator:
         self.action_weight = float(action_weight)
         self.delta = float(delta)
         self.knn_chunk_size = int(knn_chunk_size)
+        self.feature_source = str(feature_source)
+        self.transformer_layer = int(transformer_layer)
         self.calib_fraction = float(calib_fraction)
         self.seed = int(seed)
         self.verbose_fit = bool(verbose_fit)
 
-        self.encoder = LPBV2Encoder(model_ckpt=self.model_ckpt, device=self.device)
+        self.encoder = LPBV2Encoder(
+            model_ckpt=self.model_ckpt,
+            device=self.device,
+            feature_source=self.feature_source,
+            transformer_layer=self.transformer_layer,
+        )
 
         # If user did not provide a camera->view map, default to a 1:1 identity
         # over the encoder's view_names (assume cameras are named the same).
@@ -93,12 +102,17 @@ class LPBV2BenchmarkDiscriminator:
     # Encoding helpers                                                   #
     # ------------------------------------------------------------------ #
 
-    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str]:
+    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str, str, str]:
         group_key = getattr(trajectory, "demo_path", None)
         if group_key is None:
             group_key = getattr(trajectory, "episode_path", "")
         cache_key = getattr(trajectory, "cache_npz_path", "")
-        return (str(getattr(trajectory, "file_path", "")), str(cache_key or group_key))
+        return (
+            str(getattr(trajectory, "file_path", "")),
+            str(cache_key or group_key),
+            self.feature_source,
+            str(self.transformer_layer),
+        )
 
     def _resolve_camera(self, view: str) -> str:
         # Reverse-lookup camera name from view_name (we stored cam->view map).
@@ -121,6 +135,17 @@ class LPBV2BenchmarkDiscriminator:
             return states[:, :target_dim].astype(np.float32, copy=False)
         pad = np.zeros((states.shape[0], target_dim - d), dtype=np.float32)
         return np.concatenate([states.astype(np.float32, copy=False), pad], axis=1)
+
+    def _slice_action(self, actions: np.ndarray, target_dim: Optional[int]) -> np.ndarray:
+        if target_dim is None:
+            return actions.astype(np.float32, copy=False)
+        d = int(actions.shape[1])
+        if d == target_dim:
+            return actions.astype(np.float32, copy=False)
+        if d > target_dim:
+            return actions[:, :target_dim].astype(np.float32, copy=False)
+        pad = np.zeros((actions.shape[0], target_dim - d), dtype=np.float32)
+        return np.concatenate([actions.astype(np.float32, copy=False), pad], axis=1)
 
     @torch.no_grad()
     def _encode(self, trajectory: BenchmarkTrajectory) -> torch.Tensor:
@@ -153,7 +178,16 @@ class LPBV2BenchmarkDiscriminator:
 
         # Proprio slicing/padding must match the training-time proprio encoder input.
         prop = self._slice_proprio(states[:T], target_dim=target_proprio_dim)
-        act = self.encoder.prepare_actions(actions[:T], t_len=T)
+        if self.feature_source == "encoder":
+            act = self.encoder.prepare_actions(actions[:T], t_len=T)
+        else:
+            # transformer features expect per-step actions (not flattened windows)
+            target_action_dim = None
+            try:
+                target_action_dim = int(self.encoder.model.action_encoder.in_chans)
+            except Exception:
+                target_action_dim = None
+            act = self._slice_action(actions[:T], target_dim=target_action_dim)
 
         # Pre-build per-view image arrays (T, 3, H, W) at original_img_size,
         # converted to float in [0, 1].
@@ -187,10 +221,9 @@ class LPBV2BenchmarkDiscriminator:
                 v: torch.from_numpy(per_view_chw[v][start:end]) for v in view_names
             }
             batch_prop = torch.from_numpy(prop[start:end])
+            # encode_batch applies the same normalization/cropping used during dynamics training.
             batch_act = torch.from_numpy(act[start:end])
-            # encode_batch returns (B, visual_emb_total + proprio_emb + action_emb) with the same
-            # normalization/cropping used during dynamics training.
-            f = self.encoder.encode_batch(batch_imgs, batch_prop, batch_act)
+            f = self.encoder.encode_batch(batch_imgs, batch_prop, actions=batch_act)
             feats.append(f.detach().cpu())
 
         out = torch.cat(feats, dim=0)
@@ -240,16 +273,28 @@ class LPBV2BenchmarkDiscriminator:
                 calib_feats.append(f)
                 calib_total += int(f.shape[0])
 
-            visual_dim = int(self.encoder.visual_emb_dim_total)
-            proprio_dim = int(self.encoder.proprio_emb_dim)
-            action_dim = int(self.encoder.action_emb_dim)
             feat_dim = int(bank_feats[0].shape[1])
+            if self.feature_source == "encoder":
+                visual_dim = int(self.encoder.visual_emb_dim_total)
+                proprio_dim = int(self.encoder.proprio_emb_dim)
+                action_dim = int(self.encoder.action_emb_dim)
+                visual_weight = float(self.visual_weight)
+                proprio_weight = float(self.proprio_weight)
+                action_weight = float(self.action_weight)
+            else:
+                visual_dim = int(feat_dim)
+                proprio_dim = 0
+                action_dim = 0
+                visual_weight = 1.0
+                proprio_weight = 1.0
+                action_weight = 1.0
 
             if self.verbose_fit:
                 print(
                     f"[lpb_v2][fit] task={task} "
                     f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
                     f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
+                    f"feature_source={self.feature_source} layer={self.transformer_layer}  "
                     f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
                 )
 
@@ -257,9 +302,9 @@ class LPBV2BenchmarkDiscriminator:
                 visual_dim=visual_dim,
                 proprio_dim=proprio_dim,
                 action_dim=action_dim,
-                visual_weight=self.visual_weight,
-                proprio_weight=self.proprio_weight,
-                action_weight=self.action_weight,
+                visual_weight=visual_weight,
+                proprio_weight=proprio_weight,
+                action_weight=action_weight,
                 delta=self.delta,
                 chunk_size=self.knn_chunk_size,
                 device=self.device,
@@ -279,6 +324,11 @@ class LPBV2BenchmarkDiscriminator:
                 "proprio_dim": proprio_dim,
                 "action_dim": action_dim,
                 "action_weight": float(self.action_weight),
+                "feature_source": self.feature_source,
+                "transformer_layer": int(self.transformer_layer),
+                "effective_visual_weight": float(visual_weight),
+                "effective_proprio_weight": float(proprio_weight),
+                "effective_action_weight": float(action_weight),
             }
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
@@ -308,8 +358,12 @@ class LPBV2BenchmarkDiscriminator:
             "thresholds": thresholds,
             "step_scores_raw": step_scores,
             "feature_len": int(feat.shape[0]),
+            "feature_source": self.feature_source,
+            "transformer_layer": int(self.transformer_layer),
             "visual_weight": float(self.visual_weight),
             "proprio_weight": float(self.proprio_weight),
+            "effective_visual_weight": float(det.visual_weight),
+            "effective_proprio_weight": float(det.proprio_weight),
             "view_names": list(self.encoder.view_names),
         }
         return DiscriminatorOutput(
@@ -327,6 +381,9 @@ class LPBV2BenchmarkDiscriminator:
             "camera_to_view": dict(self.camera_to_view),
             "visual_weight": float(self.visual_weight),
             "proprio_weight": float(self.proprio_weight),
+            "transformer_metric": "uniform_l2" if self.feature_source == "transformer" else "block_weighted_l2",
+            "feature_source": self.feature_source,
+            "transformer_layer": int(self.transformer_layer),
             "delta": float(self.delta),
             "knn_chunk_size": int(self.knn_chunk_size),
             "calib_fraction": float(self.calib_fraction),

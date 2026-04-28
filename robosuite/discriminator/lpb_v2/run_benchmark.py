@@ -48,6 +48,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--delta", type=float, default=10.0,
                         help="Percentile-based false-alarm budget (0-100).")
     parser.add_argument("--knn-chunk-size", type=int, default=2048)
+    parser.add_argument("--knn-feature-source", type=str, default="encoder",
+                        choices=["encoder", "transformer"],
+                        help="KNN feature source: encoder baseline or transformer hidden state.")
+    parser.add_argument("--knn-transformer-layer", type=int, default=-1,
+                        help="Transformer layer for KNN when --knn-feature-source=transformer.")
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
@@ -100,6 +105,8 @@ def main() -> None:
         action_weight=float(args.action_weight),
         delta=float(args.delta),
         knn_chunk_size=int(args.knn_chunk_size),
+        feature_source=str(args.knn_feature_source),
+        transformer_layer=int(args.knn_transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),
