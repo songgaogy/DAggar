@@ -18,7 +18,7 @@ TASKS="${TASKS:-PandaLift PandaPickPlaceCan PandaStack PickPlaceBread PickPlaceC
 # Build a Hydra list literal: [path1,path2,...]
 EXPERT_PATHS=""
 for task in ${TASKS}; do
-    path="${ROOT_DIR}/data/${task}/expert"
+    path="${ROOT_DIR}/data/${task}/success_rollout"
     if [[ -z "${EXPERT_PATHS}" ]]; then
         EXPERT_PATHS="${path}"
     else
@@ -34,7 +34,8 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 EXPERT_RATIO="${EXPERT_RATIO:-0.5}"
 
-SAVE_DIR="${SAVE_DIR:-${ROOT_DIR}/checkpoints/lpb/dynamics}"
+RUN_TAG="${RUN_TAG:-run_$(date +%Y%m%d_%H%M%S)}"
+SAVE_DIR="${SAVE_DIR:-${ROOT_DIR}/checkpoints/lpb/dynamics/${RUN_TAG}}"
 SAVE_NAME="${SAVE_NAME:-dynamics_model.pt}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"

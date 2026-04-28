@@ -16,11 +16,11 @@ cd "${REPO_ROOT}"
 
 FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
 SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
-TASKS="PickPlaceBread PickPlaceCan PickPlaceCereal PickPlaceMilk"
+TASKS="${TASKS:-PickPlaceBread PickPlaceCan PickPlaceCereal PickPlaceMilk}"
 
 # Per-task trajectory caps. Empty / non-positive int = use all trajectories.
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-100}"
-MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-200}"
+MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb/eval/${RUN_NAME}}"
@@ -30,7 +30,7 @@ mkdir -p "${OUT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # Required checkpoint.
-LPB_CKPT="${LPB_CKPT:-${REPO_ROOT}/checkpoints/lpb/dynamics/dynamics_model.pt}"
+LPB_CKPT="checkpoints/lpb/dynamics/expert_oringal/dynamics_model_ep0010.pt"
 if [[ ! -f "${LPB_CKPT}" ]]; then
     echo "[lpb] ERROR: LPB_CKPT not found: ${LPB_CKPT}" >&2
     echo "       Set LPB_CKPT=/abs/path/to/model.pt (from train_lpb_dynamics.sh)." >&2
