@@ -53,6 +53,7 @@ from robosuite.pipeline.utils import (
     checkpoint_path,
     checkpoint_step_path,
     format_episode_line,
+    list_hdf5_demo_names,
     load_demo_paths,
     load_transition_chunks,
     maybe_build_wandb,
@@ -73,6 +74,9 @@ from robosuite.pipeline.utils.io import resolve_task_demo_paths
 from robosuite.pipeline.utils.train_utils import resolve_demo_task_name
 
 print = partial(builtins.print, flush=True)
+
+
+AWR_DEMO_LOADER_SCHEMA_VERSION = 2
 
 
 def _initial_discriminator_images(obs: dict[str, Any], camera_names: list[str]) -> dict[str, np.ndarray]:
@@ -394,43 +398,72 @@ def _build_transition_loader(
         # Keep flow-style observations (camera + proprio formatting) so they stay compatible
         # with the AWR model + normalizers, but compute reward/done via env replay so that
         # success can occur before the final padded step in fixed-length rollouts.
-        flow_transitions = load_hdf5_demos_into_flow_transitions(
-            path,
-            policy_camera_names=policy_camera_names,
-            camera_aliases=camera_aliases,
-            img_height=img_height,
-            img_width=img_width,
-            proprio_keys=proprio_keys,
-            renderer=renderer,
-            control_freq=control_freq,
-            demo_names=demo_names,
-            state_extractor=state_extractor,
-        )
-        if not flow_transitions:
-            return flow_transitions
+        available_demo_names = set(list_hdf5_demo_names(path))
+        if demo_names is None:
+            selected_demo_names = sorted(available_demo_names)
+        else:
+            selected_demo_names = [str(name) for name in demo_names if str(name) in available_demo_names]
 
-        env_transitions = load_hdf5_demos_into_transitions(
-            path,
-            camera_names=tuple(policy_camera_names),
-            img_height=int(img_height),
-            img_width=int(img_width),
-            proprio_keys=tuple(proprio_keys),
-            renderer=str(renderer),
-            control_freq=int(control_freq),
-            demo_names=None if demo_names is None else tuple(str(name) for name in demo_names),
-        )
-        if len(env_transitions) != len(flow_transitions):
-            raise RuntimeError(
-                "Offline demo env replay transitions length mismatch with flow transitions: "
-                f"{len(env_transitions)} vs {len(flow_transitions)} for {Path(path)}"
+        aligned_transitions = []
+        total_flow_transitions = 0
+        total_env_transitions = 0
+        truncated_demo_count = 0
+        for demo_name in selected_demo_names:
+            flow_transitions = load_hdf5_demos_into_flow_transitions(
+                path,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=img_height,
+                img_width=img_width,
+                proprio_keys=proprio_keys,
+                renderer=renderer,
+                control_freq=control_freq,
+                demo_names=[demo_name],
+                state_extractor=state_extractor,
+            )
+            if not flow_transitions:
+                continue
+
+            env_transitions = load_hdf5_demos_into_transitions(
+                path,
+                camera_names=tuple(policy_camera_names),
+                img_height=int(img_height),
+                img_width=int(img_width),
+                proprio_keys=tuple(proprio_keys),
+                renderer=str(renderer),
+                control_freq=int(control_freq),
+                demo_names=(demo_name,),
+            )
+            if not env_transitions:
+                raise RuntimeError(
+                    "Offline demo env replay produced zero transitions for non-empty flow demo: "
+                    f"{Path(path)}:{demo_name}"
+                )
+            if len(env_transitions) > len(flow_transitions):
+                raise RuntimeError(
+                    "Offline demo env replay produced more transitions than flow loading: "
+                    f"{len(env_transitions)} vs {len(flow_transitions)} for {Path(path)}:{demo_name}"
+                )
+
+            total_flow_transitions += len(flow_transitions)
+            total_env_transitions += len(env_transitions)
+            if len(env_transitions) < len(flow_transitions):
+                truncated_demo_count += 1
+
+            for flow_t, env_t in zip(flow_transitions, env_transitions):
+                flow_t.reward = float(env_t.reward)
+                flow_t.done = bool(env_t.done)
+                flow_t.reward_source = "env_success"
+                aligned_transitions.append(flow_t)
+
+        if truncated_demo_count > 0:
+            print(
+                "[INFO] Truncated AWR offline demo transitions at env replay terminal steps: "
+                f"demos={truncated_demo_count}, kept={total_env_transitions}, original={total_flow_transitions}, "
+                f"path={Path(path)}"
             )
 
-        for flow_t, env_t in zip(flow_transitions, env_transitions):
-            flow_t.reward = float(env_t.reward)
-            flow_t.done = bool(env_t.done)
-            flow_t.reward_source = "env_success"
-
-        return flow_transitions
+        return aligned_transitions
 
     return _loader
 
@@ -823,6 +856,7 @@ def main(cfg: DictConfig) -> None:
 
     proprio_keys = [str(key) for key in list(cfg.env.proprio_keys or [])]
     cache_key_parts = [
+        f"loader-v{AWR_DEMO_LOADER_SCHEMA_VERSION}",
         f"h{int(cfg.env.img_height)}",
         f"w{int(cfg.env.img_width)}",
         f"cams-{'_'.join(policy_camera_names)}",

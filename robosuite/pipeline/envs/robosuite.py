@@ -670,6 +670,8 @@ def load_hdf5_demos_into_transitions(
                             demo_source="offline_demo",
                         )
                     )
+                    if done:
+                        break
     finally:
         env.close()
     return transitions

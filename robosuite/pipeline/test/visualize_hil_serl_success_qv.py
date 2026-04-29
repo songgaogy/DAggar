@@ -153,6 +153,14 @@ def load_success_transitions(
     return transitions
 
 
+def crop_at_first_success_or_terminal(transitions: list[Transition]) -> tuple[list[Transition], int | None]:
+    for index, transition in enumerate(transitions):
+        reward = None if transition.reward is None else float(transition.reward)
+        if bool(transition.done) or (reward is not None and reward >= 0.0):
+            return transitions[: index + 1], index
+    return transitions, None
+
+
 def build_agent(payload: dict[str, Any], algorithm_cfg: dict[str, Any], transitions: list[Transition]):
     action_dim = int(np.asarray(transitions[0].action).reshape(-1).shape[0])
     action_low = -np.ones(action_dim, dtype=np.float32)
@@ -391,6 +399,8 @@ def main() -> None:
         renderer=str(args.renderer),
         control_freq=int(args.control_freq),
     )
+    original_transition_count = len(transitions)
+    transitions, first_terminal_index = crop_at_first_success_or_terminal(transitions)
     if args.max_steps is not None:
         transitions = transitions[: max(1, int(args.max_steps))]
 
@@ -416,6 +426,10 @@ def main() -> None:
         "selected_hdf5": str(selected.hdf5_path),
         "selected_demo_key": selected.demo_key,
         "selected_demo_length": int(selected.length),
+        "original_loaded_steps": int(original_transition_count),
+        "first_success_or_terminal_index": (
+            None if first_terminal_index is None else int(first_terminal_index)
+        ),
         "used_steps": int(len(transitions)),
         "image_keys": image_keys,
         "image_size": int(image_size),

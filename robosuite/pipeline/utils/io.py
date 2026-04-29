@@ -14,6 +14,10 @@ from ..common.types import Transition
 from ..common.utils import clone_array_tree
 
 
+class LegacyRewardSchemeError(Exception):
+    pass
+
+
 def serialize_transition(transition: Transition) -> dict[str, Any]:
     return {
         "obs": clone_array_tree(transition.obs),
@@ -55,7 +59,9 @@ def save_transition_shard(path: str | Path, transitions: Sequence[Transition]) -
 
 def load_transition_shard(path: str | Path) -> list[Transition]:
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
-    return [deserialize_transition(item) for item in payload]
+    transitions = [deserialize_transition(item) for item in payload]
+    _raise_on_legacy_positive_rewards(transitions, path=path)
+    return transitions
 
 
 def list_hdf5_demo_names(path: str | Path) -> list[str]:
@@ -192,6 +198,22 @@ def _mirror_cache_file(source: str | Path, mirror_cache_dir: str | Path | None) 
     if destination.exists() and destination.stat().st_mtime >= source_path.stat().st_mtime:
         return
     shutil.copy2(source_path, destination)
+
+
+def _raise_on_legacy_positive_rewards(transitions: Sequence[Transition], *, path: str | Path) -> None:
+    positive_rewards = [
+        float(transition.reward)
+        for transition in transitions
+        if transition.reward is not None and float(transition.reward) > 0.0
+    ]
+    if not positive_rewards:
+        return
+    unique_positive = sorted({round(value, 6) for value in positive_rewards})
+    raise LegacyRewardSchemeError(
+        "Legacy 0/1 reward transition cache detected at "
+        f"{Path(path)}: found positive rewards {unique_positive}. "
+        "HIL-SERL expects sparse -1/0 rewards. Delete the cache and rebuild demos."
+    )
 
 
 def _get_hdf5_demo_group(file_handle: h5py.File | h5py.Group) -> h5py.Group:

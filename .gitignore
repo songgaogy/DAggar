@@ -140,3 +140,4 @@ error.txt
 wandb/
 logs/
 redundant/
+tmp/

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-CHECKPOINT="outputs/hil_serl/hil_serl_PickPlaceCereal_2026-04-28_13-55-38/checkpoints/latest.pt"
+CHECKPOINT="outputs/hil_serl/hil_serl_PickPlaceCereal_2026-04-30_14-20-15/checkpoints/step_00030000_updates_00015175_ep_00306.pt"
 SUCCESS_ROLLOUT_DIR="${SUCCESS_ROLLOUT_DIR:-data/PickPlaceCereal/success_rollout}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/hil_serl/qv_visualization}"
 SEED=0

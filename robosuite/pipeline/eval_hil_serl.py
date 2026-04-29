@@ -46,7 +46,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame height.")
     parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame width.")
     parser.add_argument("--interactive", action="store_true", help="Open the robosuite viewer during eval.")
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic action sampling.")
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use deterministic action sampling. Enabled by default; pass --no-deterministic for stochastic eval.",
+    )
     parser.add_argument("--device", default=None, help="Optional learner/model device override.")
     parser.add_argument("--inference-device", default=None, help="Optional inference device override.")
     parser.add_argument("--camera-names", default=None, help="Comma-separated policy camera names override.")

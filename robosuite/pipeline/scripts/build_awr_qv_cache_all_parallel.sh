@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CUDA_VISIBLE_DEVICES=0
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
@@ -11,7 +12,7 @@ FORCE_REBUILD="${FORCE_REBUILD:-false}"
 TASK_FILTER="${TASK_FILTER:-all}"
 MAX_JOBS="${MAX_JOBS:-6}"
 LEARNER_DEVICES="${LEARNER_DEVICES:-${LEARNER_DEVICE:-cuda:0}}"
-INFERENCE_DEVICES="${INFERENCE_DEVICES:-${INFERENCE_DEVICE:-cuda:1}}"
+INFERENCE_DEVICES="${INFERENCE_DEVICES:-${INFERENCE_DEVICE:-cuda:0}}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 EXTRA_ARGS=("$@")
 

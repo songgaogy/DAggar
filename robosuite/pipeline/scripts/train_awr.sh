@@ -5,8 +5,8 @@ ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # ---------------------------------------------------------
-ENVIRONMENT="${ENVIRONMENT:-Stack}"
-DEMO_TASK_NAME="${DEMO_TASK_NAME:-PandaStack}"
+ENVIRONMENT="${ENVIRONMENT:-PickPlaceBread}"
+DEMO_TASK_NAME="${DEMO_TASK_NAME:-PickPlaceBread}"
 TRAIN_EPISODE_MAX_STEPS="${TRAIN_EPISODE_MAX_STEPS:-500}"
 
 EXPERT_NUM_TRAJ="${EXPERT_NUM_TRAJ:-20}"
@@ -32,7 +32,7 @@ LEARNER_DEVICE="${LEARNER_DEVICE:-cuda:0}"
 INFERENCE_DEVICE="${INFERENCE_DEVICE:-cuda:1}"
 DISCRIMINATOR_DEVICE="${DISCRIMINATOR_DEVICE:-cuda:1}"
 ACTION_HORIZON="${ACTION_HORIZON:-8}"
-EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
+EXECUTE_HORIZON="${EXECUTE_HORIZON:-8}"
 N_ODE_STEPS="${N_ODE_STEPS:-8}"
 
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"

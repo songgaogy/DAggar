@@ -82,6 +82,8 @@ fi
 
 if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
   PY_ARGS+=(--deterministic)
+else
+  PY_ARGS+=(--no-deterministic)
 fi
 
 if [[ -n "${DEVICE}" ]]; then
