@@ -1,6 +1,7 @@
 """Agilex trajectory discovery.
 
-Failure side: walks ``<fail_labeled_root>/<task>/out.hdf5`` and iterates
+Failure side: walks ``<fail_labeled_root>/<task>/out.hdf5`` plus
+``<task>/out-*.hdf5`` (e.g. ``out-2.hdf5``) and iterates
 ``episodes/<split>/<episode_N>`` groups (split is typically ``fail_rollout``).
 
 Success side: walks ``<success_root>/<task>/success_rollout/episode_*.hdf5``
@@ -22,6 +23,18 @@ from .trajectory import AgilexBenchmarkTrajectory
 
 SUCCESS_SPLIT_DIR = "success_rollout"
 FAIL_OUT_HDF5_NAME = "out.hdf5"
+
+
+def _list_failure_manifest_hdf5_paths(task_dir: str) -> list[str]:
+    """Return manifest paths: ``out.hdf5`` if present, then ``out-*.hdf5`` sorted."""
+    paths: list[str] = []
+    primary = os.path.join(task_dir, FAIL_OUT_HDF5_NAME)
+    if os.path.isfile(primary):
+        paths.append(primary)
+    for p in sorted(glob.glob(os.path.join(task_dir, "out-*.hdf5"))):
+        if os.path.isfile(p):
+            paths.append(p)
+    return paths
 
 
 def _filter_tasks(all_tasks: list[str], allow: Optional[list[str]]) -> list[str]:
@@ -131,54 +144,60 @@ def _discover_failures(
     task_dirs = _filter_tasks(task_dirs, tasks_allow)
 
     for task in task_dirs:
-        out_path = os.path.join(fail_labeled_root, task, FAIL_OUT_HDF5_NAME)
-        if not os.path.isfile(out_path):
+        task_dir = os.path.join(fail_labeled_root, task)
+        manifest_paths = _list_failure_manifest_hdf5_paths(task_dir)
+        if not manifest_paths:
             continue
-        with h5py.File(out_path, "r") as f:
-            if "episodes" not in f:
-                continue
-            remaining = None if max_fail_per_task is None else int(max_fail_per_task)
-            for split in sorted(f["episodes"].keys()):
-                ep_keys = sorted(f[f"episodes/{split}"].keys())
-                for ep_key in ep_keys:
+        remaining = None if max_fail_per_task is None else int(max_fail_per_task)
+        for out_path in manifest_paths:
+            with h5py.File(out_path, "r") as f:
+                if "episodes" not in f:
+                    continue
+                for split in sorted(f["episodes"].keys()):
+                    ep_keys = sorted(f[f"episodes/{split}"].keys())
+                    for ep_key in ep_keys:
+                        if remaining is not None and remaining <= 0:
+                            break
+                        g = f[f"episodes/{split}/{ep_key}"]
+                        try:
+                            num_frames, cams = _probe_group(
+                                g,
+                                is_failure=True,
+                                proprio_field=proprio_field,
+                            )
+                        except Exception as exc:
+                            print(f"[real_world] skip failure {out_path}:{split}/{ep_key}: {exc}")
+                            continue
+                        segments_raw = g.attrs.get("failure_segments_json", "[]")
+                        try:
+                            segments = json.loads(segments_raw)
+                        except Exception:
+                            segments = []
+                        out.append(
+                            AgilexBenchmarkTrajectory(
+                                task_name=task,
+                                num_frames=num_frames,
+                                is_failure=True,
+                                video_id=str(g.attrs.get("video_id", f"{task}/{split}/{ep_key}")),
+                                available_cameras=cams,
+                                failure_segments=list(segments),
+                                source_hdf5_path=str(g.attrs.get("source_hdf5_path", "")),
+                                source_demo_key=ep_key,
+                                file_path=out_path,
+                                episode_path=f"episodes/{split}/{ep_key}",
+                                proprio_field=proprio_field,
+                                proprio_slice=proprio_slice,
+                                action_slice=action_slice,
+                            )
+                        )
+                        if remaining is not None:
+                            remaining -= 1
                     if remaining is not None and remaining <= 0:
                         break
-                    g = f[f"episodes/{split}/{ep_key}"]
-                    try:
-                        num_frames, cams = _probe_group(
-                            g,
-                            is_failure=True,
-                            proprio_field=proprio_field,
-                        )
-                    except Exception as exc:
-                        print(f"[real_world] skip failure {out_path}:{split}/{ep_key}: {exc}")
-                        continue
-                    segments_raw = g.attrs.get("failure_segments_json", "[]")
-                    try:
-                        segments = json.loads(segments_raw)
-                    except Exception:
-                        segments = []
-                    out.append(
-                        AgilexBenchmarkTrajectory(
-                            task_name=task,
-                            num_frames=num_frames,
-                            is_failure=True,
-                            video_id=str(g.attrs.get("video_id", f"{task}/{split}/{ep_key}")),
-                            available_cameras=cams,
-                            failure_segments=list(segments),
-                            source_hdf5_path=str(g.attrs.get("source_hdf5_path", "")),
-                            source_demo_key=ep_key,
-                            file_path=out_path,
-                            episode_path=f"episodes/{split}/{ep_key}",
-                            proprio_field=proprio_field,
-                            proprio_slice=proprio_slice,
-                            action_slice=action_slice,
-                        )
-                    )
-                    if remaining is not None:
-                        remaining -= 1
                 if remaining is not None and remaining <= 0:
                     break
+            if remaining is not None and remaining <= 0:
+                break
     return out
 
 

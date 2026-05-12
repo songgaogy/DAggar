@@ -29,8 +29,9 @@ class FailureBenchmark(_CoreFailureBenchmark):
     """Real-world (agilex) benchmark.
 
     Args:
-        fail_labeled_root: directory containing ``<task>/out.hdf5`` annotated
-            files (e.g. ``data/agilex/failure_annotations/out_by_task``).
+        fail_labeled_root: directory containing ``<task>/out.hdf5`` and optional
+            ``<task>/out-*.hdf5`` annotated files (e.g.
+            ``data/agilex/failure_annotations/out_by_task``).
         success_root: directory containing ``<task>/success_rollout/episode_*.hdf5``
             (e.g. ``data/agilex``).
         tasks: optional task filter, e.g. ``["candy_in_plate"]``.
