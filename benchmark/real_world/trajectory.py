@@ -2,7 +2,7 @@
 
 Two on-disk layouts are supported through a single class:
 
-  Annotated failures (``failure_annotations/out_by_task/<task>/out.hdf5``)
+  Annotated failures (``.../<task>/out.hdf5`` and optional ``.../out-*.hdf5``)
       The episode group lives at ``episodes/<split>/<episode_N>``; pass that
       path via ``episode_path``. The group exposes:
           {episode_path}/action                           (T, 14) float32
