@@ -16,7 +16,7 @@ This matches the original LPB reward semantics (lower min_dist = more
 in-distribution = lower failure score) while letting us emit binary preds.
 
 The dynamics model that produces the encoder + proprio_encoder is loaded
-from a checkpoint via `robosuite.discriminator.lpb_v2.model_loader.load_model`.
+from a checkpoint via `robosuite.discriminator.lpb_v2.core.model_loader.load_model`.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from robosuite.discriminator.lpb_v2.model_loader import load_model
+from robosuite.discriminator.lpb_v2.core.model_loader import load_model
 from robosuite.discriminator.lpb_v2.utils.normalizer import LinearNormalizer
 
 

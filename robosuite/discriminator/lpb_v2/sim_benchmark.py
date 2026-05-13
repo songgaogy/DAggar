@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 
 from benchmark.robosuite import FailureBenchmark
-from robosuite.discriminator.lpb_v2.benchmark import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:

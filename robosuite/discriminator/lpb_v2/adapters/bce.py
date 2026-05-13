@@ -6,7 +6,7 @@ single shared :class:`BCEDiscriminator` trained on pooled (D_e, D_o) frames,
 plus per-task thresholds.
 
 Training labels use **GT failure timing** only: each failure bank trajectory is
-sliced at ``first_gt_failure_frame()`` — prefix ``[0, t*)`` joins ``D_e``,
+sliced at ``first_gt_failure_frame()``: prefix ``[0, t*)`` joins ``D_e``,
 suffix ``[t*, T)`` is ``D_o``.
 
 Hard invariants:
@@ -28,8 +28,11 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from .bce_discriminator import BCEDiscriminator
-from .benchmark import LPBV2BenchmarkDiscriminator, _pad_to_length
+from robosuite.discriminator.lpb_v2.adapters.single_bank import (
+    LPBV2BenchmarkDiscriminator,
+    _pad_to_length,
+)
+from robosuite.discriminator.lpb_v2.detectors.bce import BCEDiscriminator
 
 
 class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
@@ -129,11 +132,11 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         bank_calib_overlap = sorted(bank_keys & calib_keys)
         problems = []
         if overlap_bank:
-            problems.append(f"eval ∩ fail_bank = {overlap_bank}")
+            problems.append(f"eval intersect fail_bank = {overlap_bank}")
         if overlap_calib:
-            problems.append(f"eval ∩ fail_calib = {overlap_calib}")
+            problems.append(f"eval intersect fail_calib = {overlap_calib}")
         if bank_calib_overlap:
-            problems.append(f"fail_bank ∩ fail_calib = {bank_calib_overlap}")
+            problems.append(f"fail_bank intersect fail_calib = {bank_calib_overlap}")
         if problems:
             raise RuntimeError(
                 "BCEBenchmarkDiscriminator disjointness invariant violated:\n  - "
