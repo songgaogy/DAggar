@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase-A BCE-WAM benchmark entry point for real-world Agilex data.
+# BCE-WAM benchmark (GT failure split) for real-world Agilex data.
 # Hard constraint: training does NOT run benchmark evaluation. bench.evaluate
 # is called by the runner only after fit_on_benchmark returns.
 #
@@ -17,8 +17,11 @@ SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/agilex}"
 CACHE_ROOT="${CACHE_ROOT:-${REPO_ROOT}/data/.agilex_train_cache}"
 TASKS="${TASKS:-candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot}"
 
+# --------------------------------------------------------
+# for evaluation
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-25}"
 MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"
+# --------------------------------------------------------
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_eval/${RUN_NAME}}"
@@ -48,12 +51,13 @@ PROPRIO_WEIGHT="${PROPRIO_WEIGHT:-2.0}"
 ACTION_WEIGHT="${ACTION_WEIGHT:-1.0}"
 DELTA="${DELTA:-10.0}"
 KNN_CHUNK_SIZE="${KNN_CHUNK_SIZE:-2048}"
-# Phase-A locks the feature space to transformer layer 1 (matches Phase-1 diagnostic + two-bank).
+# Locks the feature space to transformer layer 1 (matches diagnostic + two-bank).
 KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-transformer}"
 KNN_TRANSFORMER_LAYER="${KNN_TRANSFORMER_LAYER:-1}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
 
+# --------------------------------------------------------
 # BCE head + optim knobs.
 HEAD_HIDDEN="${HEAD_HIDDEN:-256}"
 HEAD_LAYERS="${HEAD_LAYERS:-2}"
@@ -62,10 +66,13 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 
-# Failure pool selection for D_o.
+# Balance: MAX_EXPERT_OTHER_RATIO caps |D_e| <= ratio * |D_o|. <=0 disables.
+MAX_EXPERT_OTHER_RATIO="${MAX_EXPERT_OTHER_RATIO:-1.0}"
+
+# Failure pool: disjoint from eval failures; each traj split at first_gt_failure_frame.
 FAIL_BANK_PER_TASK="${FAIL_BANK_PER_TASK:-25}"
-FAIL_BANK_IDS_JSON="${FAIL_BANK_IDS_JSON:-}"
-FAIL_CALIB_PER_TASK="${FAIL_CALIB_PER_TASK:-0}"
+# --------------------------------------------------------
+
 
 EXTRA_ARGS=()
 if [[ "${USE_CACHE:-1}" == "1" ]]; then
@@ -85,9 +92,6 @@ if [[ -n "${PROPRIO_INDICES:-}" ]]; then
 fi
 if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
-fi
-if [[ -n "${FAIL_BANK_IDS_JSON}" ]]; then
-    EXTRA_ARGS+=(--fail-bank-ids-json "${FAIL_BANK_IDS_JSON}")
 fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.run_bce_benchmark \
@@ -119,8 +123,8 @@ fi
     --lr                   "${LR}" \
     --weight-decay         "${WEIGHT_DECAY}" \
     --batch-size           "${BATCH_SIZE}" \
+    --max-expert-other-ratio "${MAX_EXPERT_OTHER_RATIO}" \
     --fail-bank-per-task   "${FAIL_BANK_PER_TASK}" \
-    --fail-calib-per-task  "${FAIL_CALIB_PER_TASK}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 

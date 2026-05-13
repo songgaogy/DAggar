@@ -1,10 +1,8 @@
-"""BCE-style density-ratio failure discriminator on frozen WAM latent.
+"""BCE-style density-ratio failure discriminator on frozen WAM latent (GT split).
 
-Phase A: PU-learning. ``D_e`` = success-rollout frames pooled across tasks;
-``D_o`` = failure-rollout frames pooled across tasks (entire trajectories, no GT
-slicing). One shared MLP head ``g_θ(z)`` is trained with
-``BCEWithLogitsLoss`` so the logit estimates the latent occupancy log
-density-ratio ``log ρ_e(z) − log ρ_o(z)``.
+``D_e`` pools success-rollout frames plus, from each failure bank trajectory, the
+prefix before ``first_gt_failure_frame()``; ``D_o`` pools suffix frames after
+that cut. One shared MLP head ``g_θ(z)`` is trained with ``BCEWithLogitsLoss``.
 
 Score convention (matches ``LPBV2KNN`` so the benchmark JSON layout is unchanged):
 
@@ -30,7 +28,6 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from torch import nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from .knn import DetectionResult
@@ -143,31 +140,6 @@ class BCEDiscriminator:
             outs.append(g.detach().cpu().numpy().astype(np.float32))
         return np.concatenate(outs, axis=0)
 
-    @staticmethod
-    def nnpu_loss(logits, labels, pi=0.5):
-        logits = logits.view(-1)
-        labels = labels.view(-1)
-
-        pos_mask = labels > 0.5
-        unl_mask = labels <= 0.5
-
-        if pos_mask.sum() == 0 or unl_mask.sum() == 0:
-            return None
-
-        logits_p = logits[pos_mask]
-        logits_u = logits[unl_mask]
-
-        pos_risk = F.softplus(-logits_p).mean()
-
-        neg_risk_u = F.softplus(logits_u).mean()
-        neg_risk_p = F.softplus(logits_p).mean()
-
-        neg_risk = neg_risk_u - pi * neg_risk_p
-        neg_risk = torch.clamp(neg_risk, min=0.0)
-
-        loss = pi * pos_risk + neg_risk
-        return loss
-
     # ------------------------------------------------------------------ #
     # Fit                                                                #
     # ------------------------------------------------------------------ #
@@ -185,8 +157,9 @@ class BCEDiscriminator:
         delta: float = 10.0,
         seed: int = 0,
         verbose: bool = True,
+        max_expert_other_ratio: Optional[float] = 1.0,
     ) -> Dict[str, float]:
-        """Train the shared head with balanced BCE, then calibrate per-task thresholds.
+        """Train the shared head with BCE; then calibrate per-task thresholds.
 
         Args:
             expert_features: list of (T_i, D) tensors. Pooled into ``D_e``.
@@ -197,6 +170,8 @@ class BCEDiscriminator:
             epochs: fixed epoch budget. No early stopping, no validation eval.
             delta: percentile-based false-alarm budget in [0, 100]. ``tau =
                 percentile(failure_score on success-calib, 100 - delta)``.
+            max_expert_other_ratio: cap ``|D_e| <= max_expert_other_ratio * |D_o|``
+                via random subsampling. ``None`` disables the cap. Default 1.0 (1:1).
         Returns:
             Per-task threshold dict.
         """
@@ -206,6 +181,10 @@ class BCEDiscriminator:
             raise ValueError(f"epochs must be >= 1, got {epochs}")
         if batch_size < 2:
             raise ValueError(f"batch_size must be >= 2, got {batch_size}")
+        if max_expert_other_ratio is not None and float(max_expert_other_ratio) <= 0.0:
+            raise ValueError(
+                f"max_expert_other_ratio must be > 0 or None, got {max_expert_other_ratio}"
+            )
 
         self._delta = float(delta)
 
@@ -224,6 +203,22 @@ class BCEDiscriminator:
                 f"feature dim mismatch: in_dim={self.in_dim}, "
                 f"D_e={Z_e.shape[1]}, D_o={Z_o.shape[1]}"
             )
+        Ne_raw = int(Z_e.shape[0])
+        No_raw = int(Z_o.shape[0])
+
+        # ------- cap |D_e| relative to |D_o| (avoid the success side dwarfing failures) ----------
+        if max_expert_other_ratio is not None:
+            cap = int(float(max_expert_other_ratio) * float(No_raw))
+            if cap > 0 and Ne_raw > cap:
+                g_sub = torch.Generator(device="cpu").manual_seed(int(seed))
+                idx = torch.randperm(Ne_raw, generator=g_sub)[:cap]
+                Z_e = Z_e[idx]
+                if verbose:
+                    print(
+                        f"[bce][balance] subsampled D_e: {Ne_raw} -> {cap} frames "
+                        f"(ratio={float(max_expert_other_ratio):.2f} * No={No_raw})",
+                        flush=True,
+                    )
         Ne = int(Z_e.shape[0])
         No = int(Z_o.shape[0])
         Z = torch.cat([Z_e, Z_o], dim=0)
@@ -278,7 +273,7 @@ class BCEDiscriminator:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=total_steps, eta_min=0.0
         )
-        loss_fn = nn.BCEWithLogitsLoss()
+        bce_loss_fn = nn.BCEWithLogitsLoss()
 
         # ------- train loop (NO eval, NO AUROC) ----------
         self.head.train()
@@ -290,8 +285,7 @@ class BCEDiscriminator:
                 z_batch = z_batch.to(self.device, non_blocking=True)
                 y_batch = y_batch.to(self.device, non_blocking=True)
                 g = self.head(z_batch)
-                # NOTE: pi by default is 0.5, which is balanced sampling.
-                loss = self.nnpu_loss(g, y_batch, pi=0.5)
+                loss = bce_loss_fn(g, y_batch)
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 optim.step()

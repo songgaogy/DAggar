@@ -1,4 +1,4 @@
-"""Unit tests for the Phase-A BCE-WAM discriminator.
+"""Unit tests for the BCE-WAM discriminator (GT split, BCE loss).
 
 Run with:
     python -m pytest robosuite/discriminator/lpb_v2/tests/test_bce_discriminator.py -v
@@ -192,6 +192,30 @@ def test_assert_disjoint_raises_on_overlap() -> None:
         fail_bank_trajs=[_StubTraj(video_id="v3"), _StubTraj(video_id="v4")],
         fail_calib_trajs=calib_trajs,
     )
+
+
+def test_max_expert_other_ratio_caps_de() -> None:
+    """When |D_e| >> |D_o|, the cap should subsample D_e to ratio * |D_o|."""
+    in_dim = 8
+    Z_e = _gaussian_class(1000, in_dim, mean=+1.0, std=0.5, seed=40)
+    Z_o = _gaussian_class(100, in_dim, mean=-1.0, std=0.5, seed=41)
+    Z_calib = _gaussian_class(40, in_dim, mean=+1.0, std=0.5, seed=42)
+
+    det = BCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det.fit(
+        expert_features=[Z_e],
+        other_features=[Z_o],
+        expert_calib_per_task={"t": [Z_calib]},
+        epochs=2,
+        batch_size=32,
+        seed=0,
+        verbose=False,
+        max_expert_other_ratio=1.0,
+    )
+    # We can't easily peek the subsampled Ne from outside, but we can check
+    # that training history is non-empty (training proceeded) and threshold exists.
+    assert det._train_history
+    assert "t" in det.thresholds
 
 
 def test_state_dict_roundtrip() -> None:

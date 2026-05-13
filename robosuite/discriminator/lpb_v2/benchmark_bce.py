@@ -1,9 +1,13 @@
-"""Benchmark adapter for the Phase-A BCE-WAM failure discriminator.
+"""Benchmark adapter for the BCE-WAM failure discriminator (GT failure split).
 
 Sits on top of :class:`LPBV2BenchmarkDiscriminator` so all the WAM encoding +
 trajectory feature cache is reused unchanged. Replaces the per-task KNN with a
 single shared :class:`BCEDiscriminator` trained on pooled (D_e, D_o) frames,
 plus per-task thresholds.
+
+Training labels use **GT failure timing** only: each failure bank trajectory is
+sliced at ``first_gt_failure_frame()`` — prefix ``[0, t*)`` joins ``D_e``,
+suffix ``[t*, T)`` is ``D_o``.
 
 Hard invariants:
   * No ``video_id`` in ``fail_bank_trajectories`` / ``fail_calib_trajectories``
@@ -29,7 +33,7 @@ from .benchmark import LPBV2BenchmarkDiscriminator, _pad_to_length
 
 
 class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
-    """Phase-A BCE failure detector exposed through the BenchmarkTrajectory API."""
+    """BCE failure detector (GT-labeled prefix/suffix split) over the benchmark API."""
 
     name = "lpb_v2_bce"
 
@@ -39,6 +43,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         model_ckpt: str,
         fail_bank_trajectories: Sequence[BenchmarkTrajectory],
         fail_calib_trajectories: Optional[Sequence[BenchmarkTrajectory]] = None,
+        max_expert_other_ratio: Optional[float] = 1.0,
         head_hidden: int = 256,
         head_layers: int = 2,
         epochs: int = 20,
@@ -83,6 +88,11 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         self.fail_calib_trajectories: List[BenchmarkTrajectory] = (
             list(fail_calib_trajectories) if fail_calib_trajectories else []
         )
+
+        self.max_expert_other_ratio: Optional[float] = (
+            None if max_expert_other_ratio is None else float(max_expert_other_ratio)
+        )
+
         self.head_hidden = int(head_hidden)
         self.head_layers = int(head_layers)
         self.epochs = int(epochs)
@@ -144,6 +154,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
             "model_ckpt": str(self.model_ckpt),
+            "max_expert_other_ratio": self.max_expert_other_ratio,
             "fail_bank_video_ids": sorted(
                 str(t.video_id) for t in self.fail_bank_trajectories
             ),
@@ -181,7 +192,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
 
         if not task_to_success:
             raise RuntimeError(
-                "BCE Phase-A requires success trajectories per task in the eval set."
+                "BCE benchmark requires success trajectories per task in the eval set."
             )
 
         rng = np.random.default_rng(int(self.seed))
@@ -223,19 +234,45 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             expert_calib_per_task[task] = feats_list
             expert_calib_stats[task] = tot
 
-        # Pool failure trajectories whole; no GT slicing in Phase A.
+        # Pool failure bank: prefix [0, t*) -> D_e, suffix [t*, T) -> D_o (GT).
         pooled_other: List[torch.Tensor] = []
-        fail_stats_per_task: Dict[str, int] = {}
+        fail_other_stats_per_task: Dict[str, int] = {}
+        fail_prefix_stats_per_task: Dict[str, int] = {}
+        skipped_no_gt: List[str] = []
         for t in self.fail_bank_trajectories:
             f = self._encode(t)
-            pooled_other.append(f)
-            fail_stats_per_task[str(t.task_name)] = (
-                fail_stats_per_task.get(str(t.task_name), 0) + int(f.shape[0])
+            task_name = str(t.task_name)
+            t_star = t.first_gt_failure_frame()
+            T = int(f.shape[0])
+            if t_star is None:
+                skipped_no_gt.append(str(t.video_id))
+                continue
+            t_star_int = int(t_star)
+            if t_star_int <= 0 or t_star_int >= T:
+                skipped_no_gt.append(str(t.video_id))
+                continue
+            prefix = f[:t_star_int]
+            suffix = f[t_star_int:]
+            pooled_expert.append(prefix)
+            pooled_other.append(suffix)
+            fail_prefix_stats_per_task[task_name] = (
+                fail_prefix_stats_per_task.get(task_name, 0) + int(prefix.shape[0])
+            )
+            fail_other_stats_per_task[task_name] = (
+                fail_other_stats_per_task.get(task_name, 0) + int(suffix.shape[0])
+            )
+
+        if skipped_no_gt and self.verbose_fit:
+            print(
+                f"[bce][gt] WARNING: skipped {len(skipped_no_gt)} failure "
+                f"trajectories without usable first_gt_failure_frame: "
+                f"{skipped_no_gt[:8]}{'...' if len(skipped_no_gt) > 8 else ''}",
+                flush=True,
             )
         if not pooled_other:
             raise RuntimeError(
-                "BCE Phase-A requires at least one failure trajectory in "
-                "fail_bank_trajectories."
+                "BCE requires at least one failure suffix in fail_bank_trajectories. "
+                "Check GT annotations."
             )
 
         # ------ infer in_dim, build shared detector, fit ------
@@ -251,10 +288,13 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             ne = sum(int(t.shape[0]) for t in pooled_expert)
             no = sum(int(t.shape[0]) for t in pooled_other)
             nc = sum(int(t.shape[0]) for ts in expert_calib_per_task.values() for t in ts)
+            prefix_total = sum(fail_prefix_stats_per_task.values())
             print(
                 f"[bce][fit] tasks={sorted(task_to_success)} "
                 f"feat_dim={feat_dim} "
-                f"Ne(train)={ne} No(train)={no} N_calib={nc} "
+                f"Ne(train)={ne} (incl. fail_prefix={prefix_total}) "
+                f"No(train)={no} N_calib={nc} "
+                f"max_expert_other_ratio={self.max_expert_other_ratio} "
                 f"feature_source={self.feature_source} layer={self.transformer_layer}",
                 flush=True,
             )
@@ -266,8 +306,8 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             device=self.device,
         )
 
-        # NOTE: this is the only training call. It runs purely on BCE loss
-        # over a fixed epoch budget. No eval, no AUROC, no validation pass.
+        # NOTE: this is the only training call. It runs purely on BCE over a fixed
+        # epoch budget. No eval, no AUROC, no validation pass.
         thresholds = self._shared_detector.fit(
             expert_features=pooled_expert,
             other_features=pooled_other,
@@ -278,6 +318,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             batch_size=self.batch_size,
             delta=self.delta,
             seed=self.seed,
+            max_expert_other_ratio=self.max_expert_other_ratio,
             verbose=self.verbose_fit,
         )
 
@@ -299,9 +340,10 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
-            "phase": "A_pu_learning",
+            "max_expert_other_ratio": self.max_expert_other_ratio,
             "num_fail_bank_trajectories": int(len(self.fail_bank_trajectories)),
             "num_fail_calib_trajectories": int(len(self.fail_calib_trajectories)),
+            "num_fail_bank_skipped_no_gt": int(len(skipped_no_gt)),
             "train_history": list(self._shared_detector._train_history),
         }
         for task, tau in thresholds.items():
@@ -313,7 +355,8 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
                 "num_calib_success_trajectories": int(len(calib_success_per_task[task])),
                 "num_train_success_frames": int(pooled_expert_stats.get(task, 0)),
                 "num_calib_success_frames": int(expert_calib_stats.get(task, 0)),
-                "num_fail_train_frames": int(fail_stats_per_task.get(task, 0)),
+                "num_fail_other_frames": int(fail_other_stats_per_task.get(task, 0)),
+                "num_fail_prefix_frames": int(fail_prefix_stats_per_task.get(task, 0)),
                 "calib_score_min": None if cs is None else float(cs.calib_score_min),
                 "calib_score_max": None if cs is None else float(cs.calib_score_max),
                 "calib_score_mean": None if cs is None else float(cs.calib_score_mean),
@@ -356,7 +399,6 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             "feature_len": int(feat.shape[0]),
             "feature_source": self.feature_source,
             "transformer_layer": int(self.transformer_layer),
-            "phase": "A_pu_learning",
             "view_names": list(self.encoder.view_names),
         }
         return DiscriminatorOutput(

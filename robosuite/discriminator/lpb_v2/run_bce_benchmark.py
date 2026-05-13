@@ -1,4 +1,4 @@
-"""Run the Phase-A BCE-WAM discriminator through the real-world Agilex benchmark.
+"""Run the BCE-WAM discriminator (GT failure split) on the real-world Agilex benchmark.
 
 Mirrors `run_two_bank_real_world_benchmark.py` but swaps in
 :class:`BCEBenchmarkDiscriminator`. Hard constraint: training and evaluation
@@ -56,6 +56,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet-fit", action="store_true")
 
     # BCE knobs.
+    parser.add_argument("--max-expert-other-ratio", type=float, default=1.0,
+                        help="Cap |D_e| <= ratio * |D_o| by random subsampling. "
+                             "Use a value <= 0 to disable.")
     parser.add_argument("--head-hidden", type=int, default=256)
     parser.add_argument("--head-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=20)
@@ -63,9 +66,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
 
-    # Phase-A failure-pool selection (mirrors two-bank script).
+    # Failure-pool selection (mirrors two-bank script).
     parser.add_argument("--fail-bank-per-task", type=int, default=25,
-                        help="How many disjoint failure trajectories per task to use as D_o.")
+                        help="How many disjoint failure trajectories per task to use as D_o source.")
     parser.add_argument(
         "--fail-bank-ids-json",
         type=str,
@@ -73,7 +76,7 @@ def _parse_args() -> argparse.Namespace:
         help="Optional JSON path mapping task_name -> [video_id, ...] to override auto-selection.",
     )
     parser.add_argument("--fail-calib-per-task", type=int, default=0,
-                        help="Phase-A does not require fail-calib; keep at 0 unless you have a reason.")
+                        help="Optional extra failure trajectories reserved for calib (rarely used).")
     return parser.parse_args()
 
 
@@ -224,10 +227,15 @@ def main() -> None:
         flush=True,
     )
 
+    # ratio<=0 means "disable cap"
+    max_eo_ratio: Optional[float] = (
+        None if float(args.max_expert_other_ratio) <= 0.0 else float(args.max_expert_other_ratio)
+    )
     discriminator = BCEBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         fail_bank_trajectories=fail_bank_trajs,
         fail_calib_trajectories=fail_calib_trajs,
+        max_expert_other_ratio=max_eo_ratio,
         head_hidden=int(args.head_hidden),
         head_layers=int(args.head_layers),
         epochs=int(args.epochs),
@@ -251,7 +259,7 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[real_world][bce] training Phase-A BCE head (no eval during training)...", flush=True)
+        print("[real_world][bce] training BCE head (GT split; no eval during training)...", flush=True)
         discriminator.fit_on_benchmark(trajs)
         # Eval happens here, AFTER training finishes. Single eval pass, no
         # mid-training evaluation has been (or will be) executed.
@@ -270,7 +278,12 @@ def main() -> None:
             result.save_json(args.save_json)
             manifest_path = os.path.join(out_dir, "fail_bank_manifest.json")
             manifest = {
-                "phase": "A_pu_learning",
+                "labeling": "gt_failure_split",
+                "loss": "bce",
+                "max_expert_other_ratio": (
+                    None if float(args.max_expert_other_ratio) <= 0.0
+                    else float(args.max_expert_other_ratio)
+                ),
                 "fail_bank": bank_by_task,
                 "fail_calib": calib_by_task,
                 "fail_bank_per_task": int(args.fail_bank_per_task),
