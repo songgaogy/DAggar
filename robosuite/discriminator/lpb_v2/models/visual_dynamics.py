@@ -56,10 +56,10 @@ class VisualDynamicsModel(nn.Module):
             self.per_view_norm = nn.ModuleDict({
                 view_name: nn.LayerNorm(self.encoder.emb_dim, elementwise_affine=False)
                 for view_name in view_names
-            }).to("cuda")
+            })
             if len(view_names) > 1: 
                 total_dim = self.encoder.emb_dim * len(view_names)
-                self.fusion_norm = nn.LayerNorm(total_dim, elementwise_affine=False).to("cuda")
+                self.fusion_norm = nn.LayerNorm(total_dim, elementwise_affine=False)
 
     def train(self, mode=True):
         super().train(mode)

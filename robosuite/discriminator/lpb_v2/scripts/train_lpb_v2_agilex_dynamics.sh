@@ -8,11 +8,12 @@
 set -euo pipefail
 
 export HYDRA_FULL_ERROR=1
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0,1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
 TASKS="${TASKS:-candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot}"
 CACHE_ROOT="${CACHE_ROOT:-data/.agilex_train_cache}"
@@ -40,12 +41,17 @@ CROPPED_IMG_SIZE="${CROPPED_IMG_SIZE:-224}"
 ACTION_EMB_DIM="${ACTION_EMB_DIM:-7}"
 PROPRIO_EMB_DIM="${PROPRIO_EMB_DIM:-32}"
 
+# ------------------------------------------------------------
 EPOCHS="${EPOCHS:-50}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
+BATCH_SIZE="${BATCH_SIZE:-48}"  # each GPU under DDP
 FRAMESKIP="${FRAMESKIP:-1}"
-RUN_NAME="${RUN_NAME:-agilex_train}"
+RUN_NAME="${RUN_NAME:-agilex_train-dinov3}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="./checkpoints/lpb_v2/dynamics/${RUN_NAME}-${TIMESTAMP}"
+
+# NOTE: change me!!
+ACTION_LOSS_WEIGHT="${ACTION_LOSS_WEIGHT:-1.0}"
+# ------------------------------------------------------------
 
 EXTRA_OVERRIDES=()
 EXTRA_OVERRIDES+=("env.cache_root=${CACHE_ROOT}")
@@ -68,7 +74,7 @@ fi
 
 EXTRA_OVERRIDES+=("$@")
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.training.train \
+TRAIN_ARGS=(
     env=agilex \
     env.view_names="${VIEW_NAMES}" \
     env.action_dim="${ACTION_DIM}" \
@@ -79,5 +85,18 @@ EXTRA_OVERRIDES+=("$@")
     env.proprio_emb_dim="${PROPRIO_EMB_DIM}" \
     training.epochs="${EPOCHS}" \
     training.batch_size="${BATCH_SIZE}" \
+    training.action_loss_weight="${ACTION_LOSS_WEIGHT}" \
     frameskip="${FRAMESKIP}" \
     "${EXTRA_OVERRIDES[@]}"
+)
+
+if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
+    "${PYTHON_BIN}" -m torch.distributed.run \
+        --standalone \
+        --nproc_per_node="${NPROC_PER_NODE}" \
+        -m robosuite.discriminator.lpb_v2.training.train \
+        "${TRAIN_ARGS[@]}"
+else
+    "${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.training.train \
+        "${TRAIN_ARGS[@]}"
+fi

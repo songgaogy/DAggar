@@ -9,7 +9,7 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.discriminator.lpb_v2.models.resnet_encoder import ResNetEncoder
+from robosuite.discriminator.lpb_v2.models.dinov3_encoder import DINOv3Encoder
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
         )
 
     view_names = _get_view_names(train_cfg)
-    encoder = ResNetEncoder(policy_ckpt_path=None, view_names=view_names)
+    encoder = DINOv3Encoder(policy_ckpt_path=None, view_names=view_names)
 
     if "encoder" in result:
         encoder.load_state_dict(result["encoder"])

@@ -22,9 +22,9 @@ training:
   save_every_x_epoch: 10
   # Finetune lr for the visual encoder when model.train_encoder=True.
   # 1.5e-4 == 30% of predictor_lr (5e-4); ignored if encoder is frozen.
-  encoder_lr: 1.5e-4
-  predictor_lr: 5e-4
-  action_encoder_lr: 5e-4
+  encoder_lr: 5e-5
+  predictor_lr: 1e-4
+  action_encoder_lr: 1e-4
   num_workers: 4
 
 img_size: ${env.original_img_size}
