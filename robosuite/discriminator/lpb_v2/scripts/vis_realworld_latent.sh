@@ -21,18 +21,12 @@ EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/checkpoints/lpb_v2/real_world_eval}"
 SOURCE_RUN_NAME="${SOURCE_RUN_NAME:-run_20260429_103014}"
 BENCHMARK_JSON="${BENCHMARK_JSON:-${EVAL_ROOT}/${SOURCE_RUN_NAME}/benchmark.json}"
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${EVAL_ROOT}/${RUN_NAME}_vis}"
+OUT_DIR="${OUT_DIR:-${EVAL_ROOT}/${RUN_NAME}_vis-dinov3}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-lpb-v2-latent-${RUN_NAME}}"
 mkdir -p "${MPLCONFIGDIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
-
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
-if [[ ! -f "${MODEL_CKPT}" ]]; then
-    echo "[real_world][lpb_v2][latent] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
-    exit 1
-fi
 
 # Right-arm Agilex defaults: qpos[:, 7:14], action[:, 7:14].
 ACTION_START="${ACTION_START:-7}"
@@ -45,8 +39,11 @@ DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
 
 # --------------------------------------------------------
-KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-encoder}"
-KNN_TRANSFORMER_LAYER="${KNN_TRANSFORMER_LAYER:--1}"
+# auto detect normalizers
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-dinov3-20260513_221529/checkpoints/model_39.pth}"
+
+KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-transformer}"
+KNN_TRANSFORMER_LAYER="${KNN_TRANSFORMER_LAYER:-1}"
 SEED="${SEED:-0}"
 # --------------------------------------------------------
 
