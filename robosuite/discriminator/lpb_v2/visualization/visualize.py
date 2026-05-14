@@ -1,7 +1,7 @@
 """Failure-detector visualization for the LPB v2 KNN discriminator.
 
 Usage (from repo root):
-    python -m robosuite.discriminator.lpb_v2.visualize \
+    python -m robosuite.discriminator.lpb_v2.visualization.visualize \
         --model-ckpt /abs/path/checkpoints/lpb_v2/dynamics/<run>/checkpoints/model_49.pth \
         --fail-root /abs/path/data/utils/fail_rollout \
         --success-root /abs/path/data/utils/success_rollout \
@@ -42,7 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 from benchmark.core import BenchmarkTrajectory
 from benchmark.robosuite import FailureBenchmark
 
-from robosuite.discriminator.lpb_v2.benchmark import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _percentile_summary(values: np.ndarray) -> str:

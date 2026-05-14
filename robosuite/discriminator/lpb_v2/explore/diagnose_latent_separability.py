@@ -40,7 +40,7 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 from benchmark.core import BenchmarkTrajectory
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.benchmark import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
 from robosuite.discriminator.lpb_v2.utils.vis_latent import (
     PHASE_FAILURE_AFTER_GT,
     PHASE_FAILURE_BEFORE_GT,

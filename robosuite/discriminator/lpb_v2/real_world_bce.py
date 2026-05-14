@@ -1,4 +1,10 @@
-"""Run the two-bank KNN (success bank + failure bank) through the real-world Agilex benchmark."""
+"""Run the BCE-WAM discriminator (GT failure split) on the real-world Agilex benchmark.
+
+Mirrors `run_two_bank_real_world_benchmark.py` but swaps in
+:class:`BCEBenchmarkDiscriminator`. Hard constraint: training and evaluation
+are separated -- ``fit_on_benchmark`` does no evaluation, and ``bench.evaluate``
+is invoked here *after* the head is trained.
+"""
 
 from __future__ import annotations
 
@@ -11,9 +17,7 @@ from benchmark.core import EvalConfig
 from benchmark.real_world import FailureBenchmark
 from benchmark.real_world.loader import discover_agilex_trajectories
 from benchmark.real_world.trajectory import AgilexBenchmarkTrajectory
-from robosuite.discriminator.lpb_v2.benchmark_two_bank import (
-    TwoBankBenchmarkDiscriminator,
-)
+from robosuite.discriminator.lpb_v2.adapters.bce import BCEBenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:
@@ -24,6 +28,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-root", type=str, default=None)
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
+    parser.add_argument("--save-ckpt-dir", type=str, default=None)
     parser.add_argument("--max-fail-per-task", type=int, default=None)
     parser.add_argument("--max-success-per-task", type=int, default=None)
 
@@ -37,7 +42,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encode-batch-size", type=int, default=32)
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
     parser.add_argument("--camera-to-view", type=str, default=None)
-
+    
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
@@ -50,29 +55,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
 
-    # Two-bank knobs.
-    parser.add_argument("--fail-bank-per-task", type=int, default=10)
-    parser.add_argument("--fail-bank-last-k", type=int, default=60)
+    # BCE knobs.
+    parser.add_argument("--max-expert-other-ratio", type=float, default=1.0,
+                        help="Cap |D_e| <= ratio * |D_o| by random subsampling. "
+                             "Use a value <= 0 to disable.")
+    parser.add_argument("--head-hidden", type=int, default=256)
+    parser.add_argument("--head-layers", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--batch-size", type=int, default=512)
+
+    # Failure-pool selection (mirrors two-bank script).
+    parser.add_argument("--fail-bank-per-task", type=int, default=25,
+                        help="How many disjoint failure trajectories per task to use as D_o source.")
     parser.add_argument(
         "--fail-bank-ids-json",
         type=str,
         default=None,
         help="Optional JSON path mapping task_name -> [video_id, ...] to override auto-selection.",
     )
-    parser.add_argument("--fail-calib-per-task", type=int, default=0)
-    parser.add_argument(
-        "--score-mode",
-        type=str,
-        default="difference",
-        choices=["difference", "ratio", "dsucc_only"],
-    )
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument(
-        "--calib-mode",
-        type=str,
-        default="success_percentile",
-        choices=["success_percentile", "two_class_youden"],
-    )
+    parser.add_argument("--fail-calib-per-task", type=int, default=0,
+                        help="Optional extra failure trajectories reserved for calib (rarely used).")
     return parser.parse_args()
 
 
@@ -95,6 +99,7 @@ def _select_bank_and_calib(
 ) -> tuple[List[AgilexBenchmarkTrajectory], List[AgilexBenchmarkTrajectory]]:
     """Deterministically pick fail-bank + fail-calib trajectories per task.
 
+    Same shape as :func:`run_two_bank_real_world_benchmark._select_bank_and_calib`.
     Picks the first N by sorted video_id from the disjoint bank pool. If
     `fail_bank_ids_override` is provided, those ids are used verbatim and
     must already be present in the pool.
@@ -158,12 +163,12 @@ def main() -> None:
     n_fail = len(eval_fail_keys)
     n_succ = len(trajs) - n_fail
     print(
-        f"[real_world][two_bank] eval set: {len(trajs)} trajectories "
+        f"[real_world][bce] eval set: {len(trajs)} trajectories "
         f"(failure={n_fail}, success={n_succ}) tasks={eval_tasks}",
         flush=True,
     )
 
-    # ALL labeled failure trajectories (no cap), regardless of cache_root.
+    # Discover ALL labeled failure trajectories (no cap), regardless of cache_root.
     all_fail = discover_agilex_trajectories(
         fail_labeled_root=args.fail_root,
         success_root=args.success_root,
@@ -177,7 +182,7 @@ def main() -> None:
     all_fail = [t for t in all_fail if bool(t.is_failure)]
     bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
     print(
-        f"[real_world][two_bank] failure discovery: all_fail={len(all_fail)} "
+        f"[real_world][bce] failure discovery: all_fail={len(all_fail)} "
         f"eval_fail={len(eval_fail_keys)} bank_pool={len(bank_pool)}",
         flush=True,
     )
@@ -201,7 +206,7 @@ def main() -> None:
         fail_bank_ids_override=fail_bank_ids_override,
     )
 
-    # Hard-assert disjointness (defence-in-depth; the adapter also checks).
+    # Defence-in-depth disjoint check (adapter also asserts inside fit_on_benchmark).
     bank_keys = {str(t.video_id) for t in fail_bank_trajs}
     calib_keys = {str(t.video_id) for t in fail_calib_trajs}
     overlap = sorted((bank_keys | calib_keys) & eval_fail_keys)
@@ -217,25 +222,27 @@ def main() -> None:
     for t in fail_calib_trajs:
         calib_by_task.setdefault(str(t.task_name), []).append(str(t.video_id))
     print(
-        "[real_world][two_bank] fail bank sizes per task: "
+        "[real_world][bce] fail bank sizes per task: "
         + ", ".join(f"{k}={len(v)}" for k, v in sorted(bank_by_task.items())),
         flush=True,
     )
-    if fail_calib_trajs:
-        print(
-            "[real_world][two_bank] fail calib sizes per task: "
-            + ", ".join(f"{k}={len(v)}" for k, v in sorted(calib_by_task.items())),
-            flush=True,
-        )
 
-    discriminator = TwoBankBenchmarkDiscriminator(
+    # ratio<=0 means "disable cap"
+    max_eo_ratio: Optional[float] = (
+        None if float(args.max_expert_other_ratio) <= 0.0 else float(args.max_expert_other_ratio)
+    )
+    discriminator = BCEBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         fail_bank_trajectories=fail_bank_trajs,
         fail_calib_trajectories=fail_calib_trajs,
-        fail_bank_last_k=int(args.fail_bank_last_k),
-        alpha=float(args.alpha),
-        score_mode=str(args.score_mode),
-        calib_mode=str(args.calib_mode),
+        max_expert_other_ratio=max_eo_ratio,
+        head_hidden=int(args.head_hidden),
+        head_layers=int(args.head_layers),
+        epochs=int(args.epochs),
+        lr=float(args.lr),
+        weight_decay=float(args.weight_decay),
+        batch_size=int(args.batch_size),
+        save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
@@ -252,15 +259,18 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[real_world][two_bank] fitting two-bank detector...", flush=True)
+        print("[real_world][bce] training BCE head (GT split; no eval during training)...", flush=True)
         discriminator.fit_on_benchmark(trajs)
+        # Eval happens here, AFTER training finishes. Single eval pass, no
+        # mid-training evaluation has been (or will be) executed.
+        print("[real_world][bce] training complete; running bench.evaluate(...)", flush=True)
         result = bench.evaluate(
             discriminator,
             EvalConfig(step_binarize_strategy="provided"),
         )
         print(result.summary())
         calib_summary = discriminator.calibration_summary()
-        print("[real_world][two_bank] calibration summary:", calib_summary)
+        print("[real_world][bce] calibration summary:", calib_summary)
 
         if args.save_json:
             out_dir = os.path.dirname(os.path.abspath(args.save_json))
@@ -268,24 +278,30 @@ def main() -> None:
             result.save_json(args.save_json)
             manifest_path = os.path.join(out_dir, "fail_bank_manifest.json")
             manifest = {
+                "labeling": "gt_failure_split",
+                "loss": "bce",
+                "max_expert_other_ratio": (
+                    None if float(args.max_expert_other_ratio) <= 0.0
+                    else float(args.max_expert_other_ratio)
+                ),
                 "fail_bank": bank_by_task,
                 "fail_calib": calib_by_task,
                 "fail_bank_per_task": int(args.fail_bank_per_task),
                 "fail_calib_per_task": int(args.fail_calib_per_task),
-                "fail_bank_last_k": int(args.fail_bank_last_k),
                 "eval_fail_video_ids": sorted(eval_fail_keys),
-                "fail_bank_index_ranges": calib_summary.get("fail_bank_index_ranges", {}),
-                "score_mode": str(args.score_mode),
-                "alpha": float(args.alpha),
-                "calib_mode": str(args.calib_mode),
                 "delta": float(args.delta),
+                "epochs": int(args.epochs),
+                "lr": float(args.lr),
+                "batch_size": int(args.batch_size),
+                "head_hidden": int(args.head_hidden),
+                "head_layers": int(args.head_layers),
                 "knn_feature_source": str(args.knn_feature_source),
                 "knn_transformer_layer": int(args.knn_transformer_layer),
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)
-            print(f"[real_world][two_bank] wrote {args.save_json}")
-            print(f"[real_world][two_bank] wrote {manifest_path}")
+            print(f"[real_world][bce] wrote {args.save_json}")
+            print(f"[real_world][bce] wrote {manifest_path}")
     finally:
         discriminator.close()
 

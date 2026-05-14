@@ -68,7 +68,7 @@ fi
 
 EXTRA_OVERRIDES+=("$@")
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.train \
+"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.training.train \
     env=agilex \
     env.view_names="${VIEW_NAMES}" \
     env.action_dim="${ACTION_DIM}" \

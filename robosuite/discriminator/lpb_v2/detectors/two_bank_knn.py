@@ -32,7 +32,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 import torch
 
-from .knn import DetectionResult, knn_min_l2_dist
+from .single_bank_knn import DetectionResult, knn_min_l2_dist
 
 
 _VALID_SCORE_MODES = ("difference", "ratio", "dsucc_only")

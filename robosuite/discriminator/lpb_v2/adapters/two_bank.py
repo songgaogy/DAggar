@@ -27,8 +27,11 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from .benchmark import LPBV2BenchmarkDiscriminator, _pad_to_length
-from .two_bank_knn import TwoBankKNN
+from robosuite.discriminator.lpb_v2.adapters.single_bank import (
+    LPBV2BenchmarkDiscriminator,
+    _pad_to_length,
+)
+from robosuite.discriminator.lpb_v2.detectors.two_bank_knn import TwoBankKNN
 
 
 def _fail_frame_range(num_frames: int, first_gt: Optional[int], last_k: int) -> Optional[range]:
@@ -167,11 +170,11 @@ class TwoBankBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         bank_calib_overlap = sorted(bank_keys & calib_keys)
         problems = []
         if overlap_bank:
-            problems.append(f"eval ∩ fail_bank = {overlap_bank}")
+            problems.append(f"eval intersect fail_bank = {overlap_bank}")
         if overlap_calib:
-            problems.append(f"eval ∩ fail_calib = {overlap_calib}")
+            problems.append(f"eval intersect fail_calib = {overlap_calib}")
         if bank_calib_overlap:
-            problems.append(f"fail_bank ∩ fail_calib = {bank_calib_overlap}")
+            problems.append(f"fail_bank intersect fail_calib = {bank_calib_overlap}")
         if problems:
             raise RuntimeError(
                 "TwoBankBenchmarkDiscriminator disjointness invariant violated:\n  - "

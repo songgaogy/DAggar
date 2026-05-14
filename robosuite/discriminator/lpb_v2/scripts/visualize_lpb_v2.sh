@@ -93,7 +93,7 @@ if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${ME
     fi
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualize \
+"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualization.visualize \
     --model-ckpt         "${MODEL_CKPT}" \
     --fail-root          "${FAIL_ROOT}" \
     --success-root       "${SUCCESS_ROOT}" \

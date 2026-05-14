@@ -7,7 +7,7 @@
 #     bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_benchmark.sh
 #
 # Required: MODEL_CKPT must point to a trained dynamics checkpoint .pth.
-# Recommended layout (produced by `robosuite.discriminator.lpb_v2.train`):
+# Recommended layout (produced by `robosuite.discriminator.lpb_v2.training.train`):
 #   checkpoints/lpb_v2/dynamics/<run_name-timestamp>/{hydra.yaml, normalizer.pth, checkpoints/model_<epoch>.pth}
 # Point MODEL_CKPT to:
 #   checkpoints/lpb_v2/dynamics/<run_name-timestamp>/checkpoints/model_<epoch>.pth
@@ -80,7 +80,7 @@ if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${ME
     fi
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.run_benchmark \
+"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.sim_benchmark \
     --model-ckpt          "${MODEL_CKPT}" \
     --fail-root           "${FAIL_ROOT}" \
     --success-root        "${SUCCESS_ROOT}" \

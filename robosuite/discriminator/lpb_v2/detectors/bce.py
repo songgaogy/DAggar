@@ -2,7 +2,7 @@
 
 ``D_e`` pools success-rollout frames plus, from each failure bank trajectory, the
 prefix before ``first_gt_failure_frame()``; ``D_o`` pools suffix frames after
-that cut. One shared MLP head ``g_θ(z)`` is trained with ``BCEWithLogitsLoss``.
+that cut. One shared MLP head ``g_theta(z)`` is trained with ``BCEWithLogitsLoss``.
 
 Score convention (matches ``LPBV2KNN`` so the benchmark JSON layout is unchanged):
 
@@ -30,7 +30,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from .knn import DetectionResult
+from .single_bank_knn import DetectionResult
 
 
 # --------------------------------------------------------------------------- #
@@ -42,8 +42,8 @@ class BCEHead(nn.Module):
     """MLP scalar-logit head on top of a frozen latent.
 
     Architecture (num_layers=2, hidden=256):
-        Linear(in_dim, hidden) → LayerNorm → GELU
-        Linear(hidden,  hidden) → LayerNorm → GELU
+        Linear(in_dim, hidden) -> LayerNorm -> GELU
+        Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden, 1)
     """
 

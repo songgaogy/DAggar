@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 
 from benchmark.core import BenchmarkTrajectory
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.benchmark import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 PHASE_SUCCESS = "success"

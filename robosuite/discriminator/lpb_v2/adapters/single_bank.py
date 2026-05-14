@@ -20,7 +20,7 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from .knn import LPBV2Encoder, LPBV2KNN
+from robosuite.discriminator.lpb_v2.detectors.single_bank_knn import LPBV2Encoder, LPBV2KNN
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:

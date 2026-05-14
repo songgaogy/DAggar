@@ -83,7 +83,7 @@ if [[ -n "${FAIL_BANK_IDS_JSON}" ]]; then
     EXTRA_ARGS+=(--fail-bank-ids-json "${FAIL_BANK_IDS_JSON}")
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.run_two_bank_real_world_benchmark \
+"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.real_world_two_bank \
     --model-ckpt          "${MODEL_CKPT}" \
     --fail-root           "${FAIL_ROOT}" \
     --success-root        "${SUCCESS_ROOT}" \

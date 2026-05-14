@@ -6,7 +6,7 @@ import argparse
 
 from benchmark.core import EvalConfig
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.benchmark import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:

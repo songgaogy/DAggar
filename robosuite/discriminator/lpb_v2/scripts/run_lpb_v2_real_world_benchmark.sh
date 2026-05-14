@@ -69,7 +69,7 @@ if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.run_real_world_benchmark \
+"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.real_world_single_bank \
     --model-ckpt          "${MODEL_CKPT}" \
     --fail-root           "${FAIL_ROOT}" \
     --success-root        "${SUCCESS_ROOT}" \
