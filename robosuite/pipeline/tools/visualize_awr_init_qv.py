@@ -164,15 +164,28 @@ def load_demo_transitions(
         control_freq=int(control_freq),
         demo_names=(str(selected.demo_key),),
     )
-    if len(env_transitions) != len(transitions):
+    if not env_transitions:
         raise RuntimeError(
-            "Env replay transitions length mismatch with flow transitions: "
+            "Env replay produced zero transitions for non-empty flow demo: "
+            f"{selected.hdf5_path}::{selected.demo_key}"
+        )
+    if len(env_transitions) > len(transitions):
+        raise RuntimeError(
+            "Env replay produced more transitions than flow loading: "
             f"{len(env_transitions)} vs {len(transitions)} for {selected.hdf5_path}::{selected.demo_key}"
         )
+    if len(env_transitions) < len(transitions):
+        print(
+            "[INFO] Truncated visualization transitions at env replay terminal step: "
+            f"kept={len(env_transitions)}, original={len(transitions)}, "
+            f"demo={selected.hdf5_path}::{selected.demo_key}"
+        )
+        transitions = transitions[: len(env_transitions)]
     for idx, (flow_t, env_t) in enumerate(zip(transitions, env_transitions)):
         _ = idx
         flow_t.reward = float(env_t.reward)
         flow_t.done = bool(env_t.done)
+        flow_t.reward_source = "env_success"
         if isinstance(flow_t.info, dict):
             flow_t.info["reward_source"] = "env_success"
             flow_t.info["success_from_env_replay"] = True

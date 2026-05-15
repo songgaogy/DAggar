@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-ENV_NAME="Stack"
-TASK_NAME="PandaStack"
-CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/awr/awr_Stack_2026-04-30_16-36-44/checkpoints/step_00010000_updates_00004950_ep_00033.pt"
+ENV_NAME="PickPlaceBread"
+TASK_NAME="PickPlaceBread"
+CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/outputs/awr/awr_PickPlaceBread_2026-05-15_22-24-31/checkpoints/step_00010000_updates_00003300_ep_00033.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=400
 VIDEO_OUTPUT="${VIDEO_OUTPUT:-false}"

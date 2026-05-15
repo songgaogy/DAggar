@@ -10,7 +10,7 @@ SUCCESS_NUM_TRAJ="${SUCCESS_NUM_TRAJ:-20}"
 FAIL_NUM_TRAJ="${FAIL_NUM_TRAJ:-20}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 TASK_FILTER="${TASK_FILTER:-all}"
-MAX_JOBS="${MAX_JOBS:-6}"
+MAX_JOBS="${MAX_JOBS:-3}"
 LEARNER_DEVICES="${LEARNER_DEVICES:-${LEARNER_DEVICE:-cuda:0}}"
 INFERENCE_DEVICES="${INFERENCE_DEVICES:-${INFERENCE_DEVICE:-cuda:0}}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
@@ -20,7 +20,7 @@ TASK_SPECS=(
   "Stack:PandaStack"
   "PickPlaceBread:PickPlaceBread"
   "PickPlaceCereal:PickPlaceCereal"
-  "PickPlaceMilk:PickPlaceMilk"
+  # "PickPlaceMilk:PickPlaceMilk"
 )
 
 IFS="," read -r -a LEARNER_DEVICE_LIST <<< "${LEARNER_DEVICES}"

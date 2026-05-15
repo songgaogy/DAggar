@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-TASK_DATA_NAME="${TASK_DATA_NAME:-PickPlaceMilk}"
+TASK_DATA_NAME="${TASK_DATA_NAME:-PandaStack}"
 QV_CACHE="${QV_CACHE:-outputs/awr/qv_cache/${TASK_DATA_NAME}.pt}"
 SPLIT="${SPLIT:-success_rollout}"
 DEMO_ROOT="${DEMO_ROOT:-data}"
@@ -65,6 +65,6 @@ echo "[awr_qv] qv_cache=${QV_CACHE}"
 echo "[awr_qv] task_data_name=${TASK_DATA_NAME} split=${SPLIT}"
 echo "[awr_qv] seed=${SEED} max_windows=${MAX_WINDOWS:-all}"
 
-"${PYTHON_BIN}" -m robosuite.pipeline.test.visualize_awr_init_qv \
+"${PYTHON_BIN}" -m robosuite.pipeline.tools.visualize_awr_init_qv \
   "${PY_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
