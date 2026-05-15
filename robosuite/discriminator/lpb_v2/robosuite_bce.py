@@ -73,6 +73,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--calib-mode",
+        type=str,
+        default="two_class_youden",
+        choices=["success_percentile", "two_class_youden"],
+        help="Per-task threshold calibration. success_percentile follows the "
+             "original delta-percentile rule on success-calib frames. "
+             "two_class_youden (default) overrides tau with argmax(TPR-FPR) on "
+             "(success-calib, fail-suffix) failure scores. Either choice leaves "
+             "step_scores untouched, so AUROC/AUPRC are unaffected.",
+    )
 
     # Failure-pool selection.
     parser.add_argument("--fail-bank-per-task", type=int, default=25,
@@ -249,7 +260,7 @@ def main() -> None:
         None if float(args.max_expert_other_ratio) <= 0.0 else float(args.max_expert_other_ratio)
     )
     discriminator = BCEBenchmarkDiscriminator(
-        model_ckpt=str(args.model_ckpt),
+        model_ckpt=str(args.model_ckpt),        # freezed WAM model
         fail_bank_trajectories=fail_bank_trajs,
         fail_calib_trajectories=fail_calib_trajs,
         max_expert_other_ratio=max_eo_ratio,
@@ -259,6 +270,7 @@ def main() -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         batch_size=int(args.batch_size),
+        calib_mode=str(args.calib_mode),
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
@@ -275,10 +287,13 @@ def main() -> None:
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),
     )
+
     try:
+        # fit bce model
         print("[robosuite][bce] training BCE head (GT split; no eval during training)...",
               flush=True)
         discriminator.fit_on_benchmark(trajs)
+
         print("[robosuite][bce] training complete; running bench.evaluate(...)", flush=True)
         result = bench.evaluate(
             discriminator,
@@ -309,6 +324,7 @@ def main() -> None:
                 "fail_calib_per_task": int(args.fail_calib_per_task),
                 "eval_fail_video_ids": sorted(eval_fail_keys),
                 "delta": float(args.delta),
+                "calib_mode": str(args.calib_mode),
                 "epochs": int(args.epochs),
                 "lr": float(args.lr),
                 "batch_size": int(args.batch_size),

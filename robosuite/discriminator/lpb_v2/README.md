@@ -39,7 +39,8 @@ lpb_v2/
   training/
     train.py                       # Hydra entry for latent dynamics pretraining
   visualization/
-    visualize.py                   # Latent visualization utilities
+    visualize.py                   # Single-bank KNN per-trajectory visualization
+    visualize_bce.py               # BCE discriminator per-trajectory visualization
   config/                          # Hydra configs
   data/                            # HDF5 / preprocessed / Agilex datasets
   models/                          # ResNet, proprio MLP, ViT predictor, dynamics model
@@ -255,7 +256,9 @@ Files:
 - `detectors/bce.py`
 - `adapters/bce.py`
 - `real_world_bce.py`
+- `robosuite_bce.py`
 - `scripts/run_bce_real_world_benchmark.sh`
+- `scripts/run_bce_robosuite_benchmark.sh`
 - `tests/test_bce_discriminator.py`
 
 Workflow:
@@ -276,12 +279,23 @@ g(z) = head(z)                 # larger means more expert-like
 failure_score = -g(z)          # larger means more failure-like
 ```
 
-5. Calibrate per-task thresholds on held-out success frames:
+5. Calibrate per-task thresholds. Default is **two-class Youden** (failure-aware):
 
 ```text
-tau_task = percentile(success_calib_failure_scores, 100 - delta)
+tau_task = argmax_t  TPR(t) - FPR(t)
+           over s_succ = success-calib failure scores
+           and  s_fail = fail-bank GT-suffix failure scores
 pred_t = 1 iff failure_score_t >= tau_task
 ```
+
+Selectable via `--calib-mode`. The original PU-style alternative is:
+
+```text
+# --calib-mode success_percentile
+tau_task = percentile(success_calib_failure_scores, 100 - delta)
+```
+
+Calibration only affects `pred_t` (and downstream F1 / precision / recall). AUROC and AUPRC are computed from the continuous `step_scores` and are invariant under `calib_mode`.
 
 Run:
 
@@ -304,9 +318,79 @@ MAX_EXPERT_OTHER_RATIO=1.0     # <=0 disables the D_e cap
 SAVE_CKPT_DIR=/path/to/out/checkpoints
 KNN_FEATURE_SOURCE=transformer
 KNN_TRANSFORMER_LAYER=1
+CALIB_MODE=two_class_youden    # two_class_youden | success_percentile
 ```
 
 Hard invariant: `BCEBenchmarkDiscriminator.fit_on_benchmark(...)` trains and calibrates only. It does not call `bench.evaluate(...)` and does not compute AUROC during training. Evaluation happens later in `real_world_bce.py`.
+
+---
+
+## Per-trajectory visualization
+
+Each discriminator variant has a paired visualization entry that renders, for a sampled set of failure trajectories, an MP4 (per-frame HUD + red border on predicted-failure frames) plus a multi-page PDF (per-trajectory score curve, calibrated threshold, GT failure segments, summary page).
+
+### Single-bank KNN visualization
+
+```bash
+MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
+TASK=PickPlaceCereal \
+  bash robosuite/discriminator/lpb_v2/scripts/visualize_lpb_v2.sh
+```
+
+Driver: `visualization/visualize.py`.
+
+### BCE visualization (robosuite-sim)
+
+```bash
+MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
+TASK=PickPlaceCereal NUM_TRAJS=3 \
+  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh
+```
+
+### BCE visualization (real-world Agilex)
+
+```bash
+MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
+TASK=candy_in_plate NUM_TRAJS=3 \
+  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_realworld.sh
+```
+
+Both BCE entrances are thin wrappers around `visualization/visualize_bce.py` (single Python module, dispatched by `--kind {robosuite,realworld}`). They mirror the corresponding `run_bce_*_benchmark.sh` for failure-bank construction and BCE head hyperparameters:
+
+```bash
+FAIL_BANK_PER_TASK=25
+HEAD_HIDDEN=256
+HEAD_LAYERS=2
+EPOCHS=20
+LR=3e-4
+WEIGHT_DECAY=1e-4
+BATCH_SIZE=512
+MAX_EXPERT_OTHER_RATIO=1.0
+FEATURE_SOURCE=transformer
+TRANSFORMER_LAYER=1
+DELTA=10.0
+```
+
+The visualizer always reports the two-class Youden operating point computed from the same `(success-calib, fail-suffix)` failure-score distributions used by `CALIB_MODE=two_class_youden` in the benchmark runner. To inspect a different `tau`, change `CALIB_MODE` in the runner script and rerun — there is no separate viz knob.
+
+By default the script fits a fresh BCE head and writes `bce_head.pth` under `<OUT_DIR>/checkpoints/`. To skip training and reuse a previously fitted head, pass `LOAD_CKPT=/abs/path/to/bce_head.pth` (the per-task thresholds are restored from the ckpt; failure-bank discovery is skipped).
+
+Score / threshold semantics on screen:
+
+```text
+g(z)            = head(z)                # expert-likeness logit
+bce_score       = -g(z)                  # shown in HUD; larger = more failure
+pred_t = 1      iff bce_score_t >= tau_task
+```
+
+Output layout:
+
+```text
+<OUT_DIR>/
+  videos/<video_id>.mp4
+  bce_v2_scores.pdf
+  checkpoints/bce_head.pth    # only on cold fit; absent under LOAD_CKPT
+```
 
 ---
 

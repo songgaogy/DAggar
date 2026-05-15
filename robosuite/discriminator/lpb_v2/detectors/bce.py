@@ -34,6 +34,41 @@ from .single_bank_knn import DetectionResult
 
 
 # --------------------------------------------------------------------------- #
+# Two-class Youden threshold (shared by adapter calibration + viz)            #
+# --------------------------------------------------------------------------- #
+
+
+def two_class_youden_threshold(s_succ: np.ndarray, s_fail: np.ndarray) -> float:
+    """``argmax_tau (TPR(tau) - FPR(tau))`` on two empirical failure-score samples.
+
+    A candidate is "failure" iff ``failure_score >= tau``. The candidate grid is
+    the union of the two empirical samples, which is sufficient for the discrete
+    J curve (J is piecewise-constant between consecutive sample values).
+
+    Args:
+        s_succ: 1-D failure scores from success/expert calibration frames.
+        s_fail: 1-D failure scores from GT failure-suffix frames.
+
+    Returns:
+        tau (float).
+    """
+    s_succ = np.asarray(s_succ, dtype=np.float64).reshape(-1)
+    s_fail = np.asarray(s_fail, dtype=np.float64).reshape(-1)
+    if s_succ.size == 0 or s_fail.size == 0:
+        raise ValueError(
+            f"two_class_youden requires non-empty success and failure score arrays "
+            f"(got n_succ={s_succ.size}, n_fail={s_fail.size})."
+        )
+    cands = np.unique(np.concatenate([s_succ, s_fail]))
+    s_succ_sorted = np.sort(s_succ)
+    s_fail_sorted = np.sort(s_fail)
+    fpr = 1.0 - np.searchsorted(s_succ_sorted, cands, side="left") / float(s_succ.size)
+    tpr = 1.0 - np.searchsorted(s_fail_sorted, cands, side="left") / float(s_fail.size)
+    j = tpr - fpr
+    return float(cands[int(np.argmax(j))])
+
+
+# --------------------------------------------------------------------------- #
 # Head                                                                        #
 # --------------------------------------------------------------------------- #
 

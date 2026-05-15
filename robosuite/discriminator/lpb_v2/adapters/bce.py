@@ -32,7 +32,13 @@ from robosuite.discriminator.lpb_v2.adapters.single_bank import (
     LPBV2BenchmarkDiscriminator,
     _pad_to_length,
 )
-from robosuite.discriminator.lpb_v2.detectors.bce import BCEDiscriminator
+from robosuite.discriminator.lpb_v2.detectors.bce import (
+    BCEDiscriminator,
+    two_class_youden_threshold,
+)
+
+
+_VALID_CALIB_MODES = ("success_percentile", "two_class_youden")
 
 
 class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
@@ -53,6 +59,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
+        calib_mode: str = "two_class_youden",
         save_ckpt_dir: Optional[str] = None,
         # forwarded to the single-bank parent for encoding / cache parity
         device: str = "cuda",
@@ -102,6 +109,11 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.batch_size = int(batch_size)
+        if str(calib_mode) not in _VALID_CALIB_MODES:
+            raise ValueError(
+                f"calib_mode must be one of {_VALID_CALIB_MODES}, got {calib_mode!r}"
+            )
+        self.calib_mode = str(calib_mode)
         self.save_ckpt_dir = None if save_ckpt_dir is None else str(save_ckpt_dir)
 
         # Single shared detector across tasks (constructed in fit_on_benchmark
@@ -143,6 +155,77 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
                 + "\n  - ".join(problems)
             )
 
+    def _recalibrate_youden(
+        self,
+        *,
+        expert_calib_per_task: Dict[str, List[torch.Tensor]],
+        fail_suffix_per_task: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, Dict[str, float]]:
+        """Replace the success-percentile per-task threshold with the J-optimal
+        split point on (success-calib failure scores, fail-suffix failure scores).
+
+        Only the per-task threshold table is mutated; the trained head itself
+        is unchanged, so AUROC / AUPRC and `step_scores` are invariant.
+        Returns per-task diagnostic stats (n_succ, n_fail, mean/std for both
+        sides) to surface in ``calibration_summary``.
+        """
+        if self._shared_detector is None:
+            raise RuntimeError("_recalibrate_youden called before head was constructed.")
+        det = self._shared_detector
+
+        per_task_stats: Dict[str, Dict[str, float]] = {}
+        for task, calib_seqs in expert_calib_per_task.items():
+            fail_seqs = fail_suffix_per_task.get(task, [])
+            if not fail_seqs:
+                raise RuntimeError(
+                    f"Task {task!r}: two_class_youden requires at least one "
+                    f"GT-failure-suffix slice in the fail-bank pool."
+                )
+
+            calib_seqs = [t for t in calib_seqs if t.numel() > 0]
+            fail_seqs = [t for t in fail_seqs if t.numel() > 0]
+            if not calib_seqs:
+                raise RuntimeError(
+                    f"Task {task!r}: two_class_youden requires success-calib frames."
+                )
+
+            calib_feats = torch.cat(
+                [s.to(torch.float32).reshape(-1, s.shape[-1]) for s in calib_seqs], dim=0,
+            )
+            fail_feats = torch.cat(
+                [s.to(torch.float32).reshape(-1, s.shape[-1]) for s in fail_seqs], dim=0,
+            )
+            s_succ = (-det._logits_np(calib_feats)).astype(np.float64)
+            s_fail = (-det._logits_np(fail_feats)).astype(np.float64)
+
+            tau_y = float(two_class_youden_threshold(s_succ, s_fail))
+            old_tau = float(det.thresholds.get(task, float("nan")))
+            det.thresholds[task] = tau_y
+            cs = det.calib_stats.get(task)
+            if cs is not None:
+                cs.threshold = tau_y
+
+            per_task_stats[task] = {
+                "threshold": tau_y,
+                "youden_threshold": tau_y,
+                "youden_success_percentile_threshold": old_tau,
+                "youden_n_succ": int(s_succ.size),
+                "youden_n_fail": int(s_fail.size),
+                "youden_succ_mean": float(s_succ.mean()),
+                "youden_succ_std": float(s_succ.std()),
+                "youden_fail_mean": float(s_fail.mean()),
+                "youden_fail_std": float(s_fail.std()),
+            }
+            if self.verbose_fit:
+                print(
+                    f"[bce][calib][youden] task={task} "
+                    f"tau: {old_tau:.5f} -> {tau_y:.5f}  "
+                    f"n_succ={s_succ.size} n_fail={s_fail.size}  "
+                    f"succ_mean={s_succ.mean():.3f} fail_mean={s_fail.mean():.3f}",
+                    flush=True,
+                )
+        return per_task_stats
+
     def _save_checkpoint(self) -> Optional[Path]:
         if self.save_ckpt_dir is None or self._shared_detector is None:
             return None
@@ -158,6 +241,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             "transformer_layer": int(self.transformer_layer),
             "model_ckpt": str(self.model_ckpt),
             "max_expert_other_ratio": self.max_expert_other_ratio,
+            "calib_mode": str(self.calib_mode),
             "fail_bank_video_ids": sorted(
                 str(t.video_id) for t in self.fail_bank_trajectories
             ),
@@ -238,7 +322,10 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             expert_calib_stats[task] = tot
 
         # Pool failure bank: prefix [0, t*) -> D_e, suffix [t*, T) -> D_o (GT).
+        # `fail_suffix_per_task` keeps the per-task slices alongside the flat
+        # pool so that two_class_youden can recompute per-task tau post-fit.
         pooled_other: List[torch.Tensor] = []
+        fail_suffix_per_task: Dict[str, List[torch.Tensor]] = {}
         fail_other_stats_per_task: Dict[str, int] = {}
         fail_prefix_stats_per_task: Dict[str, int] = {}
         skipped_no_gt: List[str] = []
@@ -258,6 +345,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             suffix = f[t_star_int:]
             pooled_expert.append(prefix)
             pooled_other.append(suffix)
+            fail_suffix_per_task.setdefault(task_name, []).append(suffix)
             fail_prefix_stats_per_task[task_name] = (
                 fail_prefix_stats_per_task.get(task_name, 0) + int(prefix.shape[0])
             )
@@ -325,6 +413,22 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             verbose=self.verbose_fit,
         )
 
+        # ------ optional Youden recalibration ------
+        # `_shared_detector.fit(...)` always calibrates per-task tau via the
+        # success_percentile rule (using `delta`). When calib_mode is
+        # two_class_youden we OVERRIDE that tau with the J-optimal split point
+        # on (success-calib, fail-suffix) failure scores. The trained head is
+        # unchanged; only the per-task threshold table is mutated. This means
+        # AUROC / AUPRC are invariant (they use continuous step_scores), while
+        # F1 / precision / recall move with tau.
+        per_task_youden_stats: Dict[str, Dict[str, float]] = {}
+        if self.calib_mode == "two_class_youden":
+            per_task_youden_stats = self._recalibrate_youden(
+                expert_calib_per_task=expert_calib_per_task,
+                fail_suffix_per_task=fail_suffix_per_task,
+            )
+            thresholds = dict(self._shared_detector.thresholds)
+
         # Alias the same detector under every task name (so the parent's
         # `_detectors_per_task[task]` lookup pattern keeps working).
         self._detectors_per_task = {task: self._shared_detector for task in task_to_success}
@@ -340,6 +444,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
             "head_layers": int(self.head_layers),
             "delta": float(self.delta),
             "calib_fraction": float(self.calib_fraction),
+            "calib_mode": str(self.calib_mode),
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
@@ -351,8 +456,9 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         }
         for task, tau in thresholds.items():
             cs = self._shared_detector.calib_stats.get(task)
-            self._calibration_stats[task] = {
+            entry: Dict[str, Any] = {
                 "threshold": float(tau),
+                "calib_mode": str(self.calib_mode),
                 "num_success_trajectories": int(len(task_to_success[task])),
                 "num_train_success_trajectories": int(len(train_success_per_task[task])),
                 "num_calib_success_trajectories": int(len(calib_success_per_task[task])),
@@ -366,6 +472,9 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
                 "calib_score_std": None if cs is None else float(cs.calib_score_std),
                 "calib_num_frames": None if cs is None else int(cs.num_calib_frames),
             }
+            if task in per_task_youden_stats:
+                entry.update(per_task_youden_stats[task])
+            self._calibration_stats[task] = entry
 
         # Final one-shot checkpoint (no mid-training snapshots).
         ckpt_path = self._save_checkpoint()

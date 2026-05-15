@@ -77,6 +77,13 @@ MAX_EXPERT_OTHER_RATIO="${MAX_EXPERT_OTHER_RATIO:-1.0}"
 # Failure pool: drawn from FAIL_TRAIN_ROOT, disjoint from FAIL_ROOT by construction.
 # If a task has fewer GT-labeled failures than FAIL_BANK_PER_TASK, all are used.
 FAIL_BANK_PER_TASK="${FAIL_BANK_PER_TASK:-25}"
+
+# Per-task threshold calibration. AUROC / AUPRC are computed from continuous
+# step_scores, so they are invariant under CALIB_MODE; only F1 / precision /
+# recall move with tau.
+#   success_percentile : tau = percentile(success-calib failure scores, 100 - DELTA)
+#   two_class_youden   : tau = argmax(TPR - FPR) on (success-calib, fail-suffix)
+CALIB_MODE="${CALIB_MODE:-two_class_youden}"
 # --------------------------------------------------------
 
 
@@ -131,6 +138,7 @@ fi
     --batch-size           "${BATCH_SIZE}" \
     --max-expert-other-ratio "${MAX_EXPERT_OTHER_RATIO}" \
     --fail-bank-per-task   "${FAIL_BANK_PER_TASK}" \
+    --calib-mode           "${CALIB_MODE}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 

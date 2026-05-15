@@ -24,7 +24,7 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"
 # --------------------------------------------------------
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_eval/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_eval_realworld/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
@@ -71,6 +71,13 @@ MAX_EXPERT_OTHER_RATIO="${MAX_EXPERT_OTHER_RATIO:-1.0}"
 
 # Failure pool: disjoint from eval failures; each traj split at first_gt_failure_frame.
 FAIL_BANK_PER_TASK="${FAIL_BANK_PER_TASK:-25}"
+
+# Per-task threshold calibration. AUROC / AUPRC are computed from continuous
+# step_scores, so they are invariant under CALIB_MODE; only F1 / precision /
+# recall move with tau.
+#   success_percentile : tau = percentile(success-calib failure scores, 100 - DELTA)
+#   two_class_youden   : tau = argmax(TPR - FPR) on (success-calib, fail-suffix)
+CALIB_MODE="${CALIB_MODE:-two_class_youden}"
 # --------------------------------------------------------
 
 
@@ -125,6 +132,7 @@ fi
     --batch-size           "${BATCH_SIZE}" \
     --max-expert-other-ratio "${MAX_EXPERT_OTHER_RATIO}" \
     --fail-bank-per-task   "${FAIL_BANK_PER_TASK}" \
+    --calib-mode           "${CALIB_MODE}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 
