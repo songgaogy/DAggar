@@ -1,0 +1,119 @@
+defaults:
+  - _self_
+
+seed: 42
+
+env:
+  environment: "Lift"
+  robots: ["Panda"]
+  config: "default"
+  controller: null
+  renderer: "mjviewer"
+  render_camera: "agentview"
+  camera_names: ["agentview", "robot0_eye_in_hand"]
+  proprio_keys: []
+  img_height: 128
+  img_width: 128
+  control_freq: 20
+  horizon: null
+
+algorithm:
+  type: "hg-dagger"
+
+  encoder:
+    encoder_type: "resnet-pretrained"
+    image_keys: ${env.camera_names}
+    proprio_keys: ["state"]
+    feature_dim: 256
+    proprio_feature_dim: 64
+    image_size: ${env.img_height}
+    cnn_channels: [32, 64, 64, 64]
+    use_layer_norm: true
+    resnet_name: "resnet10"
+    pretrained: true
+    freeze_backbone: true
+    share_image_encoder: false
+    num_spatial_blocks: 8
+    pretrained_path: "./data/pretrained/resnet10_params.pkl"
+
+  bc:
+    hidden_dims: [256, 256]
+    learning_rate: 3.0e-4
+    log_std_min: -5.0
+    log_std_max: 2.0
+    tanh_squash_distribution: true
+    hybrid_gripper_head: true
+    num_gripper_actions: 3
+    gripper_loss_weight: 1.0
+    device: "cuda:0"
+    inference_device: "auto"
+
+  online_buffer:
+    capacity: 200000
+
+  demo_buffer:
+    capacity: 200000
+
+  trainer:
+    batch_size: 256
+    warmup_steps: 0
+    updates_per_step: 1
+    steps_per_update: 50
+    random_steps: 0
+    pretrain_steps: 10000
+
+intervention:
+  enabled: true
+  device: "spacemouse"
+  pos_sensitivity: 1.0
+  rot_sensitivity: 1.0
+  reverse_xy: false
+  goal_update_mode: "target"
+  device_reset_as_episode_reset: true
+
+data:
+  demo_paths: []
+  task_name: null
+  demo_root: "./data"
+  demo_split: "expert"
+  num_trajectories: null
+
+runtime:
+  max_steps: 100000
+  interactive: true
+  viewer_enabled: true
+  viewer_backend: "auto"
+  viewer_async: false
+  viewer_startup_delay: 0.0
+  viewer_reset_warmup_frames: 2
+  visualize_gripper_markers: true
+  control_fps: ${env.control_freq}
+  render_fps: ${runtime.control_fps}
+  image_obs_fps: 10.0
+  spacemouse_fps: ${runtime.control_fps}
+  policy_fps: ${runtime.control_fps}
+  fps_log_interval: 1.0
+  async_updates: true
+  resume: false
+  checkpoint: null
+  load_buffers: true
+  eval_deterministic: false
+  buffer_save_interval: 200
+  episode_pause_sec: 1.0
+
+logging:
+  output_root: "./outputs/HG-DAgger"
+  run_name: null
+  project: "HG-DAgger_AIR"
+  entity: "songgao-personal"
+  use_wandb: true
+  wandb_mode: "offline"
+  log_interval: 10
+  checkpoint_interval: 1000
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
