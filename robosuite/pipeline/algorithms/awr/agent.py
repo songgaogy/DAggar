@@ -350,7 +350,7 @@ class AWRAgent:
             buffer_role="demo",
         )
 
-    def sample_online_step_batch(self, batch_size: int | None = None):
+    def sample_online_step_batch(self, batch_size: int | None = None, *, augment: bool = True):
         batch_size = int(batch_size or self.trainer_config.batch_size)
         return self.online_buffer.sample_step_batch(
             batch_size=batch_size,
@@ -358,7 +358,7 @@ class AWRAgent:
             proprio_mean=self.core.prop_mean,
             proprio_std=self.core.prop_std,
             device=self.core.device,
-            augment=True,
+            augment=augment,
             buffer_role="online",
         )
 
@@ -408,7 +408,7 @@ class AWRAgent:
 
     def update_value_only(self, *, step_batch=None, batch_size: int | None = None, use_online_only: bool = True) -> dict[str, float]:
         if step_batch is None:
-            step_batch = self.sample_online_step_batch(batch_size=batch_size) if use_online_only else self.sample_mixed_step_batch(batch_size=batch_size)
+            step_batch = self.sample_online_step_batch(batch_size=batch_size, augment=False) if use_online_only else self.sample_mixed_step_batch(batch_size=batch_size)
         return self.core.update_value(step_batch)
 
     def update(self, *, actor_batch=None, step_batch=None, batch_size: int | None = None) -> dict[str, float]:

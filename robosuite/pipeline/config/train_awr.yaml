@@ -286,9 +286,12 @@ runtime:
   qv_cache:
     enabled: true
     dir: "./outputs/awr/qv_cache"
+    path: null
     save: true
     strict_metadata: true
     force_rebuild: false
+    direct_load: false
+    require_existing: false
 
 logging:
   output_root: "./outputs/awr"

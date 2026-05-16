@@ -249,6 +249,11 @@ def _optional_int(value: Any) -> int | None:
 
 def resolve_qv_cache_path(cfg: DictConfig, *, task_data_name: str) -> Path:
     qv_cache_cfg = getattr(cfg.runtime, "qv_cache", None)
+    cache_path_value = None if qv_cache_cfg is None else getattr(qv_cache_cfg, "path", None)
+    if cache_path_value is not None and str(cache_path_value).strip().lower() not in {"", "none", "null"}:
+        cache_path = Path(to_absolute_path(str(cache_path_value)))
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        return cache_path
     cache_dir_value = "./outputs/awr/qv_cache" if qv_cache_cfg is None else getattr(qv_cache_cfg, "dir", "./outputs/awr/qv_cache")
     cache_dir = Path(to_absolute_path(str(cache_dir_value)))
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -840,15 +845,52 @@ def main(cfg: DictConfig) -> None:
     qv_cache_enabled = bool(getattr(qv_cache_cfg, "enabled", True)) if qv_cache_cfg is not None else True
     qv_cache_force_rebuild = bool(getattr(qv_cache_cfg, "force_rebuild", False)) if qv_cache_cfg is not None else False
     qv_cache_save_enabled = bool(getattr(qv_cache_cfg, "save", True)) if qv_cache_cfg is not None else True
+    qv_cache_direct_load = bool(getattr(qv_cache_cfg, "direct_load", False)) if qv_cache_cfg is not None else False
+    qv_cache_require_existing = qv_cache_direct_load
+    if qv_cache_cfg is not None:
+        qv_cache_require_existing = bool(getattr(qv_cache_cfg, "require_existing", qv_cache_direct_load))
     qv_cache_path = resolve_qv_cache_path(cfg, task_data_name=task_data_name)
+    qv_cache_metadata = build_qv_cache_metadata(
+        cfg,
+        task_name=task_name,
+        task_data_name=task_data_name,
+        policy_camera_names=policy_camera_names,
+        init_checkpoint=init_checkpoint,
+        awr_config=agent.awr_config,
+    )
+    qv_cache_loaded = False
+    if loaded_checkpoint is None and qv_cache_enabled and qv_cache_direct_load:
+        if qv_cache_force_rebuild:
+            raise ValueError("runtime.qv_cache.direct_load=true cannot be combined with force_rebuild=true.")
+        qv_cache_loaded = maybe_load_qv_cache(
+            cfg=cfg,
+            agent=agent,
+            trainer=trainer,
+            cache_path=qv_cache_path,
+            expected_metadata=qv_cache_metadata,
+        )
+        if not qv_cache_loaded and qv_cache_require_existing:
+            raise FileNotFoundError(f"Required Q/V cache could not be loaded from {qv_cache_path}")
+
     expert_paths = resolve_task_demo_paths(task_data_name, data_root=to_absolute_path(str(cfg.data.demo_root)), split="expert")
-    success_paths = resolve_task_demo_paths(task_data_name, data_root=to_absolute_path(str(cfg.data.demo_root)), split="success_rollout")
-    fail_paths = resolve_task_demo_paths(task_data_name, data_root=to_absolute_path(str(cfg.data.demo_root)), split="fail_rollout")
+    success_paths = []
+    fail_paths = []
+    if not qv_cache_loaded:
+        success_paths = resolve_task_demo_paths(
+            task_data_name,
+            data_root=to_absolute_path(str(cfg.data.demo_root)),
+            split="success_rollout",
+        )
+        fail_paths = resolve_task_demo_paths(
+            task_data_name,
+            data_root=to_absolute_path(str(cfg.data.demo_root)),
+            split="fail_rollout",
+        )
     if not expert_paths:
         raise FileNotFoundError(
             f"AWR requires expert demos under ./data/<task>/expert. No files were found for task '{task_data_name}'."
         )
-    if loaded_checkpoint is None and (not success_paths or not fail_paths):
+    if loaded_checkpoint is None and not qv_cache_loaded and (not success_paths or not fail_paths):
         raise FileNotFoundError(
             f"AWR requires both success_rollout and fail_rollout for value warmup. task='{task_data_name}', "
             f"success_files={len(success_paths)}, fail_files={len(fail_paths)}"
@@ -905,7 +947,9 @@ def main(cfg: DictConfig) -> None:
     else:
         print(f"[INFO] Reusing checkpoint demo buffer with {len(agent.demo_buffer)} transitions")
 
-    if len(agent.online_buffer) == 0:
+    if len(agent.online_buffer) == 0 and qv_cache_loaded:
+        print("[INFO] Skipping success/fail rollout loading because Q/V cache was loaded directly.")
+    elif len(agent.online_buffer) == 0:
         print(f"[INFO] Loading success/fail rollout trajectories for task={task_data_name}...")
         success_transitions = _load_split_transitions(
             split_name="success_rollout",
@@ -951,16 +995,7 @@ def main(cfg: DictConfig) -> None:
     else:
         print("[INFO] Reusing normalizers from checkpoint.")
 
-    qv_cache_metadata = build_qv_cache_metadata(
-        cfg,
-        task_name=task_name,
-        task_data_name=task_data_name,
-        policy_camera_names=policy_camera_names,
-        init_checkpoint=init_checkpoint,
-        awr_config=agent.awr_config,
-    )
-    qv_cache_loaded = False
-    if loaded_checkpoint is None and qv_cache_enabled:
+    if loaded_checkpoint is None and qv_cache_enabled and not qv_cache_direct_load:
         if qv_cache_force_rebuild:
             print(f"[qv_cache] force_rebuild path={qv_cache_path}")
         else:
@@ -983,7 +1018,9 @@ def main(cfg: DictConfig) -> None:
         print("[INFO] Discriminator reward is disabled. LPB discriminator worker will not be started.")
 
     requested_value_warmup_steps = max(0, int(cfg.algorithm.trainer.value_warmup_steps))
-    if loaded_checkpoint is None and start_step == 0:
+    if loaded_checkpoint is None and start_step == 0 and qv_cache_direct_load and qv_cache_loaded:
+        print(f"[warmup] skipped reason=qv_cache_direct_load path={qv_cache_path}")
+    elif loaded_checkpoint is None and start_step == 0:
         completed_warmup_steps = int(trainer.total_value_warmup_updates)
         remaining_warmup_steps = max(0, requested_value_warmup_steps - completed_warmup_steps)
         print(

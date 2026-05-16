@@ -5,8 +5,8 @@ ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # ---------------------------------------------------------
-ENVIRONMENT="${ENVIRONMENT:-PickPlaceBread}"
-DEMO_TASK_NAME="${DEMO_TASK_NAME:-PickPlaceBread}"
+ENVIRONMENT="${ENVIRONMENT:-PickPlaceMilk}"
+DEMO_TASK_NAME="${DEMO_TASK_NAME:-PickPlaceMilk}"
 TRAIN_EPISODE_MAX_STEPS="${TRAIN_EPISODE_MAX_STEPS:-500}"
 
 EXPERT_NUM_TRAJ="${EXPERT_NUM_TRAJ:-20}"
@@ -24,6 +24,11 @@ DISCRIMINATOR_REWARD_SCALE="${DISCRIMINATOR_REWARD_SCALE:-1.0}"
 DISCRIMINATOR_REWARD_CLIP="${DISCRIMINATOR_REWARD_CLIP:-5.0}"
 QV_CACHE_ENABLED="${QV_CACHE_ENABLED:-true}"
 QV_CACHE_FORCE_REBUILD="${QV_CACHE_FORCE_REBUILD:-false}"
+QV_CACHE_DIRECT_LOAD="${QV_CACHE_DIRECT_LOAD:-true}"
+QV_CACHE_REQUIRE_EXISTING="${QV_CACHE_REQUIRE_EXISTING:-true}"
+QV_CACHE_STRICT_METADATA="${QV_CACHE_STRICT_METADATA:-false}"
+QV_CACHE_DIR="${QV_CACHE_DIR:-./outputs/awr/qv_cache}"
+QV_CACHE_PATH="${QV_CACHE_PATH:-null}"
 # ---------------------------------------------------------
 
 INTERACTIVE="${INTERACTIVE:-true}"
@@ -125,7 +130,12 @@ fi
   runtime.fps_log_interval="${FPS_LOG_INTERVAL}" \
   runtime.buffer_save_interval="${BUFFER_SAVE_INTERVAL}" \
   runtime.qv_cache.enabled="${QV_CACHE_ENABLED}" \
+  runtime.qv_cache.dir="${QV_CACHE_DIR}" \
+  runtime.qv_cache.path="${QV_CACHE_PATH}" \
   runtime.qv_cache.force_rebuild="${QV_CACHE_FORCE_REBUILD}" \
+  runtime.qv_cache.direct_load="${QV_CACHE_DIRECT_LOAD}" \
+  runtime.qv_cache.require_existing="${QV_CACHE_REQUIRE_EXISTING}" \
+  runtime.qv_cache.strict_metadata="${QV_CACHE_STRICT_METADATA}" \
   runtime.discriminator_reward_enabled="${DISCRIMINATOR_REWARD_ENABLED}" \
   runtime.unthrottled="${UNTHROTTLED}" \
   runtime.async_updates="${ASYNC_UPDATES}" \

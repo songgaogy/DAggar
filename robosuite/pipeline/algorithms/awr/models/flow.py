@@ -341,7 +341,7 @@ class AWRFlowPolicy:
 
     def update_value(self, batch: AWRStepBatch) -> dict[str, float]:
         batch = batch.to(self.device)
-        self.model.train(True)
+        self.model.eval()
         language = [self.language_instruction] * batch.batch_size
 
         with torch.no_grad():

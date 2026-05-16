@@ -5,12 +5,12 @@ export CUDA_VISIBLE_DEVICES=0
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-20000}"
-EXPERT_NUM_TRAJ="${EXPERT_NUM_TRAJ:-20}"
-SUCCESS_NUM_TRAJ="${SUCCESS_NUM_TRAJ:-20}"
-FAIL_NUM_TRAJ="${FAIL_NUM_TRAJ:-20}"
+EXPERT_NUM_TRAJ="${EXPERT_NUM_TRAJ:-50}"
+SUCCESS_NUM_TRAJ="${SUCCESS_NUM_TRAJ:-50}"
+FAIL_NUM_TRAJ="${FAIL_NUM_TRAJ:-50}"
 FORCE_REBUILD="${FORCE_REBUILD:-false}"
 TASK_FILTER="${TASK_FILTER:-all}"
-MAX_JOBS="${MAX_JOBS:-3}"
+MAX_JOBS="${MAX_JOBS:-4}"
 LEARNER_DEVICES="${LEARNER_DEVICES:-${LEARNER_DEVICE:-cuda:0}}"
 INFERENCE_DEVICES="${INFERENCE_DEVICES:-${INFERENCE_DEVICE:-cuda:0}}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
@@ -20,7 +20,7 @@ TASK_SPECS=(
   "Stack:PandaStack"
   "PickPlaceBread:PickPlaceBread"
   "PickPlaceCereal:PickPlaceCereal"
-  # "PickPlaceMilk:PickPlaceMilk"
+  "PickPlaceMilk:PickPlaceMilk"
 )
 
 IFS="," read -r -a LEARNER_DEVICE_LIST <<< "${LEARNER_DEVICES}"
@@ -29,7 +29,8 @@ IFS="," read -r -a TASK_FILTER_LIST <<< "${TASK_FILTER}"
 
 cd "${ROOT_DIR}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export WANDB_MODE="${WANDB_MODE:-disabled}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_ENTITY="songgao-personal"
 export HYDRA_FULL_ERROR=1
 
 LOG_ROOT="${LOG_ROOT:-${ROOT_DIR}/outputs/awr/qv_cache_parallel_logs/$(date +%Y-%m-%d_%H-%M-%S)}"
