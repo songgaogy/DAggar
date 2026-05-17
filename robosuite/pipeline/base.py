@@ -7,21 +7,53 @@ import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 
-from robosuite.discriminator.bce.dataset import (
-    build_cached_splits as build_bce_cached_splits,
-    filter_refs_by_data_types as filter_bce_refs_by_data_types,
-    load_latent_trajectories as load_bce_latent_trajectories,
-)
-from robosuite.discriminator.bce.tpud_discriminator import TPUDDiscriminator
-from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder
-from robosuite.discriminator.dyn_bce.task_registry import normalize_task_name, resolve_checkpoint_task_name
-from robosuite.discriminator.lpb_new.core.dataset import (
-    LatentTrajectory,
-    build_cached_splits as build_lpb_cached_splits,
-    filter_refs_by_data_types as filter_lpb_refs_by_data_types,
-    load_latent_trajectories as load_lpb_latent_trajectories,
-)
-from robosuite.discriminator.lpb_new.core.knn_discriminator import LPBKNNDiscriminator
+# Legacy discriminator imports — these modules were removed on the `dipole` branch
+# (init dipole commit). The classes that depend on them (LPBNewOnlineDiscriminator,
+# TPUDOnlineDiscriminator, FlowMultiPolicyRuntime) will raise at instantiation time
+# instead of breaking module import, which would otherwise block every pipeline entry
+# point including train_dipole.py.
+try:
+    from robosuite.discriminator.bce.dataset import (  # type: ignore
+        build_cached_splits as build_bce_cached_splits,
+        filter_refs_by_data_types as filter_bce_refs_by_data_types,
+        load_latent_trajectories as load_bce_latent_trajectories,
+    )
+    from robosuite.discriminator.bce.tpud_discriminator import TPUDDiscriminator  # type: ignore
+except Exception:
+    build_bce_cached_splits = None  # type: ignore
+    filter_bce_refs_by_data_types = None  # type: ignore
+    load_bce_latent_trajectories = None  # type: ignore
+    TPUDDiscriminator = None  # type: ignore
+
+try:
+    from robosuite.discriminator.dyn_bce.modules.flow_encoder import FrozenFlowMultitaskEncoder  # type: ignore
+    from robosuite.discriminator.dyn_bce.task_registry import (  # type: ignore
+        normalize_task_name,
+        resolve_checkpoint_task_name,
+    )
+except Exception:
+    FrozenFlowMultitaskEncoder = None  # type: ignore
+
+    def normalize_task_name(name: str) -> str:  # type: ignore
+        return str(name)
+
+    def resolve_checkpoint_task_name(name: str) -> str:  # type: ignore
+        return str(name)
+
+try:
+    from robosuite.discriminator.lpb_new.core.dataset import (  # type: ignore
+        LatentTrajectory,
+        build_cached_splits as build_lpb_cached_splits,
+        filter_refs_by_data_types as filter_lpb_refs_by_data_types,
+        load_latent_trajectories as load_lpb_latent_trajectories,
+    )
+    from robosuite.discriminator.lpb_new.core.knn_discriminator import LPBKNNDiscriminator  # type: ignore
+except Exception:
+    LatentTrajectory = None  # type: ignore
+    build_lpb_cached_splits = None  # type: ignore
+    filter_lpb_refs_by_data_types = None  # type: ignore
+    load_lpb_latent_trajectories = None  # type: ignore
+    LPBKNNDiscriminator = None  # type: ignore
 from robosuite.policy.flow_multi.eval_flow import (
     center_crop_resize,
     resolve_language_instruction,

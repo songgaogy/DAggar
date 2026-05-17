@@ -186,7 +186,7 @@ def _write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
         mode="I",
         fps=int(fps),
         codec="libx264",
-        ffmpeg_params=["-pix_fmt", "yuv420p", "-movflags", "+faststart"],
+        ffmpeg_params=["-movflags", "+faststart"],
         macro_block_size=1,
     ) as writer:
         for frame in frames:
