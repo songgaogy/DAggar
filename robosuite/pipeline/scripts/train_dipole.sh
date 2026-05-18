@@ -20,6 +20,7 @@ EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
 N_ODE_STEPS="${N_ODE_STEPS:-10}"
 EVAL_EPISODE_MAX_STEPS="${EVAL_EPISODE_MAX_STEPS:-300}"
 FPS_LOG_INTERVAL="${FPS_LOG_INTERVAL:-3.0}"
+DISCRIMINATOR_DISPLAY_HZ="${DISCRIMINATOR_DISPLAY_HZ:-2.0}"   # live [disc] console line; 0 disables
 UNTHROTTLED="${UNTHROTTLED:-false}"
 
 # ----------------------------------------------------------------------------------------------
@@ -27,7 +28,7 @@ UNTHROTTLED="${UNTHROTTLED:-false}"
 # shared multi-task artefact produced by run_bce_robosuite_benchmark.sh.
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
 # NOTE: not suit for PandaStack
-LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth}"
+LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/bce_viz_robosuite/viz_bce_PickPlaceBread-20260518_014008/checkpoints/bce_head.pth}"
 
 # DIPOLE hyperparameters.
 BETA="${BETA:-1.0}"
@@ -142,7 +143,8 @@ fi
 
 EFFECTIVE_OMEGA="${OMEGA_RUNTIME_OVERRIDE:-${OMEGA}}"
 
-"${PYTHON_BIN}" -m robosuite.pipeline.train_dipole \
+TRAIN_DIPOLE_CMD=(
+  "${PYTHON_BIN}" -m robosuite.pipeline.train_dipole
   seed="${SEED_VALUE}" \
   env.environment="${ENVIRONMENT}" \
   env.renderer="mjviewer" \
@@ -156,6 +158,7 @@ EFFECTIVE_OMEGA="${OMEGA_RUNTIME_OVERRIDE:-${OMEGA}}"
   runtime.viewer_async="${VIEWER_ASYNC}" \
   runtime.viewer_backend="${VIEWER_BACKEND}" \
   runtime.fps_log_interval="${FPS_LOG_INTERVAL}" \
+  runtime.discriminator_display_hz="${DISCRIMINATOR_DISPLAY_HZ}" \
   runtime.buffer_save_interval="${BUFFER_SAVE_INTERVAL}" \
   runtime.unthrottled="${UNTHROTTLED}" \
   runtime.async_updates="${ASYNC_UPDATES}" \
@@ -187,7 +190,12 @@ EFFECTIVE_OMEGA="${OMEGA_RUNTIME_OVERRIDE:-${OMEGA}}"
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.log_interval="${LOG_INTERVAL}" \
   logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \
+  hydra/hydra_logging=none \
+  hydra/job_logging=none \
   "${EXTRA_ARGS[@]}"
+)
+
+"${TRAIN_DIPOLE_CMD[@]}"
 
 # Train with intervention + online updates:
 #   INIT_CHECKPOINT=/abs/flow_dagger_latest.pt \

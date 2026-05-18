@@ -1,0 +1,13 @@
+Follow @robosuite/pipeline/DIPOLE.md and @robosuite/pipeline/README.md and @robosuite/discriminator/lpb_v2/README.md
+Task: debug discriminator integration in DIPOLE pipeline
+
+# Pre-read 
+@robosuite/pipeline/algorithms/dipole/ contains main logic for dipole HIL algorithm, and it uses discriminator @robosuite/discriminator/lpb_v2/ to get G-value. Please look through these
+logic and files
+
+# TODO
+I found that current discriminator value output tend to be success during online dipole training (printed in log). However, discriminator visualization performance is quite good.
+1. debug discriminator integration in DIPOLE pipeline, I think there must be mistake
+2. you can follow the @robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh logic, its result is as expected
+
+communicate with me in Chinese 

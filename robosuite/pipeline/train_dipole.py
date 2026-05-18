@@ -37,7 +37,6 @@ from robosuite.pipeline.utils import (
     JsonlEventLogger,
     checkpoint_path,
     checkpoint_step_path,
-    format_episode_line,
     load_demo_paths,
     load_transition_chunks,
     maybe_build_wandb,
@@ -220,6 +219,34 @@ def format_publish_line(metrics: dict[str, float]) -> str:
     return (
         f"[publish] policy #{int(metrics.get('learner_publish_count', 0.0))} synced "
         f"at learner_update={int(metrics.get('learner_last_published_update', 0.0))}"
+    )
+
+
+# Live discriminator-display defaults (overridable via runtime.discriminator_display_hz).
+DISCRIMINATOR_DISPLAY_HZ: float = 2.0
+
+_ANSI_GREEN = "\033[32m"
+_ANSI_RED = "\033[31m"
+_ANSI_BOLD = "\033[1m"
+_ANSI_RESET = "\033[0m"
+
+
+def format_discriminator_line(
+    *,
+    step: int,
+    episode_index: int,
+    raw: float,
+    tau: float,
+    is_failure: bool,
+) -> str:
+    g_value = -raw  # convention: G > 0 means more expert/safe (g_sign=negate_raw)
+    if is_failure:
+        status = f"{_ANSI_BOLD}{_ANSI_RED}FAIL   {_ANSI_RESET}"
+    else:
+        status = f"{_ANSI_BOLD}{_ANSI_GREEN}SUCCESS{_ANSI_RESET}"
+    return (
+        f"[disc] step={step:>6d} ep={episode_index:>3d}  {status}  "
+        f"G={g_value:+.3f}  raw={raw:+.3f}  tau={tau:+.3f}"
     )
 
 
@@ -513,10 +540,13 @@ def main(cfg: DictConfig) -> None:
     run_started_monotonic = time.monotonic()
     console_log_path = checkpoint_dir / "console.log"
     runtime_log_path = checkpoint_dir / "metrics_runtime.jsonl"
+    train_log_path = checkpoint_dir / "metrics_train.jsonl"
     console_capture = ConsoleLogCapture(console_log_path)
     console_capture.start()
     runtime_logger = JsonlEventLogger(runtime_log_path)
     runtime_logger.start()
+    train_logger = JsonlEventLogger(train_log_path)
+    train_logger.start()
     runtime_logger.log(
         {
             "event": "run_start",
@@ -817,6 +847,7 @@ def main(cfg: DictConfig) -> None:
             "seed": serialize_seed(getattr(cfg, "seed", None)),
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
+            "train_log": str(train_log_path),
             "buffer_dir": str(checkpoint_dir / "buffers"),
             "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
             "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
@@ -946,6 +977,17 @@ def main(cfg: DictConfig) -> None:
     policy_gate = IntervalGate(policy_fps)
     spacemouse_gate = IntervalGate(spacemouse_fps)
     overall_fps_tracker = EMAFpsTracker()
+    discriminator_display_hz = float(
+        getattr(cfg.runtime, "discriminator_display_hz", DISCRIMINATOR_DISPLAY_HZ)
+    )
+    disc_log_gate = IntervalGate(discriminator_display_hz) if discriminator_display_hz > 0.0 else None
+    if disc_log_gate is None:
+        print("[INFO] Discriminator display disabled (runtime.discriminator_display_hz <= 0).")
+    else:
+        print(
+            f"[INFO] Discriminator display rate: {discriminator_display_hz:.2f} Hz "
+            f"(BCE threshold tau={g_provider.threshold:+.3f})"
+        )
     last_fps_log_time = time.monotonic()
     training_started_monotonic = last_fps_log_time
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
@@ -1053,15 +1095,7 @@ def main(cfg: DictConfig) -> None:
                 **event_time_fields(),
             }
         )
-        print(
-            format_runtime_line(
-                step=step,
-                episode_index=episode_index,
-                overall_fps=overall_fps,
-                learner_progress=learner_progress,
-                pending_updates=pending_updates,
-            )
-        )
+        # Runtime line is logged to JSONL only; the console keeps the disc display + episode summaries.
         last_fps_log_time = now
 
     def request_checkpoint_save(step: int, tag: str | None = None) -> None:
@@ -1297,6 +1331,48 @@ def main(cfg: DictConfig) -> None:
             episode_length += 1
             success_count += int(success)
 
+            if disc_log_gate is not None and disc_log_gate.ready(time.monotonic()):
+                try:
+                    chunk_for_disc = agent.plan_action_chunk(
+                        next_obs, deterministic=bool(cfg.runtime.eval_deterministic)
+                    )
+                    disc_info = g_provider.compute_g_for_observation(next_obs, chunk_for_disc)
+                except Exception as exc:
+                    runtime_logger.log(
+                        {
+                            "event": "discriminator_display_error",
+                            "step": int(step),
+                            "episode_index": int(episode_index),
+                            "error": repr(exc),
+                            **event_time_fields(),
+                        }
+                    )
+                else:
+                    is_failure = bool(disc_info["is_failure"])
+                    raw_score = float(disc_info["raw"])
+                    tau_value = float(disc_info["tau"])
+                    print(
+                        format_discriminator_line(
+                            step=step,
+                            episode_index=episode_index,
+                            raw=raw_score,
+                            tau=tau_value,
+                            is_failure=is_failure,
+                        )
+                    )
+                    runtime_logger.log(
+                        {
+                            "event": "discriminator_display",
+                            "step": int(step),
+                            "episode_index": int(episode_index),
+                            "raw": raw_score,
+                            "G": -raw_score,
+                            "tau": tau_value,
+                            "is_failure": int(is_failure),
+                            **event_time_fields(),
+                        }
+                    )
+
             if online_updates_enabled:
                 if async_updates:
                     update_metrics_list = trainer.maybe_update_async()
@@ -1309,12 +1385,17 @@ def main(cfg: DictConfig) -> None:
                 update_metrics = update_metrics_list[-1]
                 if step % int(cfg.logging.log_interval) == 0:
                     maybe_log(wandb_run, update_metrics, step=step)
-                    print(
-                        format_train_line(
-                            step=step,
-                            metrics=update_metrics,
-                            pending_updates=trainer.pending_async_updates() if async_updates else 0,
-                        )
+                    train_logger.log(
+                        {
+                            "event": "train_step",
+                            "step": int(step),
+                            "episode_index": int(episode_index),
+                            "pending_updates": int(
+                                trainer.pending_async_updates() if async_updates else 0
+                            ),
+                            **{k: float(v) for k, v in update_metrics.items()},
+                            **event_time_fields(),
+                        }
                     )
 
             if done:
@@ -1350,17 +1431,6 @@ def main(cfg: DictConfig) -> None:
                         ),
                         **event_time_fields(),
                     }
-                )
-                print(
-                    format_episode_line(
-                        step=step,
-                        episode_index=episode_index,
-                        episode_return=episode_return,
-                        episode_length=episode_length,
-                        success=bool(success),
-                        online_buffer_size=len(agent.online_buffer),
-                        demo_buffer_size=len(agent.demo_buffer),
-                    )
                 )
                 if episode_pause_sec > 0.0:
                     time.sleep(episode_pause_sec)
@@ -1448,6 +1518,7 @@ def main(cfg: DictConfig) -> None:
                 "seed": serialize_seed(getattr(cfg, "seed", None)),
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
+                "train_log": str(train_log_path),
                 "buffer_dir": str(checkpoint_dir / "buffers"),
                 "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
                 "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
@@ -1485,9 +1556,12 @@ def main(cfg: DictConfig) -> None:
                             runtime_logger.close()
                         finally:
                             try:
-                                buffer_writer.close()
+                                train_logger.close()
                             finally:
-                                console_capture.stop()
+                                try:
+                                    buffer_writer.close()
+                                finally:
+                                    console_capture.stop()
 
 
 if __name__ == "__main__":

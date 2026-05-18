@@ -274,6 +274,42 @@ class DipoleFlowPolicy:
         self.step_in_chunk += 1
         return action
 
+    @torch.no_grad()
+    def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
+        """Plan a fresh action chunk from ``obs`` without mutating ``current_chunk``.
+
+        Mirrors the inference path inside :meth:`select_action` but returns the full
+        un-normalized ``(horizon, action_dim)`` chunk, so callers (e.g. the live
+        discriminator display) can feed it to a G provider.
+        """
+        images = []
+        for camera_name in self.camera_names:
+            image = np.asarray(obs[camera_name], dtype=np.uint8)
+            image = _center_crop_resize(image, int(self.config.image_size))
+            images.append(np.transpose(image.astype(np.float32) / 255.0, (2, 0, 1)))
+        image_tensor = torch.from_numpy(np.stack(images, axis=0)).unsqueeze(0).to(self.inference_device)
+        image_tensor = (image_tensor - self._inference_image_mean) / self._inference_image_std
+
+        proprio = np.asarray(obs["state"], dtype=np.float32)
+        if self.prop_mean is not None and self.prop_std is not None:
+            proprio = (proprio - self.prop_mean) / (self.prop_std + 1e-6)
+        proprio_tensor = torch.from_numpy(proprio).unsqueeze(0).to(self.inference_device)
+
+        with self._inference_lock:
+            action_seq = _sample_guided_action_sequence(
+                self.inference_model,
+                images=image_tensor,
+                proprio=proprio_tensor,
+                language=[self.language_instruction],
+                action_horizon=int(self.config.action_horizon),
+                n_steps=int(self.config.n_ode_steps),
+                omega=float(self.config.guidance_omega),
+                deterministic=bool(deterministic),
+            )[0].detach().cpu().numpy().astype(np.float32)
+        if self.act_mean is not None and self.act_std is not None:
+            action_seq = action_seq * self.act_std + self.act_mean
+        return action_seq
+
     def _normalize_g(self, raw_g: torch.Tensor) -> torch.Tensor:
         mode = str(self.config.g_normalization).lower()
         if mode == "none":

@@ -2,7 +2,7 @@
 # Headless eval of a trained DIPOLE checkpoint.
 #
 # - Renders offscreen (no popping window) and saves .mp4 per episode under
-#   outputs/DIPOLE/eval/<task>__<ckpt>__<omega>__<ts>/videos/.
+#   <run_dir>/eval/<task>__<ckpt>__<omega>__<ts>/videos/ (run_dir inferred from CHECKPOINT).
 # - Runs $EPISODES rollouts per omega and writes summary.json with success rate
 #   (+ 95% Wilson CI), mean return, per-episode breakdown.
 # - Optionally sweeps a list of omegas; one output dir per omega.
@@ -22,6 +22,7 @@
 #   VIDEO_FPS=20
 #   VIDEO_IMAGE_SIZE=512
 #   MAX_VIDEOS=0                     # cap saved videos per omega; <=0 = save all
+#   OUTPUT_ROOT=                     # default: <run_dir>/eval (from CHECKPOINT path)
 #   EVAL_DETERMINISTIC=false         # true => deterministic ODE init (no noise)
 #   DEVICE=cuda:0
 #   INIT_CHECKPOINT=                 # optional override (default picks from run_info.json)
@@ -34,13 +35,13 @@ ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # ------------------------------------------------
-CHECKPOINT="${CHECKPOINT:-outputs/DIPOLE/dipole_PickPlaceBread_2026-05-17_01-32-39/checkpoints/step_00010000_updates_00006575_ep_00034.pt}"
+CHECKPOINT="${CHECKPOINT:-outputs/DIPOLE/dipole_PickPlaceBread_2026-05-18_13-28-22/checkpoints/step_00010000_updates_00003754_ep_00032.pt}"
 ENVIRONMENT="${ENVIRONMENT:-PickPlaceBread}"
 TASK_NAME="${TASK_NAME:-${ENVIRONMENT}}"
 EPISODES="${EPISODES:-50}"
 EPISODE_MAX_STEPS="${EPISODE_MAX_STEPS:-400}"
 
-OMEGA="${OMEGA:-0.2}"
+OMEGA="${OMEGA:-1}"
 OMEGA_SWEEP="${OMEGA_SWEEP:-${OMEGA}}"
 
 VIDEO_OUTPUT="${VIDEO_OUTPUT:-true}"
@@ -53,7 +54,6 @@ EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-false}"
 DEVICE="${DEVICE:-cuda:0}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT_DIR}/outputs/DIPOLE/eval}"
 SKIP_DIAGNOSTIC="${SKIP_DIAGNOSTIC:-false}"
 STRICT_DIAGNOSTIC="${STRICT_DIAGNOSTIC:-false}"
 # ------------------------------------------------
@@ -75,6 +75,20 @@ fi
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[ERROR] Checkpoint file not found: ${CHECKPOINT}" >&2
   exit 1
+fi
+
+# Default eval artifacts under the training run dir: .../dipole_<task>_<ts>/eval/
+RUN_DIR=""
+if [[ "$(basename "$(dirname "${CHECKPOINT}")")" == "checkpoints" ]]; then
+  RUN_DIR="$(cd "$(dirname "$(dirname "${CHECKPOINT}")")" && pwd)"
+fi
+if [[ -n "${OUTPUT_ROOT:-}" ]]; then
+  :
+elif [[ -n "${RUN_DIR}" && -d "${RUN_DIR}" ]]; then
+  OUTPUT_ROOT="${RUN_DIR}/eval"
+else
+  echo "[WARN] Could not infer run dir from CHECKPOINT; falling back to outputs/DIPOLE/eval." >&2
+  OUTPUT_ROOT="${ROOT_DIR}/outputs/DIPOLE/eval"
 fi
 
 # Always force headless offscreen rendering. The python driver builds the env
@@ -149,7 +163,7 @@ for omega_raw in "${OMEGAS[@]}"; do
     continue
   fi
   echo "==========================================================="
-  echo "[eval_dipole] omega=${omega}  episodes=${EPISODES}  ckpt=${CHECKPOINT}"
+  echo "[eval_dipole] omega=${omega}  episodes=${EPISODES}  output_root=${OUTPUT_ROOT}  ckpt=${CHECKPOINT}"
   echo "==========================================================="
   build_py_args "${omega}"
   RUN_OUTPUT_LOG="$(mktemp)"
@@ -172,8 +186,8 @@ done
 
 # --------------------------------------------------------------------------
 # Step 3: sweep-level aggregate summary. Reads every per-omega summary.json
-# and prints a single table; also writes outputs/.../sweep_summary.json next
-# to the first per-omega run when the sweep had > 1 entry.
+# and prints a single table; also writes <run_dir>/eval/sweep_summary.json when
+# the sweep had > 1 entry.
 # --------------------------------------------------------------------------
 if [[ "${#SUMMARY_DIRS[@]}" -gt 0 ]]; then
   echo "==========================================================="

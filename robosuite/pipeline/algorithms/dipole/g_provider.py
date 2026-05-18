@@ -36,6 +36,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -147,6 +148,7 @@ class LPBV2GProvider:
                 f"(available: {sorted(self.detector.thresholds)}). "
                 "Set algorithm.task_name to one of the calibrated tasks."
             )
+        self.threshold: float = float(self.detector.thresholds[self.task_name])
 
         self._camera_to_view: dict[str, str] = dict(camera_to_view or {})
         self._policy_camera_names: list[str] | None = None
@@ -241,6 +243,61 @@ class LPBV2GProvider:
         feat = self.encoder.encode_batch(images_per_view, proprio, actions)
         result = self.detector.score(feat, task=self.task_name)
         return torch.as_tensor(result.step_scores, dtype=torch.float32, device=self.device)
+
+    @torch.no_grad()
+    def compute_g_for_observation(
+        self,
+        obs: Mapping[str, Any],
+        action_sequence: np.ndarray,
+    ) -> dict[str, float]:
+        """Single-frame BCE score for live discriminator display.
+
+        Args:
+            obs: dict keyed by policy camera name (HxWx3 uint8 in [0, 255]) plus
+                ``"state"`` (proprio_dim,) float.
+            action_sequence: (horizon, action_dim) un-normalized policy actions.
+
+        Returns:
+            dict with ``raw`` (-g(z), higher = more failure-like), ``tau``
+            (per-task BCE threshold in raw space) and ``is_failure``
+            (``1`` if ``raw >= tau`` else ``0``).
+        """
+        if self._view_index_in_batch is None:
+            raise RuntimeError(
+                "LPBV2GProvider.bind_policy_cameras(...) must be called before compute_g_for_observation."
+            )
+        images_per_view: dict[str, torch.Tensor] = {}
+        for view, camera_idx in zip(self.view_names, self._view_index_in_batch):
+            camera_name = self._policy_camera_names[camera_idx]
+            arr = np.asarray(obs[camera_name])
+            if arr.ndim != 3 or arr.shape[-1] != 3:
+                raise ValueError(
+                    f"Expected obs[{camera_name!r}] to be HxWx3, got shape {tuple(arr.shape)}"
+                )
+            if arr.dtype == np.uint8:
+                tensor = torch.from_numpy(arr).to(self.device, dtype=torch.float32) / 255.0
+            else:
+                tensor = torch.from_numpy(arr.astype(np.float32)).to(self.device)
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+            images_per_view[view] = self._resize_to_encoder(tensor).contiguous()
+
+        proprio = torch.as_tensor(
+            np.asarray(obs["state"], dtype=np.float32), device=self.device
+        ).reshape(1, -1)
+        actions_np = np.asarray(action_sequence, dtype=np.float32)
+        if actions_np.ndim == 1:
+            actions_np = actions_np[None, :]
+        actions_raw = torch.from_numpy(actions_np).to(self.device).unsqueeze(0)
+        actions_input = self._prepare_action_input(actions_raw)
+
+        feat = self.encoder.encode_batch(images_per_view, proprio, actions_input)
+        result = self.detector.score(feat, task=self.task_name)
+        raw = float(np.asarray(result.step_scores).reshape(-1)[0])
+        return {
+            "raw": raw,
+            "tau": float(self.threshold),
+            "is_failure": int(raw >= self.threshold),
+        }
 
 
 __all__ = ["LPBV2GProvider"]

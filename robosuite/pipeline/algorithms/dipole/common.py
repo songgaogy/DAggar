@@ -56,6 +56,7 @@ class TrainerConfig:
     steps_per_update: int = 50
     random_steps: int = 0
     pretrain_steps: int = 20_000
+    max_pending_updates: int = 1
 
 
 @dataclass

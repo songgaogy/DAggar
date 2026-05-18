@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -8,6 +9,9 @@ from typing import Any
 from robosuite.pipeline.common.types import Transition
 
 from .agent import DipoleAgent
+
+
+logger = logging.getLogger(__name__)
 
 
 class DipoleTrainer:
@@ -131,9 +135,23 @@ class DipoleTrainer:
         if current_step >= int(self.config.warmup_steps) and self.agent.ready_for_update(batch_size=batch_size):
             self.start_async_worker()
             with self._async_condition:
-                self._async_pending_updates += int(self.config.updates_per_step)
-                self._async_pending_batch_size = None if batch_size is None else int(batch_size)
-                self._async_condition.notify_all()
+                requested = int(self.config.updates_per_step)
+                max_pending = max(1, int(self.config.max_pending_updates))
+                in_flight = int(self._async_pending_updates) + (1 if self._async_busy else 0)
+                accepted = min(requested, max(0, max_pending - in_flight))
+                skipped = requested - accepted
+                if accepted > 0:
+                    self._async_pending_updates += accepted
+                    self._async_pending_batch_size = None if batch_size is None else int(batch_size)
+                    self._async_condition.notify_all()
+                if skipped > 0:
+                    logger.debug(
+                        "Skipped %d async DIPOLE learner update(s): pending=%d busy=%s max_pending=%d",
+                        skipped,
+                        int(self._async_pending_updates),
+                        bool(self._async_busy),
+                        max_pending,
+                    )
         return self.drain_async_metrics()
 
     def start_async_worker(self) -> None:

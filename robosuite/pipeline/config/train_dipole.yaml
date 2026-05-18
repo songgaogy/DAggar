@@ -136,6 +136,7 @@ algorithm:
     steps_per_update: 50
     random_steps: 0
     pretrain_steps: 0                  # DIPOLE always boots from runtime.init_checkpoint
+    max_pending_updates: 1             # Cap async learner queued+busy updates
 
 intervention:
   enabled: true
@@ -169,6 +170,7 @@ runtime:
   spacemouse_fps: ${runtime.control_fps}
   policy_fps: ${runtime.control_fps}
   fps_log_interval: 1.0
+  discriminator_display_hz: 2.0  # live [disc] line refresh rate in console; 0 disables
   async_updates: true
   online_updates_enabled: true
   eval_episode_max_steps: 300
