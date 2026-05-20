@@ -1,0 +1,93 @@
+"""Dataclasses shared across the IQL Q-chunking module.
+
+Interface contract (see docs/DIPOLE_RL.md §A):
+- `IQLStepBatch` is the unit consumed by Bellman + expectile losses; rewards
+  are already aggregated as n-step discounted returns over the action chunk
+  and include the discriminator intrinsic term r_disc.
+- `IQLActorBatch` is the unit consumed by `compute_advantage_for_batch` to
+  produce the advantage signal that `AdvantageGProvider` mixes with the
+  discriminator logit.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import torch
+
+
+@dataclass
+class IQLConfig:
+    """Configuration for the IQL learner.
+
+    Notes:
+        action_horizon must match DipoleConfig.action_horizon (Q-chunking
+        assumes the critic sees the full execution chunk).
+        disc_reward_sign decides whether r_disc = -logit (default; higher =
+        more expert-like) or r_disc = +logit (raw passthrough).
+    """
+
+    action_horizon: int = 8
+    discount: float = 0.99
+    expectile_tau: float = 0.7
+
+    q_lr: float = 3e-4
+    v_lr: float = 3e-4
+    target_polyak: float = 0.005
+
+    n_step_aggregate: bool = True
+    hidden_dims: tuple[int, ...] = (512, 512)
+    grad_clip_norm: float = 1.0
+    weight_decay: float = 1e-6
+    device: str = "cuda:1"
+
+    # Reward composition (r_total = r_env + disc_reward_coef * r_disc).
+    disc_reward_coef: float = 1.0
+    disc_reward_sign: str = "negate_logit"  # "negate_logit" | "raw"
+
+
+@dataclass
+class IQLStepBatch:
+    """Transition-centric batch for Q/V updates.
+
+    Shapes:
+        context        (B, D_ctx)   — frozen encoder latent for s
+        next_context   (B, D_ctx)   — frozen encoder latent for s'
+        action_chunk   (B, H, D_a)  — normalized chunk a_{t:t+H}
+        rewards        (B, 1)       — n-step aggregated r_env + λ_disc·r_disc
+        dones          (B, 1)       — 1 if any step in chunk terminated
+        is_online      (B, 1)       — 1 if sampled from online buffer
+        is_intervention(B, 1)       — 1 if first step is an intervention
+        metadata       dict         — debug fields (episode ids, sources)
+    """
+
+    context: torch.Tensor
+    next_context: torch.Tensor
+    action_chunk: torch.Tensor
+    rewards: torch.Tensor
+    dones: torch.Tensor
+    is_online: torch.Tensor
+    is_intervention: torch.Tensor
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to(self, device: str) -> "IQLStepBatch":
+        raise NotImplementedError
+
+
+@dataclass
+class IQLActorBatch:
+    """Actor-side batch consumed by AdvantageGProvider.
+
+    Shapes:
+        context           (B, D_ctx)   — frozen encoder latent for s
+        action_chunk_raw  (B, H, D_a)  — UN-normalized chunk used to score Q
+        metadata          dict         — episode ids, mask flags
+    """
+
+    context: torch.Tensor
+    action_chunk_raw: torch.Tensor
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to(self, device: str) -> "IQLActorBatch":
+        raise NotImplementedError

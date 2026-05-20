@@ -1,0 +1,74 @@
+# DIPOLE-RL training config (DIPOLE flow + IQL Q-chunking + online BCE disc).
+#
+# Inherits the existing DIPOLE schema and adds three new sections:
+#   - algorithm.q_learning      (IQLConfig + warmup schedule)
+#   - algorithm.discriminator   (DiscriminatorConfig + online_train switch)
+#   - algorithm.advantage_g_provider  (alpha, beta, normalization modes)
+#
+# To activate the advantage-G path:
+#   algorithm.dipole.g_mode: "advantage"
+# To revert to legacy frozen-BCE G (regression):
+#   algorithm.dipole.g_mode: "bce_frozen"
+#
+# Skeleton — keep keys but commented values until the integrated trainer is
+# implemented.
+
+defaults:
+  - train_dipole
+  - _self_
+
+algorithm:
+  type: "dipole_rl"
+
+  dipole:
+    # g_mode is a NEW field added to DipoleConfig; default "bce_frozen" so
+    # existing DIPOLE runs are unaffected until the integrated trainer
+    # actively flips it.
+    g_mode: "advantage"   # "advantage" | "bce_frozen"
+
+  q_learning:
+    enabled: true
+    config:
+      action_horizon: ${algorithm.flow.action_horizon}
+      discount: 0.99
+      expectile_tau: 0.7
+      q_lr: 3.0e-4
+      v_lr: 3.0e-4
+      target_polyak: 0.005
+      n_step_aggregate: true
+      hidden_dims: [512, 512]
+      grad_clip_norm: 1.0
+      weight_decay: 1.0e-6
+      device: "cuda:1"
+      disc_reward_coef: 1.0
+      disc_reward_sign: "negate_logit"
+    warmup_value_steps: 20000
+    warmup_full_steps: 5000
+    warmup_ckpt: null
+
+  discriminator:
+    enabled: true
+    online_train: true
+    warm_start_ckpt: "checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth"
+    config:
+      lr: 3.0e-4
+      weight_decay: 1.0e-6
+      hidden: 256
+      num_layers: 2
+      batch_size: 64
+      balance_ratio: 1.0
+      update_every_n_steps: 1
+      threshold_ema: 0.99
+      warm_start_ckpt: ${algorithm.discriminator.warm_start_ckpt}
+      label_smoothing: 0.0
+      device: "cuda:1"
+
+  advantage_g_provider:
+    alpha: 1.0
+    beta: 0.5
+    advantage_normalization: "batch_zscore"
+    disc_normalization: "batch_zscore"
+
+runtime:
+  init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
+  bootstrap_g_with_frozen_bce: true   # During warmup, force g_mode=bce_frozen.
