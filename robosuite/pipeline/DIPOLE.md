@@ -20,7 +20,7 @@ Convention: `G` larger = better state/action. BCE raw scores are "larger = more 
 
 2. **Detector source**: a **pre-fitted BCE checkpoint** produced by `robosuite/discriminator/lpb_v2/scripts/run_bce_robosuite_benchmark.sh` (or its `visualize_bce_robosuite.sh` twin). DIPOLE does not fit anything itself. The default path is `checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth`.
 
-3. **Training data**: demo HDF5 + online rollouts + human intervention (HG-DAgger-style). The driver mirrors `train_flow_dagger.py`.
+3. **Training data**: demo HDF5 + online rollouts + optional human intervention.
 
 4. **Base policy**: loaded from a flow-dagger / flow-multi `.pt` checkpoint via `runtime.init_checkpoint`. **Mandatory** unless resuming a DIPOLE checkpoint.
 
@@ -39,9 +39,12 @@ robosuite/pipeline/
 │   ├── g_provider.py              # LPBV2GProvider: loads bce_head.pth, runs encoder + BCE head
 │   ├── agent.py                   # DipoleAgent
 │   └── trainer.py                 # DipoleTrainer
-├── train_dipole.py                # Hydra driver
+├── train_dipole.py                # Hydra training driver
+├── eval_dipole.py                 # Headless checkpoint eval driver
 ├── config/train_dipole.yaml       # Hydra config
-└── scripts/train_dipole.sh        # Bash entry
+└── scripts/
+    ├── train_dipole.sh            # Training bash entry
+    └── eval_dipole.sh             # Eval bash entry
 ```
 
 The legacy `tools/fit_dipole_lpb_artifact.py / .sh` and `tools/dipole_g_smoke.py` were removed — DIPOLE now only consumes the BCE artefacts produced by the upstream `lpb_v2` benchmark runner.
@@ -71,7 +74,7 @@ Initialization schemes (`cfg.algorithm.dipole.polarity_embedding_init`):
 | `zero_neg`       | `0`                 | `N(0, scale)`       | Neg branch == base policy at init       |
 | `antipodal`      | `-e, e~N(0, scale)` | `+e`                | Maximally separated init                |
 
-Loading the flow-dagger base checkpoint uses `strict=False` so the new `polarity_embedding.*` keys retain their fresh init.
+Loading the base flow-policy checkpoint uses `strict=False` so the new `polarity_embedding.*` keys retain their fresh init.
 
 > **CFG-at-start caveat**: with `polarity_embedding_init=small_gaussian` and `guidance_omega>0`, the CFG combine `(1+omega)*v_pos - omega*v_neg` *amplifies* the small init-time difference between the two branches by a factor of `(1+2*omega)`. Loss-side training is fine (`w_pos + w_neg = 1` per sample), but the very first rollouts may show extra jitter. If that becomes a problem, the lever is `polarity_embedding_init=zero_neg` (or a future zero-both + omega warmup); we're leaving the defaults as-is until we see the issue empirically.
 
@@ -183,7 +186,7 @@ The provider raises a clear error if a required encoder view is not represented 
 
 ## Config schema (`config/train_dipole.yaml`)
 
-Inherits the full `train_flow_dagger.yaml` shape with these additions / overrides:
+The DIPOLE config keeps the shared flow-policy fields and adds these DIPOLE-specific settings:
 
 ```yaml
 algorithm:
@@ -264,19 +267,14 @@ bash robosuite/pipeline/scripts/train_dipole.sh
 - **CFG-at-start jitter**: see the caveat under "Polarity-conditioned policy" above. Levers if it shows up empirically: `polarity_embedding_init=zero_neg`, or add a `guidance_omega_warmup_steps` config and ramp ω 0→target.
 - **Single-view encoders**: if the BCE ckpt's LPB encoder was trained on a single view (e.g. `view_names=["agentview"]`) but the policy uses several cameras, the provider only routes the matching view to the encoder. The other policy cameras are still used by the actor; they're just not seen by G.
 - **Backbone drift**: because backbone is trainable and the polarity embedding is tiny, sustained sigmoid saturation will let the two branches re-converge. Diagnostics: `frac_w_pos_saturated_*` and `polarity_embedding_cos` in logs; lever is `beta` or switching to `running_zscore`.
-- **Legacy discriminator imports**: `pipeline/base.py` had module-level imports of `bce`, `dyn_bce.task_registry`, and `lpb_new`, all removed on the `dipole` branch. We wrapped them in `try/except` so DIPOLE's import chain works; the classes that depended on them now raise only at instantiation.
+- **Flow-Dagger internals**: the standalone Flow-Dagger train/eval entry points were removed from `robosuite.pipeline`, but DIPOLE still reuses its internal flow config, replay-buffer base, and image preprocessing helpers.
 
 ---
 
 ## Key reuse points (file:line)
 
-- `_weighted_mean`: `robosuite/pipeline/algorithms/awr/models/flow.py:30-34`
-- AWR weighted-actor loss pattern: `awr/models/flow.py:413-440`
-- AWR `forward_actor_from_context`: `awr/models/flow.py:160-173`
 - Flow policy backbone: `robosuite/policy/flow_multi/model.py:22-176`
-- FlowDagger single-step update: `flow_dagger/models/flow.py:183-229`
-- FlowDagger ODE sampling: `flow_dagger/models/flow.py:30-50`
-- FlowDagger ckpt loader: `flow_dagger/agent.py:292-314`
-- HG-DAgger intervention routing: `hg_dagger/agent.py:156-158`
+- Flow image helpers: `robosuite/pipeline/algorithms/flow_dagger/models/flow.py`
+- Flow replay-buffer base: `robosuite/pipeline/algorithms/flow_dagger/replay_buffer.py`
 - LPB v2 encoder API: `discriminator/lpb_v2/detectors/single_bank_knn.py:106-399`
 - BCEDiscriminator load/score: `discriminator/lpb_v2/detectors/bce.py:380-455`

@@ -1,8 +1,7 @@
 """Headless eval driver for a trained DIPOLE checkpoint.
 
-Mirrors `eval_flow_dagger.py` but uses the DIPOLE polarity flow policy and
-exposes the CFG guidance omega as a CLI argument so a caller can sweep
-aggressiveness without retraining.
+Uses the DIPOLE polarity flow policy and exposes the CFG guidance omega as a
+CLI argument so a caller can sweep aggressiveness without retraining.
 
 Outputs per run:
 - summary.json with success rate, per-episode results, omega
@@ -154,7 +153,7 @@ def _resolve_eval_device(payload: dict[str, Any], override: str | None) -> str:
     return resolve_requested_device(requested, fallback=fallback)
 
 
-def _build_policy(
+def _build_dipole_policy(
     payload: dict[str, Any],
     *,
     task_name: str,
@@ -301,7 +300,7 @@ def main() -> None:
     env = build_robosuite_env(runtime_cfg)
     proprio_extractor = bind_flow_proprio_extractor(env, env_metadata)
     eval_device = _resolve_eval_device(checkpoint_payload, args.device)
-    policy = _build_policy(
+    policy = _build_dipole_policy(
         checkpoint_payload,
         task_name=args.task_name,
         device=eval_device,

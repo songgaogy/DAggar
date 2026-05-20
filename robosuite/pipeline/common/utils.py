@@ -180,7 +180,7 @@ def infer_observation_example(observation_space: Any = None, observation_example
     if observation_example is not None:
         return clone_array_tree(observation_example)
     if observation_space is None:
-        raise ValueError("Provide observation_example or observation_space to build HIL-SERL modules.")
+        raise ValueError("Provide observation_example or observation_space to build pipeline modules.")
     if hasattr(observation_space, "sample"):
         return clone_array_tree(observation_space.sample())
     raise ValueError("observation_space does not expose a sample() method.")

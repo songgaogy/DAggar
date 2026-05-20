@@ -1,5 +1,3 @@
-from .agent import FlowDaggerAgent
-from .trainer import FlowDaggerTrainer
 from .common import (
     EncoderConfig,
     FlowAugmentationConfig,
@@ -9,14 +7,14 @@ from .common import (
     TrainerConfig,
     Transition,
 )
+from .replay_buffer import FlowDaggerReplayBuffer
 
 __all__ = [
     "EncoderConfig",
     "FlowAugmentationConfig",
-    "FlowDaggerAgent",
     "FlowDaggerBatch",
     "FlowDaggerConfig",
-    "FlowDaggerTrainer",
+    "FlowDaggerReplayBuffer",
     "ReplayBufferConfig",
     "TrainerConfig",
     "Transition",

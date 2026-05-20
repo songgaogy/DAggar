@@ -212,7 +212,7 @@ def _raise_on_legacy_positive_rewards(transitions: Sequence[Transition], *, path
     raise LegacyRewardSchemeError(
         "Legacy 0/1 reward transition cache detected at "
         f"{Path(path)}: found positive rewards {unique_positive}. "
-        "HIL-SERL expects sparse -1/0 rewards. Delete the cache and rebuild demos."
+        "DIPOLE expects sparse -1/0 rewards. Delete the cache and rebuild demos."
     )
 
 

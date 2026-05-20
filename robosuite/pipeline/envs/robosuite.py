@@ -262,7 +262,7 @@ class RobosuiteViewerRuntime:
         if self.backend != "mjviewer" or not self.async_mode or self._thread is not None:
             return
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._render_loop, name="hil_serl_gui", daemon=True)
+        self._thread = threading.Thread(target=self._render_loop, name="dipole_gui", daemon=True)
         self._thread.start()
 
     def publish_from_env(self, env) -> None:

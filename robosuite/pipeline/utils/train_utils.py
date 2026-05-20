@@ -235,7 +235,7 @@ def resume_checkpoint_candidates(cfg: DictConfig, output_root: Path) -> list[Pat
 
 
 def find_latest_resumable_run(output_root: Path, env_name: str) -> Path | None:
-    env_prefix = f"hil_serl_{env_name}_"
+    env_prefix = f"dipole_{env_name}_"
     candidates = []
     for latest_checkpoint in output_root.glob("*/checkpoints/latest.pt"):
         run_dir = latest_checkpoint.parent.parent
@@ -258,7 +258,7 @@ def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
         run_name = str(explicit_run_name)
         return run_name, make_checkpoint_directory(output_root, run_name)
 
-    run_name = f"hil_serl_{cfg.env.environment}_{now_readable()}"
+    run_name = f"dipole_{cfg.env.environment}_{now_readable()}"
     return run_name, make_checkpoint_directory(output_root, run_name)
 
 
@@ -520,7 +520,7 @@ class AsyncTransitionChunkWriter:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "online_chunks").mkdir(parents=True, exist_ok=True)
             (self.output_dir / "demo_chunks").mkdir(parents=True, exist_ok=True)
-            self._thread = threading.Thread(target=self._worker_loop, name="hil_serl_buffer_writer", daemon=True)
+            self._thread = threading.Thread(target=self._worker_loop, name="dipole_buffer_writer", daemon=True)
             self._thread.start()
 
     def request_transition(
@@ -699,7 +699,7 @@ class AsyncCheckpointWriter:
             if self._thread is not None:
                 return
             (self.checkpoint_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-            self._thread = threading.Thread(target=self._worker_loop, name="hil_serl_checkpoint_writer", daemon=True)
+            self._thread = threading.Thread(target=self._worker_loop, name="dipole_checkpoint_writer", daemon=True)
             self._thread.start()
 
     def request_save(

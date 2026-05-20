@@ -6,7 +6,7 @@ required; meant to be called before any rollout-eval as a quick "did the two
 CFG branches actually specialize" check.
 
 Usage:
-    python -m robosuite.pipeline.tools.diagnose_dipole_divergence \
+    python -m robosuite.pipeline.utils.diagnose_dipole_divergence \
         --checkpoint outputs/DIPOLE/<run>/checkpoints/latest.pt
 
 The diagnostic returns nonzero exit code when divergence is below the warning

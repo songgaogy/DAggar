@@ -114,7 +114,7 @@ if [[ "${SKIP_DIAGNOSTIC}" != "true" ]]; then
   if [[ "${STRICT_DIAGNOSTIC}" == "true" ]]; then
     DIAG_ARGS+=(--strict)
   fi
-  if ! "${PYTHON_BIN}" -m robosuite.pipeline.tools.diagnose_dipole_divergence "${DIAG_ARGS[@]}"; then
+  if ! "${PYTHON_BIN}" -m robosuite.pipeline.utils.diagnose_dipole_divergence "${DIAG_ARGS[@]}"; then
     if [[ "${STRICT_DIAGNOSTIC}" == "true" ]]; then
       echo "[ERROR] Diagnostic returned BAD verdict under STRICT_DIAGNOSTIC=true. Aborting eval." >&2
       exit 1
