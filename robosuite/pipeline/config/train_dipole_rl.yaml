@@ -21,6 +21,15 @@ algorithm:
   type: "dipole_rl"
 
   dipole:
+    lpb_detector:
+      # The legacy LPBV2GProvider is kept around in train_dipole_rl.py for
+      # the disc-display path (live UI overlay) and as the fallback when
+      # g_mode=bce_frozen. It uses the SAME encoder + BCE head as the
+      # online discriminator's warm_start, so we point its ckpt_path at
+      # the same checkpoint the user supplied for the disc warm-start to
+      # avoid silent divergence.
+      ckpt_path: ${algorithm.discriminator.warm_start_ckpt}
+
     # g_mode is a NEW field added to DipoleConfig; default "bce_frozen" so
     # existing DIPOLE runs are unaffected until the integrated trainer
     # actively flips it.

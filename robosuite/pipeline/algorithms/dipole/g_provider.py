@@ -33,14 +33,18 @@ is the BCE head's expert-likeness logit, so larger raw means more failure-like.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from robosuite.discriminator.lpb_v2 import BCEDiscriminator, LPBV2Encoder
+
+if TYPE_CHECKING:
+    from ..discriminator.encoder import SharedFrozenEncoder
 
 
 def _resolve_encoder_ckpt(model_ckpt: str, *, hint_root: Path | None = None) -> Path:
@@ -88,12 +92,12 @@ class LPBV2GProvider:
         task_name: str,
         device: str | torch.device = "cuda:0",
         camera_to_view: Optional[Mapping[str, str]] = None,
+        shared_encoder: Optional["SharedFrozenEncoder"] = None,
     ) -> None:
         self.ckpt_path = Path(ckpt_path).resolve()
         if not self.ckpt_path.exists():
             raise FileNotFoundError(f"BCE checkpoint not found: {self.ckpt_path}")
         ckpt = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-        self.device = torch.device(device)
         self.task_name = str(task_name)
 
         for required in ("bce_detector", "feature_source", "transformer_layer", "model_ckpt"):
@@ -107,20 +111,55 @@ class LPBV2GProvider:
         self.feature_source: str = str(ckpt["feature_source"])
         self.transformer_layer: int = int(ckpt["transformer_layer"])
 
-        encoder_ckpt_path = _resolve_encoder_ckpt(
-            str(ckpt["model_ckpt"]), hint_root=self.ckpt_path.parent
-        )
-        self.encoder = LPBV2Encoder(
-            model_ckpt=str(encoder_ckpt_path),
-            device=str(self.device),
-            feature_source=self.feature_source,
-            transformer_layer=self.transformer_layer,
-        )
-        self.view_names: list[str] = [str(v) for v in self.encoder.view_names]
-        self.frameskip: int = int(self.encoder.frameskip)
-        self.action_dim_per_step: int = int(self.encoder.action_dim_per_step)
-        self.action_input_dim: int = int(self.encoder.action_input_dim)
-        self.original_img_size: int = int(self.encoder.original_img_size)
+        if shared_encoder is None:
+            self.device = torch.device(device)
+            encoder_ckpt_path = _resolve_encoder_ckpt(
+                str(ckpt["model_ckpt"]), hint_root=self.ckpt_path.parent
+            )
+            self.encoder = LPBV2Encoder(
+                model_ckpt=str(encoder_ckpt_path),
+                device=str(self.device),
+                feature_source=self.feature_source,
+                transformer_layer=self.transformer_layer,
+            )
+            self.view_names: list[str] = [str(v) for v in self.encoder.view_names]
+            self.frameskip: int = int(self.encoder.frameskip)
+            self.action_dim_per_step: int = int(self.encoder.action_dim_per_step)
+            self.action_input_dim: int = int(self.encoder.action_input_dim)
+            self.original_img_size: int = int(self.encoder.original_img_size)
+        else:
+            # Sanity-check that the shared encoder was built from the same
+            # upstream dynamics checkpoint; warn (don't error) since path
+            # spellings may differ across config snapshots.
+            try:
+                shared_ckpt = torch.load(
+                    shared_encoder.bce_ckpt_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                shared_name = Path(str(shared_ckpt["model_ckpt"])).name
+                own_name = Path(str(ckpt["model_ckpt"])).name
+                if shared_name != own_name:
+                    warnings.warn(
+                        "LPBV2GProvider: shared_encoder.model_ckpt "
+                        f"({shared_name}) differs from this provider's BCE "
+                        f"ckpt model_ckpt ({own_name}); features and BCE "
+                        "head may be incompatible.",
+                        stacklevel=2,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.warn(
+                    f"LPBV2GProvider: could not cross-check shared_encoder "
+                    f"ckpt ({exc}); proceeding anyway.",
+                    stacklevel=2,
+                )
+            self.device = torch.device(shared_encoder.device)
+            self.encoder = shared_encoder.inner_encoder
+            self.view_names = list(shared_encoder.view_names)
+            self.frameskip = int(shared_encoder.frameskip)
+            self.action_dim_per_step = int(shared_encoder.action_dim_per_step)
+            self.action_input_dim = int(shared_encoder.action_input_dim)
+            self.original_img_size = int(shared_encoder.original_img_size[0])
 
         # Build + load the BCE head.
         bce_state = dict(ckpt["bce_detector"])

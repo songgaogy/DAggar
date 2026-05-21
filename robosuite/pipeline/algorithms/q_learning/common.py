@@ -71,8 +71,17 @@ class IQLStepBatch:
     is_intervention: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to(self, device: str) -> "IQLStepBatch":
-        raise NotImplementedError
+    def to(self, device: str | torch.device) -> "IQLStepBatch":
+        return IQLStepBatch(
+            context=self.context.to(device),
+            next_context=self.next_context.to(device),
+            action_chunk=self.action_chunk.to(device),
+            rewards=self.rewards.to(device),
+            dones=self.dones.to(device),
+            is_online=self.is_online.to(device),
+            is_intervention=self.is_intervention.to(device),
+            metadata=self.metadata,
+        )
 
 
 @dataclass
@@ -89,5 +98,9 @@ class IQLActorBatch:
     action_chunk_raw: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to(self, device: str) -> "IQLActorBatch":
-        raise NotImplementedError
+    def to(self, device: str | torch.device) -> "IQLActorBatch":
+        return IQLActorBatch(
+            context=self.context.to(device),
+            action_chunk_raw=self.action_chunk_raw.to(device),
+            metadata=self.metadata,
+        )

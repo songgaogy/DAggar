@@ -46,6 +46,10 @@ class DipoleConfig(FlowDaggerConfig):
     polarity_embedding_init: str = "small_gaussian"   # "small_gaussian" | "zero_neg" | "antipodal"
     polarity_embedding_init_scale: float = 1e-3
     lpb_detector: LPBDetectorConfig = field(default_factory=LPBDetectorConfig)
+    # DIPOLE-RL: which G provider the trainer should attach.
+    # "bce_frozen" -> LPBV2GProvider (legacy); "advantage" -> AdvantageGProvider.
+    # Read by train_dipole_rl.py; DipoleFlowPolicy itself does not consume it.
+    g_mode: str = "bce_frozen"
 
 
 @dataclass

@@ -27,6 +27,19 @@ from .models import DipoleFlowPolicy
 from .replay_buffer import DipoleReplayBuffer
 
 
+_VALID_G_MODES = ("bce_frozen", "advantage")
+
+
+def _validate_g_mode(raw: Any) -> str:
+    value = str(raw)
+    if value not in _VALID_G_MODES:
+        raise ValueError(
+            f"algorithm.dipole.g_mode='{value}' is not supported. "
+            f"Expected one of {_VALID_G_MODES}."
+        )
+    return value
+
+
 def _resolve_language_instruction(task_name: str, task_prompt_map: dict[str, Any] | None = None) -> str:
     prompt_map = {} if task_prompt_map is None else dict(task_prompt_map)
     prompt_value = prompt_map.get(task_name, DEFAULT_TASK_PROMPTS.get(task_name, task_name))
@@ -171,6 +184,7 @@ class DipoleAgent:
             polarity_embedding_init=str(cfg_get(dipole_cfg, "polarity_embedding_init", "small_gaussian")),
             polarity_embedding_init_scale=float(cfg_get(dipole_cfg, "polarity_embedding_init_scale", 1e-3)),
             lpb_detector=lpb_detector_config,
+            g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "bce_frozen")),
         )
         online_buffer_config = ReplayBufferConfig(
             capacity=int(cfg_get(online_buffer_cfg, "capacity", cfg_get(cfg, "online_buffer_capacity", 200_000))),
@@ -206,6 +220,12 @@ class DipoleAgent:
 
     def attach_g_provider(self, provider: Any) -> None:
         self.core.set_g_provider(provider)
+
+    def attach_iql_learner(self, learner: Any) -> None:
+        self.core.iql_learner = learner
+
+    def attach_discriminator(self, discriminator: Any) -> None:
+        self.core.discriminator = discriminator
 
     def select_action(self, obs, deterministic: bool = False):
         return self.core.select_action(obs=obs, deterministic=deterministic)

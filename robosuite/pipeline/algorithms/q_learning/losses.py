@@ -11,6 +11,7 @@ Implementation notes:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def bellman_q_loss(q_pred: torch.Tensor, target_q: torch.Tensor) -> torch.Tensor:
@@ -20,7 +21,7 @@ def bellman_q_loss(q_pred: torch.Tensor, target_q: torch.Tensor) -> torch.Tensor
     Returns:
         scalar MSE.
     """
-    raise NotImplementedError
+    return F.mse_loss(q_pred, target_q)
 
 
 def expectile_v_loss(diff: torch.Tensor, tau: float) -> torch.Tensor:
@@ -32,7 +33,12 @@ def expectile_v_loss(diff: torch.Tensor, tau: float) -> torch.Tensor:
     Returns:
         scalar mean loss.
     """
-    raise NotImplementedError
+    weight = torch.where(
+        diff > 0.0,
+        torch.full_like(diff, float(tau)),
+        torch.full_like(diff, 1.0 - float(tau)),
+    )
+    return (weight * diff.square()).mean()
 
 
 def compute_advantage(q1: torch.Tensor, q2: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -44,4 +50,4 @@ def compute_advantage(q1: torch.Tensor, q2: torch.Tensor, v: torch.Tensor) -> to
     Returns:
         (B,) flattened advantage.
     """
-    raise NotImplementedError
+    return (torch.min(q1, q2) - v).squeeze(-1)

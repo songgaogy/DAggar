@@ -4,18 +4,46 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import torch
 
 from robosuite.pipeline.common.types import Transition
 
 from .agent import DipoleAgent
 
 
+if TYPE_CHECKING:
+    from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
+    from robosuite.pipeline.algorithms.discriminator.online_bce import (
+        OnlineBCEDiscriminator,
+    )
+    from robosuite.pipeline.algorithms.discriminator.replay import (
+        DiscriminatorReplayBuffer,
+    )
+    from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
+    from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
+
+
 logger = logging.getLogger(__name__)
 
 
 class DipoleTrainer:
-    def __init__(self, agent: DipoleAgent, config=None) -> None:
+    def __init__(
+        self,
+        agent: DipoleAgent,
+        config=None,
+        *,
+        iql_learner: "IQLLearner | None" = None,
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        iql_replay: "IQLReplayBuffer | None" = None,
+        disc_replay: "DiscriminatorReplayBuffer | None" = None,
+        shared_encoder: "SharedFrozenEncoder | None" = None,
+        learner_device: str = "cuda:1",
+        iql_batch_size: int = 64,
+        disc_batch_size: int = 64,
+        disc_update_every_n_steps: int = 1,
+    ) -> None:
         self.agent = agent
         self.config = config or agent.trainer_config
         self.total_env_steps = 0
@@ -32,6 +60,16 @@ class DipoleTrainer:
         self._async_pending_batch_size: int | None = None
         self._async_busy = False
         self._async_error: BaseException | None = None
+        # DIPOLE-RL hooks (None == disabled, trainer degenerates to legacy DIPOLE)
+        self.iql_learner = iql_learner
+        self.discriminator = discriminator
+        self.iql_replay = iql_replay
+        self.disc_replay = disc_replay
+        self.shared_encoder = shared_encoder
+        self.learner_device = str(learner_device)
+        self.iql_batch_size = int(iql_batch_size)
+        self.disc_batch_size = int(disc_batch_size)
+        self.disc_update_every_n_steps = max(1, int(disc_update_every_n_steps))
 
     def bootstrap_demo_buffer(self, transitions: list[Transition], demo_source: str = "offline_demo") -> None:
         episode_index = int(self._offline_bootstrap_episodes)
@@ -95,6 +133,11 @@ class DipoleTrainer:
             demo_source=demo_source or ("intervention" if is_intervention else None),
         )
         self.agent.store_transition(transition)
+        # DIPOLE-RL fanout: disc_replay reclassifies lazily but we still hand the
+        # transition to it (currently a no-op) so future swaps remain symmetric.
+        # iql_replay shares the agent.online_buffer by reference; no add needed.
+        if self.disc_replay is not None:
+            self.disc_replay.add_from_transition(transition)
         self.total_env_steps += 1
         return transition
 
@@ -110,10 +153,103 @@ class DipoleTrainer:
     def train_step(self, batch_size: int | None = None) -> dict[str, float]:
         if not self.agent.ready_for_update(batch_size=batch_size):
             raise RuntimeError("Not enough valid dipole demo sequences are available for an update.")
+        # 1. Flow update (uses the currently attached G provider; advantage if RL mode is on).
         batch = self.agent.sample_demo_batch(batch_size=batch_size)
-        metrics = self.agent.update(batch=batch)
+        metrics: dict[str, float] = dict(self.agent.update(batch=batch))
+
+        # 2. IQL Q + V update (single call does Q-loss, V-loss, polyak target update).
+        if (
+            self.iql_learner is not None
+            and self.iql_replay is not None
+            and self.shared_encoder is not None
+            and self.iql_replay.ready(self.iql_batch_size)
+        ):
+            from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
+
+            step_batch = self.iql_replay.sample_step_batch(
+                self.iql_batch_size,
+                encoder=self.shared_encoder,
+                discriminator=self.discriminator,
+                device=self.learner_device,
+            )
+            iql_metrics = self.iql_learner.update(step_batch)
+            for k, v in iql_metrics.items():
+                metrics[f"iql/{k}"] = float(v)
+            with torch.no_grad():
+                adv = self.iql_learner.compute_advantage_for_batch(
+                    IQLActorBatch(
+                        context=step_batch.context,
+                        action_chunk_raw=step_batch.action_chunk,
+                    )
+                )
+            metrics["advantage_mean"] = float(adv.mean().item())
+            if self.discriminator is not None:
+                with torch.no_grad():
+                    r_disc = self.discriminator.intrinsic_reward(
+                        context=step_batch.context,
+                        action_chunk=step_batch.action_chunk,
+                    )
+                metrics["disc_reward_mean"] = float(r_disc.mean().item())
+
+        # 3. Discriminator BCE update (gated by frequency).
+        if (
+            self.discriminator is not None
+            and self.disc_replay is not None
+            and (self.total_updates % self.disc_update_every_n_steps == 0)
+            and self.disc_replay.ready(self.disc_batch_size)
+        ):
+            disc_batch = self.disc_replay.sample(self.disc_batch_size, device=self.learner_device)
+            disc_metrics = self.discriminator.update(disc_batch)
+            for k, v in disc_metrics.items():
+                metrics[f"disc/{k}"] = float(v)
+
         self.total_updates += 1
         return metrics
+
+    # ------------------------------------------------------------------ #
+    # IQL warmup helpers (called by train_dipole_rl.py before rollout)    #
+    # ------------------------------------------------------------------ #
+
+    def pretrain_iql_value(self, num_steps: int) -> list[dict[str, float]]:
+        """V-only IQL warmup. Disc is treated as frozen here (no `.update()` is
+        ever invoked during this loop); we pass it through so r_disc enters the
+        reward composition consistently with the online phase."""
+        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
+            raise RuntimeError("pretrain_iql_value requires iql_learner / iql_replay / shared_encoder.")
+        out: list[dict[str, float]] = []
+        for _ in range(int(num_steps)):
+            if not self.iql_replay.ready(self.iql_batch_size):
+                logger.warning("IQL warmup_value: replay not ready; stopping early.")
+                break
+            step_batch = self.iql_replay.sample_step_batch(
+                self.iql_batch_size,
+                encoder=self.shared_encoder,
+                discriminator=self.discriminator,
+                device=self.learner_device,
+            )
+            m = self.iql_learner.warmup_value_only(step_batch)
+            out.append({f"iql_warmup_v/{k}": float(v) for k, v in m.items()})
+        return out
+
+    def pretrain_iql_full(self, num_steps: int) -> list[dict[str, float]]:
+        """Full IQL warmup (Q + V + target polyak). Disc is frozen here — see
+        `pretrain_iql_value` docstring."""
+        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
+            raise RuntimeError("pretrain_iql_full requires iql_learner / iql_replay / shared_encoder.")
+        out: list[dict[str, float]] = []
+        for _ in range(int(num_steps)):
+            if not self.iql_replay.ready(self.iql_batch_size):
+                logger.warning("IQL warmup_full: replay not ready; stopping early.")
+                break
+            step_batch = self.iql_replay.sample_step_batch(
+                self.iql_batch_size,
+                encoder=self.shared_encoder,
+                discriminator=self.discriminator,
+                device=self.learner_device,
+            )
+            m = self.iql_learner.update(step_batch)
+            out.append({f"iql_warmup_full/{k}": float(v) for k, v in m.items()})
+        return out
 
     def maybe_update(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:
         self._raise_async_error()

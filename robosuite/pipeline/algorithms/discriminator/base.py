@@ -1,9 +1,17 @@
 """Discriminator abstract interface.
 
 All online discriminators consumed by DIPOLE-RL must implement this ABC.
-The sign convention is: `intrinsic_reward` returns higher values for more
-expert-like (s, a) — i.e. r_disc = -logit when `disc_reward_sign` is the
-default `negate_logit`.
+
+Sign convention (matches the warm-started lpb_v2 BCE head):
+    higher logit  →  more failure-like (the policy is failing here;
+                     human intervention would be appropriate)
+    label = 1     →  intervention / failure chunk
+    label = 0     →  expert demo or non-intervention on-policy chunk
+
+Reward composition (consumed by IQL): with the default
+`disc_reward_sign="negate_logit"`, `r_disc = -logit`, so that the agent
+is *rewarded* for being non-failure-like and *penalized* for being
+failure-like.
 """
 
 from __future__ import annotations
@@ -20,14 +28,14 @@ class DiscriminatorOutput:
     """Per-sample scoring output.
 
     Shapes:
-        logit:        (B,) raw BCE logit; higher = more expert-like.
-        prob_expert:  (B,) sigmoid(logit).
-        decision:     (B,) bool — predicted "human should NOT intervene".
-        metadata:     dict — threshold, normalized margin, etc.
+        logit:         (B,) raw BCE logit; higher = more failure-like.
+        prob_failure:  (B,) sigmoid(logit) ≈ P(intervention needed).
+        decision:      (B,) bool — predicted "human should intervene".
+        metadata:      dict — threshold, normalized margin, etc.
     """
 
     logit: torch.Tensor
-    prob_expert: torch.Tensor
+    prob_failure: torch.Tensor
     decision: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -39,8 +47,8 @@ class DiscriminatorBatch:
     Shapes:
         context:      (B, D_ctx) — frozen encoder latent.
         action_chunk: (B, H, D_a).
-        label:        (B,) — 1 = expert (intervention), 0 = current-policy
-                      rollout (non-intervention).
+        label:        (B,) — 1 = intervention / failure chunk,
+                              0 = expert demo or non-intervention on-policy.
     """
 
     context: torch.Tensor
@@ -71,10 +79,11 @@ class DiscriminatorBase(ABC):
         context: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        """Scalar reward used by Q-learning.
+        """Raw logit used by Q-learning (sign flip is applied at the IQL
+        replay boundary based on `cfg.disc_reward_sign`).
 
         Returns:
-            (B,) tensor; higher = more expert-like.
+            (B,) tensor; higher = more failure-like.
         """
 
     # Persistence: implementations should return / consume a dict that the

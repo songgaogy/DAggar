@@ -159,5 +159,4 @@ discriminator (no stale rewards).
 ## Dependency
 
 Depends on prompt **03_shared_encoder** (uses `SharedFrozenEncoder` via
-DI). May run in parallel with **02_online_discriminator** since you
-import disc only via `TYPE_CHECKING`.
+DI). 

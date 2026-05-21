@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def bce_with_logits_loss(
@@ -23,4 +24,16 @@ def bce_with_logits_loss(
     Returns:
         scalar mean loss.
     """
-    raise NotImplementedError
+    if not (0.0 <= label_smoothing < 0.5):
+        raise ValueError(
+            f"label_smoothing must be in [0, 0.5); got {label_smoothing}"
+        )
+    y = labels.to(dtype=logits.dtype).view(-1)
+    if label_smoothing > 0:
+        y = y * (1.0 - 2.0 * label_smoothing) + label_smoothing
+    return F.binary_cross_entropy_with_logits(
+        logits.view(-1),
+        y,
+        pos_weight=pos_weight,
+        reduction="mean",
+    )
