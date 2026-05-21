@@ -18,10 +18,12 @@ from robosuite.pipeline.common.utils import (
 from robosuite.policy.flow_multi.utils.datasets import DEFAULT_TASK_PROMPTS
 
 from .common import (
+    DipoleBatch,
     DipoleConfig,
     FlowAugmentationConfig,
     LPBDetectorConfig,
     TrainerConfig,
+    concat_dipole_batches,
 )
 from .models import DipoleFlowPolicy
 from .replay_buffer import DipoleReplayBuffer
@@ -181,8 +183,8 @@ class DipoleAgent:
             g_sign=str(cfg_get(dipole_cfg, "g_sign", "negate_raw")),
             g_normalization=str(cfg_get(dipole_cfg, "g_normalization", "batch_zscore")),
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
-            polarity_embedding_init=str(cfg_get(dipole_cfg, "polarity_embedding_init", "small_gaussian")),
-            polarity_embedding_init_scale=float(cfg_get(dipole_cfg, "polarity_embedding_init_scale", 1e-3)),
+            polarity_embedding_init=str(cfg_get(dipole_cfg, "polarity_embedding_init", "zero_pos")),
+            polarity_embedding_init_scale=float(cfg_get(dipole_cfg, "polarity_embedding_init_scale", 2e-3)),
             lpb_detector=lpb_detector_config,
             g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "bce_frozen")),
         )
@@ -199,7 +201,6 @@ class DipoleAgent:
             warmup_steps=int(cfg_get(trainer_cfg, "warmup_steps", cfg_get(cfg, "warmup_steps", 0))),
             updates_per_step=int(cfg_get(trainer_cfg, "updates_per_step", 1)),
             steps_per_update=int(cfg_get(trainer_cfg, "steps_per_update", 50)),
-            random_steps=int(cfg_get(trainer_cfg, "random_steps", 0)),
             pretrain_steps=int(cfg_get(trainer_cfg, "pretrain_steps", 20_000)),
             max_pending_updates=int(cfg_get(trainer_cfg, "max_pending_updates", 1)),
         )
@@ -297,24 +298,52 @@ class DipoleAgent:
         if transition.is_intervention:
             self.store_demo_transition(transition)
 
-    def sample_demo_batch(self, batch_size: int | None = None):
+    def _flow_sample_kwargs(self) -> dict[str, Any]:
+        return {
+            "action_mean": self.core.act_mean,
+            "action_std": self.core.act_std,
+            "proprio_mean": self.core.prop_mean,
+            "proprio_std": self.core.prop_std,
+            "device": self.core.device,
+            "augment": True,
+        }
+
+    def _sample_buffer_batch(self, buffer: DipoleReplayBuffer, batch_size: int) -> DipoleBatch:
+        batch = buffer.sample(batch_size=int(batch_size), **self._flow_sample_kwargs())
+        source = str(buffer.name)
+        batch.metadata = dict(batch.metadata)
+        batch.metadata["buffer_sources"] = [source] * int(batch.batch_size)
+        return batch
+
+    def sample_demo_batch(self, batch_size: int | None = None) -> DipoleBatch:
         batch_size = int(batch_size or self.trainer_config.batch_size)
-        return self.demo_buffer.sample(
-            batch_size=batch_size,
-            action_mean=self.core.act_mean,
-            action_std=self.core.act_std,
-            proprio_mean=self.core.prop_mean,
-            proprio_std=self.core.prop_std,
-            device=self.core.device,
-            augment=True,
-        )
+        return self._sample_buffer_batch(self.demo_buffer, batch_size)
+
+    def sample_training_batch(self, batch_size: int | None = None) -> DipoleBatch:
+        """Sample half from online_buffer and half from demo_buffer (1:1)."""
+        batch_size = int(batch_size or self.trainer_config.batch_size)
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0.")
+        n_online = batch_size // 2
+        n_demo = batch_size - n_online
+        online_batch = self._sample_buffer_batch(self.online_buffer, n_online)
+        demo_batch = self._sample_buffer_batch(self.demo_buffer, n_demo)
+        return concat_dipole_batches(online_batch, demo_batch)
 
     def ready_for_update(self, batch_size: int | None = None) -> bool:
         batch_size = int(batch_size or self.trainer_config.batch_size)
-        return self.demo_buffer.num_valid_sequences() >= batch_size and self.has_normalizers()
+        if batch_size <= 0:
+            return False
+        n_online = batch_size // 2
+        n_demo = batch_size - n_online
+        return (
+            self.online_buffer.num_valid_sequences() >= n_online
+            and self.demo_buffer.num_valid_sequences() >= n_demo
+            and self.has_normalizers()
+        )
 
     def update(self, *, batch=None, batch_size: int | None = None) -> dict[str, float]:
-        batch = batch or self.sample_demo_batch(batch_size=batch_size)
+        batch = batch or self.sample_training_batch(batch_size=batch_size)
         return self.core.update(batch=batch)
 
     def save_checkpoint(self, path: str | Path, include_buffers: bool = True, extra: dict[str, Any] | None = None) -> None:

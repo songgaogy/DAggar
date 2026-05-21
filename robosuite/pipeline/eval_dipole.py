@@ -189,7 +189,7 @@ def _build_dipole_policy(
         g_sign=str(flow_cfg.get("g_sign", "negate_raw")),
         g_normalization=str(flow_cfg.get("g_normalization", "batch_zscore")),
         g_clip=float(flow_cfg.get("g_clip", 10.0)),
-        polarity_embedding_init=str(flow_cfg.get("polarity_embedding_init", "small_gaussian")),
+        polarity_embedding_init=str(flow_cfg.get("polarity_embedding_init", "zero_pos")),
         polarity_embedding_init_scale=float(flow_cfg.get("polarity_embedding_init_scale", 1e-3)),
         lpb_detector=LPBDetectorConfig(
             ckpt_path=lpb_cfg.get("ckpt_path"),

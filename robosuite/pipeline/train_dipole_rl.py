@@ -76,7 +76,6 @@ from robosuite.pipeline.train_dipole import (
     bind_flow_proprio_extractor,
     build_flow_runtime_cfg,
     convert_env_camera_observation,
-    format_base_policy_trajectory_tag,
     format_discriminator_line,
     format_publish_line,
     load_hdf5_demos_into_flow_transitions,
@@ -84,7 +83,6 @@ from robosuite.pipeline.train_dipole import (
     maybe_set_seed,
     reset_flow_policy_observation,
     resolve_algorithm_devices,
-    resolve_base_policy_checkpoint_path,
     resolve_camera_names,
     resolve_flow_task_metadata,
     resolve_run_directory,
@@ -165,6 +163,11 @@ def _load_iql_warmup_state(
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="train_dipole_rl")
 def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train_dipole.main
+    
+    # ------------------------------------------------------------------ #
+    # Initialize the training environment.                               #
+    # ------------------------------------------------------------------ #
+    
     maybe_set_seed(getattr(cfg, "seed", None))
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -319,6 +322,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # ------------------------------------------------------------------ #
     # RL-ADD: shared encoder, IQL, discriminator, two replay wrappers.   #
     # ------------------------------------------------------------------ #
+
+    # shared ViT encoder
     bce_warm_ckpt_raw = cfg.algorithm.discriminator.warm_start_ckpt
     if bce_warm_ckpt_raw is None or str(bce_warm_ckpt_raw).strip().lower() in ("", "null"):
         raise RuntimeError(
@@ -336,9 +341,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         f"context_dim={shared_encoder.context_dim} views={shared_encoder.view_names}"
     )
 
-    # Legacy LPB-only G provider — still constructed unconditionally so the
-    # discriminator-display block at the rollout-loop site has a working
-    # compute_g_for_observation() implementation regardless of g_mode.
+    # LBP-style discriminator G provider
     lpb_cfg = cfg.algorithm.dipole.lpb_detector
     lpb_ckpt_raw = lpb_cfg.ckpt_path if lpb_cfg is not None else None
     if lpb_ckpt_raw is None or str(lpb_ckpt_raw).strip().lower() in ("", "null"):
@@ -424,7 +427,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         learner_device=rl_learner_device,
         iql_batch_size=int(cfg.algorithm.trainer.batch_size),
         disc_batch_size=int(disc_cfg.batch_size),
-        disc_update_every_n_steps=int(disc_cfg.update_every_n_steps),
+        disc_update_freq=int(disc_cfg.update_freq),
+        iql_update_freq=int(iql_cfg.update_freq),
     )
     if iql_learner is not None:
         agent.attach_iql_learner(iql_learner)
@@ -438,6 +442,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     print(
         f"[dipole] attached legacy BCE G provider (bootstrap_g_with_frozen_bce={bootstrap_with_frozen})"
     )
+
     # ------------------------------------------------------------------ #
     # END RL-ADD initial wiring.                                         #
     # ------------------------------------------------------------------ #
@@ -449,7 +454,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             f"No demo files were found for '{demo_source_name}'. "
             "Place demos under ./data/<task>/expert or set data.demo_paths explicitly."
         )
-
+    
     env = main_env
     obs = initial_obs
     control_fps = resolve_runtime_fps(cfg, "control_fps", float(cfg.env.control_freq))
@@ -650,13 +655,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # ------------------------------------------------------------------ #
     # RL-ADD: seed disc/IQL non-failure pool from offline demos.         #
     # ------------------------------------------------------------------ #
-    # Demos carry is_intervention=False → label=0 (non-failure / good
-    # behavior) per the warm-started lpb_v2 BCE convention. The IQL replay
-    # and the disc replay both wrap agent.online_buffer by reference, so a
-    # single seed call serves both subsystems. In the legacy regression
-    # path (disc_online_train=false AND q_learning.enabled=false) we skip
-    # seeding entirely — agent.online_buffer is only used for record-keeping
-    # of the rollout transitions in that path.
+
+    # load offline demos into online buffer
     if (iql_replay is not None or disc_replay is not None) and len(agent.online_buffer) == 0:
         annotated_demos = _annotate_offline_demos(transitions, namespace="offline_demo")
         if disc_replay is not None:
@@ -677,51 +677,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             f"[rl] reusing checkpoint online buffer with {len(agent.online_buffer)} transitions; "
             "failure/non_failure pools will be classified lazily on next disc/iql sample"
         )
-    # ------------------------------------------------------------------ #
-    # END RL-ADD: demo bootstrap.                                        #
-    # ------------------------------------------------------------------ #
-
-    requested_pretrain_steps = max(0, int(cfg.algorithm.trainer.pretrain_steps))
-    base_policy_checkpoint = resolve_base_policy_checkpoint_path(
-        output_root,
-        env_name=str(cfg.env.environment),
-        demo_source_name=demo_source_name,
-        max_num_trajectories=max_num_trajectories,
-        pretrain_steps=requested_pretrain_steps,
-    )
-    base_policy_metadata = {
-        "env_name": str(cfg.env.environment),
-        "demo_source_name": demo_source_name,
-        "num_trajectories": None if max_num_trajectories is None else int(max_num_trajectories),
-        "offline_transition_count": int(len(transitions)),
-        "pretrain_steps": int(requested_pretrain_steps),
-        "checkpoint_path": str(base_policy_checkpoint),
-    }
-    base_policy_reused = False
-    if loaded_checkpoint is None and initialized_checkpoint is None:
-        if base_policy_checkpoint.exists():
-            try:
-                extra = agent.load_checkpoint(base_policy_checkpoint, load_buffers=False)
-                trainer.load_state_dict(extra.get("trainer_state"))
-                loaded_checkpoint = base_policy_checkpoint
-                base_policy_reused = True
-                print(
-                    "[base_policy] reusing "
-                    f"{base_policy_checkpoint.name} "
-                    f"(trajectories={format_base_policy_trajectory_tag(max_num_trajectories)}, "
-                    f"pretrain_steps={requested_pretrain_steps})"
-                )
-            except Exception as exc:
-                print(f"[WARN] Failed to load reusable base policy {base_policy_checkpoint}: {exc}")
-        elif requested_pretrain_steps <= 0:
-            raise ValueError(
-                "Base policy checkpoint is missing and algorithm.trainer.pretrain_steps <= 0. "
-                "Set a positive pretrain_steps value to build the base policy from offline demos, "
-                "or provide an existing checkpoint."
-            )
-    elif initialized_checkpoint is not None:
-        base_policy_reused = True
-        print(f"[base_policy] initialized from multitask flow checkpoint={initialized_checkpoint}")
 
     if bool(cfg.runtime.load_buffers):
         online_chunk_dir, demo_chunk_dir = resolve_buffer_chunk_dirs(loaded_checkpoint)
@@ -737,6 +692,11 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 f"[load] chunk_buffers online={loaded_online_transitions} demo={loaded_demo_transitions} "
                 f"from {resolve_checkpoint_run_dir(loaded_checkpoint) / 'buffers'}"
             )
+
+    
+    # ------------------------------------------------------------------ #
+    # Initialize the training loop.                                      #
+    # ------------------------------------------------------------------ #
 
     wandb_run = maybe_build_wandb(cfg, run_name=run_name, run_dir=checkpoint_dir)
     device = None
@@ -908,47 +868,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         )
         print(f"[ckpt] step={step} pending={pending_updates} queued={step_checkpoint.name}")
 
-    # ------------------------------------------------------------------ #
-    # Flow base-policy pretrain (same as train_dipole.py).               #
-    # ------------------------------------------------------------------ #
-    if loaded_checkpoint is None and initialized_checkpoint is None and start_step == 0:
-        completed_pretrain_steps = int(trainer.total_pretrain_updates)
-        remaining_pretrain_steps = requested_pretrain_steps - completed_pretrain_steps
-        print(
-            f"[base_policy] training remaining_pretrain_steps={remaining_pretrain_steps} "
-            f"(completed={completed_pretrain_steps}, target={requested_pretrain_steps})"
-        )
-        for local_step in range(remaining_pretrain_steps):
-            metrics = trainer.pretrain(1)[-1]
-            absolute_pretrain_step = completed_pretrain_steps + local_step + 1
-            if absolute_pretrain_step % int(cfg.logging.log_interval) == 0:
-                maybe_log(
-                    wandb_run,
-                    {f"pretrain/{key}": value for key, value in metrics.items()},
-                    step=absolute_pretrain_step,
-                )
-                print(
-                    "[base_policy] "
-                    f"step={absolute_pretrain_step} loss={metrics.get('actor_loss', float('nan')):.4f} "
-                    f"flow={metrics.get('flow_loss', float('nan')):.4f} "
-                    f"endpoint={metrics.get('endpoint_loss', float('nan')):.4f}"
-                )
-            maybe_print_publish_events([metrics])
-        base_policy_extra = {
-            "global_step": -1,
-            "episode_index": 0,
-            "success_count": 0,
-            "trainer_state": trainer.state_dict(),
-            "base_policy_metadata": dict(base_policy_metadata),
-        }
-        agent.save_checkpoint(base_policy_checkpoint, include_buffers=False, extra=base_policy_extra)
-        print(f"[base_policy] saved {base_policy_checkpoint}")
-    elif base_policy_reused:
-        print(f"[base_policy] ready from checkpoint={base_policy_checkpoint}")
-
-    # ------------------------------------------------------------------ #
-    # RL-ADD: IQL warmup (load ckpt or run pretrain_iql_value/full).     #
-    # ------------------------------------------------------------------ #
+    # RL-ADD: IQL warmup (load ckpt or run pretrain_iql_value/full).
     warmup_ckpt_raw = cfg.algorithm.q_learning.warmup_ckpt
     if iql_learner is None:
         print("[iql_warmup] skipped (algorithm.q_learning.enabled=false)")
@@ -969,9 +889,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         full_log = trainer.pretrain_iql_full(warmup_full_steps)
         if full_log:
             print(f"[iql_warmup] full tail metrics: {full_log[-1]}")
-    # ------------------------------------------------------------------ #
-    # RL-ADD: flip g_mode → advantage if requested.                      #
-    # ------------------------------------------------------------------ #
+
+    # RL-ADD: flip g_mode → advantage if requested.
     g_mode = str(cfg.algorithm.dipole.g_mode)
     if g_mode == "advantage":
         if iql_learner is None or discriminator is None:
@@ -1002,10 +921,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         pass
     else:
         raise ValueError(f"Unknown algorithm.dipole.g_mode: {g_mode}")
-    # ------------------------------------------------------------------ #
-    # END RL-ADD: warmup + g_mode switch.                                #
-    # ------------------------------------------------------------------ #
 
+    # env runtime settings
     if bool(cfg.intervention.enabled):
         device = build_device(env, cfg.intervention)
         intervention_runtime = RobosuiteInterventionRuntime(
@@ -1013,7 +930,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             device=device,
             goal_update_mode=str(cfg.intervention.goal_update_mode),
         )
-
     obs, _ = reset_flow_policy_observation(
         env,
         preserve_mjviewer=rollout_has_renderer,
@@ -1040,11 +956,11 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             overall_fps_tracker.mark()
 
             if unthrottled_runtime or policy_gate.ready(loop_start):
-                if step < int(cfg.algorithm.trainer.random_steps):
-                    cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
-                else:
-                    cached_policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
+                cached_policy_action = agent.select_action(
+                    obs, deterministic=bool(cfg.runtime.eval_deterministic)
+                )
 
+            # action: validation intervention
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
             is_intervention = False
             reset_requested = False
@@ -1065,6 +981,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                     cached_override_action = None
                     cached_is_intervention = False
 
+            # reset the environment
             if reset_requested:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
@@ -1117,6 +1034,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 img_width=int(cfg.env.img_width),
             )
             refresh_main_viewer()
+
+            # RL statistics
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
                 done = True
             done = bool(done or success)
@@ -1169,6 +1088,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             episode_length += 1
             success_count += int(success)
 
+            # print discriminator result
             if disc_log_gate is not None and disc_log_gate.ready(time.monotonic()):
                 try:
                     chunk_for_disc = agent.plan_action_chunk(
@@ -1212,6 +1132,10 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                             **event_time_fields(),
                         }
                     )
+
+            # -----------------------------------------------------------------
+            # update all
+            # -----------------------------------------------------------------
 
             if online_updates_enabled:
                 if async_updates:
@@ -1367,9 +1291,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 "success_count": int(success_count),
                 "latest_checkpoint": str(checkpoint_path(checkpoint_dir, "latest")),
                 "trainer_state": trainer.state_dict(),
-                "base_policy_checkpoint": str(base_policy_checkpoint),
-                "base_policy_reused": bool(base_policy_reused),
-                "base_policy_metadata": dict(base_policy_metadata),
                 "algorithm_type": "dipole_rl",
                 "g_mode": str(cfg.algorithm.dipole.g_mode),
             },

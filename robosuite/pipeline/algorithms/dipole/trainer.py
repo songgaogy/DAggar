@@ -42,7 +42,8 @@ class DipoleTrainer:
         learner_device: str = "cuda:1",
         iql_batch_size: int = 64,
         disc_batch_size: int = 64,
-        disc_update_every_n_steps: int = 1,
+        disc_update_freq: int = 1,
+        iql_update_freq: int = 1,
     ) -> None:
         self.agent = agent
         self.config = config or agent.trainer_config
@@ -69,9 +70,16 @@ class DipoleTrainer:
         self.learner_device = str(learner_device)
         self.iql_batch_size = int(iql_batch_size)
         self.disc_batch_size = int(disc_batch_size)
-        self.disc_update_every_n_steps = max(1, int(disc_update_every_n_steps))
+        self.disc_update_freq = int(disc_update_freq)
+        self.iql_update_freq = int(iql_update_freq)
 
-    def bootstrap_demo_buffer(self, transitions: list[Transition], demo_source: str = "offline_demo") -> None:
+    def bootstrap_demo_buffer(
+        self,
+        transitions: list[Transition],
+        demo_source: str = "offline_demo",
+        *,
+        mirror_online: bool = True,
+    ) -> None:
         episode_index = int(self._offline_bootstrap_episodes)
         episode_step = 0
         for transition in transitions:
@@ -80,6 +88,7 @@ class DipoleTrainer:
             info = {} if transition.info is None else dict(transition.info)
             info.setdefault("episode_index", int(episode_index))
             info.setdefault("episode_step", int(episode_step))
+            info.setdefault("buffer_role", "offline")
             normalized = Transition(
                 obs=transition.obs,
                 action=transition.action,
@@ -93,6 +102,8 @@ class DipoleTrainer:
                 demo_source=transition.demo_source or demo_source,
             )
             self.agent.store_demo_transition(normalized)
+            if mirror_online:
+                self.agent.store_online_transition(normalized)
             episode_step += 1
             if bool(transition.done):
                 episode_index += 1
@@ -153,11 +164,10 @@ class DipoleTrainer:
     def train_step(self, batch_size: int | None = None) -> dict[str, float]:
         if not self.agent.ready_for_update(batch_size=batch_size):
             raise RuntimeError("Not enough valid dipole demo sequences are available for an update.")
-        # 1. Flow update (uses the currently attached G provider; advantage if RL mode is on).
-        batch = self.agent.sample_demo_batch(batch_size=batch_size)
-        metrics: dict[str, float] = dict(self.agent.update(batch=batch))
 
-        # 2. IQL Q + V update (single call does Q-loss, V-loss, polyak target update).
+        metrics: dict[str, float] = {}
+
+        # 1. IQL Q + V (before flow so AdvantageG sees Q/V from this tick).
         if (
             self.iql_learner is not None
             and self.iql_replay is not None
@@ -166,48 +176,58 @@ class DipoleTrainer:
         ):
             from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
 
-            step_batch = self.iql_replay.sample_step_batch(
-                self.iql_batch_size,
-                encoder=self.shared_encoder,
-                discriminator=self.discriminator,
-                device=self.learner_device,
-            )
-            iql_metrics = self.iql_learner.update(step_batch)
-            for k, v in iql_metrics.items():
-                metrics[f"iql/{k}"] = float(v)
-            with torch.no_grad():
-                adv = self.iql_learner.compute_advantage_for_batch(
-                    IQLActorBatch(
-                        context=step_batch.context,
-                        action_chunk_raw=step_batch.action_chunk,
-                    )
+            # Each iteration resamples and updates Q/V. metrics keep the last
+            # iteration only (WandB x-axis is env step, not inner critic step).
+            for _ in range(self.iql_update_freq):
+                step_batch = self.iql_replay.sample_step_batch(
+                    self.iql_batch_size,
+                    encoder=self.shared_encoder,
+                    discriminator=self.discriminator,
+                    device=self.learner_device,
                 )
-            metrics["advantage_mean"] = float(adv.mean().item())
-            if self.discriminator is not None:
+                iql_metrics = self.iql_learner.update(step_batch)
+                for k, v in iql_metrics.items():
+                    metrics[f"iql/{k}"] = float(v)
                 with torch.no_grad():
-                    r_disc = self.discriminator.intrinsic_reward(
-                        context=step_batch.context,
-                        action_chunk=step_batch.action_chunk,
+                    adv = self.iql_learner.compute_advantage_for_batch(
+                        IQLActorBatch(
+                            context=step_batch.context,
+                            action_chunk_raw=step_batch.action_chunk,
+                        )
                     )
-                metrics["disc_reward_mean"] = float(r_disc.mean().item())
+                metrics["advantage_mean"] = float(adv.mean().item())
+                if self.discriminator is not None:
+                    with torch.no_grad():
+                        r_disc = self.discriminator.intrinsic_reward(
+                            context=step_batch.context,
+                            action_chunk=step_batch.action_chunk,
+                        )
+                    metrics["disc_reward_mean"] = float(r_disc.mean().item())
 
-        # 3. Discriminator BCE update (gated by frequency).
+        # 2. Discriminator BCE head (before flow so disc logit in G is current).
         if (
             self.discriminator is not None
             and self.disc_replay is not None
-            and (self.total_updates % self.disc_update_every_n_steps == 0)
             and self.disc_replay.ready(self.disc_batch_size)
         ):
-            disc_batch = self.disc_replay.sample(self.disc_batch_size, device=self.learner_device)
-            disc_metrics = self.discriminator.update(disc_batch)
-            for k, v in disc_metrics.items():
-                metrics[f"disc/{k}"] = float(v)
+            for _ in range(self.disc_update_freq):
+                disc_batch = self.disc_replay.sample(self.disc_batch_size, device=self.learner_device)
+                disc_metrics = self.discriminator.update(disc_batch)
+                for k, v in disc_metrics.items():
+                    metrics[f"disc/{k}"] = float(v)
 
+        # 3. Flow / policy update last (online:demo 1:1 batch; uses g_provider from steps 1–2).
+        batch = self.agent.sample_training_batch(batch_size=batch_size)
+        flow_metrics = dict(self.agent.update(batch=batch))
+        metrics.update(flow_metrics)
+
+        metrics["iql_update_freq"] = float(self.iql_update_freq)
+        metrics["disc_update_freq"] = float(self.disc_update_freq)
         self.total_updates += 1
         return metrics
 
     # ------------------------------------------------------------------ #
-    # IQL warmup helpers (called by train_dipole_rl.py before rollout)    #
+    # IQL warmup helpers (called by train_dipole_rl.py before rollout)   #
     # ------------------------------------------------------------------ #
 
     def pretrain_iql_value(self, num_steps: int) -> list[dict[str, float]]:

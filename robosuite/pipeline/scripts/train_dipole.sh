@@ -38,7 +38,7 @@ OMEGA_RUNTIME_OVERRIDE="${OMEGA_RUNTIME_OVERRIDE:-}"
 G_SIGN="${G_SIGN:-negate_raw}"
 G_NORMALIZATION="${G_NORMALIZATION:-batch_zscore}"
 G_CLIP="${G_CLIP:-10.0}"
-POLARITY_INIT="${POLARITY_INIT:-small_gaussian}"
+POLARITY_INIT="${POLARITY_INIT:-zero_pos}"
 POLARITY_INIT_SCALE="${POLARITY_INIT_SCALE:-1.0e-3}"
 
 # Optional: camera_to_view JSON object, e.g. '{robot0_robotview: agentview}'.

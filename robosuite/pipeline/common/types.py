@@ -123,7 +123,6 @@ class TrainerConfig:
     warmup_steps: int = 100
     updates_per_step: int = 1
     steps_per_update: int = 50
-    random_steps: int = 0
     online_fraction: float = 0.5
     # Hard cap on async learner queue. When the learner falls behind, extra
     # update requests are dropped instead of accumulating an unbounded backlog.

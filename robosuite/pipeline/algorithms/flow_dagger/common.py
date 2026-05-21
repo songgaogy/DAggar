@@ -44,7 +44,6 @@ class TrainerConfig:
     warmup_steps: int = 0
     updates_per_step: int = 1
     steps_per_update: int = 50
-    random_steps: int = 0
     pretrain_steps: int = 20_000
 
 

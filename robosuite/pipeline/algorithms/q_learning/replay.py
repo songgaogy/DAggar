@@ -30,7 +30,7 @@ from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import (
 )
 
 from .common import IQLActorBatch, IQLConfig, IQLStepBatch
-from .data_util import aggregate_chunk_reward, chunk_done_mask
+from .data_util import aggregate_chunk_reward, chunk_done_mask, disc_logit_to_intrinsic_reward
 
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
@@ -190,26 +190,18 @@ class IQLReplayBuffer:
         # is provided so warmup can run before subagent-2 lands.
         #
         # Sign convention (matches lpb_v2 BCE warm-start): higher logit =
-        # more failure-like. `disc_reward_sign="negate_logit"` (default)
-        # therefore turns intrinsic_reward into r_disc = -logit so the
-        # agent is *rewarded* for being non-failure-like.
+        # more failure-like. Default maps logit -> (-1, 0) via -sigmoid(logit)
+        # (expert-like ~ 0, failure-like ~ -1).
         effective_disc_coef = 0.0 if discriminator is None else float(self.cfg.disc_reward_coef)
         if effective_disc_coef != 0.0 and discriminator is not None:
             action_for_disc = action_tensor.to(context.device, dtype=context.dtype)
             with torch.no_grad():
-                r_disc_chunk = discriminator.intrinsic_reward(
+                logit = discriminator.intrinsic_reward(
                     context=context, action_chunk=action_for_disc
-                )  # (B,) — raw logit, higher = more failure-like.
-            sign_mode = str(self.cfg.disc_reward_sign).lower()
-            if sign_mode == "negate_logit":
-                r_disc_chunk = -r_disc_chunk
-            elif sign_mode == "raw":
-                pass
-            else:
-                raise ValueError(
-                    f"IQLConfig.disc_reward_sign must be 'negate_logit' or "
-                    f"'raw'; got {self.cfg.disc_reward_sign!r}"
-                )
+                )  # (B,) raw BCE logit; higher = more failure-like.
+            r_disc_chunk = disc_logit_to_intrinsic_reward(
+                logit, str(self.cfg.disc_reward_sign)
+            )
             r_disc_per_step = (r_disc_chunk.unsqueeze(-1) / float(H)).expand(-1, H)
             r_disc_per_step = r_disc_per_step.to(reward_tensor.device, dtype=reward_tensor.dtype)
         else:

@@ -19,6 +19,24 @@ from __future__ import annotations
 import torch
 
 
+def disc_logit_to_intrinsic_reward(logit: torch.Tensor, sign_mode: str) -> torch.Tensor:
+    """Map BCE head logits to IQL intrinsic reward on (-1, 0).
+
+    Convention: higher logit = more failure-like.
+
+    - ``negate_logit`` (default): ``-sigmoid(logit)`` — expert-like ~ 0, failure-like ~ -1.
+    - ``raw``: passthrough logit (legacy / debugging).
+    """
+    mode = str(sign_mode).lower()
+    if mode == "negate_logit":
+        return -torch.sigmoid(logit)
+    if mode == "raw":
+        return logit
+    raise ValueError(
+        f"Unsupported disc_reward_sign={sign_mode!r}. Expected 'negate_logit' or 'raw'."
+    )
+
+
 def aggregate_chunk_reward(
     step_rewards: torch.Tensor,
     discount: float,

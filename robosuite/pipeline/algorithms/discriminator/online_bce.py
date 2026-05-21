@@ -43,8 +43,7 @@ class DiscriminatorConfig:
         num_layers:            head depth.
         batch_size:            disc update batch size.
         balance_ratio:         expert : policy sample ratio (default 1:1).
-        update_every_n_steps:  trainer skips disc.update for N-1 of every
-                               N learner ticks (throughput knob).
+        update_freq:           BCE head updates per learner tick (each resamples).
         threshold_ema:         EMA factor for the decision threshold.
         warm_start_ckpt:       optional path to pre-fitted bce_head.pth.
         label_smoothing:       BCE label smoothing in [0, 0.5).
@@ -58,7 +57,7 @@ class DiscriminatorConfig:
     num_layers: int = 2
     batch_size: int = 64
     balance_ratio: float = 1.0
-    update_every_n_steps: int = 1
+    update_freq: int = 1
     threshold_ema: float = 0.99
     warm_start_ckpt: str | None = None
     label_smoothing: float = 0.0

@@ -386,6 +386,8 @@ def build_flow_runtime_cfg(
     runtime_cfg.use_camera_obs = bool(use_camera_obs)
     if use_camera_obs:
         runtime_cfg.has_offscreen_renderer = True
+    else:
+        runtime_cfg.has_offscreen_renderer = bool(has_offscreen_renderer)
     return runtime_cfg
 
 
@@ -1206,10 +1208,9 @@ def main(cfg: DictConfig) -> None:
             overall_fps_tracker.mark()
 
             if unthrottled_runtime or policy_gate.ready(loop_start):
-                if step < int(cfg.algorithm.trainer.random_steps):
-                    cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
-                else:
-                    cached_policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
+                cached_policy_action = agent.select_action(
+                    obs, deterministic=bool(cfg.runtime.eval_deterministic)
+                )
 
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
             is_intervention = False

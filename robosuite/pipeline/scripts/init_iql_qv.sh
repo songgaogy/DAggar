@@ -29,16 +29,18 @@ LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/bce_viz_robosuite/viz_bce_P
 
 VALUE_STEPS="${VALUE_STEPS:-20000}"
 FULL_STEPS="${FULL_STEPS:-5000}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
 DEVICE="${DEVICE:-cuda:1}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_RL/iql_qv_cache/${ENVIRONMENT}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_rl/iql_qv_cache/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 mkdir -p "${OUTPUT_DIR}"
 
-# IQL warmup runs offline only — no display needed; force egl.
+# IQL warmup is offline (HDF5 only); env is built without offscreen rendering.
+# MUJOCO_GL is unused unless you override warmup to enable rendering.
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_ENTITY="${WANDB_ENTITY:-songgao-personal}"
+export HYDRA_FULL_ERROR=1
 
 HYDRA_OVERRIDES=(
   "env.environment=${ENVIRONMENT}"
@@ -53,6 +55,14 @@ HYDRA_OVERRIDES=(
 
 if [[ -n "${NUM_TRAJECTORIES:-}" ]]; then
   HYDRA_OVERRIDES+=("data.num_trajectories=${NUM_TRAJECTORIES}")
+fi
+
+if [[ "${DEVICE}" == cuda* ]]; then
+  if ! "${PY}" -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+    echo "[ERROR] DEVICE=${DEVICE} but torch.cuda.is_available() is False." >&2
+    echo "        Run: nvidia-smi   (fix driver/library mismatch; reboot after driver update)" >&2
+    exit 1
+  fi
 fi
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE}"

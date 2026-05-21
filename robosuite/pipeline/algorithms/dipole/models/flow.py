@@ -12,7 +12,7 @@ from robosuite.pipeline.algorithms.flow_dagger.models.flow import _center_crop_r
 from robosuite.pipeline.common.utils import clone_array_tree
 from robosuite.policy.flow_multi.model import MultiModalFlowPolicy, build_flow_policy
 
-from ..common import DipoleBatch, DipoleConfig
+from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
 
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -30,7 +30,7 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
     rest of the backbone is shared and trainable.
     """
 
-    def __init__(self, *args, polarity_embedding_init: str = "small_gaussian", polarity_embedding_init_scale: float = 1e-3, **kwargs) -> None:
+    def __init__(self, *args, polarity_embedding_init: str = "zero_pos", polarity_embedding_init_scale: float = 1e-3, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         cond_dim = int(self.condition_aggregator.output_dim)
         self.polarity_embedding = nn.Embedding(2, cond_dim)
@@ -40,16 +40,23 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
         scheme = str(scheme).lower()
         with torch.no_grad():
             self.polarity_embedding.weight.zero_()
-            if scheme == "zero_neg":
+            if scheme == "zero_pos":
+                # pos branch (row 1) zero == base flow at init; neg (row 0) small gaussian
+                self.polarity_embedding.weight[0].normal_(mean=0.0, std=scale)
+            elif scheme == "zero_neg":
                 # neg branch (row 0) zero, pos branch (row 1) small gaussian
                 self.polarity_embedding.weight[1].normal_(mean=0.0, std=scale)
             elif scheme == "antipodal":
                 e = torch.randn_like(self.polarity_embedding.weight[0]) * scale
                 self.polarity_embedding.weight[0].copy_(-e)
                 self.polarity_embedding.weight[1].copy_(e)
-            else:
-                # default small_gaussian: both rows iid N(0, scale)
+            elif scheme == "small_gaussian":
                 self.polarity_embedding.weight.normal_(mean=0.0, std=scale)
+            else:
+                raise ValueError(
+                    f"Unsupported polarity_embedding_init={scheme!r}. "
+                    "Expected one of: zero_pos, zero_neg, small_gaussian, antipodal."
+                )
 
     def forward_from_context(
         self,
@@ -311,6 +318,7 @@ class DipoleFlowPolicy:
         return action_seq
 
     def _normalize_g(self, raw_g: torch.Tensor) -> torch.Tensor:
+        # TODO: decide how compute G
         mode = str(self.config.g_normalization).lower()
         if mode == "none":
             return raw_g
@@ -340,54 +348,100 @@ class DipoleFlowPolicy:
             return 2.0 * (raw_g - lo) / span - 1.0
         raise ValueError(f"Unknown g_normalization mode: {mode}")
 
+    @staticmethod
+    def _resolve_demo_sample_mask(batch: DipoleBatch, device: torch.device) -> torch.Tensor | None:
+        """True for rows sampled from demo_buffer (see ``buffer_sources`` metadata)."""
+        sources = batch.metadata.get("buffer_sources")
+        if sources is None or len(sources) != batch.batch_size:
+            return None
+        return torch.tensor(
+            [str(source) == "demo_buffer" for source in sources],
+            device=device,
+            dtype=torch.bool,
+        )
+
+    def _g_weights_from_raw(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        if str(self.config.g_sign).lower() == "negate_raw":
+            g = -raw
+        else:
+            g = raw
+        g_norm = self._normalize_g(g)
+        logit = (float(self.config.beta) * g_norm + float(self.config.k)).clamp(
+            -float(self.config.g_clip), float(self.config.g_clip)
+        )
+        w_pos = torch.sigmoid(logit)
+        w_neg = 1.0 - w_pos
+        n = int(raw.numel())
+        metrics = {
+            "raw_lpb_score_mean": float(raw.mean().item()),
+            "raw_lpb_score_std": float(raw.std().item() if n > 1 else 0.0),
+            "raw_lpb_score_min": float(raw.min().item()),
+            "raw_lpb_score_max": float(raw.max().item()),
+            "G_mean": float(g_norm.mean().item()),
+            "G_std": float(g_norm.std().item() if n > 1 else 0.0),
+            "logit_mean": float(logit.mean().item()),
+            "logit_std": float(logit.std().item() if n > 1 else 0.0),
+        }
+        return w_pos, w_neg, metrics
+
     def _compute_branch_weights(
         self,
         batch: DipoleBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-        """Return (w_pos, w_neg, metrics) tensors of shape (B,)."""
+        """Return (w_pos, w_neg, metrics) tensors of shape (B,).
+
+        When ``buffer_sources`` is set (1:1 online/demo training batch):
+        - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
+        - online_buffer rows: G / normalization / sigmoid use online rows only
+        """
         B = batch.batch_size
-        if self.g_provider is None:
-            zero_g = torch.zeros(B, dtype=torch.float32, device=self.device)
-            logit = (float(self.config.beta) * zero_g + float(self.config.k)).clamp(
-                -float(self.config.g_clip), float(self.config.g_clip)
-            )
-            w_pos = torch.sigmoid(logit)
-            w_neg = 1.0 - w_pos
-            metrics = {
+        demo_mask = self._resolve_demo_sample_mask(batch, self.device)
+
+        if demo_mask is not None:
+            w_pos = torch.ones(B, dtype=torch.float32, device=self.device)
+            w_neg = torch.zeros(B, dtype=torch.float32, device=self.device)
+            online_mask = ~demo_mask
+            metrics: dict[str, float] = {
+                "frac_demo_buffer": float(demo_mask.float().mean().item()),
+                "w_pos_mean_demo": 1.0,
                 "raw_lpb_score_mean": 0.0,
                 "raw_lpb_score_std": 0.0,
                 "raw_lpb_score_min": 0.0,
                 "raw_lpb_score_max": 0.0,
                 "G_mean": 0.0,
                 "G_std": 0.0,
-                "logit_mean": float(logit.mean().item()),
-                "logit_std": float(logit.std().item() if B > 1 else 0.0),
+                "logit_mean": 0.0,
+                "logit_std": 0.0,
             }
+            if not bool(online_mask.any().item()):
+                return w_pos, w_neg, metrics
+
+            online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
+            if self.g_provider is None:
+                zero_g = torch.zeros(int(online_indices.numel()), dtype=torch.float32, device=self.device)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(zero_g)
+            else:
+                with torch.no_grad():
+                    online_batch = select_dipole_batch(batch, online_indices)
+                    raw = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(raw)
+
+            w_pos[online_mask] = w_online_pos
+            w_neg[online_mask] = w_online_neg
+            metrics.update(g_metrics)
+            metrics["w_pos_mean_online"] = float(w_online_pos.mean().item())
+            metrics["w_neg_mean_online"] = float(w_online_neg.mean().item())
+            return w_pos, w_neg, metrics
+
+        # Legacy path: demo-only batch without buffer_sources (full-batch G + intervention mask).
+        if self.g_provider is None:
+            zero_g = torch.zeros(B, dtype=torch.float32, device=self.device)
+            w_pos, w_neg, metrics = self._g_weights_from_raw(zero_g)
         else:
             with torch.no_grad():
                 raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-                if str(self.config.g_sign).lower() == "negate_raw":
-                    g = -raw
-                else:
-                    g = raw
-                g_norm = self._normalize_g(g)
-                logit = (float(self.config.beta) * g_norm + float(self.config.k)).clamp(
-                    -float(self.config.g_clip), float(self.config.g_clip)
-                )
-                w_pos = torch.sigmoid(logit)
-                w_neg = 1.0 - w_pos
-                metrics = {
-                    "raw_lpb_score_mean": float(raw.mean().item()),
-                    "raw_lpb_score_std": float(raw.std().item() if B > 1 else 0.0),
-                    "raw_lpb_score_min": float(raw.min().item()),
-                    "raw_lpb_score_max": float(raw.max().item()),
-                    "G_mean": float(g_norm.mean().item()),
-                    "G_std": float(g_norm.std().item() if B > 1 else 0.0),
-                    "logit_mean": float(logit.mean().item()),
-                    "logit_std": float(logit.std().item() if B > 1 else 0.0),
-                }
+            w_pos, w_neg, metrics = self._g_weights_from_raw(raw)
 
-        # Explicit intervention mask: w_pos=1, w_neg=0 for intervention samples.
         is_int = batch.is_intervention.to(self.device).bool().reshape(-1)
         w_pos = torch.where(is_int, torch.ones_like(w_pos), w_pos)
         w_neg = torch.where(is_int, torch.zeros_like(w_neg), w_neg)

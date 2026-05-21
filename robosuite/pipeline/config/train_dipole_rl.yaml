@@ -51,6 +51,7 @@ algorithm:
       device: "cuda:1"
       disc_reward_coef: 1.0
       disc_reward_sign: "negate_logit"
+      update_freq: 1
     warmup_value_steps: 20000
     warmup_full_steps: 5000
     warmup_ckpt: null
@@ -66,7 +67,7 @@ algorithm:
       num_layers: 2
       batch_size: 64
       balance_ratio: 1.0
-      update_every_n_steps: 1
+      update_freq: 1
       threshold_ema: 0.99
       warm_start_ckpt: ${algorithm.discriminator.warm_start_ckpt}
       label_smoothing: 0.0

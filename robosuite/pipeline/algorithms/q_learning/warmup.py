@@ -58,6 +58,7 @@ from robosuite.pipeline.utils.io import load_demo_paths
 from robosuite.pipeline.utils.train_utils import (
     resolve_camera_names,
     resolve_demo_task_name,
+    resolve_requested_device,
 )
 
 
@@ -200,12 +201,14 @@ def main(cfg: DictConfig) -> None:
     # extractor train_dipole.py uses (the LPB encoder was trained against
     # that exact proprio format).
     flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
+    # Offline warmup reads images from HDF5 and proprio from flattened states;
+    # no sim.render() — skip EGL/offscreen context creation.
     main_runtime_cfg = build_flow_runtime_cfg(
         cfg,
         env_metadata=flow_env_metadata,
         camera_names=policy_camera_names,
         has_renderer=False,
-        has_offscreen_renderer=True,
+        has_offscreen_renderer=False,
         use_camera_obs=False,
         renderer=str(cfg.env.renderer),
     )
@@ -219,7 +222,14 @@ def main(cfg: DictConfig) -> None:
 
         # Build encoder and bind to policy cameras.
         bce_ckpt = to_absolute_path(str(cfg.algorithm.discriminator.warm_start_ckpt))
-        device = str(q_cfg_block.config.device)
+        requested_device = str(q_cfg_block.config.device)
+        default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = resolve_requested_device(requested_device, fallback=default_device)
+        if str(requested_device).startswith("cuda") and device == "cpu":
+            raise RuntimeError(
+                f"Requested device '{requested_device}' but torch.cuda.is_available() is False. "
+                "Run `nvidia-smi` and fix any driver/library mismatch (reboot after a driver update)."
+            )
         camera_to_view: dict[str, str] = {
             str(k): str(v)
             for k, v in dict(OmegaConf.select(cfg, "algorithm.dipole.lpb_detector.camera_to_view", default={}) or {}).items()
@@ -233,7 +243,9 @@ def main(cfg: DictConfig) -> None:
         encoder.bind_policy_cameras(policy_camera_names)
 
         # Build buffer with action_horizon matching IQL config.
-        iql_cfg = IQLConfig(**OmegaConf.to_container(q_cfg_block.config, resolve=True))
+        iql_cfg_dict = OmegaConf.to_container(q_cfg_block.config, resolve=True)
+        iql_cfg_dict["device"] = device
+        iql_cfg = IQLConfig(**iql_cfg_dict)
         capacity = int(getattr(cfg.runtime, "demo_buffer_capacity", 200_000))
         buffer = FlowDaggerReplayBuffer(
             config=ReplayBufferConfig(capacity=capacity, batch_size=batch_size),

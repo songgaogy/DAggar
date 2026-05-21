@@ -114,8 +114,8 @@ algorithm:
     g_sign: "negate_raw"               # negate_raw | raw
     g_normalization: "batch_zscore"    # batch_zscore | running_zscore | minmax | none
     g_clip: 10.0
-    polarity_embedding_init: "small_gaussian"   # small_gaussian | zero_neg | antipodal
-    polarity_embedding_init_scale: 1.0e-3
+    polarity_embedding_init: "zero_pos"   # zero_pos | zero_neg | small_gaussian | antipodal
+    polarity_embedding_init_scale: 2.0e-3
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
 
     lpb_detector:
@@ -134,7 +134,6 @@ algorithm:
     warmup_steps: 0
     updates_per_step: 1
     steps_per_update: 50
-    random_steps: 0
     pretrain_steps: 0                  # DIPOLE always boots from runtime.init_checkpoint
     max_pending_updates: 1             # Cap async learner queued+busy updates
 
@@ -185,14 +184,14 @@ runtime:
   episode_pause_sec: 1.0
 
 logging:
-  output_root: "./outputs/DIPOLE"
+  output_root: "./outputs/DIPOLE_rl"
   run_name: null
   project: "DIPOLE_AIR"
   entity: "songgao-personal"
   use_wandb: true
   wandb_mode: "offline"
   log_interval: 10
-  checkpoint_interval: 1000
+  checkpoint_interval: 5000
 
 hydra:
   run:
