@@ -79,6 +79,18 @@ algorithm:
     advantage_normalization: "batch_zscore"
     disc_normalization: "batch_zscore"
 
+# Used only by ``python -m ...q_learning.warmup`` (init_iql_qv.sh).
+warmup:
+  demo_splits:
+    - expert
+    - success_rollout
+    - fail_rollout
+  # Max HDF5 trajectories per split (null = all demos in that folder).
+  num_trajectories:
+    expert: 20
+    success_rollout: 50
+    fail_rollout: 50
+
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
   bootstrap_g_with_frozen_bce: true   # During warmup, force g_mode=bce_frozen.

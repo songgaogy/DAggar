@@ -84,7 +84,7 @@ _wandb:
           commit: 45bb4241699dba58a5aa503215af14b6ac0d25de
         root: /home/dodo/Documents/DAggar/robosuite
         host: dodo-System-Product-Name
-        executable: /home/dodo/miniconda3/envs/daggar/bin/python3.10
+        executable: /home/dodo/miniconda3/envs/dagger/bin/python3.10
         cpu_count: 16
         cpu_count_logical: 32
         gpu_type: NVIDIA GeForce RTX 4090

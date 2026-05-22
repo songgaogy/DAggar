@@ -26,7 +26,7 @@ mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-lpb-v2-latent-${RUN_NAME}}"
 mkdir -p "${MPLCONFIGDIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then

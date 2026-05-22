@@ -14,18 +14,22 @@
 #   BATCH_SIZE        — minibatch size (default 64).
 #   DEVICE            — learner device (default cuda:1).
 #   OUTPUT_DIR        — per-task output dir (default outputs/DIPOLE_RL/iql_qv_cache/<ENVIRONMENT>).
-#   NUM_TRAJECTORIES  — cap on expert trajectories (default unset = all).
+#   NUM_TRAJECTORIES  — alias for NUM_TRAJECTORIES_EXPERT (legacy).
+#   NUM_TRAJECTORIES_EXPERT / _SUCCESS / _FAIL — per-split HDF5 caps
+#                        (unset = all; maps to warmup.num_trajectories.*).
+#   WARMUP_DEMO_SPLITS — comma-separated HDF5 subdirs under data/<task>/
+#                        (default: expert,success_rollout,fail_rollout).
 
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
 
-PY="${PY:-$HOME/miniconda3/envs/daggar/bin/python}"
+PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
-ENVIRONMENT="${ENVIRONMENT:-PickPlaceBread}"
+ENVIRONMENT="${ENVIRONMENT:-PickPlaceMilk}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/bce_viz_robosuite/viz_bce_PickPlaceBread-20260518_014008/checkpoints/bce_head.pth}"
+LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/bce_viz_robosuite/viz_bce_PickPlaceMilk-20260518_014308/checkpoints/bce_head.pth}"
 
 VALUE_STEPS="${VALUE_STEPS:-20000}"
 FULL_STEPS="${FULL_STEPS:-5000}"
@@ -42,8 +46,13 @@ export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_ENTITY="${WANDB_ENTITY:-songgao-personal}"
 export HYDRA_FULL_ERROR=1
 
+# Match train_dipole.sh: demo HDF5 dirs use env name (e.g. PickPlaceBread),
+# not robot-prefixed PandaPickPlaceBread from resolve_demo_task_name fallback.
+DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
+
 HYDRA_OVERRIDES=(
   "env.environment=${ENVIRONMENT}"
+  "data.task_name=${DEMO_TASK_NAME}"
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
   "algorithm.discriminator.warm_start_ckpt=${LPB_CKPT}"
   "algorithm.q_learning.warmup_value_steps=${VALUE_STEPS}"
@@ -53,8 +62,24 @@ HYDRA_OVERRIDES=(
   "+warmup.batch_size=${BATCH_SIZE}"
 )
 
-if [[ -n "${NUM_TRAJECTORIES:-}" ]]; then
-  HYDRA_OVERRIDES+=("data.num_trajectories=${NUM_TRAJECTORIES}")
+# set number of trajectories for each split
+# NOTE: we do not need gt-fail label in iql training
+NUM_TRAJECTORIES_EXPERT="${NUM_TRAJECTORIES_EXPERT:-${NUM_TRAJECTORIES:-}}"
+if [[ -n "${NUM_TRAJECTORIES_EXPERT:-}" ]]; then
+  HYDRA_OVERRIDES+=("warmup.num_trajectories.expert=${NUM_TRAJECTORIES_EXPERT}")
+fi
+if [[ -n "${NUM_TRAJECTORIES_SUCCESS:-}" ]]; then
+  HYDRA_OVERRIDES+=("warmup.num_trajectories.success_rollout=${NUM_TRAJECTORIES_SUCCESS}")
+fi
+if [[ -n "${NUM_TRAJECTORIES_FAIL:-}" ]]; then
+  HYDRA_OVERRIDES+=("warmup.num_trajectories.fail_rollout=${NUM_TRAJECTORIES_FAIL}")
+fi
+
+if [[ -n "${WARMUP_DEMO_SPLITS:-}" ]]; then
+  IFS=',' read -r -a _warmup_splits <<< "${WARMUP_DEMO_SPLITS}"
+  for _split in "${_warmup_splits[@]}"; do
+    HYDRA_OVERRIDES+=("+warmup.demo_splits+=${_split}")
+  done
 fi
 
 if [[ "${DEVICE}" == cuda* ]]; then

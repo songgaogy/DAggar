@@ -16,7 +16,7 @@ TASKS="${TASKS:-candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot}"
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-50}"
 MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 ACTION_START="${ACTION_START:-7}"
 ACTION_STOP="${ACTION_STOP:-14}"

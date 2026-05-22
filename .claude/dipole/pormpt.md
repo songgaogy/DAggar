@@ -138,6 +138,6 @@ export WANDB_MODE=offline
 export WANDB_ENTITY=songgao-personal
 ```
 
-Use `/home/dodo/miniconda3/envs/daggar/bin/python` as the default Python binary unless the local script conventions indicate otherwise.
+Use `/home/dodo/miniconda3/envs/dagger/bin/python` as the default Python binary unless the local script conventions indicate otherwise.
 
 communicate with me in Chinese. Ask me anything if you are unclear.

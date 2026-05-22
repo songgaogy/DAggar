@@ -104,7 +104,7 @@ impossible to embed runtime dims into the saved config. The restructured order i
 - `PreprocessedCacheDynamicsModelDataset(tasks=all_6_tasks)` → 881,279 samples ✓
 - `PreprocessedCacheDynamicsModelDataset(tasks=['PickPlaceBread'])` → 158,826 samples ✓
 - `plan.py` override logic: `prior_in_chans=14, action_dim=7` for preprocessed config ✓
-- Basic module imports in daggar env ✓
+- Basic module imports in dagger env ✓
 
 ## Files Modified
 
@@ -123,7 +123,7 @@ impossible to embed runtime dims into the saved config. The restructured order i
 
 ```bash
 cd /path/to/robosuite
-conda activate daggar
+conda activate dagger
 python -m robosuite.discriminator.lpb_original.train env=preprocessed \
   hydra.run.dir=checkpoints/lpb_original/dynamics/$(date +%Y.%m.%d/%H.%M.%S)_preprocessed
 ```

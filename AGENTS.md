@@ -39,4 +39,4 @@ You are an elite AI Research Engineer specializing in Embodied AI, Robotics, Fou
 
 # Basic Background Knowledge
 - **logging**: User prefers using `WandB` to do training logging. User's wandb name is `WANDB_NAME=songgao-personal` and always use `WANDB_MODE="offline"`.
-- **python environment**: in this current repo, use conda environment `daggar`, or run python under `/home/dodo/miniconda3/envs/daggar/bin/python`
+- **python environment**: in this current repo, use conda environment `dagger`, or run python under `/home/dodo/miniconda3/envs/dagger/bin/python`

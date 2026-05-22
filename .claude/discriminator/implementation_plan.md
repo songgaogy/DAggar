@@ -6,7 +6,7 @@
 >
 > **Reference context**: `.claude/discriminator/conversation_context.md`.
 >
-> **User preferences**: follow `AGENTS.md` strictly (minimal modifications, English code comments, concise, WandB offline for logging, `daggar` conda env).
+> **User preferences**: follow `AGENTS.md` strictly (minimal modifications, English code comments, concise, WandB offline for logging, `dagger` conda env).
 
 ---
 
@@ -283,7 +283,7 @@ Keep existing `lpb/visualize.py` untouched.
 # D³-Disc benchmark driver; mirrors lpb_knn benchmark script layout.
 set -euo pipefail
 
-PYTHON=/home/dodo/miniconda3/envs/daggar/bin/python
+PYTHON=/home/dodo/miniconda3/envs/dagger/bin/python
 POLICY_CKPT=${POLICY_CKPT:-checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}
 CACHE_ROOT=${CACHE_ROOT:-data/.lpb_score_cache}
 FAIL_ROOT=${FAIL_ROOT:-data}       # <task>/fail_rollout/*.hdf5 pattern
@@ -391,7 +391,7 @@ These should only be raised if you hit something ambiguous in the spec. Do not r
 
 ## 10. Final check before merging
 
-Run, in order, from repo root with `daggar` env activated:
+Run, in order, from repo root with `dagger` env activated:
 ```bash
 WANDB_MODE=offline WANDB_NAME=songgao-personal \
   bash robosuite/discriminator/d3disc/scripts/run_d3_benchmark.sh \

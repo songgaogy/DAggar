@@ -32,7 +32,7 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # ------------------------------------------------
 CHECKPOINT="${CHECKPOINT:-outputs/DIPOLE/dipole_PickPlaceBread_2026-05-18_13-28-22/checkpoints/step_00010000_updates_00003754_ep_00032.pt}"

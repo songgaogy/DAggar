@@ -18,8 +18,8 @@ bash robosuite/pipeline/scripts/eval_dipole.sh
 Direct module entry points are also available:
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python -m robosuite.pipeline.train_dipole
-/home/dodo/miniconda3/envs/daggar/bin/python -m robosuite.pipeline.eval_dipole --help
+/home/dodo/miniconda3/envs/dagger/bin/python -m robosuite.pipeline.train_dipole
+/home/dodo/miniconda3/envs/dagger/bin/python -m robosuite.pipeline.eval_dipole --help
 ```
 
 The scripts assume the repo root is `$HOME/Documents/DAggar/robosuite` by

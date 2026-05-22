@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # By default, pool data from the same 6 tasks as LPB.
 # You can set TASK=... to run a single task instead.

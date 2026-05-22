@@ -47,7 +47,7 @@ with a single `SharedFrozenEncoder` instance and asserts:
 ### Step 3 — Warmup smoke
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python \
+/home/dodo/miniconda3/envs/dagger/bin/python \
   -m robosuite.pipeline.algorithms.q_learning.warmup \
   --value-steps 200 --full-steps 200 \
   --demo-h5 <pick small HDF5 in repo> \

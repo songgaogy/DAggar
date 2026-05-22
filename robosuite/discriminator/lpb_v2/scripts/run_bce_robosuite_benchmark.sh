@@ -41,7 +41,7 @@ SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then

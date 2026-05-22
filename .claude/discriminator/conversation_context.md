@@ -7,7 +7,7 @@
 ## 1. Who the user is, what they want
 
 - Researcher (Songgao) working on imitation-learning failure detection in robosuite environments.
-- Native Chinese speaker; uses WandB offline (`WANDB_MODE=offline`, `WANDB_NAME=songgao-personal`); conda env `daggar`; Python at `/home/dodo/miniconda3/envs/daggar/bin/python`.
+- Native Chinese speaker; uses WandB offline (`WANDB_MODE=offline`, `WANDB_NAME=songgao-personal`); conda env `dagger`; Python at `/home/dodo/miniconda3/envs/dagger/bin/python`.
 - Follows `AGENTS.md` rules strictly: minimal-modifications, English code comments, no unprompted refactors, no silent behavior changes.
 - Task framing: **improve the LPB discriminator from an RL theoretical perspective** to make it more principled while retaining its SOTA empirical advantage.
 

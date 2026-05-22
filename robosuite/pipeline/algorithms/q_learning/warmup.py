@@ -16,6 +16,9 @@ Run as a Hydra module (CLI overrides land on `train_dipole_rl.yaml`):
 
 `+warmup.output_path` is required (use `+` to add the key — it lives only
 in the warmup namespace).
+
+Per-split HDF5 caps: ``warmup.num_trajectories.{expert,success_rollout,fail_rollout}``
+(null = all demos in that folder).
 """
 
 from __future__ import annotations
@@ -63,6 +66,44 @@ from robosuite.pipeline.utils.train_utils import (
 
 
 print = partial(builtins.print, flush=True)
+
+# Robosuite task dirs use these folder names (see flow_multi/generate_rollout_data.py).
+DEFAULT_WARMUP_DEMO_SPLITS: tuple[str, ...] = ("expert", "success_rollout", "fail_rollout")
+
+
+def _resolve_warmup_demo_splits(cfg: DictConfig) -> tuple[str, ...]:
+    """HDF5 subdirs under ``data/<task_name>/`` to load for offline IQL warmup."""
+    raw = OmegaConf.select(cfg, "warmup.demo_splits", default=None)
+    if raw is None:
+        return DEFAULT_WARMUP_DEMO_SPLITS
+    splits = tuple(str(name) for name in list(raw))
+    if not splits:
+        raise ValueError("warmup.demo_splits must be a non-empty list of directory names.")
+    return splits
+
+
+def _normalize_trajectory_cap(value: Any) -> int | None:
+    if value is None:
+        return None
+    cap = int(value)
+    return None if cap <= 0 else cap
+
+
+def _resolve_split_max_trajectories(cfg: DictConfig, split: str) -> int | None:
+    """Per-split HDF5 demo cap from ``warmup.num_trajectories.<split>``.
+
+    Falls back to legacy ``data.num_trajectories`` for the expert split only.
+    """
+    limits = OmegaConf.select(cfg, "warmup.num_trajectories", default=None)
+    if limits is not None:
+        if split in limits:
+            return _normalize_trajectory_cap(limits[split])
+        return None
+
+    if split == "expert":
+        legacy = OmegaConf.select(cfg, "data.num_trajectories", default=None)
+        return _normalize_trajectory_cap(legacy)
+    return None
 
 
 def _annotate_episode_metadata(
@@ -166,11 +207,6 @@ def main(cfg: DictConfig) -> None:
     full_steps = int(getattr(q_cfg_block, "warmup_full_steps", 5000))
     batch_size = int(getattr(cfg.algorithm.trainer, "batch_size", 64)) if "trainer" in cfg.algorithm else 64
     batch_size = int(getattr(warmup_cfg, "batch_size", batch_size))
-    max_num_trajectories = OmegaConf.select(cfg, "data.num_trajectories", default=None)
-    if max_num_trajectories is not None:
-        max_num_trajectories = int(max_num_trajectories)
-        if max_num_trajectories <= 0:
-            max_num_trajectories = None
 
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     if init_checkpoint is None:
@@ -272,9 +308,16 @@ def main(cfg: DictConfig) -> None:
 
         cache_dir = output_path.parent / "_demo_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        demo_splits = _resolve_warmup_demo_splits(cfg)
+        split_caps = {split: _resolve_split_max_trajectories(cfg, split) for split in demo_splits}
+        print(
+            f"[warmup] demo_splits={demo_splits} caps={split_caps} "
+            f"task={task_data_name} root={data_root}"
+        )
+        print("[warmup] start loading splits... it may takes a few minutes...")
         episode_index_base = 0
         total_loaded = 0
-        for split in ("expert", "success", "fail"):
+        for split in demo_splits:
             n_loaded, episode_index_base = _load_split_into_buffer(
                 buffer=buffer,
                 task_name=task_data_name,
@@ -283,7 +326,7 @@ def main(cfg: DictConfig) -> None:
                 hdf5_loader=hdf5_loader,
                 cache_dir=cache_dir,
                 episode_index_base=episode_index_base,
-                max_num_trajectories=max_num_trajectories if split == "expert" else None,
+                max_num_trajectories=split_caps[split],
             )
             total_loaded += n_loaded
         if total_loaded == 0:

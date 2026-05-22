@@ -31,7 +31,7 @@ fi
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_ENTITY="${WANDB_ENTITY:-songgao-personal}"
 
-PY="${PY:-$HOME/miniconda3/envs/daggar/bin/python}"
+PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
 if [[ -z "${INIT_CHECKPOINT:-}" ]]; then
   echo "ERROR: INIT_CHECKPOINT is required (path to flow-dagger / flow-multi base checkpoint)." >&2

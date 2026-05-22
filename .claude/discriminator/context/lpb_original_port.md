@@ -127,7 +127,7 @@ sim ever needed.
 
 ### `train.py`
 - Hydra `@main(config_name="train_hdf5")`.
-- Single-GPU torch loop (no `accelerate` — daggar env doesn't have it).
+- Single-GPU torch loop (no `accelerate` — dagger env doesn't have it).
 - Builds model the same way as `dyn_model/train.py:init_models`:
   `ResNetEncoder` + Hydra-instantiated proprio/action encoders + ViT predictor +
   `VisualDynamicsModel`.
@@ -140,7 +140,7 @@ sim ever needed.
 
 ## Verifications done
 
-- All top-level modules import cleanly in the daggar conda env.
+- All top-level modules import cleanly in the dagger conda env.
 - `dyn_model` and `diffusion_policy` resolve to the vendored paths inside
   `lpb_original/`.
 - `knn_min_l2_dist` matches `torch.cdist(...).min(dim=1).values`.
@@ -170,7 +170,7 @@ bash robosuite/discriminator/lpb_original/scripts/run_lpb_original_benchmark.sh
 
 ## Caveats / future work
 
-1. `accelerate` is missing in daggar env. Vendored `dyn_model/train.py` won't
+1. `accelerate` is missing in dagger env. Vendored `dyn_model/train.py` won't
    run as-is; use `lpb_original/train.py` (single-GPU, no accelerate).
 2. `policy_ckpt_path` (diffusion-policy ckpt with `obs_encoder`) is a hard
    upstream requirement. If user doesn't have one, `ResNetEncoder` would need
