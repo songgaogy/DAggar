@@ -366,6 +366,15 @@ class DipoleAgent:
             "language_instruction": self.language_instruction,
             "core": self.core.state_dict(),
         }
+        # Debug snapshot of the RL companions (IQL Q/V + online disc head).
+        # Absence is fine (legacy DIPOLE run / regression mode) — these are
+        # for offline analysis, not resume.
+        iql_learner = getattr(self.core, "iql_learner", None)
+        if iql_learner is not None and hasattr(iql_learner, "state_dict"):
+            payload["iql_state"] = iql_learner.state_dict()
+        discriminator = getattr(self.core, "discriminator", None)
+        if discriminator is not None and hasattr(discriminator, "state_dict"):
+            payload["discriminator_state"] = discriminator.state_dict()
         if include_buffers:
             payload["online_buffer"] = self.online_buffer.state_dict()
             payload["demo_buffer"] = self.demo_buffer.state_dict()

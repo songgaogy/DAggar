@@ -101,14 +101,21 @@ class AdvantageGProvider:
             (B,) tensor of G values on the same device as
             `batch.action_sequences_raw`.
         """
+        action_chunk_raw = batch.action_sequences_raw.to(
+            device=torch.device(self.encoder.device), dtype=torch.float32
+        )
+        # Encoder is single-frame and consumes the proposed action via
+        # `action_real`. Use the chunk's first step — consistent with the
+        # IQL replay's chunk-start `context` and with the lpb v2 BCE head's
+        # training-time inputs.
+        first_action = action_chunk_raw[:, 0, :]
         context = self.encoder.encode(
             image_obs_raw=batch.image_obs_raw,
             proprio_raw=batch.proprio_raw,
+            action_real=first_action,
         )
 
-        action_chunk_raw = batch.action_sequences_raw.to(
-            device=context.device, dtype=torch.float32
-        )
+        action_chunk_raw = action_chunk_raw.to(device=context.device)
 
         actor_batch = IQLActorBatch(
             context=context,
@@ -119,9 +126,7 @@ class AdvantageGProvider:
         advantage = self.iql_learner.compute_advantage_for_batch(actor_batch)
         advantage = advantage.reshape(-1)
 
-        disc_out = self.discriminator.score(
-            context=context, action_chunk=action_chunk_raw
-        )
+        disc_out = self.discriminator.score(context=context)
         disc_logit = disc_out.logit.reshape(-1)
 
         a_norm = self._normalize(advantage, mode=self.advantage_normalization, stats="advantage")

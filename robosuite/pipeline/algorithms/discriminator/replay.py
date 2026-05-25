@@ -1,22 +1,18 @@
-"""Balanced replay buffer for online discriminator training.
+"""Balanced per-frame replay buffer for online discriminator training.
 
 Wraps the trainer's base online buffer (any `FlowDaggerReplayBuffer`-style
-store) by reference and partitions valid chunk-start indices into two
-buckets:
+store) by reference. With the single-frame `OnlineBCEDiscriminator`, the
+buffer indexes individual `Transition`s — not H-step chunk windows — and
+partitions them into:
 
-    failure_starts     : chunks where any step in the H-length window has
-                         `is_intervention=True`. Human intervention is the
-                         positive (label=1) class — the policy failed and
-                         the human had to take over.
+    failure_starts     : transitions where `is_intervention=True`. The
+                         policy was failing on this frame and the human
+                         had to take over. Label = 1 (positive class).
     non_failure_starts : everything else (offline expert demos, successful
-                         on-policy rollouts, ...). Label=0.
+                         on-policy rollouts, ...). Label = 0.
 
 Sign convention matches the warm-started lpb_v2 BCE head: higher logit =
 more failure-like / more intervention-like.
-
-This mirrors `IQLReplayBuffer`'s windowing pattern (see
-`robosuite/pipeline/algorithms/q_learning/replay.py`) so there is a
-single source of truth for the underlying frames.
 
 The buffer never stores encoder latents: it runs the frozen
 `SharedFrozenEncoder` at sample time so the encoder / camera binding can
@@ -45,20 +41,18 @@ if TYPE_CHECKING:
 
 
 class DiscriminatorReplayBuffer:
-    """Balanced two-bucket sampler over the shared online transition store.
+    """Balanced per-frame sampler over the shared online transition store.
 
     Args:
         cfg:            DiscriminatorConfig (uses batch_size, balance_ratio).
         base_buffer:    underlying store. Must expose `_storage`, `_lock`,
-                        `_get_valid_start_indices_locked()`, `camera_names`,
-                        `image_size`, `action_horizon`, `add(transition)`.
+                        `camera_names`, `add(transition)`.
         encoder:        SharedFrozenEncoder (`bind_policy_cameras` must
                         already have been called by the trainer).
-        action_horizon: H — must equal `base_buffer.action_horizon`.
 
     Label convention:
-        label = 1.0 → intervention chunk → policy was failing
-        label = 0.0 → demo or non-intervention on-policy chunk → good behavior
+        label = 1.0 → intervention frame → policy was failing
+        label = 0.0 → demo or non-intervention on-policy frame → good behavior
     """
 
     def __init__(
@@ -67,26 +61,16 @@ class DiscriminatorReplayBuffer:
         base_buffer: Any,
         *,
         encoder: "SharedFrozenEncoder",
-        action_horizon: int,
     ) -> None:
         self.cfg = cfg
         self._base = base_buffer
         self._encoder = encoder
-        self.action_horizon = int(action_horizon)
-        base_H = int(getattr(base_buffer, "action_horizon", -1))
-        if base_H != self.action_horizon:
-            raise ValueError(
-                "DiscriminatorReplayBuffer: base_buffer.action_horizon "
-                f"({base_H}) must equal action_horizon ({self.action_horizon})."
-            )
 
         self._failure_starts: list[int] = []
         self._non_failure_starts: list[int] = []
-        # Track which valid_starts have already been classified so refresh
-        # is incremental. We key on (storage_len, valid_starts_tuple)
-        # — robust to ring-buffer rebuild because the cache invalidates on
-        # length change.
-        self._last_valid_starts_signature: tuple[int, int] = (0, 0)
+        # Cached classification keyed on storage length; cache invalidates
+        # whenever the underlying buffer grows or rebuilds.
+        self._last_storage_len: int = -1
 
     # ------------------------------------------------------------------ #
     # Bookkeeping                                                         #
@@ -108,28 +92,22 @@ class DiscriminatorReplayBuffer:
 
     def _refresh_buckets(self) -> None:
         with self._base._lock:  # noqa: SLF001
-            valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
             storage = list(self._base._storage)  # noqa: SLF001
-        sig = (len(storage), len(valid_starts))
-        if sig == self._last_valid_starts_signature and (
-            self._failure_starts or self._non_failure_starts
+        if (
+            len(storage) == self._last_storage_len
+            and (self._failure_starts or self._non_failure_starts)
         ):
             return
-        H = self.action_horizon
         failure: list[int] = []
         non_failure: list[int] = []
-        for s in valid_starts:
-            window = storage[s : s + H]
-            if len(window) < H:
-                continue
-            is_failure = any(bool(item.is_intervention) for item in window)
-            if is_failure:
-                failure.append(int(s))
+        for idx, item in enumerate(storage):
+            if bool(getattr(item, "is_intervention", False)):
+                failure.append(int(idx))
             else:
-                non_failure.append(int(s))
+                non_failure.append(int(idx))
         self._failure_starts = failure
         self._non_failure_starts = non_failure
-        self._last_valid_starts_signature = sig
+        self._last_storage_len = len(storage)
 
     # ------------------------------------------------------------------ #
     # Mutation                                                            #
@@ -147,17 +125,14 @@ class DiscriminatorReplayBuffer:
 
         Demos carry `is_intervention=False` (they are reference behavior,
         not corrections) and therefore fall into the *non-failure* pool
-        (label=0). This matches the lpb_v2 BCE-head warm-start convention
-        where higher logit = more failure-like; demos contribute the
-        non-failure half of the BCE objective.
+        (label=0). Online ``update()`` maps replay labels to LPB expert
+        targets via ``1 - label`` (head outputs expert-likeness logits).
         """
         if not demos:
             return
         for t in demos:
             self._base.add(t)
-        # Force a recompute so the freshly added demos are reflected in
-        # non_failure_starts on next sample.
-        self._last_valid_starts_signature = (-1, -1)
+        self._last_storage_len = -1
 
     # ------------------------------------------------------------------ #
     # Sampling                                                            #
@@ -183,7 +158,7 @@ class DiscriminatorReplayBuffer:
         if n_failure > 0 and not self._failure_starts:
             raise RuntimeError(
                 "DiscriminatorReplayBuffer.sample: failure pool is empty. "
-                "Wait until at least one intervention chunk is recorded "
+                "Wait until at least one intervention frame is recorded "
                 "before calling sample (gate with `ready(batch_size)`)."
             )
         if n_non_failure > 0 and not self._non_failure_starts:
@@ -193,41 +168,32 @@ class DiscriminatorReplayBuffer:
                 "rollout."
             )
 
-        failure_starts = self._sample_indices(
+        failure_idx = self._sample_indices(
             self._failure_starts, n_failure, allow_replacement=True
         )
-        non_failure_starts = self._sample_indices(
+        non_failure_idx = self._sample_indices(
             self._non_failure_starts,
             n_non_failure,
             allow_replacement=len(self._non_failure_starts) < n_non_failure,
         )
-        all_starts = failure_starts + non_failure_starts
-
-        H = self.action_horizon
+        all_idx = failure_idx + non_failure_idx
         camera_names = list(self._base.camera_names)
-        image_size = int(self._base.image_size)
 
-        s_images: list[np.ndarray] = []
-        s_proprio: list[np.ndarray] = []
+        images: list[np.ndarray] = []
+        proprio: list[np.ndarray] = []
         actions: list[np.ndarray] = []
         with self._base._lock:  # noqa: SLF001
             storage = self._base._storage  # noqa: SLF001
-            for start in all_starts:
-                sequence = storage[start : start + H]
-                first = sequence[0]
-                s_obs = first.obs
-                s_images.append(_stack_views_uint8(s_obs, camera_names, image_size))
-                s_proprio.append(np.asarray(s_obs["state"], dtype=np.float32))
-                actions.append(
-                    np.stack(
-                        [np.asarray(item.action, dtype=np.float32) for item in sequence],
-                        axis=0,
-                    )
-                )
+            for i in all_idx:
+                t = storage[i]
+                obs = t.obs
+                images.append(_stack_views_uint8(obs, camera_names))
+                proprio.append(np.asarray(obs["state"], dtype=np.float32))
+                actions.append(np.asarray(t.action, dtype=np.float32))
 
-        s_image_tensor = _to_image_tensor(np.stack(s_images, axis=0), device)
-        s_proprio_tensor = torch.from_numpy(
-            np.ascontiguousarray(np.stack(s_proprio, axis=0))
+        image_tensor = _to_image_tensor(np.stack(images, axis=0), device)
+        proprio_tensor = torch.from_numpy(
+            np.ascontiguousarray(np.stack(proprio, axis=0))
         ).float()
         action_tensor = torch.from_numpy(
             np.ascontiguousarray(np.stack(actions, axis=0))
@@ -235,18 +201,19 @@ class DiscriminatorReplayBuffer:
 
         with torch.no_grad():
             context = self._encoder.encode(
-                image_obs_raw=s_image_tensor, proprio_raw=s_proprio_tensor
+                image_obs_raw=image_tensor,
+                proprio_raw=proprio_tensor,
+                action_real=action_tensor,
             )
 
-        labels = torch.zeros(len(all_starts), dtype=torch.float32)
-        # First `len(failure_starts)` rows correspond to intervention
-        # chunks → label=1 (failure / positive class).
-        labels[: len(failure_starts)] = 1.0
+        labels = torch.zeros(len(all_idx), dtype=torch.float32)
+        # First `len(failure_idx)` rows correspond to intervention frames
+        # → label=1 (failure / positive class).
+        labels[: len(failure_idx)] = 1.0
 
         target_device = torch.device(device)
         return DiscriminatorBatch(
             context=context.to(target_device),
-            action_chunk=action_tensor.to(target_device),
             label=labels.to(target_device),
         )
 

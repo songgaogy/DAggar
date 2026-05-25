@@ -22,7 +22,6 @@ from robosuite.pipeline.algorithms.q_learning.common import IQLConfig, IQLStepBa
 from robosuite.pipeline.algorithms.q_learning.data_util import (
     aggregate_chunk_reward,
     chunk_done_mask,
-    disc_logit_to_intrinsic_reward,
 )
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.losses import (
@@ -46,7 +45,6 @@ def _make_cfg(action_horizon: int = 2) -> IQLConfig:
         weight_decay=0.0,
         device="cpu",
         disc_reward_coef=0.0,
-        disc_reward_sign="negate_logit",
     )
 
 
@@ -93,14 +91,6 @@ def test_bellman_q_loss_matches_mse() -> None:
     pred = torch.tensor([[1.0], [2.0], [3.0]])
     target = torch.tensor([[1.5], [1.0], [4.0]])
     assert torch.allclose(bellman_q_loss(pred, target), torch.nn.functional.mse_loss(pred, target))
-
-
-def test_disc_logit_to_intrinsic_reward_sigmoid_range() -> None:
-    good = disc_logit_to_intrinsic_reward(torch.tensor([-10.0, -5.0]), "negate_logit")
-    bad = disc_logit_to_intrinsic_reward(torch.tensor([10.0, 5.0]), "negate_logit")
-    assert good.min() > -1.0 and good.max() < 0.0
-    assert bad.min() > -1.0 and bad.max() < 0.0
-    assert float(good.mean()) > float(bad.mean())
 
 
 def test_aggregate_chunk_reward_closed_form() -> None:

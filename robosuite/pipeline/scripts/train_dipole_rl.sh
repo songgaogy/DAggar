@@ -10,6 +10,7 @@
 #   IQL_WARMUP_CKPT  — overrides algorithm.q_learning.warmup_ckpt
 #   ALPHA, BETA      — overrides algorithm.advantage_g_provider.{alpha,beta}
 #   G_MODE           — "advantage" | "bce_frozen"
+#   LOGGING_USE_TENSORBOARD / LOGGING_USE_WANDB          — logging backends
 #   INTERACTIVE / VIEWER_ENABLED / INTERVENTION_ENABLED  — same semantics
 #                      as scripts/train_dipole.sh.
 
@@ -28,10 +29,9 @@ else
   export MUJOCO_GL="${MUJOCO_GL:-egl}"
 fi
 
-export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_ENTITY="${WANDB_ENTITY:-songgao-personal}"
-
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
+LOGGING_USE_TENSORBOARD="${LOGGING_USE_TENSORBOARD:-true}"
+LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
 
 if [[ -z "${INIT_CHECKPOINT:-}" ]]; then
   echo "ERROR: INIT_CHECKPOINT is required (path to flow-dagger / flow-multi base checkpoint)." >&2
@@ -40,6 +40,8 @@ fi
 
 HYDRA_ARGS=(
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
+  "logging.use_tensorboard=${LOGGING_USE_TENSORBOARD}"
+  "logging.use_wandb=${LOGGING_USE_WANDB}"
 )
 [[ -n "${LPB_CKPT:-}" ]]              && HYDRA_ARGS+=("algorithm.discriminator.warm_start_ckpt=${LPB_CKPT}")
 [[ -n "${IQL_WARMUP_CKPT:-}" ]]       && HYDRA_ARGS+=("algorithm.q_learning.warmup_ckpt=${IQL_WARMUP_CKPT}")

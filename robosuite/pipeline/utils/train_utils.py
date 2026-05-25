@@ -82,25 +82,69 @@ def resolve_demo_inputs(cfg: DictConfig) -> tuple[str, list[Path], int | None]:
     return task_name, demo_paths, max_num_trajectories
 
 
-def maybe_build_wandb(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
-    if not bool(cfg.logging.use_wandb):
+def _as_scalar(value: Any) -> float | int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return float(value.detach().cpu().item())
+    if isinstance(value, np.ndarray):
+        if value.size != 1:
+            return None
+        return float(value.reshape(-1)[0])
+    return None
+
+
+def _tensorboard_tag(key: str) -> str:
+    return str(key).strip().replace(" ", "_")
+
+
+class TensorBoardMetricLogger:
+    def __init__(self, writer, log_dir: Path) -> None:
+        self.writer = writer
+        self.log_dir = log_dir
+
+    def log(self, payload: dict[str, Any], step: int) -> None:
+        for key, value in payload.items():
+            scalar = _as_scalar(value)
+            if scalar is None:
+                continue
+            self.writer.add_scalar(_tensorboard_tag(key), scalar, int(step))
+
+    def log_text(self, tag: str, text: str, step: int = 0) -> None:
+        self.writer.add_text(_tensorboard_tag(tag), text, int(step))
+
+    def flush(self) -> None:
+        self.writer.flush()
+
+    def close(self) -> None:
+        self.writer.close()
+
+
+def maybe_build_tensorboard(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
+    if not bool(getattr(cfg.logging, "use_tensorboard", True)):
         return None
     try:
-        import wandb
+        from torch.utils.tensorboard import SummaryWriter
     except ImportError:
-        print("wandb is not installed. Falling back to stdout logging.")
+        print("tensorboard is not installed. Falling back to stdout and JSONL logging.")
         return None
 
-    os.environ.setdefault("WANDB_MODE", str(cfg.logging.wandb_mode))
-    run = wandb.init(
-        project=str(cfg.logging.project),
-        entity=str(cfg.logging.entity),
-        mode=str(cfg.logging.wandb_mode),
-        config=OmegaConf.to_container(cfg, resolve=True),
-        name=str(cfg.logging.run_name or run_name) if (cfg.logging.run_name is not None or run_name is not None) else None,
-        dir=str(run_dir if run_dir is not None else Path(to_absolute_path(str(cfg.logging.output_root)))),
-    )
-    return run
+    base_dir = run_dir if run_dir is not None else Path(to_absolute_path(str(cfg.logging.output_root)))
+    tensorboard_dir = Path(str(getattr(cfg.logging, "tensorboard_dir", "tensorboard")))
+    log_dir = tensorboard_dir if tensorboard_dir.is_absolute() else base_dir / tensorboard_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+    logger = TensorBoardMetricLogger(writer, log_dir)
+    resolved_cfg = OmegaConf.to_yaml(cfg, resolve=True)
+    logger.log_text("run/config_resolved", f"```\n{resolved_cfg}\n```", step=0)
+    if run_name is not None:
+        logger.log_text("run/name", str(run_name), step=0)
+    print(f"[tensorboard] log_dir={log_dir}")
+    return logger
 
 
 def resolve_checkpoint_reference(reference: Any) -> Path | None:
@@ -192,10 +236,10 @@ def build_runtime_cfg(
     )
 
 
-def maybe_log(run, payload: dict[str, Any], step: int) -> None:
-    if run is None:
+def maybe_log(logger, payload: dict[str, Any], step: int) -> None:
+    if logger is None:
         return
-    run.log(payload, step=step)
+    logger.log(payload, step=step)
 
 
 def checkpoint_path(checkpoint_dir: Path, tag: str) -> Path:

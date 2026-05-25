@@ -197,12 +197,16 @@ class DipoleTrainer:
                     )
                 metrics["advantage_mean"] = float(adv.mean().item())
                 if self.discriminator is not None:
-                    with torch.no_grad():
-                        r_disc = self.discriminator.intrinsic_reward(
-                            context=step_batch.context,
-                            action_chunk=step_batch.action_chunk,
+                    meta = step_batch.metadata or {}
+                    if "disc_reward_chunk_mean" in meta:
+                        chunk_mean = float(meta["disc_reward_chunk_mean"])
+                        metrics["disc_reward_chunk_mean"] = chunk_mean
+                        # Legacy dashboards key (now = mean over all H frames).
+                        metrics["disc_reward_mean"] = chunk_mean
+                    if "disc_reward_first_frame_mean" in meta:
+                        metrics["disc_reward_first_frame_mean"] = float(
+                            meta["disc_reward_first_frame_mean"]
                         )
-                    metrics["disc_reward_mean"] = float(r_disc.mean().item())
 
         # 2. Discriminator BCE head (before flow so disc logit in G is current).
         if (

@@ -24,8 +24,10 @@ class IQLConfig:
     Notes:
         action_horizon must match DipoleConfig.action_horizon (Q-chunking
         assumes the critic sees the full execution chunk).
-        disc_reward_sign: ``negate_logit`` (default) maps logit to (-1, 0) via
-        -sigmoid(logit); ``raw`` passes the logit through unchanged.
+        r_disc is sourced from ``OnlineBCEDiscriminator.intrinsic_reward``:
+        ``-sigmoid(failure_score - tau)`` with ``failure_score = -head(z)``
+        (LPB convention). Per-frame values lie in (-1, 0); the replay
+        γ-aggregates them with r_env via ``aggregate_chunk_reward``.
     """
 
     action_horizon: int = 8
@@ -44,7 +46,6 @@ class IQLConfig:
 
     # Reward composition (r_total = r_env + disc_reward_coef * r_disc).
     disc_reward_coef: float = 1.0
-    disc_reward_sign: str = "negate_logit"  # "negate_logit" -> -sigmoid(logit) in (-1, 0); "raw"
     # Gradient steps per learner tick inside DipoleTrainer.train_step (each resamples).
     update_freq: int = 1
 
@@ -54,7 +55,9 @@ class IQLStepBatch:
     """Transition-centric batch for Q/V updates.
 
     Shapes:
-        context        (B, D_ctx)   — frozen encoder latent for s
+        context        (B, D_ctx)   — frozen latent at chunk start s_t
+                                      (Q/V Bellman state; disc also scores
+                                      all H frames inside the replay sampler)
         next_context   (B, D_ctx)   — frozen encoder latent for s'
         action_chunk   (B, H, D_a)  — normalized chunk a_{t:t+H}
         rewards        (B, 1)       — n-step aggregated r_env + λ_disc·r_disc

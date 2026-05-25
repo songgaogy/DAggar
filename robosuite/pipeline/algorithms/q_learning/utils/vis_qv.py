@@ -20,6 +20,10 @@ import torch
 from hydra.utils import to_absolute_path
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
+from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
+    LPBV2OfflineScorer,
+    lpb_disc_intrinsic_from_failure_score,
+)
 from robosuite.pipeline.algorithms.discriminator.online_bce import (
     DiscriminatorConfig,
     OnlineBCEDiscriminator,
@@ -28,9 +32,15 @@ from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.data_util import (
     aggregate_chunk_reward,
     chunk_done_mask,
-    disc_logit_to_intrinsic_reward,
+)
+from robosuite.pipeline.algorithms.q_learning.replay import (
+    _stack_views_uint8,
+    _to_image_tensor,
 )
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
+from robosuite.pipeline.algorithms.q_learning.utils.vis_discriminator_util import (
+    visualize_selected_trajectory_discriminator,
+)
 from robosuite.pipeline.common import Transition
 from robosuite.pipeline.train_dipole import load_hdf5_demos_into_flow_transitions
 from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, parse_env_info
@@ -46,6 +56,20 @@ class SelectedDemo:
     demo_key: str
     length: int
     successful: bool
+
+
+@dataclass
+class PerStepTrainingDisc:
+    """Per-frame Online BCE scores aligned with IQL warmup / vis Q/V."""
+
+    bce_logit: np.ndarray
+    intrinsic_reward: np.ndarray
+    threshold: float
+    pred_failure: np.ndarray
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.bce_logit.shape[0])
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,9 +92,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disc-ckpt",
         default=None,
-        help="BCE discriminator head checkpoint for plotting discriminator-shaped reward.",
+        help="Override BCE head checkpoint for r_disc (Online BCE) and discriminator/ LPB viz.",
     )
     parser.add_argument("--no-disc-reward", action="store_true")
+    parser.add_argument(
+        "--no-disc-viz",
+        action="store_true",
+        help="Disable per-frame BCE discriminator visualization on the selected Q/V trajectory.",
+    )
+    parser.add_argument(
+        "--disc-viz-camera",
+        default="agentview",
+        type=str,
+        help="Camera used for the discriminator HUD video. Defaults to agentview.",
+    )
+    parser.add_argument("--disc-viz-border-thickness", type=int, default=10)
+    parser.add_argument("--disc-viz-no-flip-vertical", action="store_true")
     return parser.parse_args()
 
 
@@ -206,46 +243,98 @@ def build_iql_and_encoder(
     return iql, encoder, iql_cfg, encoder_meta
 
 
-def build_discriminator(
-    *,
-    payload: dict[str, Any],
+def build_training_discriminator(
     encoder: SharedFrozenEncoder,
+    encoder_meta: dict[str, Any],
+    *,
     action_dim: int,
-    action_horizon: int,
     device: str,
     disc_ckpt_override: str | None,
-    disabled: bool,
-) -> OnlineBCEDiscriminator | None:
-    if disabled:
-        return None
-    encoder_meta = dict(payload.get("encoder_meta", {}))
+) -> OnlineBCEDiscriminator:
+    """Frozen ``OnlineBCEDiscriminator`` matching IQL warmup / replay sampling."""
+    raw_ckpt = (
+        disc_ckpt_override
+        or encoder_meta.get("disc_warm_start_ckpt")
+        or encoder_meta.get("bce_ckpt")
+        or ""
+    )
+    if not raw_ckpt:
+        raise KeyError(
+            "IQL checkpoint encoder_meta does not define bce_ckpt / disc_warm_start_ckpt."
+        )
+    bce_ckpt = str(Path(to_absolute_path(str(raw_ckpt))).resolve())
+    meta_json = encoder_meta.get("meta_json_path")
+    initial_threshold = encoder_meta.get("bce_youden_threshold")
+    disc_cfg = DiscriminatorConfig(
+        device=str(device),
+        warm_start_ckpt=bce_ckpt,
+        initial_threshold=(
+            float(initial_threshold) if initial_threshold is not None else None
+        ),
+        meta_json_path=(
+            str(Path(to_absolute_path(str(meta_json))).resolve())
+            if meta_json
+            else None
+        ),
+    )
+    discriminator = OnlineBCEDiscriminator(
+        cfg=disc_cfg,
+        encoder=encoder,
+        context_dim=int(encoder.context_dim),
+        action_dim=int(action_dim),
+    )
+    for param in discriminator.head.parameters():
+        param.requires_grad_(False)
+    discriminator.head.eval()
+    return discriminator
+
+
+def resolve_disc_ckpt_path(
+    encoder_meta: dict[str, Any],
+    disc_ckpt_override: str | None,
+) -> Path:
     if disc_ckpt_override:
         ckpt_path = Path(to_absolute_path(str(disc_ckpt_override))).resolve()
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"Discriminator checkpoint does not exist: {ckpt_path}")
     else:
         raw_path = str(
             encoder_meta.get("disc_warm_start_ckpt")
             or encoder_meta.get("bce_ckpt")
             or ""
         )
-        ckpt_path = Path(raw_path).resolve() if raw_path else None
-
+        ckpt_path = Path(to_absolute_path(raw_path)).resolve() if raw_path else None
     if ckpt_path is None or not ckpt_path.exists():
-        print(f"[WARN] BCE checkpoint missing; skipping discriminator reward: {ckpt_path}")
+        raise FileNotFoundError(
+            "BCE checkpoint missing. Pass --disc-ckpt or set encoder_meta.bce_ckpt."
+        )
+    return ckpt_path
+
+
+def build_lpb_scorer(
+    *,
+    payload: dict[str, Any],
+    task_name: str,
+    device: str,
+    batch_size: int,
+    disc_ckpt_override: str | None,
+    disabled: bool,
+) -> LPBV2OfflineScorer | None:
+    """LPB v2 BCE scorer — same path as visualize_bce_robosuite.sh (discriminator/ viz)."""
+    if disabled:
         return None
-    disc_cfg = DiscriminatorConfig(warm_start_ckpt=str(ckpt_path), device=device)
-    discriminator = OnlineBCEDiscriminator(
-        cfg=disc_cfg,
-        encoder=encoder,
-        context_dim=int(encoder.context_dim),
-        action_dim=int(action_dim),
-        action_horizon=int(action_horizon),
+    encoder_meta = dict(payload.get("encoder_meta", {}))
+    ckpt_path = resolve_disc_ckpt_path(encoder_meta, disc_ckpt_override)
+    meta_json = encoder_meta.get("meta_json_path")
+    return LPBV2OfflineScorer(
+        bce_ckpt_path=ckpt_path,
+        task_name=str(task_name),
+        device=str(device),
+        batch_size=max(1, int(batch_size)),
+        meta_json_path=(
+            str(Path(to_absolute_path(str(meta_json))).resolve())
+            if meta_json
+            else None
+        ),
     )
-    for param in discriminator.head.parameters():
-        param.requires_grad_(False)
-    discriminator.head.eval()
-    return discriminator
 
 
 def center_crop_resize(image: np.ndarray, image_size: int) -> np.ndarray:
@@ -291,34 +380,147 @@ def next_obs_for_window(transitions: list[Transition], start: int, horizon: int)
     return transitions[start + horizon - 1].next_obs, True
 
 
-def encode_observations(
+def encode_observation_batch(
     encoder: SharedFrozenEncoder,
     observations: list[dict[str, Any]],
+    actions: np.ndarray | None,
     *,
     camera_names: list[str],
-    image_size: int,
     batch_size: int,
+    device: str,
 ) -> torch.Tensor:
-    chunks = []
+    """Replay-aligned encoder forward: uint8 views + optional real actions for s'."""
+    if actions is not None and len(actions) != len(observations):
+        raise ValueError(
+            f"actions length {len(actions)} != observations length {len(observations)}"
+        )
+    chunks: list[torch.Tensor] = []
     for start in range(0, len(observations), int(batch_size)):
-        batch_obs = observations[start : start + int(batch_size)]
+        end = min(len(observations), start + int(batch_size))
+        batch_obs = observations[start:end]
         image_np = np.stack(
-            [stack_views(obs, camera_names, image_size) for obs in batch_obs],
+            [_stack_views_uint8(obs, camera_names) for obs in batch_obs],
             axis=0,
         )
         proprio_np = np.stack(
             [np.asarray(obs["state"], dtype=np.float32) for obs in batch_obs],
             axis=0,
         )
-        image_tensor = torch.from_numpy(np.ascontiguousarray(image_np)).float().div_(255.0)
+        image_tensor = _to_image_tensor(np.ascontiguousarray(image_np), device)
         proprio_tensor = torch.from_numpy(np.ascontiguousarray(proprio_np)).float()
+        action_tensor = None
+        if actions is not None:
+            action_tensor = torch.from_numpy(
+                np.ascontiguousarray(actions[start:end], dtype=np.float32)
+            ).float()
         with torch.no_grad():
-            chunks.append(encoder.encode(image_obs_raw=image_tensor, proprio_raw=proprio_tensor).detach().cpu())
+            latent = encoder.encode(
+                image_obs_raw=image_tensor,
+                proprio_raw=proprio_tensor,
+                action_real=action_tensor,
+            )
+        chunks.append(latent.detach().cpu())
     return torch.cat(chunks, dim=0)
 
 
 def tensor_to_float(tensor: torch.Tensor, index: int) -> float:
     return float(tensor[index].detach().cpu().item())
+
+
+def per_step_training_disc_from_chunks(
+    *,
+    num_transitions: int,
+    horizon: int,
+    starts: list[int],
+    disc_step_cpu: torch.Tensor,
+    disc_logit_cpu: torch.Tensor,
+    threshold: float,
+) -> PerStepTrainingDisc:
+    """Map (W, H) chunk disc tensors to per-frame series (length T).
+
+    Frame ``t`` uses window ``start = min(t, T - H)`` and offset ``h = t - start``,
+    matching the chunk position used when ``t`` is the sliding-window start in
+    ``steps.csv`` (``disc_intrinsic_step0`` at ``step == t``).
+    """
+    transition_count = int(num_transitions)
+    max_start = max(0, transition_count - int(horizon))
+    start_to_wi = {int(start): wi for wi, start in enumerate(starts)}
+    intrinsic = np.zeros((transition_count,), dtype=np.float32)
+    logit = np.zeros((transition_count,), dtype=np.float32)
+    for step in range(transition_count):
+        start = min(int(step), max_start)
+        offset = int(step) - int(start)
+        wi = start_to_wi[int(start)]
+        intrinsic[step] = float(disc_step_cpu[wi, offset].item())
+        logit[step] = float(disc_logit_cpu[wi, offset].item())
+    threshold_f = float(threshold)
+    # tau is on failure_score = -expert_logit (LPB convention).
+    pred_failure = ((-logit) >= threshold_f).astype(np.int64)
+    return PerStepTrainingDisc(
+        bce_logit=logit,
+        intrinsic_reward=intrinsic,
+        threshold=threshold_f,
+        pred_failure=pred_failure,
+    )
+
+
+def pad_failure_scores_to_length(
+    failure_scores: np.ndarray, num_transitions: int
+) -> np.ndarray:
+    scores = np.asarray(failure_scores, dtype=np.float32).reshape(-1)
+    if scores.size == 0:
+        raise ValueError("pad_failure_scores_to_length got empty failure_scores.")
+    if scores.size < num_transitions:
+        pad = np.full((num_transitions - scores.size,), float(scores[-1]), dtype=np.float32)
+        scores = np.concatenate([scores, pad], axis=0)
+    elif scores.size > num_transitions:
+        scores = scores[:num_transitions]
+    return scores
+
+
+def lpb_intrinsic_from_failure_scores(
+    failure_scores: np.ndarray, tau: float
+) -> np.ndarray:
+    """``r_disc = -sigmoid(failure_score - tau)`` (shared with warmup / replay)."""
+    out = lpb_disc_intrinsic_from_failure_score(failure_scores, tau)
+    return np.asarray(out, dtype=np.float32)
+
+
+def per_step_disc_from_lpb_scores(
+    failure_scores: np.ndarray, *, tau: float, num_transitions: int
+) -> PerStepTrainingDisc:
+    scores = pad_failure_scores_to_length(failure_scores, num_transitions)
+    intrinsic = lpb_intrinsic_from_failure_scores(scores, tau)
+    expert_logit = -scores
+    threshold_f = float(tau)
+    pred_failure = (scores >= threshold_f).astype(np.int64)
+    return PerStepTrainingDisc(
+        bce_logit=expert_logit,
+        intrinsic_reward=intrinsic,
+        threshold=threshold_f,
+        pred_failure=pred_failure,
+    )
+
+
+def fill_chunk_disc_from_per_frame_intrinsic(
+    *,
+    starts: list[int],
+    horizon: int,
+    num_transitions: int,
+    intrinsic_per_frame: np.ndarray,
+    expert_logit_per_frame: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_windows = len(starts)
+    disc_step = torch.zeros((num_windows, horizon), dtype=torch.float32)
+    disc_logit = torch.zeros((num_windows, horizon), dtype=torch.float32)
+    for wi, start in enumerate(starts):
+        for offset in range(horizon):
+            frame_idx = int(start) + offset
+            if frame_idx >= num_transitions:
+                frame_idx = num_transitions - 1
+            disc_step[wi, offset] = float(intrinsic_per_frame[frame_idx])
+            disc_logit[wi, offset] = float(expert_logit_per_frame[frame_idx])
+    return disc_step, disc_logit
 
 
 def compute_qv_metrics(
@@ -333,7 +535,15 @@ def compute_qv_metrics(
     max_windows: int | None,
     batch_size: int,
     device: str,
-) -> list[dict[str, float]]:
+    lpb_failure_scores: np.ndarray | None = None,
+    lpb_tau: float | None = None,
+) -> tuple[list[dict[str, float]], PerStepTrainingDisc | None]:
+    """Compute per-window Q/V/advantage/TD metrics over the selected demo.
+
+    When ``lpb_failure_scores`` is set, ``r_disc`` uses the same LPB benchmark
+    scores as ``discriminator/`` viz (``-sigmoid(failure_score - tau)``). Otherwise
+    falls back to ``OnlineBCEDiscriminator`` on ``encode_chunk_frames`` latents.
+    """
     horizon = int(iql_cfg.action_horizon)
     discount = float(iql_cfg.discount)
     windows = build_windows(transitions, horizon=horizon, max_windows=max_windows)
@@ -361,27 +571,126 @@ def compute_qv_metrics(
     if forced_done.size:
         done_np[:, -1] = np.maximum(done_np[:, -1], forced_done)
 
-    context_cpu = encode_observations(
-        encoder,
-        current_obs,
-        camera_names=camera_names,
-        image_size=image_size,
-        batch_size=batch_size,
+    # Chunk tensors for encode_chunk_frames (same uint8 stacking as IQL replay).
+    chunk_images_np = np.stack(
+        [
+            np.stack([_stack_views_uint8(item.obs, camera_names) for item in sequence], axis=0)
+            for _, sequence in windows
+        ],
+        axis=0,
     )
-    next_context_cpu = encode_observations(
-        encoder,
-        next_obs,
-        camera_names=camera_names,
-        image_size=image_size,
-        batch_size=batch_size,
+    chunk_proprio_np = np.stack(
+        [
+            np.stack([np.asarray(item.obs["state"], dtype=np.float32) for item in sequence], axis=0)
+            for _, sequence in windows
+        ],
+        axis=0,
     )
+    view_count, channels, img_h, img_w = chunk_images_np.shape[2:]
+    num_windows = len(windows)
+    context_dim = int(encoder.context_dim)
+
     actions_cpu = torch.from_numpy(np.ascontiguousarray(action_np)).float()
     rewards_cpu = torch.from_numpy(np.ascontiguousarray(reward_np)).float()
     dones_cpu = torch.from_numpy(np.ascontiguousarray(done_np)).float()
+    use_lpb_disc = (
+        lpb_failure_scores is not None
+        and lpb_tau is not None
+        and float(iql_cfg.disc_reward_coef) != 0.0
+    )
+    use_disc_reward = use_lpb_disc or (
+        discriminator is not None and float(iql_cfg.disc_reward_coef) != 0.0
+    )
+    score_with_disc = use_lpb_disc or discriminator is not None
+    intrinsic_per_frame: np.ndarray | None = None
+    expert_logit_per_frame: np.ndarray | None = None
+    if use_lpb_disc:
+        assert lpb_failure_scores is not None and lpb_tau is not None
+        scores_padded = pad_failure_scores_to_length(
+            lpb_failure_scores, len(transitions)
+        )
+        intrinsic_per_frame = lpb_intrinsic_from_failure_scores(
+            scores_padded, float(lpb_tau)
+        )
+        expert_logit_per_frame = -scores_padded
+
+    # Match IQLReplayBuffer: chunk-start context from encode_chunk_frames; s' via
+    # encode(..., action_real=last chunk action). Do NOT use encode() without actions.
+    chunk_ctx_cpu = torch.empty((num_windows, horizon, context_dim), dtype=torch.float32)
+    disc_step_cpu: torch.Tensor | None = None
+    disc_logit_cpu: torch.Tensor | None = None
+    if score_with_disc:
+        disc_step_cpu = torch.empty((num_windows, horizon), dtype=torch.float32)
+        disc_logit_cpu = torch.empty((num_windows, horizon), dtype=torch.float32)
+
+    for start_idx in range(0, num_windows, int(batch_size)):
+        end_idx = min(num_windows, start_idx + int(batch_size))
+        batch_size_local = end_idx - start_idx
+        batch_actions = actions_cpu[start_idx:end_idx].to(device)
+        batch_chunk_images = chunk_images_np[start_idx:end_idx]
+        batch_chunk_proprio = chunk_proprio_np[start_idx:end_idx]
+        flat_images = np.ascontiguousarray(
+            batch_chunk_images.reshape(
+                batch_size_local * horizon, view_count, channels, img_h, img_w
+            )
+        )
+        chunk_images_tensor = _to_image_tensor(flat_images, device).view(
+            batch_size_local, horizon, view_count, channels, img_h, img_w
+        )
+        chunk_proprio_tensor = torch.from_numpy(
+            np.ascontiguousarray(batch_chunk_proprio)
+        ).float()
+        with torch.no_grad():
+            chunk_ctx = encoder.encode_chunk_frames(
+                chunk_images=chunk_images_tensor,
+                chunk_proprio=chunk_proprio_tensor,
+                chunk_actions=batch_actions,
+            )
+            chunk_ctx_cpu[start_idx:end_idx] = chunk_ctx.detach().cpu()
+            if (
+                use_lpb_disc
+                and disc_step_cpu is not None
+                and disc_logit_cpu is not None
+                and intrinsic_per_frame is not None
+                and expert_logit_per_frame is not None
+            ):
+                batch_starts = starts[start_idx:end_idx]
+                step_chunk, logit_chunk = fill_chunk_disc_from_per_frame_intrinsic(
+                    starts=batch_starts,
+                    horizon=horizon,
+                    num_transitions=len(transitions),
+                    intrinsic_per_frame=intrinsic_per_frame,
+                    expert_logit_per_frame=expert_logit_per_frame,
+                )
+                disc_step_cpu[start_idx:end_idx] = step_chunk
+                disc_logit_cpu[start_idx:end_idx] = logit_chunk
+            elif score_with_disc and disc_step_cpu is not None and disc_logit_cpu is not None:
+                assert discriminator is not None
+                flat_ctx = chunk_ctx.reshape(batch_size_local * horizon, -1)
+                r_disc_flat = discriminator.intrinsic_reward(context=flat_ctx)
+                disc_step_cpu[start_idx:end_idx] = r_disc_flat.view(
+                    batch_size_local, horizon
+                ).detach().cpu()
+                disc_logit_cpu[start_idx:end_idx] = (
+                    discriminator.score(context=flat_ctx).logit.view(batch_size_local, horizon).detach().cpu()
+                )
+
+    context_cpu = chunk_ctx_cpu[:, 0, :]
+    next_actions_np = np.ascontiguousarray(action_np[:, -1, :], dtype=np.float32)
+    next_context_cpu = encode_observation_batch(
+        encoder,
+        next_obs,
+        next_actions_np,
+        camera_names=camera_names,
+        batch_size=batch_size,
+        device=device,
+    )
 
     metrics: list[dict[str, float]] = []
-    for start_idx in range(0, len(windows), int(batch_size)):
-        end_idx = min(len(windows), start_idx + int(batch_size))
+    bootstrap_discount = float(discount) ** horizon
+    for start_idx in range(0, num_windows, int(batch_size)):
+        end_idx = min(num_windows, start_idx + int(batch_size))
+        batch_size_local = end_idx - start_idx
         context = context_cpu[start_idx:end_idx].to(device)
         next_context = next_context_cpu[start_idx:end_idx].to(device)
         actions = actions_cpu[start_idx:end_idx].to(device)
@@ -389,6 +698,28 @@ def compute_qv_metrics(
         dones = dones_cpu[start_idx:end_idx].to(device)
 
         with torch.no_grad():
+            if use_disc_reward and disc_step_cpu is not None:
+                disc_step = disc_step_cpu[start_idx:end_idx].to(device)
+                disc_reward_horizon = aggregate_chunk_reward(disc_step, discount)
+                disc_reward_chunk = disc_step.sum(dim=1, keepdim=True)
+                disc_intrinsic_step0 = disc_step[:, :1]
+                if use_lpb_disc and expert_logit_per_frame is not None:
+                    disc_logit = torch.from_numpy(
+                        expert_logit_per_frame[starts[start_idx:end_idx]]
+                    ).to(device=device, dtype=rewards.dtype)
+                else:
+                    assert discriminator is not None
+                    disc_logit = discriminator.score(
+                        context=chunk_ctx_cpu[start_idx:end_idx, 0, :].to(device)
+                    ).logit.view(-1)
+            else:
+                disc_reward_horizon = torch.zeros(
+                    (batch_size_local, 1), device=device, dtype=rewards.dtype
+                )
+                disc_reward_chunk = torch.zeros_like(disc_reward_horizon)
+                disc_intrinsic_step0 = torch.zeros_like(disc_reward_horizon)
+                disc_logit = torch.zeros((batch_size_local,), device=device, dtype=rewards.dtype)
+
             q1 = iql.q1(context, actions)
             q2 = iql.q2(context, actions)
             q_min = torch.minimum(q1, q2)
@@ -399,20 +730,9 @@ def compute_qv_metrics(
             env_reward_horizon = aggregate_chunk_reward(rewards, discount)
             done_horizon = chunk_done_mask(dones).to(device)
 
-            if discriminator is not None and float(iql_cfg.disc_reward_coef) != 0.0:
-                disc_logit = discriminator.intrinsic_reward(context=context, action_chunk=actions)
-                disc_reward_chunk = disc_logit_to_intrinsic_reward(
-                    disc_logit, str(iql_cfg.disc_reward_sign)
-                )
-                disc_per_step = (disc_reward_chunk.unsqueeze(-1) / float(horizon)).expand(-1, horizon)
-                disc_reward_horizon = aggregate_chunk_reward(disc_per_step, discount)
-            else:
-                disc_logit = torch.zeros((end_idx - start_idx,), device=device, dtype=context.dtype)
-                disc_reward_chunk = torch.zeros_like(disc_logit)
-                disc_reward_horizon = torch.zeros_like(env_reward_horizon)
-
             total_reward_horizon = env_reward_horizon + float(iql_cfg.disc_reward_coef) * disc_reward_horizon
-            td_target = total_reward_horizon + (discount**horizon) * (1.0 - done_horizon) * next_v
+            bootstrap_v = bootstrap_discount * (1.0 - done_horizon) * next_v
+            td_target = total_reward_horizon + bootstrap_v
             td_residual = td_target - q_min
             advantage = q_min - v
 
@@ -422,8 +742,10 @@ def compute_qv_metrics(
                 "step": float(starts[global_idx]),
                 "env_reward_horizon": tensor_to_float(env_reward_horizon, local_idx),
                 "disc_logit": tensor_to_float(disc_logit, local_idx),
+                "disc_intrinsic_step0": tensor_to_float(disc_intrinsic_step0, local_idx),
                 "disc_reward_chunk": tensor_to_float(disc_reward_chunk, local_idx),
                 "disc_reward_horizon": tensor_to_float(disc_reward_horizon, local_idx),
+                "bootstrap_v": tensor_to_float(bootstrap_v, local_idx),
                 "total_reward_horizon": tensor_to_float(total_reward_horizon, local_idx),
                 "done_horizon": tensor_to_float(done_horizon, local_idx),
                 "q1": tensor_to_float(q1, local_idx),
@@ -443,7 +765,29 @@ def compute_qv_metrics(
                         actions_cpu[global_idx, horizon_index, action_index].item()
                     )
             metrics.append(row)
-    return metrics
+
+    per_step_disc = None
+    if use_lpb_disc and lpb_failure_scores is not None and lpb_tau is not None:
+        per_step_disc = per_step_disc_from_lpb_scores(
+            lpb_failure_scores,
+            tau=float(lpb_tau),
+            num_transitions=len(transitions),
+        )
+    elif (
+        score_with_disc
+        and disc_step_cpu is not None
+        and disc_logit_cpu is not None
+        and discriminator is not None
+    ):
+        per_step_disc = per_step_training_disc_from_chunks(
+            num_transitions=len(transitions),
+            horizon=horizon,
+            starts=starts,
+            disc_step_cpu=disc_step_cpu,
+            disc_logit_cpu=disc_logit_cpu,
+            threshold=float(discriminator.threshold),
+        )
+    return metrics, per_step_disc
 
 
 def write_metrics_csv(path: Path, metrics: list[dict[str, float]]) -> None:
@@ -469,7 +813,13 @@ def write_video(path: Path, transitions: list[Transition], image_keys: list[str]
                 writer.append_data(np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0])
 
 
-def plot_qv(path_base: Path, metrics: list[dict[str, float]], title: str) -> None:
+def plot_qv(
+    path_base: Path,
+    metrics: list[dict[str, float]],
+    title: str,
+    *,
+    per_step_disc: PerStepTrainingDisc | None = None,
+) -> None:
     steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
     q_min = np.asarray([row["q_min"] for row in metrics], dtype=np.float32)
     q_mean = np.asarray([row["q_mean"] for row in metrics], dtype=np.float32)
@@ -482,6 +832,8 @@ def plot_qv(path_base: Path, metrics: list[dict[str, float]], title: str) -> Non
     env_rewards = np.asarray([row["env_reward_horizon"] for row in metrics], dtype=np.float32)
     total_rewards = np.asarray([row["total_reward_horizon"] for row in metrics], dtype=np.float32)
     disc_rewards = np.asarray([row["disc_reward_horizon"] for row in metrics], dtype=np.float32)
+    disc_step0 = np.asarray([row["disc_intrinsic_step0"] for row in metrics], dtype=np.float32)
+    bootstrap_v = np.asarray([row["bootstrap_v"] for row in metrics], dtype=np.float32)
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
@@ -494,10 +846,12 @@ def plot_qv(path_base: Path, metrics: list[dict[str, float]], title: str) -> Non
     axes[0].legend(loc="best")
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(steps, td_target, label="TD target", color="tab:purple")
+    axes[1].plot(steps, td_target, label="TD target (r + γ^H V')", color="tab:purple")
     axes[1].plot(steps, q_min, label="Q min", color="tab:blue", alpha=0.75)
+    axes[1].plot(steps, bootstrap_v, label="γ^H · V(s')", color="tab:green", alpha=0.65, linestyle="--")
+    axes[1].plot(steps, total_rewards, label="chunk r_total", color="tab:gray", alpha=0.65, linestyle=":")
     axes[1].set_ylabel("Target / Q")
-    axes[1].legend(loc="best")
+    axes[1].legend(loc="best", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
     axes[2].plot(steps, td_residual, label="TD residual", color="tab:red")
@@ -507,9 +861,33 @@ def plot_qv(path_base: Path, metrics: list[dict[str, float]], title: str) -> Non
     axes[2].legend(loc="best")
     axes[2].grid(True, alpha=0.3)
 
-    axes[3].step(steps, total_rewards, where="post", label="total chunk reward", color="tab:gray")
+    axes[3].step(steps, total_rewards, where="post", label="total chunk reward (Bellman r)", color="tab:gray")
     axes[3].step(steps, env_rewards, where="post", label="env chunk reward", color="tab:olive", alpha=0.75)
-    axes[3].plot(steps, disc_rewards, label="disc chunk reward", color="tab:pink", alpha=0.85)
+    axes[3].plot(
+        steps,
+        disc_rewards,
+        label="disc γ-agg (8-step window)",
+        color="tab:pink",
+        alpha=0.85,
+    )
+    axes[3].plot(
+        steps,
+        disc_step0,
+        label="disc intrinsic @ chunk start",
+        color="tab:red",
+        alpha=0.55,
+        linestyle="--",
+    )
+    if per_step_disc is not None:
+        frame_steps = np.arange(int(per_step_disc.num_frames), dtype=np.float32)
+        axes[3].plot(
+            frame_steps,
+            per_step_disc.intrinsic_reward,
+            label="disc intrinsic (per-frame)",
+            color="tab:orange",
+            alpha=0.45,
+            linewidth=1.0,
+        )
     axes[3].set_ylabel("Reward")
     axes[3].set_xlabel("Step")
     axes[3].legend(loc="best")
@@ -535,7 +913,6 @@ def summarize_metrics(metrics: list[dict[str, float]], iql_cfg: IQLConfig) -> di
         "action_horizon": int(iql_cfg.action_horizon),
         "discount": float(iql_cfg.discount),
         "disc_reward_coef": float(iql_cfg.disc_reward_coef),
-        "disc_reward_sign": str(iql_cfg.disc_reward_sign),
         "env_reward_horizon_mean": float(env_rewards.mean()),
         "env_reward_horizon_min": float(env_rewards.min()),
         "env_reward_horizon_max": float(env_rewards.max()),
@@ -570,15 +947,6 @@ def main() -> None:
     camera_names = [str(name) for name in encoder_meta["policy_camera_names"]]
     image_size = int(encoder_meta.get("image_size", 128))
     action_dim = int(encoder_meta.get("policy_action_dim", iql.action_dim))
-    discriminator = build_discriminator(
-        payload=payload,
-        encoder=encoder,
-        action_dim=action_dim,
-        action_horizon=int(iql_cfg.action_horizon),
-        device=device,
-        disc_ckpt_override=args.disc_ckpt,
-        disabled=bool(args.no_disc_reward),
-    )
 
     selected = select_demo(split_dir, seed=int(args.seed), demo_key=args.demo_key)
     transitions = load_demo_transitions(
@@ -588,7 +956,48 @@ def main() -> None:
         renderer=str(args.renderer),
         control_freq=int(args.control_freq),
     )
-    metrics = compute_qv_metrics(
+
+    lpb_scorer: LPBV2OfflineScorer | None = None
+    lpb_failure_scores: np.ndarray | None = None
+    lpb_tau: float | None = None
+    need_lpb = (not bool(args.no_disc_reward)) or (not bool(args.no_disc_viz))
+    if need_lpb:
+        lpb_scorer = build_lpb_scorer(
+            payload=payload,
+            task_name=task_data_name,
+            device=device,
+            batch_size=max(1, int(args.batch_size)),
+            disc_ckpt_override=args.disc_ckpt,
+            disabled=False,
+        )
+        assert lpb_scorer is not None
+        lpb_failure_scores = lpb_scorer.score_hdf5_demo(
+            selected.hdf5_path,
+            selected.demo_key,
+            fps=int(args.video_fps),
+        )
+        lpb_tau = float(lpb_scorer.tau)
+        print(
+            f"[vis_qv] LPB disc scores: T={lpb_failure_scores.shape[0]} "
+            f"tau={lpb_tau:.6f} (source={lpb_scorer.tau_source}) "
+            f"disc_reward_coef={float(iql_cfg.disc_reward_coef)}"
+        )
+
+    discriminator = None
+    if not bool(args.no_disc_reward) and lpb_failure_scores is None:
+        discriminator = build_training_discriminator(
+            encoder,
+            encoder_meta,
+            action_dim=action_dim,
+            device=device,
+            disc_ckpt_override=args.disc_ckpt,
+        )
+        print(
+            f"[vis_qv] online disc fallback: threshold={discriminator.threshold:.6f} "
+            f"(source={discriminator.threshold_source})"
+        )
+
+    metrics, per_step_disc = compute_qv_metrics(
         iql=iql,
         encoder=encoder,
         discriminator=discriminator,
@@ -599,11 +1008,13 @@ def main() -> None:
         max_windows=args.max_windows,
         batch_size=max(1, int(args.batch_size)),
         device=device,
+        lpb_failure_scores=lpb_failure_scores,
+        lpb_tau=lpb_tau,
     )
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_root = Path(to_absolute_path(str(args.output_root))).resolve()
-    output_dir = output_root / f"{task_data_name}_iql-qv/{args.split}_{timestamp}"
+    output_dir = output_root / f"{task_data_name}_iql-qv/{args.split}_seed{args.seed}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = output_dir / "steps.csv"
@@ -613,7 +1024,51 @@ def main() -> None:
 
     write_metrics_csv(csv_path, metrics)
     write_video(video_path, transitions, image_keys=camera_names, fps=int(args.video_fps))
-    plot_qv(plot_base, metrics, title=f"{task_data_name} {args.split} {selected.hdf5_path.name}::{selected.demo_key}")
+    plot_qv(
+        plot_base,
+        metrics,
+        title=f"{task_data_name} {args.split} {selected.hdf5_path.name}::{selected.demo_key}",
+        per_step_disc=per_step_disc,
+    )
+
+    disc_viz_outputs = None
+    if not bool(args.no_disc_viz):
+        if lpb_scorer is None:
+            lpb_scorer = build_lpb_scorer(
+                payload=payload,
+                task_name=task_data_name,
+                device=device,
+                batch_size=max(1, int(args.batch_size)),
+                disc_ckpt_override=args.disc_ckpt,
+                disabled=False,
+            )
+        disc_ckpt_path = resolve_disc_ckpt_path(encoder_meta, args.disc_ckpt)
+        disc_viz_result = visualize_selected_trajectory_discriminator(
+            disc_ckpt=str(disc_ckpt_path),
+            task_name=task_data_name,
+            selected_hdf5_path=selected.hdf5_path,
+            selected_demo_key=selected.demo_key,
+            transitions=transitions,
+            camera_names=camera_names,
+            image_size=image_size,
+            output_dir=output_dir / "discriminator",
+            device=device,
+            batch_size=max(1, int(args.batch_size)),
+            video_fps=int(args.video_fps),
+            camera_name=args.disc_viz_camera,
+            border_thickness=int(args.disc_viz_border_thickness),
+            flip_vertical=not bool(args.disc_viz_no_flip_vertical),
+            scorer=lpb_scorer,
+        )
+        disc_viz_outputs = {
+            "output_dir": str(disc_viz_result.output_dir),
+            "scores_csv": str(disc_viz_result.scores_csv),
+            "plot_png": str(disc_viz_result.plot_png),
+            "plot_pdf": str(disc_viz_result.plot_pdf),
+            "video": str(disc_viz_result.video),
+            "summary": str(disc_viz_result.summary_json),
+            "scoring_path": "LPBV2OfflineScorer(BCEBenchmarkDiscriminator.score_trajectory)",
+        }
 
     summary = {
         "iql_ckpt": str(iql_ckpt),
@@ -631,7 +1086,29 @@ def main() -> None:
         "image_size": int(image_size),
         "device": str(device),
         "q_chunking": True,
-        "disc_reward_enabled": discriminator is not None and not bool(args.no_disc_reward),
+        "disc_reward_enabled": (
+            (lpb_failure_scores is not None or discriminator is not None)
+            and float(iql_cfg.disc_reward_coef) != 0.0
+        ),
+        "disc_reward_source": (
+            "LPBV2OfflineScorer(-sigmoid(failure_score - tau))"
+            if lpb_failure_scores is not None
+            else (
+                "OnlineBCEDiscriminator.intrinsic_reward(encode_chunk_frames)"
+                if discriminator is not None
+                else None
+            )
+        ),
+        "disc_threshold": None if discriminator is None else float(discriminator.threshold),
+        "disc_threshold_source": None if discriminator is None else str(discriminator.threshold_source),
+        "lpb_disc_viz_tau": None if lpb_scorer is None else float(lpb_scorer.tau),
+        "lpb_disc_viz_tau_source": None if lpb_scorer is None else str(lpb_scorer.tau_source),
+        "per_step_disc_frames": None if per_step_disc is None else int(per_step_disc.num_frames),
+        "per_step_disc_first_pred_failure": (
+            None
+            if per_step_disc is None or not bool(per_step_disc.pred_failure.any())
+            else int(np.where(per_step_disc.pred_failure.astype(bool))[0][0])
+        ),
         "bce_ckpt": str(encoder_meta.get("bce_ckpt", "")),
         "disc_ckpt_override": None if args.disc_ckpt is None else str(Path(to_absolute_path(str(args.disc_ckpt))).resolve()),
         "outputs": {
@@ -639,6 +1116,7 @@ def main() -> None:
             "video": str(video_path),
             "plot_png": str(plot_base.with_suffix(".png")),
             "plot_pdf": str(plot_base.with_suffix(".pdf")),
+            "discriminator": disc_viz_outputs,
         },
         "metrics_summary": summarize_metrics(metrics, iql_cfg),
     }
@@ -650,6 +1128,10 @@ def main() -> None:
     print(f"video={video_path}")
     print(f"plot_png={plot_base.with_suffix('.png')}")
     print(f"plot_pdf={plot_base.with_suffix('.pdf')}")
+    if disc_viz_outputs is not None:
+        print(f"disc_viz_dir={disc_viz_outputs['output_dir']}")
+        print(f"disc_viz_video={disc_viz_outputs['video']}")
+        print(f"disc_viz_plot_png={disc_viz_outputs['plot_png']}")
     print(f"summary={summary_path}")
 
 

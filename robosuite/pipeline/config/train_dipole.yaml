@@ -188,7 +188,9 @@ logging:
   run_name: null
   project: "DIPOLE_AIR"
   entity: "songgao-personal"
-  use_wandb: true
+  use_tensorboard: true
+  tensorboard_dir: "tensorboard"
+  use_wandb: false
   wandb_mode: "offline"
   log_interval: 10
   checkpoint_interval: 5000

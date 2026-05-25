@@ -57,7 +57,7 @@ from robosuite.pipeline.utils import (
     checkpoint_step_path,
     load_demo_paths,
     load_transition_chunks,
-    maybe_build_wandb,
+    maybe_build_tensorboard,
     maybe_log,
     maybe_wrap_visualization,
     resolve_buffer_chunk_dirs,
@@ -370,10 +370,10 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # false) degenerates into the existing DipoleTrainer with no IQL work
     # per tick.
     policy_action_dim = int(agent.flow_config.action_dim)
-    policy_action_horizon = int(agent.flow_config.action_horizon)
     iql_cfg_dict = OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True)
     iql_cfg = IQLConfig(**iql_cfg_dict)
     q_learning_enabled = bool(getattr(cfg.algorithm.q_learning, "enabled", True))
+
     if q_learning_enabled:
         iql_learner = IQLLearner(
             iql_cfg, context_dim=int(shared_encoder.context_dim), action_dim=policy_action_dim
@@ -387,6 +387,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # Discriminator + replay. Gated by `algorithm.discriminator.online_train`
     # so the legacy regression run leaves the BCE head frozen on disk.
     disc_cfg_dict = OmegaConf.to_container(cfg.algorithm.discriminator.config, resolve=True)
+    if disc_cfg_dict.get("warm_start_ckpt"):
+        disc_cfg_dict["warm_start_ckpt"] = str(bce_warm_ckpt)
     disc_cfg = DiscriminatorConfig(**disc_cfg_dict)
     disc_online_train = bool(getattr(cfg.algorithm.discriminator, "online_train", True))
     if disc_online_train:
@@ -395,13 +397,16 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             encoder=shared_encoder,
             context_dim=int(shared_encoder.context_dim),
             action_dim=policy_action_dim,
-            action_horizon=policy_action_horizon,
+        )
+        print(
+            f"[rl] online_disc threshold={discriminator.threshold:.6f} "
+            f"(source={discriminator.threshold_source}); "
+            f"EMA continues from this seed during update()."
         )
         disc_replay = DiscriminatorReplayBuffer(
             disc_cfg,
             agent.online_buffer,
             encoder=shared_encoder,
-            action_horizon=policy_action_horizon,
         )
     else:
         discriminator = None
@@ -659,6 +664,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # load offline demos into online buffer
     if (iql_replay is not None or disc_replay is not None) and len(agent.online_buffer) == 0:
         annotated_demos = _annotate_offline_demos(transitions, namespace="offline_demo")
+
         if disc_replay is not None:
             disc_replay.bootstrap_from_demos(annotated_demos)
             print(
@@ -698,7 +704,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # Initialize the training loop.                                      #
     # ------------------------------------------------------------------ #
 
-    wandb_run = maybe_build_wandb(cfg, run_name=run_name, run_dir=checkpoint_dir)
+    metric_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=checkpoint_dir)
     device = None
     intervention_runtime = None
 
@@ -793,14 +799,29 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         overall_fps = overall_fps_tracker.snapshot(elapsed)
         pending_updates = trainer.pending_async_updates() if async_updates else 0
         runtime_payload = {
-            "overall_fps": overall_fps,
-            "learner_actor_updates": float(learner_progress["actor_updates"]),
-            "learner_updates_until_publish": float(learner_progress["updates_until_publish"]),
-            "learner_publish_count": float(learner_progress["publish_count"]),
+            "runtime/overall_fps": overall_fps,
+            "runtime/pending_updates": float(pending_updates),
+            "runtime/elapsed_sec": float(time.monotonic() - training_started_monotonic),
+            "learner/total_updates": float(learner_progress["total_updates"]),
+            "learner/actor_updates": float(learner_progress["actor_updates"]),
+            "learner/updates_until_publish": float(learner_progress["updates_until_publish"]),
+            "learner/publish_count": float(learner_progress["publish_count"]),
+            "buffer/total_transition_count": float(total_transition_count),
+            "intervention/total_transitions": float(total_intervention_transitions),
+            "intervention/global_ratio": (
+                float(total_intervention_transitions) / float(total_transition_count)
+                if total_transition_count > 0
+                else 0.0
+            ),
+            "episode/current_transition_count": float(episode_transition_count),
+            "episode/current_intervention_transitions": float(episode_intervention_transitions),
+            "episode/current_intervention_ratio": (
+                float(episode_intervention_transitions) / float(episode_transition_count)
+                if episode_transition_count > 0
+                else 0.0
+            ),
         }
-        if async_updates:
-            runtime_payload["pending_updates"] = float(pending_updates)
-        maybe_log(wandb_run, runtime_payload, step=step)
+        maybe_log(metric_logger, runtime_payload, step=step)
         runtime_logger.log(
             {
                 "event": "runtime",
@@ -1084,6 +1105,22 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                         **event_time_fields(),
                     }
                 )
+                maybe_log(
+                    metric_logger,
+                    {
+                        "intervention/total_transitions": int(total_intervention_transitions),
+                        "intervention/global_ratio": float(total_intervention_transitions)
+                        / float(total_transition_count),
+                        "episode/current_intervention_transitions": int(
+                            episode_intervention_transitions
+                        ),
+                        "episode/current_intervention_ratio": float(
+                            episode_intervention_transitions
+                        )
+                        / float(episode_transition_count),
+                    },
+                    step=step,
+                )
             episode_return += reward
             episode_length += 1
             success_count += int(success)
@@ -1132,6 +1169,16 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                             **event_time_fields(),
                         }
                     )
+                    maybe_log(
+                        metric_logger,
+                        {
+                            "discriminator/raw": raw_score,
+                            "discriminator/G": -raw_score,
+                            "discriminator/tau": tau_value,
+                            "discriminator/is_failure": int(is_failure),
+                        },
+                        step=step,
+                    )
 
             # -----------------------------------------------------------------
             # update all
@@ -1148,7 +1195,15 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 maybe_print_publish_events(update_metrics_list)
                 update_metrics = update_metrics_list[-1]
                 if step % int(cfg.logging.log_interval) == 0:
-                    maybe_log(wandb_run, update_metrics, step=step)
+                    train_payload = {
+                        "train/pending_updates": float(
+                            trainer.pending_async_updates() if async_updates else 0
+                        ),
+                        "train/online_buffer_size": float(len(agent.online_buffer)),
+                        "train/demo_buffer_size": float(len(agent.demo_buffer)),
+                        **{f"train/{key}": value for key, value in update_metrics.items()},
+                    }
+                    maybe_log(metric_logger, train_payload, step=step)
                     train_logger.log(
                         {
                             "event": "train_step",
@@ -1163,14 +1218,29 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                     )
 
             if done:
-                episode_payload = {
-                    "episode_return": float(episode_return),
-                    "episode_length": int(episode_length),
-                    "episode_success": int(success),
-                    "online_buffer_size": len(agent.online_buffer),
-                    "demo_buffer_size": len(agent.demo_buffer),
-                }
-                maybe_log(wandb_run, episode_payload, step=step)
+                maybe_log(
+                    metric_logger,
+                    {
+                        "episode/return": float(episode_return),
+                        "episode/length": int(episode_length),
+                        "episode/success": int(success),
+                        "episode/transition_count": int(episode_transition_count),
+                        "episode/intervention_transitions": int(episode_intervention_transitions),
+                        "episode/intervention_ratio": (
+                            float(episode_intervention_transitions) / float(episode_transition_count)
+                            if episode_transition_count > 0
+                            else 0.0
+                        ),
+                        "buffer/online_size": len(agent.online_buffer),
+                        "buffer/demo_size": len(agent.demo_buffer),
+                        "intervention/global_ratio": (
+                            float(total_intervention_transitions) / float(total_transition_count)
+                            if total_transition_count > 0
+                            else 0.0
+                        ),
+                    },
+                    step=step,
+                )
                 runtime_logger.log(
                     {
                         "event": "episode_end",
@@ -1283,6 +1353,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
                 "train_log": str(train_log_path),
+                "tensorboard_log": None if metric_logger is None else str(metric_logger.log_dir),
                 "buffer_dir": str(checkpoint_dir / "buffers"),
                 "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
                 "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
@@ -1299,8 +1370,22 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             trainer.close_async_worker(wait=False)
         if intervention_runtime is not None:
             intervention_runtime.close()
-        if wandb_run is not None:
-            wandb_run.finish()
+        maybe_log(
+            metric_logger,
+            {
+                "run/success_count": int(success_count),
+                "run/total_transition_count": int(total_transition_count),
+                "run/total_intervention_transitions": int(total_intervention_transitions),
+                "run/global_intervention_ratio": (
+                    float(total_intervention_transitions) / float(total_transition_count)
+                    if total_transition_count > 0
+                    else 0.0
+                ),
+            },
+            step=last_step if last_step >= 0 else 0,
+        )
+        if metric_logger is not None:
+            metric_logger.close()
         try:
             env.close()
         finally:

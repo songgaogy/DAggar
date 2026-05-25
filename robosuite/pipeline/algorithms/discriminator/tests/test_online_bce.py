@@ -12,8 +12,7 @@ import glob
 import os
 import threading
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Sequence
 
 import numpy as np
 import pytest
@@ -53,13 +52,18 @@ def _resolve_bce_ckpt() -> str | None:
 
 
 class _FakeEncoder:
-    """Stand-in for SharedFrozenEncoder. Returns a zero context."""
+    """Stand-in for SharedFrozenEncoder.
+
+    Returns a context derived from proprio (and action_real, if supplied)
+    so tests can verify that the encoder receives the right inputs.
+    """
 
     def __init__(self, context_dim: int) -> None:
         self.context_dim = int(context_dim)
         self._policy_camera_idx = [0]
         self._view_names = ["frontview_image"]
         self._original_img_size = (4, 4)
+        self.device = "cpu"
 
     @property
     def view_names(self) -> list[str]:
@@ -73,7 +77,13 @@ class _FakeEncoder:
         return None
 
     @torch.no_grad()
-    def encode(self, *, image_obs_raw: torch.Tensor, proprio_raw: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        *,
+        image_obs_raw: torch.Tensor,
+        proprio_raw: torch.Tensor,
+        action_real: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B = int(image_obs_raw.shape[0])
         return torch.zeros(B, self.context_dim)
 
@@ -93,9 +103,6 @@ class _FakeBaseBuffer:
             self._storage.append(transition)
 
     def _get_valid_start_indices_locked(self) -> list[int]:
-        # Allow any window where start + H <= len(storage) AND no episode
-        # boundary in the middle. For our synthetic data we just use a
-        # single contiguous episode so every aligned start is valid.
         H = self.action_horizon
         return [i for i in range(len(self._storage) - H + 1)]
 
@@ -134,7 +141,6 @@ def test_trainable_head_forward_shape() -> None:
     head = TrainableBCEHead(in_dim=24, hidden=32, num_layers=2)
     out = head(torch.randn(7, 24))
     assert out.shape == (7,)
-    # Zero-init of final Linear means first forward returns zeros.
     assert torch.allclose(out, torch.zeros(7), atol=1e-6)
 
 
@@ -143,7 +149,25 @@ def test_trainable_head_forward_shape() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_warm_start_copies_at_least_one_linear(tmp_path: Path) -> None:
+def test_initial_threshold_from_config() -> None:
+    cfg = DiscriminatorConfig(
+        device="cpu",
+        hidden=16,
+        num_layers=1,
+        initial_threshold=2.0867,
+        warm_start_ckpt=None,
+    )
+    encoder = _FakeEncoder(context_dim=4)
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=4, action_dim=2)
+    assert disc.threshold == pytest.approx(2.0867)
+    assert disc.threshold_source == "config.initial_threshold"
+
+
+def test_warm_start_loads_first_linear(tmp_path: Path) -> None:
+    """With in_dim == ckpt['in_dim'] (single-frame head), warm-start must
+    load EVERY layer including `net.0.weight`. The new strict assertion
+    inside `warm_start_from_lpb_bce_ckpt` enforces this so we never fall
+    back silently to a Kaiming-random first projection."""
     ckpt_path = _resolve_bce_ckpt()
     if ckpt_path is None:
         pytest.skip("No lpb_v2 BCE checkpoint available for warm-start test.")
@@ -154,12 +178,18 @@ def test_warm_start_copies_at_least_one_linear(tmp_path: Path) -> None:
     if in_dim_ckpt <= 0:
         pytest.skip("ckpt missing 'in_dim'; can't size head to match.")
     head = TrainableBCEHead(in_dim=in_dim_ckpt, hidden=hidden, num_layers=num_layers)
-    before = {k: v.detach().clone() for k, v in head.state_dict().items()}
+    before_first = head.state_dict()["net.0.weight"].detach().clone()
     n = head.warm_start_from_lpb_bce_ckpt(ckpt_path)
     assert n >= 1
-    after = head.state_dict()
-    changed = sum(1 for k, v in before.items() if not torch.equal(v, after[k]))
-    assert changed >= 1
+    after_first = head.state_dict()["net.0.weight"]
+    # The first Linear must have been updated by warm-start.
+    assert not torch.equal(before_first, after_first), (
+        "warm_start did not change net.0.weight; the single-frame head is "
+        "supposed to load this layer verbatim from the lpb v2 ckpt."
+    )
+    # Exact match against the ckpt's stored weight.
+    ckpt_first = ckpt["bce_detector"]["head"]["net.0.weight"]
+    assert torch.allclose(after_first, ckpt_first.to(after_first.dtype), atol=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,16 +200,21 @@ def test_warm_start_copies_at_least_one_linear(tmp_path: Path) -> None:
 def test_score_shape_and_no_grad() -> None:
     cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=1)
     encoder = _FakeEncoder(context_dim=8)
-    disc = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=4, action_horizon=3
-    )
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=4)
     ctx = torch.randn(5, 8)
-    ach = torch.randn(5, 3, 4)
-    out = disc.score(context=ctx, action_chunk=ach)
+    out = disc.score(context=ctx)
     assert out.logit.shape == (5,)
     assert out.prob_failure.shape == (5,)
     assert out.decision.dtype == torch.bool
     assert not out.logit.requires_grad
+
+
+def test_featurize_rejects_wrong_context_dim() -> None:
+    cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=1)
+    encoder = _FakeEncoder(context_dim=8)
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
+    with pytest.raises(ValueError, match="context must be"):
+        disc.score(context=torch.randn(3, 7))
 
 
 # --------------------------------------------------------------------------- #
@@ -191,17 +226,14 @@ def test_update_reduces_loss_on_synthetic_batch() -> None:
     torch.manual_seed(0)
     cfg = DiscriminatorConfig(device="cpu", hidden=32, num_layers=2, lr=3e-3)
     encoder = _FakeEncoder(context_dim=8)
-    disc = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=2, action_horizon=2
-    )
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
 
     n_each = 32
     expert_ctx = torch.randn(n_each, 8) + 2.0
     policy_ctx = torch.randn(n_each, 8) - 2.0
     ctx = torch.cat([expert_ctx, policy_ctx], dim=0)
-    ach = torch.randn(2 * n_each, 2, 2)
     labels = torch.cat([torch.ones(n_each), torch.zeros(n_each)], dim=0)
-    batch = DiscriminatorBatch(context=ctx, action_chunk=ach, label=labels)
+    batch = DiscriminatorBatch(context=ctx, label=labels)
 
     initial = disc.update(batch)["disc_loss"]
     for _ in range(60):
@@ -212,36 +244,59 @@ def test_update_reduces_loss_on_synthetic_batch() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 5. Intrinsic reward sign after training                                      #
+# 5. Intrinsic reward sign / formula                                           #
 # --------------------------------------------------------------------------- #
 
 
 def test_intrinsic_reward_sign() -> None:
-    """After training, label=1 (failure) ctx must produce a higher logit
-    than label=0 (non-failure / expert demo) ctx. The IQL boundary then
-    negates this so reward is high for non-failure behavior.
+    """`intrinsic_reward` = -sigmoid(failure_score - tau) ∈ (-1, 0).
+
+    Train with LPB-aligned targets (1 = expert). Failure-like ctx should
+    receive a lower (more negative) reward than expert-like ctx.
     """
     torch.manual_seed(0)
     cfg = DiscriminatorConfig(device="cpu", hidden=32, num_layers=2, lr=3e-3)
     encoder = _FakeEncoder(context_dim=8)
-    disc = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=2, action_horizon=2
-    )
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
 
     n_each = 32
-    failure_ctx = torch.randn(n_each, 8) + 2.0          # label=1
-    non_failure_ctx = torch.randn(n_each, 8) - 2.0      # label=0
-    ctx = torch.cat([failure_ctx, non_failure_ctx], dim=0)
-    ach = torch.randn(2 * n_each, 2, 2)
-    labels = torch.cat([torch.ones(n_each), torch.zeros(n_each)], dim=0)
-    batch = DiscriminatorBatch(context=ctx, action_chunk=ach, label=labels)
+    expert_ctx = torch.randn(n_each, 8) + 2.0           # expert target 1
+    failure_ctx = torch.randn(n_each, 8) - 2.0          # expert target 0
+    ctx = torch.cat([expert_ctx, failure_ctx], dim=0)
+    # Replay-style labels: 1 = failure (maps to expert_target = 0).
+    labels = torch.cat([torch.zeros(n_each), torch.ones(n_each)], dim=0)
+    batch = DiscriminatorBatch(context=ctx, label=labels)
     for _ in range(80):
         disc.update(batch)
 
-    r_failure = disc.intrinsic_reward(context=failure_ctx, action_chunk=ach[:n_each])
-    r_non_failure = disc.intrinsic_reward(context=non_failure_ctx, action_chunk=ach[n_each:])
-    assert r_failure.mean().item() > r_non_failure.mean().item()
+    r_failure = disc.intrinsic_reward(context=failure_ctx)
+    r_non_failure = disc.intrinsic_reward(context=expert_ctx)
     assert r_failure.shape == (n_each,)
+    assert r_failure.min().item() >= -1.0 and r_failure.max().item() <= 0.0
+    assert r_non_failure.min().item() >= -1.0 and r_non_failure.max().item() <= 0.0
+    assert r_failure.mean().item() < r_non_failure.mean().item()
+
+
+def test_intrinsic_reward_formula_matches_sigmoid_threshold() -> None:
+    """`intrinsic_reward(ctx)` must equal `-sigmoid(failure_score - tau)` with
+    ``failure_score = -head(ctx)``.
+    """
+    torch.manual_seed(7)
+    cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=2)
+    encoder = _FakeEncoder(context_dim=4)
+    disc = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=4, action_dim=2)
+    disc.threshold = 0.75
+
+    ctx = torch.randn(6, 4)
+    r = disc.intrinsic_reward(context=ctx)
+
+    with torch.no_grad():
+        head_in = disc._featurize(ctx)
+        expert_logit = disc.head(head_in)
+        failure_score = -expert_logit
+        expected = -torch.sigmoid(failure_score - 0.75)
+    assert torch.allclose(r, expected, atol=1e-6)
+    assert r.shape == (6,)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,27 +308,21 @@ def test_state_dict_roundtrip() -> None:
     torch.manual_seed(0)
     cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=1, lr=1e-3)
     encoder = _FakeEncoder(context_dim=8)
-    a = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=2, action_horizon=2
-    )
+    a = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
     n_each = 4
     ctx = torch.cat([torch.randn(n_each, 8) + 1.0, torch.randn(n_each, 8) - 1.0], dim=0)
-    ach = torch.randn(2 * n_each, 2, 2)
     labels = torch.cat([torch.ones(n_each), torch.zeros(n_each)], dim=0)
     for _ in range(5):
-        a.update(DiscriminatorBatch(context=ctx, action_chunk=ach, label=labels))
+        a.update(DiscriminatorBatch(context=ctx, label=labels))
 
     sd = a.state_dict()
 
-    b = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=2, action_horizon=2
-    )
+    b = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
     b.load_state_dict(sd, strict=True)
 
     fixed_ctx = torch.randn(3, 8)
-    fixed_ach = torch.randn(3, 2, 2)
-    out_a = a.score(context=fixed_ctx, action_chunk=fixed_ach).logit
-    out_b = b.score(context=fixed_ctx, action_chunk=fixed_ach).logit
+    out_a = a.score(context=fixed_ctx).logit
+    out_b = b.score(context=fixed_ctx).logit
     assert torch.allclose(out_a, out_b, atol=1e-6)
     assert b._step == a._step
     assert b.threshold == pytest.approx(a.threshold)
@@ -282,15 +331,25 @@ def test_state_dict_roundtrip() -> None:
 def test_state_dict_dim_mismatch_raises() -> None:
     cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=1)
     encoder = _FakeEncoder(context_dim=8)
-    a = OnlineBCEDiscriminator(
-        cfg, encoder=encoder, context_dim=8, action_dim=2, action_horizon=2
-    )
+    a = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
     sd = a.state_dict()
     b = OnlineBCEDiscriminator(
-        cfg, encoder=_FakeEncoder(9), context_dim=9, action_dim=2, action_horizon=2
+        cfg, encoder=_FakeEncoder(9), context_dim=9, action_dim=2
     )
     with pytest.raises(ValueError, match="context_dim"):
         b.load_state_dict(sd, strict=True)
+
+
+def test_state_dict_ignores_legacy_action_horizon() -> None:
+    """Older checkpoints carried `action_horizon`; the single-frame
+    discriminator just ignores it on load (no hard-assert)."""
+    cfg = DiscriminatorConfig(device="cpu", hidden=16, num_layers=1)
+    encoder = _FakeEncoder(context_dim=8)
+    a = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
+    sd = a.state_dict()
+    sd["action_horizon"] = 4  # legacy field
+    b = OnlineBCEDiscriminator(cfg, encoder=encoder, context_dim=8, action_dim=2)
+    b.load_state_dict(sd, strict=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -303,15 +362,12 @@ def test_bce_loss_with_smoothing() -> None:
     labels = torch.tensor([1.0, 0.0])
     plain = bce_with_logits_loss(logits, labels, label_smoothing=0.0).item()
     smoothed = bce_with_logits_loss(logits, labels, label_smoothing=0.1).item()
-    # Smoothing leaves the symmetric-zero-logit loss unchanged in mean
-    # (both halves of label values share the same logit), so compare to
-    # the analytical value -log(0.5) ≈ 0.6931 instead.
     assert plain == pytest.approx(0.6931471, abs=1e-4)
     assert smoothed == pytest.approx(0.6931471, abs=1e-4)
 
 
 # --------------------------------------------------------------------------- #
-# 8. Replay buffer balance                                                     #
+# 8. Replay buffer balance (per-frame)                                         #
 # --------------------------------------------------------------------------- #
 
 
@@ -325,10 +381,10 @@ def test_replay_buffer_balance() -> None:
     base = _FakeBaseBuffer(
         camera_names=["frontview_image"], image_size=image_size, action_horizon=H
     )
-    # 40 transitions, alternating 4-step blocks of intervention / not.
+    # 40 transitions: alternating per-frame intervention so the buffer has
+    # exactly 20 failure and 20 non-failure frames.
     for i in range(40):
-        block = i // H
-        is_intv = (block % 2 == 0)
+        is_intv = (i % 2 == 0)
         base.add(_make_transition(
             proprio_dim=proprio_dim, image_size=image_size, action_dim=action_dim,
             is_intervention=is_intv, episode_index=0, episode_step=i,
@@ -338,15 +394,12 @@ def test_replay_buffer_balance() -> None:
         device="cpu", batch_size=8, balance_ratio=1.0, hidden=8, num_layers=1
     )
     encoder = _FakeEncoder(context_dim=6)
-    rb = DiscriminatorReplayBuffer(
-        cfg, base, encoder=encoder, action_horizon=H
-    )
+    rb = DiscriminatorReplayBuffer(cfg, base, encoder=encoder)
     assert rb.ready(8)
     batch = rb.sample(8, device="cpu")
     assert batch.context.shape == (8, encoder.context_dim)
-    assert batch.action_chunk.shape == (8, H, action_dim)
     assert batch.label.shape == (8,)
-    # Intervention chunks → label=1 (failure); non-intervention → label=0.
+    # Per-frame label: half from failure pool, half from non-failure pool.
     n_failure = int((batch.label > 0.5).sum().item())
     n_non_failure = int((batch.label < 0.5).sum().item())
     assert n_failure == 4
@@ -364,4 +417,4 @@ def test_replay_buffer_balance() -> None:
     ]
     pre_non_failure = rb.num_non_failure
     rb.bootstrap_from_demos(demos)
-    assert rb.num_non_failure >= pre_non_failure + 1
+    assert rb.num_non_failure == pre_non_failure + H

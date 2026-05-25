@@ -23,16 +23,24 @@ class _FakeEncoder:
 
     def __init__(self, context_dim: int) -> None:
         self.context_dim = int(context_dim)
+        self.device = "cpu"
         self.bind_calls: list[list[str]] = []
+        self.last_action_real: torch.Tensor | None = None
 
     def bind_policy_cameras(self, cams: Sequence[str]) -> None:
         self.bind_calls.append(list(cams))
 
     @torch.no_grad()
     def encode(
-        self, *, image_obs_raw: torch.Tensor, proprio_raw: torch.Tensor
+        self,
+        *,
+        image_obs_raw: torch.Tensor,
+        proprio_raw: torch.Tensor,
+        action_real: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B = int(image_obs_raw.shape[0])
+        if action_real is not None:
+            self.last_action_real = action_real.detach().clone()
         return torch.zeros(B, self.context_dim)
 
 
@@ -60,7 +68,7 @@ class _FakeDisc:
         self.logit_values = logit_values
 
     @torch.no_grad()
-    def score(self, *, context: torch.Tensor, action_chunk: torch.Tensor):
+    def score(self, *, context: torch.Tensor):
         B = int(context.shape[0])
         if isinstance(self.logit_values, torch.Tensor):
             assert self.logit_values.shape == (B,), (

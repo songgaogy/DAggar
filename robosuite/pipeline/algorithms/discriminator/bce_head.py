@@ -7,18 +7,38 @@ stays untouched.
 
 `warm_start_from_lpb_bce_ckpt` copies weights from a pre-fitted ckpt
 (e.g. `checkpoints/lpb_v2/bce_viz_robosuite/<run>/checkpoints/bce_head.pth`).
-Only shape-matching tensors are copied; in particular the first Linear
-is re-initialized because this head's in_dim is `D_ctx + H * D_a`
-(action-conditioned) whereas the frozen lpb_v2 head was `D_ctx` only.
+With the single-frame head (`in_dim = D_ctx`) every layer — including the
+first Linear `(hidden, D_ctx)` — should match the ckpt shape and load
+verbatim; the warm-start call hard-asserts that the first Linear was
+loaded so we don't silently fall back to a random projection.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 import torch
 from torch import nn
+
+
+def read_lpb_bce_head_hparams(ckpt_path: str | Path) -> dict[str, int]:
+    """Read ``in_dim``, ``hidden``, ``num_layers`` from a lpb v2 ``bce_head.pth``."""
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(f"BCE checkpoint not found: {path}")
+    state: dict[str, Any] = torch.load(str(path), map_location="cpu", weights_only=False)
+    bce_detector = state.get("bce_detector", None)
+    in_dim = int(state.get("in_dim", 0) or 0)
+    hidden = int(state.get("hidden", 256) or 256)
+    num_layers = int(state.get("num_layers", 2) or 2)
+    if isinstance(bce_detector, dict):
+        in_dim = int(bce_detector.get("in_dim", in_dim) or in_dim)
+        hidden = int(bce_detector.get("hidden", hidden) or hidden)
+        num_layers = int(bce_detector.get("num_layers", num_layers) or num_layers)
+    if in_dim <= 0:
+        raise ValueError(f"BCE checkpoint {path} has invalid in_dim={in_dim}")
+    return {"in_dim": in_dim, "hidden": hidden, "num_layers": num_layers}
 
 
 class TrainableBCEHead(nn.Module):
@@ -108,6 +128,24 @@ class TrainableBCEHead(nn.Module):
                 "warm_start_from_lpb_bce_ckpt: no shape-compatible tensors "
                 "found between ckpt head and TrainableBCEHead. Ckpt keys: "
                 f"{list(head_state.keys())}; head keys: {list(own.keys())}."
+            )
+        # Hard-assert: the first Linear (`net.0.weight`) MUST be in the
+        # compatible set. The whole point of the single-frame head redesign
+        # is to make this layer loadable from the lpb v2 ckpt; if it is
+        # missing here, the head shape (in_dim) is not aligned with the
+        # ckpt and we'd silently keep a Kaiming-random projection.
+        first_layer_key = "net.0.weight"
+        if first_layer_key in own and first_layer_key not in compatible:
+            ckpt_shape = (
+                tuple(head_state[first_layer_key].shape)
+                if isinstance(head_state.get(first_layer_key), torch.Tensor)
+                else None
+            )
+            raise RuntimeError(
+                f"warm_start_from_lpb_bce_ckpt: first Linear '{first_layer_key}' "
+                f"shape mismatch (head expects {tuple(own[first_layer_key].shape)}, "
+                f"ckpt has {ckpt_shape}). The single-frame head requires "
+                "in_dim == ckpt['in_dim'] (== encoder.context_dim)."
             )
         missing, unexpected = self.load_state_dict({**own, **compatible}, strict=False)
         # The above call replaced every key in own_keys_before, so count

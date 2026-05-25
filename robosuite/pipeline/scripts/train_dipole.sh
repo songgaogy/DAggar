@@ -53,6 +53,7 @@ case "${DIPOLE_MODE}" in
     INTERVENTION_ENABLED="${INTERVENTION_ENABLED:-false}"
     ASYNC_UPDATES="${ASYNC_UPDATES:-false}"
     VISUALIZE_GRIPPER_MARKERS="${VISUALIZE_GRIPPER_MARKERS:-false}"
+    LOGGING_USE_TENSORBOARD="${LOGGING_USE_TENSORBOARD:-false}"
     LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
     VIEWER_ASYNC="${VIEWER_ASYNC:-false}"
     VIEWER_BACKEND="${VIEWER_BACKEND:-mjviewer}"
@@ -70,7 +71,8 @@ case "${DIPOLE_MODE}" in
     INTERVENTION_ENABLED="${INTERVENTION_ENABLED:-true}"
     ASYNC_UPDATES="${ASYNC_UPDATES:-true}"
     VISUALIZE_GRIPPER_MARKERS="${VISUALIZE_GRIPPER_MARKERS:-true}"
-    LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-true}"
+    LOGGING_USE_TENSORBOARD="${LOGGING_USE_TENSORBOARD:-true}"
+    LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
     VIEWER_ASYNC="${VIEWER_ASYNC:-true}"
     VIEWER_BACKEND="${VIEWER_BACKEND:-mjviewer}"
     RENDER_FPS="${RENDER_FPS:-10}"
@@ -96,8 +98,6 @@ EXTRA_ARGS=("$@")
 export ROOT_DIR
 export PYTHONFAULTHANDLER=1
 export HYDRA_FULL_ERROR=1
-export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_ENTITY="${WANDB_ENTITY:-songgao-personal}"
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   export CUDA_VISIBLE_DEVICES
 fi
@@ -187,6 +187,7 @@ TRAIN_DIPOLE_CMD=(
   algorithm.dipole.polarity_embedding_init_scale="${POLARITY_INIT_SCALE}" \
   algorithm.dipole.lpb_detector.ckpt_path="${LPB_CKPT}" \
   algorithm.dipole.lpb_detector.camera_to_view="${LPB_CAMERA_TO_VIEW}" \
+  logging.use_tensorboard="${LOGGING_USE_TENSORBOARD}" \
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.log_interval="${LOG_INTERVAL}" \
   logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \

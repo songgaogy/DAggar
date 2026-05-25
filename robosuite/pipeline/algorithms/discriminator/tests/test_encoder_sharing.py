@@ -87,7 +87,6 @@ def test_encoder_id_shared_across_modules(bce_ckpt: str) -> None:
         encoder=enc,
         context_dim=enc.context_dim,
         action_dim=action_dim,
-        action_horizon=iql_cfg.action_horizon,
     )
 
     adv = AdvantageGProvider(
@@ -141,7 +140,6 @@ def test_memory_overhead_under_threshold(bce_ckpt: str) -> None:
         encoder=enc,
         context_dim=enc.context_dim,
         action_dim=action_dim,
-        action_horizon=iql_cfg.action_horizon,
     )
     adv = AdvantageGProvider(
         iql_learner=iql, discriminator=disc, encoder=enc,

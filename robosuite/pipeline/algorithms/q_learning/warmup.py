@@ -36,9 +36,9 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-from robosuite.pipeline.algorithms.discriminator.online_bce import (
-    DiscriminatorConfig,
-    OnlineBCEDiscriminator,
+from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
+    LPBV2OfflineScorer,
+    annotate_transitions_lpb_by_demo,
 )
 from robosuite.pipeline.algorithms.flow_dagger.common import (
     FlowAugmentationConfig,
@@ -140,6 +140,16 @@ def _annotate_episode_metadata(
     return current_index
 
 
+def _tag_transitions_with_hdf5_path(
+    transitions: list[Any], hdf5_path: Path
+) -> None:
+    resolved = str(hdf5_path.resolve())
+    for trans in transitions:
+        info = dict(trans.info or {})
+        info["source_hdf5_path"] = resolved
+        trans.info = info
+
+
 def _load_split_into_buffer(
     *,
     buffer: FlowDaggerReplayBuffer,
@@ -150,6 +160,8 @@ def _load_split_into_buffer(
     cache_dir: Path,
     episode_index_base: int,
     max_num_trajectories: int | None,
+    lpb_scorer: LPBV2OfflineScorer | None,
+    control_freq: int,
 ) -> tuple[int, int]:
     """Load one split's HDF5 demos into `buffer`. Returns (n_transitions_added,
     new_episode_index_base)."""
@@ -157,24 +169,54 @@ def _load_split_into_buffer(
     if not demo_paths:
         print(f"[warmup] split='{split}' resolved to zero demo paths under {data_root}/{task_name}/{split} — skipping.")
         return 0, episode_index_base
-    transitions = load_demo_paths(
-        demo_paths,
-        cache_dir=cache_dir,
-        mirror_cache_dir=None,
-        hdf5_loader=hdf5_loader,
-        max_num_trajectories=max_num_trajectories,
-        cache_key=f"iql_warmup_{split}",
+
+    total_transitions = 0
+    next_base = episode_index_base
+    remaining = max_num_trajectories
+    for raw_path in demo_paths:
+        if remaining is not None and remaining <= 0:
+            break
+        cap = remaining
+        path_transitions = load_demo_paths(
+            [raw_path],
+            cache_dir=cache_dir,
+            mirror_cache_dir=None,
+            hdf5_loader=hdf5_loader,
+            max_num_trajectories=cap,
+            cache_key=f"iql_warmup_{split}",
+        )
+        if not path_transitions:
+            continue
+        _tag_transitions_with_hdf5_path(path_transitions, Path(raw_path))
+        if lpb_scorer is not None:
+            n_demos = annotate_transitions_lpb_by_demo(
+                path_transitions,
+                lpb_scorer,
+                fps=int(control_freq),
+            )
+            print(
+                f"[warmup][lpb] scored {n_demos} demos in {Path(raw_path).name} "
+                f"tau={lpb_scorer.tau:.6f}"
+            )
+        next_base = _annotate_episode_metadata(
+            path_transitions,
+            buffer_role="offline",
+            demo_source=f"{task_name}/{split}",
+            episode_index_base=next_base,
+        )
+        for trans in path_transitions:
+            buffer.add(trans)
+        if remaining is not None:
+            remaining -= sum(1 for t in path_transitions if bool(t.done))
+        total_transitions += len(path_transitions)
+
+    if total_transitions == 0:
+        return 0, episode_index_base
+    print(
+        f"[warmup] split='{split}' loaded {total_transitions} transitions "
+        f"({next_base - episode_index_base} episodes)"
     )
-    next_base = _annotate_episode_metadata(
-        transitions,
-        buffer_role="offline",
-        demo_source=f"{task_name}/{split}",
-        episode_index_base=episode_index_base,
-    )
-    for trans in transitions:
-        buffer.add(trans)
-    print(f"[warmup] split='{split}' loaded {len(transitions)} transitions ({next_base - episode_index_base} episodes)")
-    return len(transitions), next_base
+    return total_transitions, next_base
 
 
 def _resolve_policy_action_dim(init_payload: dict[str, Any] | None, env) -> int:
@@ -249,6 +291,9 @@ def main(cfg: DictConfig) -> None:
         renderer=str(cfg.env.renderer),
     )
     print(f"[warmup] building env env={task_name} cameras={policy_camera_names}")
+    lpb_scorer: LPBV2OfflineScorer | None = None
+    disc_cfg_dict: dict[str, Any] = {}
+
     env = build_robosuite_env(main_runtime_cfg)
     try:
         env.reset()
@@ -278,10 +323,10 @@ def main(cfg: DictConfig) -> None:
         )
         encoder.bind_policy_cameras(policy_camera_names)
 
-        # Build buffer with action_horizon matching IQL config.
         iql_cfg_dict = OmegaConf.to_container(q_cfg_block.config, resolve=True)
         iql_cfg_dict["device"] = device
         iql_cfg = IQLConfig(**iql_cfg_dict)
+
         capacity = int(getattr(cfg.runtime, "demo_buffer_capacity", 200_000))
         buffer = FlowDaggerReplayBuffer(
             config=ReplayBufferConfig(capacity=capacity, batch_size=batch_size),
@@ -314,6 +359,28 @@ def main(cfg: DictConfig) -> None:
             f"[warmup] demo_splits={demo_splits} caps={split_caps} "
             f"task={task_data_name} root={data_root}"
         )
+
+        disc_cfg_dict = OmegaConf.to_container(
+            cfg.algorithm.discriminator.config, resolve=True
+        )
+        if "warm_start_ckpt" in disc_cfg_dict and disc_cfg_dict["warm_start_ckpt"]:
+            disc_cfg_dict["warm_start_ckpt"] = to_absolute_path(
+                str(disc_cfg_dict["warm_start_ckpt"])
+            )
+        if float(iql_cfg.disc_reward_coef) != 0.0:
+            meta_json = disc_cfg_dict.get("meta_json_path")
+            lpb_scorer = LPBV2OfflineScorer(
+                bce_ckpt_path=bce_ckpt,
+                task_name=str(task_data_name),
+                device=str(device),
+                batch_size=32,
+                meta_json_path=(
+                    str(Path(to_absolute_path(str(meta_json))).resolve())
+                    if meta_json
+                    else None
+                ),
+            )
+
         print("[warmup] start loading splits... it may takes a few minutes...")
         episode_index_base = 0
         total_loaded = 0
@@ -327,6 +394,8 @@ def main(cfg: DictConfig) -> None:
                 cache_dir=cache_dir,
                 episode_index_base=episode_index_base,
                 max_num_trajectories=split_caps[split],
+                lpb_scorer=lpb_scorer,
+                control_freq=int(cfg.env.control_freq),
             )
             total_loaded += n_loaded
         if total_loaded == 0:
@@ -348,49 +417,21 @@ def main(cfg: DictConfig) -> None:
             f"to fill batch_size={batch_size}."
         )
 
-    # Build a FROZEN OnlineBCEDiscriminator so the warmup reward composition
-    # (r_total = r_env + disc_reward_coef * r_disc) matches the online phase.
-    # The head is warm-started from `algorithm.discriminator.warm_start_ckpt`
-    # via DiscriminatorConfig.warm_start_ckpt, kept in eval mode, with all
-    # parameters frozen. We NEVER call `disc.update()` here — only
-    # `intrinsic_reward(...)` under no_grad inside the replay sampler.
-    disc_cfg_dict = OmegaConf.to_container(
-        cfg.algorithm.discriminator.config, resolve=True
-    )
-    if "warm_start_ckpt" in disc_cfg_dict and disc_cfg_dict["warm_start_ckpt"]:
-        disc_cfg_dict["warm_start_ckpt"] = to_absolute_path(
-            str(disc_cfg_dict["warm_start_ckpt"])
-        )
-    disc_cfg = DiscriminatorConfig(**disc_cfg_dict)
-    if not (str(disc_cfg.device) == str(iql_cfg.device) == str(encoder.device)):
-        raise RuntimeError(
-            "IQL warmup device mismatch: "
-            f"disc_cfg.device={disc_cfg.device} iql_cfg.device={iql_cfg.device} "
-            f"encoder.device={encoder.device}"
-        )
-    discriminator = OnlineBCEDiscriminator(
-        cfg=disc_cfg,
-        encoder=encoder,
-        context_dim=int(encoder.context_dim),
-        action_dim=int(policy_action_dim),
-        action_horizon=int(iql_cfg.action_horizon),
-    )
-    for p in discriminator.head.parameters():
-        p.requires_grad_(False)
-    discriminator.head.eval()
+    lpb_tau = float(lpb_scorer.tau) if lpb_scorer is not None else None
+    lpb_tau_source = str(lpb_scorer.tau_source) if lpb_scorer is not None else None
     print(
-        f"[warmup] frozen disc ready ({type(discriminator).__name__}); "
-        f"warm_start={disc_cfg.warm_start_ckpt} "
-        f"disc_reward_coef={float(iql_cfg.disc_reward_coef)}"
+        f"[warmup] disc_reward: LPB benchmark scores on transition.info "
+        f"(coef={float(iql_cfg.disc_reward_coef)} "
+        f"tau={lpb_tau} source={lpb_tau_source})"
     )
 
-    # Warmup loops.
+    # Warmup loops (r_disc from pre-annotated LPB fields; no OnlineBCEDiscriminator).
     print(f"[warmup] starting value-only loop for {value_steps} steps (batch={batch_size})")
     for step in range(value_steps):
         batch = replay.sample_step_batch(
             batch_size,
             encoder=encoder,
-            discriminator=discriminator,
+            discriminator=None,
             device=device,
         )
         metrics = iql.warmup_value_only(batch)
@@ -406,7 +447,7 @@ def main(cfg: DictConfig) -> None:
         batch = replay.sample_step_batch(
             batch_size,
             encoder=encoder,
-            discriminator=discriminator,
+            discriminator=None,
             device=device,
         )
         metrics = iql.update(batch)
@@ -429,8 +470,12 @@ def main(cfg: DictConfig) -> None:
             "task": task_data_name,
             "task_env": task_name,
             "policy_action_dim": int(policy_action_dim),
-            "disc_warm_start_ckpt": str(disc_cfg.warm_start_ckpt or ""),
+            "disc_warm_start_ckpt": str(bce_ckpt),
+            "meta_json_path": str(disc_cfg_dict.get("meta_json_path", "")),
+            "bce_youden_threshold": float(lpb_tau) if lpb_tau is not None else float("nan"),
+            "bce_threshold_source": str(lpb_tau_source or ""),
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
+            "disc_reward_source": "LPBV2OfflineScorer(-sigmoid(failure_score - tau))",
         },
         "schema_version": 1,
     }
