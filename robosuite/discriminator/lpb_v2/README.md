@@ -60,7 +60,7 @@ lpb_v2/
 In this workspace the expected Python environment is:
 
 ```bash
-/home/dodo/miniconda3/envs/dagger/bin/python
+/home/dodo/miniconda3/envs/daggar/bin/python
 ```
 
 Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through WandB, use:
@@ -467,7 +467,7 @@ from robosuite.discriminator.lpb_v2.detectors import (
 BCE unit tests:
 
 ```bash
-/home/dodo/miniconda3/envs/dagger/bin/python -m pytest \
+/home/dodo/miniconda3/envs/daggar/bin/python -m pytest \
   robosuite/discriminator/lpb_v2/tests/test_bce_discriminator.py -v
 ```
 

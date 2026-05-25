@@ -50,10 +50,9 @@ def instantiate_local(node: Any, **kwargs):
     return hydra.utils.instantiate(_retarget(node), **kwargs)
 
 
-def load_ckpt(snapshot_path: Path, device: torch.device | None = None):
-    _ = device  # weights are moved to the target device after load (see load_model).
+def load_ckpt(snapshot_path: Path, device: torch.device):
     with snapshot_path.open("rb") as f:
-        return torch.load(f, map_location="cpu")
+        return torch.load(f, map_location=device)
 
 
 def _get_view_names(train_cfg: DictConfig):

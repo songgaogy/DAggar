@@ -29,15 +29,6 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-
-def _resolve_torch_device(device: str) -> torch.device:
-    normalized = str(device).strip()
-    if normalized.startswith("cuda") and not torch.cuda.is_available():
-        return torch.device("cpu")
-    if normalized == "cuda":
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    return torch.device(normalized)
-
 from robosuite.discriminator.lpb_v2.core.model_loader import load_model
 from robosuite.discriminator.lpb_v2.utils.normalizer import LinearNormalizer
 
@@ -129,7 +120,7 @@ class LPBV2Encoder:
         feature_source: str = "encoder",
         transformer_layer: int = -1,
     ) -> None:
-        self.device = _resolve_torch_device(device)
+        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
         feature_source = str(feature_source)
         if feature_source not in {"encoder", "transformer"}:
             raise ValueError(f"feature_source must be 'encoder' or 'transformer', got {feature_source!r}")
@@ -206,7 +197,7 @@ class LPBV2Encoder:
 
         normalizer = LinearNormalizer()
         if norm_path is not None:
-            normalizer.load_state_dict(torch.load(norm_path, map_location="cpu"))
+            normalizer.load_state_dict(torch.load(norm_path, map_location=self.device))
         else:
             # Fallback: rebuild the normalizer from the training dataset config.
             # This is deterministic for the same dataset and matches the original training code.
@@ -444,7 +435,7 @@ class LPBV2KNN:
         self.action_weight = float(action_weight)
         self.delta = float(delta)
         self.chunk_size = int(chunk_size)
-        self.device = _resolve_torch_device(device)
+        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
 
         self.bank: Optional[torch.Tensor] = None
         self.threshold: Optional[float] = None
