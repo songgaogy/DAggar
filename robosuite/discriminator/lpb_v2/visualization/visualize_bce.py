@@ -19,6 +19,11 @@ Two entry kinds (``--kind``):
     field/slice and action slice; bank pool drawn from the same FAIL_ROOT,
     filtered by video_id against the eval set.
 
+Use ``--split`` to choose which eval trajectories are rendered:
+
+  * ``fail_rollout``    - sample from ``--fail-root`` (default)
+  * ``success_rollout`` - sample from ``--success-root`` (``is_failure=False``)
+
 Outputs:
     <out_dir>/videos/<video_id>.mp4
     <out_dir>/<pdf-name>.pdf
@@ -360,7 +365,13 @@ class BCEVisualizer:
     # PDF                                                                #
     # ------------------------------------------------------------------ #
 
-    def render_pdf(self, vizs: List[PerTrajectoryViz], out_path: str) -> None:
+    def render_pdf(
+        self,
+        vizs: List[PerTrajectoryViz],
+        out_path: str,
+        *,
+        split: str = "fail_rollout",
+    ) -> None:
         if not vizs:
             raise RuntimeError("No trajectories to plot.")
         task = vizs[0].task_name
@@ -419,7 +430,7 @@ class BCEVisualizer:
                 f"  calib_score_mean = {_g(per_task, 'calib_score_mean')}  "
                 f"calib_score_std  = {_g(per_task, 'calib_score_std')}",
                 "",
-                f"Sampled failure trajectories: {len(vizs)}",
+                f"Sampled {split} trajectories: {len(vizs)}",
                 "",
                 "Trigger rule: flag when bce_failure_score = -head_logit(z) >= tau.",
             ]
@@ -499,18 +510,19 @@ class BCEVisualizer:
 
     def visualize(
         self,
-        fail_trajectories: List[BenchmarkTrajectory],
+        trajectories: List[BenchmarkTrajectory],
         *,
         out_dir: str,
         pdf_name: str,
+        split: str = "fail_rollout",
     ) -> dict:
-        if not fail_trajectories:
-            raise RuntimeError("No failure trajectories provided for visualization.")
+        if not trajectories:
+            raise RuntimeError("No trajectories provided for visualization.")
         videos_dir = os.path.join(out_dir, "videos")
         os.makedirs(videos_dir, exist_ok=True)
         vizs: List[PerTrajectoryViz] = []
         video_paths: List[str] = []
-        for traj in fail_trajectories:
+        for traj in trajectories:
             viz = self._score_trajectory(traj)
             video_path = os.path.join(videos_dir, f"{_safe_id(traj.video_id)}.mp4")
             self.render_video(traj, viz, video_path)
@@ -542,9 +554,46 @@ class BCEVisualizer:
             video_paths.append(video_path)
 
         pdf_path = os.path.join(out_dir, pdf_name)
-        self.render_pdf(vizs, pdf_path)
+        self.render_pdf(vizs, pdf_path, split=split)
         print(f"[bce][viz] wrote PDF -> {pdf_path}", flush=True)
         return {"videos": video_paths, "pdf": pdf_path}
+
+
+# ---------------------------------------------------------------------- #
+# Eval-trajectory sampling for visualization                               #
+# ---------------------------------------------------------------------- #
+
+
+def _sample_trajectories_for_viz(
+    trajs: Sequence[BenchmarkTrajectory],
+    *,
+    task: str,
+    split: str,
+    num_trajs: int,
+    seed: int,
+) -> List[BenchmarkTrajectory]:
+    """Sample trajectories from the eval benchmark for MP4/PDF rendering."""
+    if split == "success_rollout":
+        pool = [t for t in trajs if not bool(t.is_failure) and str(t.task_name) == str(task)]
+        kind = "success"
+    elif split == "fail_rollout":
+        pool = [t for t in trajs if bool(t.is_failure) and str(t.task_name) == str(task)]
+        kind = "failure"
+    else:
+        raise ValueError(f"unknown split {split!r}; expected success_rollout or fail_rollout")
+
+    if not pool:
+        raise RuntimeError(
+            f"No {kind} trajectories in eval set for task {task!r} (split={split!r})."
+        )
+    rng = random.Random(int(seed))
+    n = min(int(num_trajs), len(pool))
+    sampled = rng.sample(pool, n)
+    print(
+        f"[bce][viz] sampled {n}/{len(pool)} {split} trajectories from {task}",
+        flush=True,
+    )
+    return sampled
 
 
 # ---------------------------------------------------------------------- #
@@ -764,6 +813,14 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", required=True, choices=["robosuite", "realworld"])
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="fail_rollout",
+        choices=["success_rollout", "fail_rollout"],
+        help="Eval split to visualize: fail_rollout (--fail-root) or "
+             "success_rollout (--success-root).",
+    )
     parser.add_argument("--model-ckpt", required=True, help="LPB v2 dynamics checkpoint .pth")
     parser.add_argument("--fail-root", required=True)
     parser.add_argument("--success-root", required=True)
@@ -836,15 +893,13 @@ def main() -> None:
         raise SystemExit("--fail-train-root is required when --kind robosuite")
 
     bench, trajs, fail_bank_trajs = _build_benchmark_and_bank(args)
-
-    fail_trajs = [t for t in trajs if bool(t.is_failure) and str(t.task_name) == str(args.task)]
-    if not fail_trajs:
-        raise RuntimeError(f"No failure trajectories in eval set for task {args.task!r}.")
-
-    rng = random.Random(int(args.seed))
-    n = min(int(args.num_trajs), len(fail_trajs))
-    sampled = rng.sample(fail_trajs, n)
-    print(f"[bce][viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}", flush=True)
+    sampled = _sample_trajectories_for_viz(
+        trajs,
+        task=str(args.task),
+        split=str(args.split),
+        num_trajs=int(args.num_trajs),
+        seed=int(args.seed),
+    )
 
     save_ckpt_dir = args.save_ckpt_dir or os.path.join(str(args.out_dir), "checkpoints")
     max_eo_ratio = (
@@ -947,6 +1002,7 @@ def main() -> None:
             sampled,
             out_dir=str(args.out_dir),
             pdf_name=str(args.pdf_name),
+            split=str(args.split),
         )
         print(
             f"[bce][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",

@@ -31,8 +31,9 @@ METADATA_CACHE_ROOT="${METADATA_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
 CACHE_CAMERA_NAMES="${CACHE_CAMERA_NAMES:-agentview birdview frontview}"
 
 # -------------------------------------------------
-TASK="${TASK:-PickPlaceCereal}"
-NUM_TRAJS="${NUM_TRAJS:-3}"
+TASK="PickPlaceMilk"
+SPLIT="success_rollout"     # success_rollout or fail_rollout
+NUM_TRAJS=3
 SEED="${SEED:-0}"
 FPS="${FPS:-20}"
 BORDER_THICKNESS="${BORDER_THICKNESS:-10}"
@@ -47,13 +48,11 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
 RUN_NAME="${RUN_NAME:-viz_bce_${TASK}}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_viz_robosuite/${RUN_NAME}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_viz_robosuite-${SPLIT}/${RUN_NAME}-${TIMESTAMP}}"
 PDF_NAME="${PDF_NAME:-bce_v2_scores.pdf}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
-
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
@@ -126,8 +125,9 @@ if [[ -n "${SAVE_CKPT_DIR:-}" ]]; then
     EXTRA_ARGS+=(--save-ckpt-dir "${SAVE_CKPT_DIR}")
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualization.visualize_bce \
+python -m robosuite.discriminator.lpb_v2.visualization.visualize_bce \
     --kind                  robosuite \
+    --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \
     --fail-root             "${FAIL_ROOT}" \
     --success-root          "${SUCCESS_ROOT}" \

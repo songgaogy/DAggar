@@ -25,8 +25,8 @@ SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/agilex}"
 CACHE_ROOT="${CACHE_ROOT:-${REPO_ROOT}/data/.agilex_train_cache}"
 
 # -------------------------------------------------
-TASK="${TASK:-candy_in_plate}"
-NUM_TRAJS="${NUM_TRAJS:-3}"
+TASK="candy_in_plate"
+NUM_TRAJS=3
 SEED="${SEED:-0}"
 FPS="${FPS:-20}"
 BORDER_THICKNESS="${BORDER_THICKNESS:-10}"
@@ -117,8 +117,11 @@ if [[ -n "${SAVE_CKPT_DIR:-}" ]]; then
     EXTRA_ARGS+=(--save-ckpt-dir "${SAVE_CKPT_DIR}")
 fi
 
+SPLIT="${SPLIT:-fail_rollout}"
+
 "${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualization.visualize_bce \
     --kind                  realworld \
+    --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \
     --fail-root             "${FAIL_ROOT}" \
     --success-root          "${SUCCESS_ROOT}" \
