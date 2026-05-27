@@ -23,15 +23,17 @@ cd "$ROOT_DIR"
 
 ENVIRONMENT="PickPlaceCereal"
 SEED=1
-SPLIT="success_rollout"    # success_rollout or fail_rollout
+SPLIT="fail_rollout"    # success_rollout or fail_rollout
+TARGET_PATH="iql_qv_cache-weight1_0"
 
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 LPB_CKPT_DIR="${LPB_CKPT_DIR:-${ROOT_DIR}/checkpoints/lpb_v2/bce_ckeckpoints/${ENVIRONMENT}}"
 LPB_CKPT="${LPB_CKPT:-${LPB_CKPT_DIR}/bce_head.pth}"
 LPB_META_JSON="${LPB_META_JSON:-${LPB_CKPT_DIR}/meta.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_rl/iql_qv_cache/${ENVIRONMENT}}"
-IQL_CKPT="${IQL_CKPT:-${OUTPUT_DIR}/iql_state.pt}"
+TARGET_DIR="${ROOT_DIR}/outputs/DIPOLE_rl/${TARGET_PATH}/${ENVIRONMENT}"
+IQL_CKPT="${TARGET_DIR}/iql_state.pt"
+OUTPUT_DIR="${ROOT_DIR}/outputs/DIPOLE_rl/${TARGET_PATH}-vis"
 DEVICE="${DEVICE:-cuda:0}"
 
 
@@ -59,26 +61,6 @@ if [[ ! -f "${LPB_META_JSON}" ]]; then
 fi
 LPB_TAU="$("${PY}" -c "import json, sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['bce_youden_threshold'])" "${LPB_META_JSON}")"
 
-if [[ "${DEVICE}" == cuda* ]]; then
-  if ! "${PY}" -c "import re, sys, torch; dev=sys.argv[1]; ok=torch.cuda.is_available(); m=re.fullmatch(r'cuda:(\\d+)', dev); ok = ok and (m is None or int(m.group(1)) < torch.cuda.device_count()); raise SystemExit(0 if ok else 1)" "${DEVICE}" 2>/dev/null; then
-    echo "[ERROR] DEVICE=${DEVICE} is not available to torch." >&2
-    exit 1
-  fi
-fi
-
-EXTRA_ARGS=(--device "${DEVICE}")
-if [[ "${NO_DISC_VIZ:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--no-disc-viz)
-fi
-if [[ -n "${DISC_VIZ_CAMERA:-}" ]]; then
-  EXTRA_ARGS+=(--disc-viz-camera "${DISC_VIZ_CAMERA}")
-fi
-if [[ -n "${DISC_VIZ_BORDER_THICKNESS:-}" ]]; then
-  EXTRA_ARGS+=(--disc-viz-border-thickness "${DISC_VIZ_BORDER_THICKNESS}")
-fi
-if [[ "${DISC_VIZ_NO_FLIP_VERTICAL:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--disc-viz-no-flip-vertical)
-fi
 
 echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seed=${SEED}"
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
@@ -88,9 +70,11 @@ echo "[vis_iql_qv] device=${DEVICE}"
 
 exec "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
   --iql-ckpt "${IQL_CKPT}" \
+  --output-root "${OUTPUT_DIR}" \
   --task-data-name "${DEMO_TASK_NAME}" \
   --disc-ckpt "${LPB_CKPT}" \
   --split "${SPLIT}" \
   --seed "${SEED}" \
+  --device "${DEVICE}" \
   "${EXTRA_ARGS[@]}" \
   "$@"

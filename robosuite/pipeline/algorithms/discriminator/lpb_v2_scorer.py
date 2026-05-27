@@ -20,8 +20,9 @@ Public surface:
   back to a recomputed Youden threshold and finally to the checkpoint
   detector threshold with a clear warning.
 - `score_hdf5_demo(hdf5_path, demo_key)`: per-frame failure_score `(T,)` via
-  `BCEBenchmarkDiscriminator.score_trajectory(...)` (uses RAW HDF5 images +
-  states + TRUE actions — the feature distribution the BCE head was trained on).
+  `BCEBenchmarkDiscriminator.score_trajectory(...)`. Success-rollout HDF5 demos
+  first resolve to the LPB preprocessed cache by action fingerprint so the score
+  matches `visualize_bce.py`; other demos use raw HDF5 images/states/actions.
 - `failure_score_to_margin_reward(scores)`: returns `tau - failure_score`
   (per user's `r_disc` convention: higher = more expert-like).
 - `annotate_transitions_with_lpb_scores(transitions, failure_scores, tau)`:
@@ -31,6 +32,7 @@ Public surface:
 
 from __future__ import annotations
 
+import hashlib
 import h5py
 import json
 from argparse import Namespace
@@ -66,6 +68,22 @@ DEFAULT_CACHE_CAMERA_NAMES = ("agentview", "birdview", "frontview")
 # Common ckpt layout: <root>/<task>/bce_head.pth lives next to a meta.json
 # that carries the operational Youden threshold ("bce_youden_threshold").
 META_JSON_FILENAME = "meta.json"
+
+
+def _action_fingerprint(actions: np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(actions, dtype=np.float32))
+    hasher = hashlib.sha1()
+    hasher.update(str(tuple(arr.shape)).encode("utf-8"))
+    hasher.update(arr.tobytes())
+    return hasher.hexdigest()
+
+
+def _cache_camera_names(num_views: int) -> tuple[str, ...]:
+    names = tuple(DEFAULT_CACHE_CAMERA_NAMES)
+    if len(names) >= int(num_views):
+        return names[: int(num_views)]
+    extra = tuple(f"view_{i}" for i in range(len(names), int(num_views)))
+    return names + extra
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +282,80 @@ class SafeRobosuiteBenchmarkTrajectory(RobosuiteBenchmarkTrajectory):
             return np.asarray(annotations["failure_segment_index"][:], dtype=np.int32)
 
 
+class TransitionBackedRobosuiteBenchmarkTrajectory(RobosuiteBenchmarkTrajectory):
+    """Benchmark trajectory backed by already preprocessed pipeline transitions."""
+
+    def __init__(
+        self,
+        *,
+        task_name: str,
+        transitions: Sequence[Transition],
+        camera_names: Sequence[str],
+        video_id: str,
+        fps: int,
+        is_failure: bool,
+        failure_segments: list[dict[str, Any]],
+        source_hdf5_path: str = "",
+        source_demo_key: str = "",
+        failure_mask: np.ndarray | None = None,
+    ) -> None:
+        if not transitions:
+            raise ValueError("TransitionBackedRobosuiteBenchmarkTrajectory requires transitions.")
+        self._transitions = list(transitions)
+        self._camera_names = tuple(str(name) for name in camera_names)
+        self._failure_mask = None if failure_mask is None else np.asarray(failure_mask, dtype=np.uint8)
+        super().__init__(
+            task_name=str(task_name),
+            num_frames=len(self._transitions),
+            is_failure=bool(is_failure),
+            video_id=str(video_id),
+            fps=int(fps),
+            available_cameras=self._camera_names,
+            failure_segments=list(failure_segments),
+            source_hdf5_path=str(source_hdf5_path),
+            source_demo_key=str(source_demo_key),
+            file_path="",
+            demo_path="",
+            cache_npz_path="",
+        )
+
+    def load_images(self, cameras: Sequence[str] | None = None) -> dict[str, np.ndarray]:
+        req = tuple(str(c) for c in (cameras if cameras is not None else self._camera_names))
+        missing = [c for c in req if c not in self._camera_names]
+        if missing:
+            raise KeyError(
+                f"cameras {missing} not available for {self.video_id}; "
+                f"available: {self._camera_names}"
+            )
+        return {
+            cam: np.stack(
+                [np.asarray(trans.obs[cam], dtype=np.uint8) for trans in self._transitions],
+                axis=0,
+            )
+            for cam in req
+        }
+
+    def load_states(self) -> np.ndarray:
+        return np.stack(
+            [np.asarray(trans.obs["state"], dtype=np.float32) for trans in self._transitions],
+            axis=0,
+        )
+
+    def load_actions(self) -> np.ndarray:
+        return np.stack(
+            [np.asarray(trans.action, dtype=np.float32) for trans in self._transitions],
+            axis=0,
+        )
+
+    def load_failure_mask(self) -> np.ndarray | None:
+        if not self.is_failure:
+            return None
+        return None if self._failure_mask is None else self._failure_mask.copy()
+
+    def load_failure_segment_index(self) -> np.ndarray | None:
+        return None
+
+
 def _load_failure_mask_and_segments(
     hdf5_path: Path, demo_key: str, length: int
 ) -> tuple[np.ndarray | None, list[dict[str, Any]]]:
@@ -322,6 +414,119 @@ def _build_selected_trajectory(
         source_demo_key=str(demo_key),
         file_path=str(hdf5_path),
         demo_path=demo_path,
+    )
+
+
+def _build_transition_trajectory(
+    *,
+    transitions: Sequence[Transition],
+    task_name: str,
+    camera_names: Sequence[str] | None,
+    fps: int,
+    hdf5_path: Path | None = None,
+    demo_key: str | None = None,
+    successful: bool | None = None,
+) -> TransitionBackedRobosuiteBenchmarkTrajectory:
+    """Build a benchmark trajectory from pipeline-preprocessed transitions."""
+    if not transitions:
+        raise ValueError("_build_transition_trajectory requires non-empty transitions.")
+
+    if camera_names is None:
+        camera_tuple = tuple(
+            sorted(str(k) for k in transitions[0].obs.keys() if str(k) != "state")
+        )
+    else:
+        camera_tuple = tuple(str(name) for name in camera_names)
+    if not camera_tuple:
+        raise ValueError("_build_transition_trajectory could not resolve any cameras.")
+
+    for camera_name in camera_tuple:
+        if camera_name not in transitions[0].obs:
+            raise KeyError(
+                f"Transition observation is missing camera '{camera_name}'. "
+                f"Available: {sorted(transitions[0].obs.keys())}"
+            )
+
+    gt_mask: np.ndarray | None = None
+    segments: list[dict[str, Any]] = []
+    if hdf5_path is not None and demo_key:
+        gt_mask, segments = _load_failure_mask_and_segments(
+            Path(hdf5_path),
+            str(demo_key),
+            length=len(transitions),
+        )
+        if gt_mask is not None and gt_mask.shape[0] != len(transitions):
+            aligned = np.zeros((len(transitions),), dtype=np.uint8)
+            n_copy = min(int(gt_mask.shape[0]), len(transitions))
+            aligned[:n_copy] = gt_mask[:n_copy]
+            gt_mask = aligned
+
+    if successful is None:
+        demo_success_values = [
+            bool((trans.info or {}).get("demo_success_attr", False))
+            for trans in transitions
+            if "demo_success_attr" in (trans.info or {})
+        ]
+        successful = bool(all(demo_success_values)) if demo_success_values else None
+
+    is_failure = (
+        (successful is False)
+        or bool(segments)
+        or (gt_mask is not None and bool(gt_mask.any()))
+    )
+    if hdf5_path is not None and demo_key:
+        video_id = f"{Path(hdf5_path).stem}_{demo_key}"
+    else:
+        video_id = str((transitions[0].info or {}).get("demo_name", "transition_demo"))
+
+    return TransitionBackedRobosuiteBenchmarkTrajectory(
+        task_name=str(task_name),
+        transitions=transitions,
+        camera_names=camera_tuple,
+        video_id=video_id,
+        fps=int(fps),
+        is_failure=bool(is_failure),
+        failure_segments=segments,
+        source_hdf5_path="" if hdf5_path is None else str(hdf5_path),
+        source_demo_key="" if demo_key is None else str(demo_key),
+        failure_mask=gt_mask,
+    )
+
+
+def _is_success_rollout_hdf5(path: Path) -> bool:
+    return "success_rollout" in {str(part) for part in path.parts}
+
+
+def _read_hdf5_demo_actions(hdf5_path: Path, demo_key: str) -> np.ndarray:
+    with h5py.File(hdf5_path, "r") as file_handle:
+        root = "demos" if "demos" in file_handle else "data"
+        group = file_handle[root][str(demo_key)]
+        return np.asarray(group["actions"][:], dtype=np.float32)
+
+
+def _build_cache_trajectory(
+    *,
+    cache_path: Path,
+    task_name: str,
+    fps: int,
+) -> RobosuiteBenchmarkTrajectory:
+    with np.load(str(cache_path), allow_pickle=False) as data:
+        images = data["images_chw"]
+        proprio = data["proprio"]
+        actions = data["actions"]
+        length = int(
+            min(int(images.shape[0]), int(proprio.shape[0]), int(actions.shape[0]))
+        )
+        cameras = _cache_camera_names(int(images.shape[1]))
+    return RobosuiteBenchmarkTrajectory(
+        task_name=str(task_name),
+        num_frames=int(length),
+        is_failure=False,
+        video_id=str(cache_path.stem),
+        fps=int(fps),
+        available_cameras=cameras,
+        failure_segments=[],
+        cache_npz_path=str(cache_path),
     )
 
 
@@ -410,6 +615,10 @@ class LPBV2OfflineScorer:
         self.device = str(device)
         self.batch_size = max(1, int(batch_size))
         self.task_name = str(task_name)
+        self._success_cache_root = Path(to_absolute_path(DEFAULT_SUCCESS_CACHE_ROOT)).resolve()
+        self._success_cache_index: dict[str, Path] | None = None
+        self._success_cache_warned_unavailable = False
+        self._success_cache_misses: set[str] = set()
 
         discriminator, detector, payload = _build_bce_discriminator_from_ckpt(
             self.ckpt_path,
@@ -471,6 +680,74 @@ class LPBV2OfflineScorer:
             flush=True,
         )
 
+    def _get_success_cache_index(self) -> dict[str, Path]:
+        if self._success_cache_index is not None:
+            return self._success_cache_index
+
+        task_dir = self._success_cache_root / str(self.detector_task)
+        index: dict[str, Path] = {}
+        if not task_dir.is_dir():
+            if not self._success_cache_warned_unavailable:
+                print(
+                    f"[LPBV2OfflineScorer][WARN] success cache dir not found: {task_dir}; "
+                    "success_rollout scoring will use raw HDF5.",
+                    flush=True,
+                )
+                self._success_cache_warned_unavailable = True
+            self._success_cache_index = index
+            return index
+
+        for cache_path in sorted(task_dir.glob("*.npz")):
+            try:
+                with np.load(str(cache_path), allow_pickle=False) as data:
+                    if "actions" not in data:
+                        continue
+                    fp = _action_fingerprint(np.asarray(data["actions"], dtype=np.float32))
+            except Exception:
+                continue
+            index.setdefault(fp, cache_path)
+
+        print(
+            f"[LPBV2OfflineScorer] indexed {len(index)} success cache demos from {task_dir}",
+            flush=True,
+        )
+        self._success_cache_index = index
+        return index
+
+    def _maybe_build_success_cache_trajectory(
+        self,
+        hdf5_path: Path,
+        demo_key: str,
+        *,
+        fps: int,
+    ) -> RobosuiteBenchmarkTrajectory | None:
+        if not _is_success_rollout_hdf5(hdf5_path):
+            return None
+
+        index = self._get_success_cache_index()
+        if not index:
+            return None
+
+        actions = _read_hdf5_demo_actions(hdf5_path, str(demo_key))
+        fp = _action_fingerprint(actions)
+        cache_path = index.get(fp)
+        if cache_path is None:
+            miss_key = f"{hdf5_path}:{demo_key}"
+            if miss_key not in self._success_cache_misses:
+                print(
+                    f"[LPBV2OfflineScorer][WARN] no LPB success cache match for "
+                    f"{miss_key}; using raw HDF5.",
+                    flush=True,
+                )
+                self._success_cache_misses.add(miss_key)
+            return None
+
+        return _build_cache_trajectory(
+            cache_path=cache_path,
+            task_name=self.detector_task,
+            fps=int(fps),
+        )
+
     # ------------------------------------------------------------------ #
     # Public scoring API                                                  #
     # ------------------------------------------------------------------ #
@@ -487,11 +764,46 @@ class LPBV2OfflineScorer:
         `T` is the demo's frame count after the encoder's internal truncation
         (min length across actions/states/cameras). Higher = more failure-like.
         """
-        trajectory = _build_selected_trajectory(
-            hdf5_path=Path(hdf5_path),
-            demo_key=str(demo_key),
-            task_name=self.detector_task,
+        hdf5_path_obj = Path(hdf5_path)
+        trajectory = self._maybe_build_success_cache_trajectory(
+            hdf5_path_obj,
+            str(demo_key),
             fps=int(fps),
+        )
+        if trajectory is None:
+            trajectory = _build_selected_trajectory(
+                hdf5_path=hdf5_path_obj,
+                demo_key=str(demo_key),
+                task_name=self.detector_task,
+                fps=int(fps),
+            )
+        scored = self._discriminator.score_trajectory(trajectory)
+        return np.asarray(scored.step_scores, dtype=np.float32)
+
+    def score_transitions(
+        self,
+        transitions: Sequence[Transition],
+        *,
+        camera_names: Sequence[str] | None = None,
+        fps: int = 20,
+        hdf5_path: str | Path | None = None,
+        demo_key: str | None = None,
+        successful: bool | None = None,
+    ) -> np.ndarray:
+        """Score already-loaded pipeline transitions.
+
+        This path preserves the Flow/IQL preprocessing done by
+        ``load_hdf5_demos_into_flow_transitions``: images are the policy frames
+        and states are the extracted 14-D robot proprio, not raw simulator state.
+        """
+        trajectory = _build_transition_trajectory(
+            transitions=transitions,
+            task_name=self.detector_task,
+            camera_names=camera_names,
+            fps=int(fps),
+            hdf5_path=None if hdf5_path is None else Path(hdf5_path),
+            demo_key=demo_key,
+            successful=successful,
         )
         scored = self._discriminator.score_trajectory(trajectory)
         return np.asarray(scored.step_scores, dtype=np.float32)

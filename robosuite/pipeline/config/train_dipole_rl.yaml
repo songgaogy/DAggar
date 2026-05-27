@@ -49,9 +49,8 @@ algorithm:
       grad_clip_norm: 1.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      # r_total = r_env + disc_reward_coef * r_disc, where r_disc =
-      # OnlineBCEDiscriminator.intrinsic_reward (∈ (-1, 0)).
-      disc_reward_coef: 1.0
+      output_reward_coef: 1.0
+      disc_reward_coef: 0.3
       update_freq: 1
     warmup_value_steps: 20000
     warmup_full_steps: 10000
@@ -88,8 +87,8 @@ warmup:
     - fail_rollout
   # Max HDF5 trajectories per split (null = all demos in that folder).
   num_trajectories:
-    expert: 20
-    success_rollout: 30
+    expert: 0
+    success_rollout: 50
     fail_rollout: 50
 
 runtime:

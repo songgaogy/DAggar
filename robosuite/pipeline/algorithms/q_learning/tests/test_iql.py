@@ -45,6 +45,7 @@ def _make_cfg(action_horizon: int = 2) -> IQLConfig:
         weight_decay=0.0,
         device="cpu",
         disc_reward_coef=0.0,
+        output_reward_coef=1.0,
     )
 
 

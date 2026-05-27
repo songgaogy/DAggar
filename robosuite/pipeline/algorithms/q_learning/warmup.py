@@ -24,6 +24,9 @@ Per-split HDF5 caps: ``warmup.num_trajectories.{expert,success_rollout,fail_roll
 from __future__ import annotations
 
 import builtins
+import multiprocessing as mp
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
@@ -34,6 +37,7 @@ import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
 from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
@@ -49,6 +53,7 @@ from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
 from robosuite.pipeline.envs import build_robosuite_env
+from robosuite.pipeline.envs.robosuite import RobosuiteRuntimeConfig
 from robosuite.pipeline.train_dipole import (
     bind_flow_proprio_extractor,
     build_flow_runtime_cfg,
@@ -57,7 +62,7 @@ from robosuite.pipeline.train_dipole import (
     resolve_flow_task_metadata,
 )
 from robosuite.pipeline.utils import resolve_task_demo_paths
-from robosuite.pipeline.utils.io import load_demo_paths
+from robosuite.pipeline.utils.io import list_hdf5_demo_names, load_transition_shard
 from robosuite.pipeline.utils.train_utils import (
     resolve_camera_names,
     resolve_demo_task_name,
@@ -69,6 +74,19 @@ print = partial(builtins.print, flush=True)
 
 # Robosuite task dirs use these folder names (see flow_multi/generate_rollout_data.py).
 DEFAULT_WARMUP_DEMO_SPLITS: tuple[str, ...] = ("expert", "success_rollout", "fail_rollout")
+
+
+def _resolve_warmup_num_load_workers(cfg: DictConfig) -> int:
+    raw = OmegaConf.select(cfg, "warmup.num_load_workers", default="auto")
+    if raw is None or str(raw).strip().lower() == "auto":
+        cpu_count = os.cpu_count() or 1
+        affinity_count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else cpu_count
+        return max(1, min(affinity_count, 16))
+    return max(0, int(raw))
+
+
+def _resolve_warmup_demo_chunk_size(cfg: DictConfig) -> int:
+    return max(1, int(OmegaConf.select(cfg, "warmup.load_worker_demo_chunk_size", default=2)))
 
 
 def _resolve_warmup_demo_splits(cfg: DictConfig) -> tuple[str, ...]:
@@ -86,7 +104,9 @@ def _normalize_trajectory_cap(value: Any) -> int | None:
     if value is None:
         return None
     cap = int(value)
-    return None if cap <= 0 else cap
+    if cap < 0:
+        raise ValueError(f"Trajectory cap must be >= 0 or null, got {cap}.")
+    return cap
 
 
 def _resolve_split_max_trajectories(cfg: DictConfig, split: str) -> int | None:
@@ -150,6 +170,79 @@ def _tag_transitions_with_hdf5_path(
         trans.info = info
 
 
+def _select_split_demo_jobs(
+    demo_paths: list[Path],
+    *,
+    max_num_trajectories: int | None,
+) -> list[tuple[Path, list[str] | None]]:
+    jobs: list[tuple[Path, list[str] | None]] = []
+    remaining = max_num_trajectories
+    for path in demo_paths:
+        if remaining is not None and remaining <= 0:
+            break
+        suffix = path.suffix.lower()
+        if suffix == ".pt":
+            if remaining is not None:
+                raise ValueError(
+                    "Trajectory-limited demo loading only supports HDF5 expert files. "
+                    f"Remove max_num_trajectories or convert {path} to HDF5 input."
+                )
+            jobs.append((path, None))
+            continue
+        if suffix not in {".hdf5", ".h5"}:
+            raise ValueError(f"Unsupported demo file type: {path}. Expected .pt, .hdf5, or .h5.")
+        demo_names = list_hdf5_demo_names(path)
+        if remaining is not None:
+            demo_names = demo_names[:remaining]
+        if not demo_names:
+            continue
+        jobs.append((path, demo_names))
+        if remaining is not None:
+            remaining -= len(demo_names)
+    return jobs
+
+
+def _chunk_demo_names(demo_names: list[str], chunk_size: int) -> list[list[str]]:
+    return [
+        demo_names[start : start + int(chunk_size)]
+        for start in range(0, len(demo_names), int(chunk_size))
+    ]
+
+
+def _load_hdf5_worker(
+    *,
+    path: str,
+    demo_names: list[str],
+    runtime_cfg: RobosuiteRuntimeConfig,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
+    proprio_keys: tuple[str, ...],
+    renderer: str,
+    control_freq: int,
+    flow_env_metadata: dict[str, Any] | None,
+) -> list[Any]:
+    env = build_robosuite_env(runtime_cfg)
+    try:
+        env.reset()
+        extractor = bind_flow_proprio_extractor(env, flow_env_metadata)
+        return load_hdf5_demos_into_flow_transitions(
+            path,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+            img_height=int(img_height),
+            img_width=int(img_width),
+            proprio_keys=tuple(proprio_keys),
+            renderer=str(renderer),
+            control_freq=int(control_freq),
+            demo_names=list(demo_names),
+            state_extractor=extractor,
+        )
+    finally:
+        env.close()
+
+
 def _load_split_into_buffer(
     *,
     buffer: FlowDaggerReplayBuffer,
@@ -157,11 +250,21 @@ def _load_split_into_buffer(
     data_root: str,
     split: str,
     hdf5_loader,
-    cache_dir: Path,
+    runtime_cfg: RobosuiteRuntimeConfig,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
+    proprio_keys: tuple[str, ...],
+    renderer: str,
     episode_index_base: int,
     max_num_trajectories: int | None,
     lpb_scorer: LPBV2OfflineScorer | None,
     control_freq: int,
+    num_load_workers: int,
+    load_worker_start_method: str,
+    load_worker_demo_chunk_size: int,
+    flow_env_metadata: dict[str, Any] | None,
 ) -> tuple[int, int]:
     """Load one split's HDF5 demos into `buffer`. Returns (n_transitions_added,
     new_episode_index_base)."""
@@ -170,24 +273,92 @@ def _load_split_into_buffer(
         print(f"[warmup] split='{split}' resolved to zero demo paths under {data_root}/{task_name}/{split} — skipping.")
         return 0, episode_index_base
 
+    jobs = _select_split_demo_jobs(demo_paths, max_num_trajectories=max_num_trajectories)
+    if not jobs:
+        print(f"[warmup] split='{split}' selected zero demos — skipping.")
+        return 0, episode_index_base
+
+    hdf5_jobs = [
+        (path, demo_names)
+        for path, demo_names in jobs
+        if path.suffix.lower() in {".hdf5", ".h5"} and demo_names
+    ]
+    hdf5_chunks: list[tuple[Path, int, list[str]]] = []
+    total_hdf5_demos = 0
+    for path, demo_names in hdf5_jobs:
+        total_hdf5_demos += len(demo_names or [])
+        for chunk_index, chunk_demo_names in enumerate(
+            _chunk_demo_names(list(demo_names or []), load_worker_demo_chunk_size)
+        ):
+            hdf5_chunks.append((path, chunk_index, chunk_demo_names))
+    effective_workers = min(max(0, int(num_load_workers)), len(hdf5_chunks))
+    print(
+        f"[warmup] split='{split}' loading {len(jobs)} files "
+        f"({len(hdf5_jobs)} hdf5, {total_hdf5_demos} demos, "
+        f"{len(hdf5_chunks)} chunks, workers={effective_workers})"
+    )
+
+    loaded_chunks: dict[tuple[Path, int], list[Any]] = {}
+    if effective_workers > 1:
+        context = mp.get_context(str(load_worker_start_method))
+        with ProcessPoolExecutor(max_workers=effective_workers, mp_context=context) as executor:
+            futures = {
+                executor.submit(
+                    _load_hdf5_worker,
+                    path=str(path),
+                    demo_names=list(chunk_demo_names),
+                    runtime_cfg=runtime_cfg,
+                    policy_camera_names=list(policy_camera_names),
+                    camera_aliases=dict(camera_aliases),
+                    img_height=int(img_height),
+                    img_width=int(img_width),
+                    proprio_keys=tuple(proprio_keys),
+                    renderer=str(renderer),
+                    control_freq=int(control_freq),
+                    flow_env_metadata=None if flow_env_metadata is None else dict(flow_env_metadata),
+                ): (path, chunk_index, len(chunk_demo_names))
+                for path, chunk_index, chunk_demo_names in hdf5_chunks
+            }
+            with tqdm(
+                total=total_hdf5_demos,
+                desc=f"[warmup] load {split}",
+                unit="demo",
+            ) as progress:
+                for future in as_completed(futures):
+                    path, chunk_index, num_demos = futures[future]
+                    loaded_chunks[(path, chunk_index)] = future.result()
+                    progress.update(int(num_demos))
+
     total_transitions = 0
     next_base = episode_index_base
-    remaining = max_num_trajectories
-    for raw_path in demo_paths:
-        if remaining is not None and remaining <= 0:
-            break
-        cap = remaining
-        path_transitions = load_demo_paths(
-            [raw_path],
-            cache_dir=cache_dir,
-            mirror_cache_dir=None,
-            hdf5_loader=hdf5_loader,
-            max_num_trajectories=cap,
-            cache_key=f"iql_warmup_{split}",
+    serial_load_progress = None
+    if effective_workers <= 1 and total_hdf5_demos > 0:
+        serial_load_progress = tqdm(
+            total=total_hdf5_demos,
+            desc=f"[warmup] load {split}",
+            unit="demo",
         )
+    for raw_path, demo_names in tqdm(
+        jobs,
+        desc=f"[warmup] finalize {split}",
+        unit="file",
+    ):
+        raw_path = Path(raw_path)
+        if raw_path.suffix.lower() == ".pt":
+            path_transitions = load_transition_shard(raw_path)
+        elif effective_workers > 1:
+            path_transitions = []
+            for chunk_index, _ in enumerate(
+                _chunk_demo_names(list(demo_names or []), load_worker_demo_chunk_size)
+            ):
+                path_transitions.extend(loaded_chunks[(raw_path, chunk_index)])
+        else:
+            path_transitions = hdf5_loader(raw_path, demo_names=list(demo_names or []))
+            if serial_load_progress is not None and raw_path.suffix.lower() in {".hdf5", ".h5"}:
+                serial_load_progress.update(len(demo_names or []))
         if not path_transitions:
             continue
-        _tag_transitions_with_hdf5_path(path_transitions, Path(raw_path))
+        _tag_transitions_with_hdf5_path(path_transitions, raw_path)
         if lpb_scorer is not None:
             n_demos = annotate_transitions_lpb_by_demo(
                 path_transitions,
@@ -206,9 +377,9 @@ def _load_split_into_buffer(
         )
         for trans in path_transitions:
             buffer.add(trans)
-        if remaining is not None:
-            remaining -= sum(1 for t in path_transitions if bool(t.done))
         total_transitions += len(path_transitions)
+    if serial_load_progress is not None:
+        serial_load_progress.close()
 
     if total_transitions == 0:
         return 0, episode_index_base
@@ -351,13 +522,24 @@ def main(cfg: DictConfig) -> None:
                 state_extractor=extractor,
             )
 
-        cache_dir = output_path.parent / "_demo_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
         demo_splits = _resolve_warmup_demo_splits(cfg)
         split_caps = {split: _resolve_split_max_trajectories(cfg, split) for split in demo_splits}
+        num_load_workers = _resolve_warmup_num_load_workers(cfg)
+        load_worker_demo_chunk_size = _resolve_warmup_demo_chunk_size(cfg)
+        load_worker_start_method = str(
+            OmegaConf.select(cfg, "warmup.load_worker_start_method", default="spawn")
+        )
+        if load_worker_start_method not in mp.get_all_start_methods():
+            raise ValueError(
+                f"warmup.load_worker_start_method={load_worker_start_method!r} is not available. "
+                f"Available: {mp.get_all_start_methods()}"
+            )
         print(
             f"[warmup] demo_splits={demo_splits} caps={split_caps} "
-            f"task={task_data_name} root={data_root}"
+            f"task={task_data_name} root={data_root} "
+            f"num_load_workers={num_load_workers} "
+            f"load_worker_demo_chunk_size={load_worker_demo_chunk_size} "
+            f"start_method={load_worker_start_method}"
         )
 
         disc_cfg_dict = OmegaConf.to_container(
@@ -391,11 +573,21 @@ def main(cfg: DictConfig) -> None:
                 data_root=data_root,
                 split=split,
                 hdf5_loader=hdf5_loader,
-                cache_dir=cache_dir,
+                runtime_cfg=main_runtime_cfg,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=int(cfg.env.img_height),
+                img_width=int(cfg.env.img_width),
+                proprio_keys=tuple(cfg.env.proprio_keys or []),
+                renderer=str(cfg.env.renderer),
                 episode_index_base=episode_index_base,
                 max_num_trajectories=split_caps[split],
                 lpb_scorer=lpb_scorer,
                 control_freq=int(cfg.env.control_freq),
+                num_load_workers=num_load_workers,
+                load_worker_start_method=load_worker_start_method,
+                load_worker_demo_chunk_size=load_worker_demo_chunk_size,
+                flow_env_metadata=flow_env_metadata,
             )
             total_loaded += n_loaded
         if total_loaded == 0:
@@ -422,6 +614,7 @@ def main(cfg: DictConfig) -> None:
     print(
         f"[warmup] disc_reward: LPB benchmark scores on transition.info "
         f"(coef={float(iql_cfg.disc_reward_coef)} "
+        f"output_reward_coef={float(iql_cfg.output_reward_coef)} "
         f"tau={lpb_tau} source={lpb_tau_source})"
     )
 
@@ -475,6 +668,7 @@ def main(cfg: DictConfig) -> None:
             "bce_youden_threshold": float(lpb_tau) if lpb_tau is not None else float("nan"),
             "bce_threshold_source": str(lpb_tau_source or ""),
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
+            "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "LPBV2OfflineScorer(-sigmoid(failure_score - tau))",
         },
         "schema_version": 1,

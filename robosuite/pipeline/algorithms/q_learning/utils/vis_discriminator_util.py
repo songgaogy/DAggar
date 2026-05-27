@@ -35,10 +35,12 @@ from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
     LPBV2OfflineScorer,
     _build_bce_discriminator_from_ckpt,
     _build_selected_trajectory,
+    _build_transition_trajectory,
     _compute_youden_threshold_for_task,
     _load_failure_mask_and_segments,
     _resolve_task_for_detector,
     SafeRobosuiteBenchmarkTrajectory,
+    TransitionBackedRobosuiteBenchmarkTrajectory,
 )
 from robosuite.pipeline.common import Transition
 
@@ -51,9 +53,11 @@ __all__ = [
     "SafeRobosuiteBenchmarkTrajectory",
     "_build_bce_discriminator_from_ckpt",
     "_build_selected_trajectory",
+    "_build_transition_trajectory",
     "_compute_youden_threshold_for_task",
     "_load_failure_mask_and_segments",
     "_resolve_task_for_detector",
+    "TransitionBackedRobosuiteBenchmarkTrajectory",
 ]
 
 
@@ -460,7 +464,8 @@ def visualize_selected_trajectory_discriminator(
 
     If `scorer` is provided, it is reused (saves a redundant model build);
     otherwise a fresh `LPBV2OfflineScorer` is constructed from `disc_ckpt`.
-    Either way, the scoring path is identical to the warmup reward path.
+    Either way, the scoring path is identical to the Q/V reward path: it uses
+    the raw HDF5 LPB trajectory path, matching ``visualize_bce.py``.
     """
     if not transitions:
         raise RuntimeError("Cannot visualize discriminator on an empty trajectory.")
@@ -474,21 +479,25 @@ def visualize_selected_trajectory_discriminator(
             batch_size=max(1, int(batch_size)),
         )
     detector_task = scorer.detector_task
+    selected_path = Path(selected_hdf5_path)
     trajectory = _build_selected_trajectory(
-        hdf5_path=Path(selected_hdf5_path),
+        hdf5_path=selected_path,
         demo_key=str(selected_demo_key),
         task_name=detector_task,
         fps=int(video_fps),
     )
-    scored = scorer._discriminator.score_trajectory(trajectory)  # noqa: SLF001
-    scores = np.asarray(scored.step_scores, dtype=np.float32)
+    scores = scorer.score_hdf5_demo(
+        selected_path,
+        str(selected_demo_key),
+        fps=int(video_fps),
+    )
     threshold = float(scorer.tau)
     threshold_source = str(scorer.tau_source)
     checkpoint_threshold = float(scorer.checkpoint_detector_threshold)
     thresholds = np.full_like(scores, float(threshold), dtype=np.float32)
     predictions = (scores >= float(threshold)).astype(np.int64)
     gt_mask, segments = _load_failure_mask_and_segments(
-        Path(selected_hdf5_path),
+        selected_path,
         str(selected_demo_key),
         length=int(scores.shape[0]),
     )
@@ -552,9 +561,9 @@ def visualize_selected_trajectory_discriminator(
         "checkpoint_detector_threshold": checkpoint_threshold,
         "threshold_source": str(threshold_source),
         "scoring_path": "LPBV2OfflineScorer.score_hdf5_demo(BCEBenchmarkDiscriminator.score_trajectory)",
-        "feature_source": str(scored.aux.get("feature_source", "")),
-        "transformer_layer": int(scored.aux.get("transformer_layer", -1)),
-        "view_names": list(scored.aux.get("view_names", [])),
+        "feature_source": str(scorer._payload.get("feature_source", "")),  # noqa: SLF001
+        "transformer_layer": int(scorer._payload.get("transformer_layer", -1)),  # noqa: SLF001
+        "view_names": list(scorer._discriminator.encoder.view_names),  # noqa: SLF001
         "available_cameras": list(trajectory.available_cameras),
         "selected_hdf5": str(selected_hdf5_path),
         "selected_demo_key": str(selected_demo_key),

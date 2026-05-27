@@ -13,6 +13,7 @@ Optional env:
   LPB_DISC_VIZ_DEMO=demo_000035
   LPB_DISC_VIZ_DEVICE=cuda:0
   LPB_DISC_VIZ_OUTPUT=/abs/path/to/plot.png   # if set, also save here
+  LPB_DISC_VIZ_SKIP_ASSERT=1                # skip fail-rollout shape checks (e.g. success_rollout)
 """
 
 from __future__ import annotations
@@ -242,9 +243,11 @@ def test_visualize_lpb_disc_reward_on_fail_demo(
     print(f"[lpb_disc_viz] wrote {out_png}")
     print(f"[lpb_disc_viz] summary={json.dumps(summary, indent=2)}")
 
+    assert out_png.is_file() and out_png.stat().st_size > 10_000
+    if os.environ.get("LPB_DISC_VIZ_SKIP_ASSERT", "").strip() in ("1", "true", "yes"):
+        return
     assert summary["num_frames"] >= 50.0
     assert summary["corr_failure_score_intrinsic"] < -0.5
     # Fail rollout: later frames should be more failure-like (higher score, more negative r_disc).
     assert summary["failure_score_late_mean"] > summary["failure_score_early_mean"]
     assert summary["intrinsic_late_mean"] < summary["intrinsic_early_mean"]
-    assert out_png.is_file() and out_png.stat().st_size > 10_000

@@ -47,7 +47,6 @@ from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor
 
 
 DEFAULT_DEMO_ROOT = "data"
-DEFAULT_OUTPUT_ROOT = "outputs/DIPOLE_rl/iql_qv_visualization"
 
 
 @dataclass
@@ -80,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-data-name", default=None)
     parser.add_argument("--split", default="success_rollout")
     parser.add_argument("--demo-root", default=DEFAULT_DEMO_ROOT)
-    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", required=True)
     parser.add_argument("--demo-key", default=None)
     parser.add_argument("--seed", type=int, default=2)
     parser.add_argument("--max-windows", type=int, default=None)
@@ -730,7 +729,7 @@ def compute_qv_metrics(
             env_reward_horizon = aggregate_chunk_reward(rewards, discount)
             done_horizon = chunk_done_mask(dones).to(device)
 
-            total_reward_horizon = env_reward_horizon + float(iql_cfg.disc_reward_coef) * disc_reward_horizon
+            total_reward_horizon = float(iql_cfg.output_reward_coef) * env_reward_horizon + float(iql_cfg.disc_reward_coef) * disc_reward_horizon
             bootstrap_v = bootstrap_discount * (1.0 - done_horizon) * next_v
             td_target = total_reward_horizon + bootstrap_v
             td_residual = td_target - q_min
@@ -854,7 +853,7 @@ def plot_qv(
     axes[1].legend(loc="best", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(steps, td_residual, label="TD residual", color="tab:red")
+    # axes[2].plot(steps, td_residual, label="TD residual", color="tab:red")
     axes[2].plot(steps, advantage, label="advantage Qmin - V", color="tab:brown")
     axes[2].axhline(0.0, color="black", linewidth=1)
     axes[2].set_ylabel("Residual / Adv")
@@ -980,7 +979,7 @@ def main() -> None:
         print(
             f"[vis_qv] LPB disc scores: T={lpb_failure_scores.shape[0]} "
             f"tau={lpb_tau:.6f} (source={lpb_scorer.tau_source}) "
-            f"disc_reward_coef={float(iql_cfg.disc_reward_coef)}"
+            f"output_reward_coef={float(iql_cfg.output_reward_coef)} disc_reward_coef={float(iql_cfg.disc_reward_coef)}"
         )
 
     discriminator = None
@@ -1067,7 +1066,7 @@ def main() -> None:
             "plot_pdf": str(disc_viz_result.plot_pdf),
             "video": str(disc_viz_result.video),
             "summary": str(disc_viz_result.summary_json),
-            "scoring_path": "LPBV2OfflineScorer(BCEBenchmarkDiscriminator.score_trajectory)",
+            "scoring_path": "LPBV2OfflineScorer.score_hdf5_demo(BCEBenchmarkDiscriminator.score_trajectory)",
         }
 
     summary = {
@@ -1090,6 +1089,7 @@ def main() -> None:
             (lpb_failure_scores is not None or discriminator is not None)
             and float(iql_cfg.disc_reward_coef) != 0.0
         ),
+        "output_reward_coef": float(iql_cfg.output_reward_coef),
         "disc_reward_source": (
             "LPBV2OfflineScorer(-sigmoid(failure_score - tau))"
             if lpb_failure_scores is not None

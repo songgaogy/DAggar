@@ -1,23 +1,3 @@
-"""Chunk-centric replay sampler for IQL.
-
-Wraps the same underlying `Transition` store used by `DipoleReplayBuffer`
-(any `FlowDaggerReplayBuffer` subclass) to avoid duplicating frames. On
-sample it:
-  1. Picks valid windows where all H steps share the same episode (delegates
-     to the base buffer's valid-start cache).
-  2. Validates the `start + H` boundary for `s'`; falls back to
-     `_storage[start+H-1].next_obs` (and forces done=1) if the next step is
-     out of storage or cross-episode.
-  3. Runs the frozen `SharedFrozenEncoder` on s and s' under `no_grad`.
-  4. Synthesizes `r_total = r_env + disc_reward_coef · r_disc` using the
-     CURRENT discriminator (re-evaluated per sample to avoid stale rewards).
-     When `discriminator is None` the disc term is skipped without mutating
-     `cfg.disc_reward_coef`.
-  5. Returns `IQLStepBatch` / `IQLActorBatch`.
-
-Mirrors baseline awr/replay_buffer.py:295-510 for the windowing logic.
-"""
-
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -101,7 +81,7 @@ class IQLReplayBuffer:
             online buffer; passed by reference, not copied). Must expose
             `_storage`, `_lock`, `_get_valid_start_indices_locked()`,
             `camera_names`, `image_size`, `action_horizon`.
-        cfg: IQLConfig (carries action_horizon, discount, disc_reward_coef).
+        cfg: IQLConfig
     """
 
     def __init__(self, base_buffer: Any, cfg: IQLConfig) -> None:
@@ -264,6 +244,7 @@ class IQLReplayBuffer:
 
         # Per-frame disc reward: LPB pre-annotations (offline) or online head.
         effective_disc_coef = float(self.cfg.disc_reward_coef)
+        effective_output_coef = float(self.cfg.output_reward_coef)
         use_lpb_disc = (
             effective_disc_coef != 0.0
             and len(lpb_disc_per_sequence) == B
@@ -284,7 +265,7 @@ class IQLReplayBuffer:
         else:
             r_disc_per_step = torch.zeros_like(reward_tensor)
 
-        r_total_chunk = reward_tensor + effective_disc_coef * r_disc_per_step
+        r_total_chunk = effective_output_coef * reward_tensor + effective_disc_coef * r_disc_per_step
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
         dones = chunk_done_mask(done_tensor)
 
