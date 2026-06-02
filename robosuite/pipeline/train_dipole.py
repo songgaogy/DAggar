@@ -431,7 +431,7 @@ def _reset_flow_env_for_demo(
     state_extractor._build_robot_joint_indices()
 
 
-def _sparse_env_step_reward(env, state: np.ndarray, action: np.ndarray) -> tuple[float, bool]:
+def _sparse_env_step_reward(env, state: np.ndarray, action: np.ndarray, reward_mode: str = "-1/0") -> tuple[float, bool]:
     """Replay one stored transition and return sparse -1/0 outcome reward from env success."""
     env.sim.set_state_from_flattened(np.asarray(state))
     env.sim.forward()
@@ -441,7 +441,9 @@ def _sparse_env_step_reward(env, state: np.ndarray, action: np.ndarray) -> tuple
         _, _, _, _, info = step_output
     else:
         _, _, _, info = step_output
-    reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
+    reward, success = sparse_success_reward(
+        env, info if isinstance(info, dict) else None, reward_mode=reward_mode
+    )
     return float(reward), bool(success)
 
 
@@ -457,6 +459,7 @@ def load_hdf5_demos_into_flow_transitions(
     control_freq: int,
     demo_names: list[str] | None,
     state_extractor: RobosuiteProprioExtractor,
+    reward_mode: str = "-1/0"
 ) -> list:
     _ = proprio_keys
     _ = renderer
@@ -528,7 +531,7 @@ def load_hdf5_demos_into_flow_transitions(
                     camera_aliases=camera_aliases,
                 )
                 is_last_step = step_idx == len(actions) - 1
-                reward, step_success = _sparse_env_step_reward(env, states[step_idx], actions[step_idx])
+                reward, step_success = _sparse_env_step_reward(env, states[step_idx], actions[step_idx], reward_mode=reward_mode)
                 transitions.append(
                     Transition(
                         obs=obs_images,

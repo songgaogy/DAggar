@@ -24,7 +24,7 @@ cd "$ROOT_DIR"
 ENVIRONMENT="PickPlaceCereal"
 SEED=1
 SPLIT="fail_rollout"    # success_rollout or fail_rollout
-TARGET_PATH="iql_qv_cache-weight1_0"
+TARGET_PATH="iql_qv_cache-weight0_1"
 
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"

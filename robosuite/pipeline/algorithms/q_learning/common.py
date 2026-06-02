@@ -45,6 +45,7 @@ class IQLConfig:
     device: str = "cuda:1"
 
     # Reward composition (r_total = r_env * output_reward_coef + disc_reward_coef * r_disc).
+    reward_mode: str = "-1/0"   # "0/1" | "-1/0"
     output_reward_coef: float = 1.0
     disc_reward_coef: float = 1.0
     # Gradient steps per learner tick inside DipoleTrainer.train_step (each resamples).

@@ -222,6 +222,7 @@ def _load_hdf5_worker(
     renderer: str,
     control_freq: int,
     flow_env_metadata: dict[str, Any] | None,
+    reward_mode: str = "-1/0",
 ) -> list[Any]:
     env = build_robosuite_env(runtime_cfg)
     try:
@@ -238,6 +239,7 @@ def _load_hdf5_worker(
             control_freq=int(control_freq),
             demo_names=list(demo_names),
             state_extractor=extractor,
+            reward_mode=str(reward_mode),
         )
     finally:
         env.close()
@@ -265,6 +267,7 @@ def _load_split_into_buffer(
     load_worker_start_method: str,
     load_worker_demo_chunk_size: int,
     flow_env_metadata: dict[str, Any] | None,
+    reward_mode: str = "-1/0",
 ) -> tuple[int, int]:
     """Load one split's HDF5 demos into `buffer`. Returns (n_transitions_added,
     new_episode_index_base)."""
@@ -316,6 +319,7 @@ def _load_split_into_buffer(
                     renderer=str(renderer),
                     control_freq=int(control_freq),
                     flow_env_metadata=None if flow_env_metadata is None else dict(flow_env_metadata),
+                    reward_mode=str(reward_mode),
                 ): (path, chunk_index, len(chunk_demo_names))
                 for path, chunk_index, chunk_demo_names in hdf5_chunks
             }
@@ -508,6 +512,13 @@ def main(cfg: DictConfig) -> None:
             augmentation_config=FlowAugmentationConfig(),
         )
 
+        reward_mode = str(iql_cfg.reward_mode)
+        if reward_mode not in {"0/1", "-1/0"}:
+            raise ValueError(f"Invalid reward_mode={reward_mode!r}; expected '0/1' or '-1/0'.")
+        print(f"[warmup] reward_mode={reward_mode}")
+        if reward_mode == "0/1" and float(iql_cfg.disc_reward_coef) != 0.0:
+            raise ValueError("disc_reward_coef must be 0.0 when reward_mode is 0/1")
+
         def hdf5_loader(path, demo_names=None):
             return load_hdf5_demos_into_flow_transitions(
                 path,
@@ -520,6 +531,7 @@ def main(cfg: DictConfig) -> None:
                 control_freq=int(cfg.env.control_freq),
                 demo_names=demo_names,
                 state_extractor=extractor,
+                reward_mode=reward_mode,
             )
 
         demo_splits = _resolve_warmup_demo_splits(cfg)
@@ -588,6 +600,7 @@ def main(cfg: DictConfig) -> None:
                 load_worker_start_method=load_worker_start_method,
                 load_worker_demo_chunk_size=load_worker_demo_chunk_size,
                 flow_env_metadata=flow_env_metadata,
+                reward_mode=reward_mode,
             )
             total_loaded += n_loaded
         if total_loaded == 0:

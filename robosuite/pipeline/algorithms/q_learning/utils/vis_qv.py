@@ -734,6 +734,8 @@ def compute_qv_metrics(
             td_target = total_reward_horizon + bootstrap_v
             td_residual = td_target - q_min
             advantage = q_min - v
+            # Chunk Bellman target minus V (same γ^H bootstrap as IQL training).
+            advantage_td1 = td_target - v
 
         for local_idx, global_idx in enumerate(range(start_idx, end_idx)):
             row = {
@@ -757,6 +759,7 @@ def compute_qv_metrics(
                 "td_target": tensor_to_float(td_target, local_idx),
                 "td_residual": tensor_to_float(td_residual, local_idx),
                 "advantage": tensor_to_float(advantage, local_idx),
+                "advantage_td1": tensor_to_float(advantage_td1, local_idx),
             }
             for horizon_index in range(horizon):
                 for action_index in range(actions_cpu.shape[-1]):
@@ -812,13 +815,26 @@ def write_video(path: Path, transitions: list[Transition], image_keys: list[str]
                 writer.append_data(np.concatenate(frames, axis=1) if len(frames) > 1 else frames[0])
 
 
-def plot_qv(
+def filter_nonoverlap_chunk_metrics(
+    metrics: list[dict[str, float]], action_horizon: int
+) -> list[dict[str, float]]:
+    """Keep one window per disjoint chunk (steps 0, H, 2H, ...)."""
+    stride = int(action_horizon)
+    if stride <= 0:
+        raise ValueError(f"action_horizon must be positive, got {action_horizon}")
+    return [row for row in metrics if int(row["step"]) % stride == 0]
+
+
+def _save_qv_timeseries_png(
     path_base: Path,
     metrics: list[dict[str, float]],
     title: str,
     *,
+    action_horizon: int,
     per_step_disc: PerStepTrainingDisc | None = None,
-) -> None:
+) -> Path:
+    if not metrics:
+        raise ValueError("Cannot plot Q/V timeseries with empty metrics.")
     steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
     q_min = np.asarray([row["q_min"] for row in metrics], dtype=np.float32)
     q_mean = np.asarray([row["q_mean"] for row in metrics], dtype=np.float32)
@@ -828,6 +844,7 @@ def plot_qv(
     td_target = np.asarray([row["td_target"] for row in metrics], dtype=np.float32)
     td_residual = np.asarray([row["td_residual"] for row in metrics], dtype=np.float32)
     advantage = np.asarray([row["advantage"] for row in metrics], dtype=np.float32)
+    advantage_td1 = np.asarray([row["advantage_td1"] for row in metrics], dtype=np.float32)
     env_rewards = np.asarray([row["env_reward_horizon"] for row in metrics], dtype=np.float32)
     total_rewards = np.asarray([row["total_reward_horizon"] for row in metrics], dtype=np.float32)
     disc_rewards = np.asarray([row["disc_reward_horizon"] for row in metrics], dtype=np.float32)
@@ -855,6 +872,13 @@ def plot_qv(
 
     # axes[2].plot(steps, td_residual, label="TD residual", color="tab:red")
     axes[2].plot(steps, advantage, label="advantage Qmin - V", color="tab:brown")
+    axes[2].plot(
+        steps,
+        advantage_td1,
+        label="advantage TD (Σγ^i r + γ^H V' - V)",
+        color="tab:red",
+        alpha=0.85,
+    )
     axes[2].axhline(0.0, color="black", linewidth=1)
     axes[2].set_ylabel("Residual / Adv")
     axes[2].legend(loc="best")
@@ -865,7 +889,7 @@ def plot_qv(
     axes[3].plot(
         steps,
         disc_rewards,
-        label="disc γ-agg (8-step window)",
+        label=f"disc γ-agg ({int(action_horizon)}-step window)",
         color="tab:pink",
         alpha=0.85,
     )
@@ -894,9 +918,39 @@ def plot_qv(
 
     fig.tight_layout()
     path_base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path_base.with_suffix(".png"), dpi=160)
-    fig.savefig(path_base.with_suffix(".pdf"))
+    out_path = path_base.with_suffix(".png")
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
+    return out_path
+
+
+def plot_qv(
+    path_base: Path,
+    metrics: list[dict[str, float]],
+    title: str,
+    *,
+    action_horizon: int,
+    per_step_disc: PerStepTrainingDisc | None = None,
+) -> dict[str, Path]:
+    """Write overlapping-window and non-overlapping-chunk Q/V plots (PNG only)."""
+    plot_paths: dict[str, Path] = {}
+    plot_paths["overlapping"] = _save_qv_timeseries_png(
+        path_base,
+        metrics,
+        title,
+        action_horizon=int(action_horizon),
+        per_step_disc=per_step_disc,
+    )
+    nonoverlap_metrics = filter_nonoverlap_chunk_metrics(metrics, int(action_horizon))
+    nonoverlap_base = path_base.parent / f"{path_base.name}_nonoverlap"
+    plot_paths["nonoverlap"] = _save_qv_timeseries_png(
+        nonoverlap_base,
+        nonoverlap_metrics,
+        f"{title} (non-overlapping chunks, stride={int(action_horizon)})",
+        action_horizon=int(action_horizon),
+        per_step_disc=per_step_disc,
+    )
+    return plot_paths
 
 
 def summarize_metrics(metrics: list[dict[str, float]], iql_cfg: IQLConfig) -> dict[str, Any]:
@@ -1023,10 +1077,11 @@ def main() -> None:
 
     write_metrics_csv(csv_path, metrics)
     write_video(video_path, transitions, image_keys=camera_names, fps=int(args.video_fps))
-    plot_qv(
+    plot_paths = plot_qv(
         plot_base,
         metrics,
         title=f"{task_data_name} {args.split} {selected.hdf5_path.name}::{selected.demo_key}",
+        action_horizon=int(iql_cfg.action_horizon),
         per_step_disc=per_step_disc,
     )
 
@@ -1114,8 +1169,8 @@ def main() -> None:
         "outputs": {
             "steps_csv": str(csv_path),
             "video": str(video_path),
-            "plot_png": str(plot_base.with_suffix(".png")),
-            "plot_pdf": str(plot_base.with_suffix(".pdf")),
+            "plot_png": str(plot_paths["overlapping"]),
+            "plot_png_nonoverlap": str(plot_paths["nonoverlap"]),
             "discriminator": disc_viz_outputs,
         },
         "metrics_summary": summarize_metrics(metrics, iql_cfg),
@@ -1126,8 +1181,8 @@ def main() -> None:
     print(f"iql_ckpt={iql_ckpt}")
     print(f"output_dir={output_dir}")
     print(f"video={video_path}")
-    print(f"plot_png={plot_base.with_suffix('.png')}")
-    print(f"plot_pdf={plot_base.with_suffix('.pdf')}")
+    print(f"plot_png={plot_paths['overlapping']}")
+    print(f"plot_png_nonoverlap={plot_paths['nonoverlap']}")
     if disc_viz_outputs is not None:
         print(f"disc_viz_dir={disc_viz_outputs['output_dir']}")
         print(f"disc_viz_video={disc_viz_outputs['video']}")

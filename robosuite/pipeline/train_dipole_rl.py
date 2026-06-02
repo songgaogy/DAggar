@@ -1044,6 +1044,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 raw_next_obs, _, done, info = step_output
             if isinstance(info, dict) and grasp_penalty is not None:
                 info.setdefault("grasp_penalty", float(grasp_penalty))
+
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
             next_obs = convert_env_camera_observation(
                 raw_next_obs,

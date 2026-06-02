@@ -543,14 +543,20 @@ def build_device(env, device_cfg):
     raise ValueError(f"Invalid device choice: {device_type}")
 
 
-def sparse_success_reward(env, info: Optional[dict[str, Any]] = None) -> tuple[float, bool]:
-    """NOTE: here we use -1/0 reward"""
+def sparse_success_reward(env, info: Optional[dict[str, Any]] = None, reward_mode: str = "-1/0") -> tuple[float, bool]:
+    """Sparse outcome reward from env success. ``reward_mode`` is ``-1/0`` or ``0/1``."""
     success = False
     if isinstance(info, dict) and "success" in info:
         success = bool(info["success"])
     if not success and hasattr(env, "_check_success"):
         success = bool(env._check_success())
-    return (0.0 if success else -1.0), success
+
+    if reward_mode == "0/1":
+        return (1.0 if success else 0.0), success
+    elif reward_mode == "-1/0":
+        return (0.0 if success else -1.0), success
+    else:
+        raise ValueError(f"Invalid reward mode: {reward_mode}")
 
 
 def load_hdf5_demos_into_transitions(
