@@ -14,7 +14,7 @@ The DIPOLE algorithm itself (steps 1–4 of the project plan) is already in plac
 | Advantage | (none) | `A = min(Q1, Q2) − V`, Q-chunking |
 | Discriminator | frozen lpb_v2 BCE head | **online-trainable** BCE head; encoder still frozen |
 | Reward | (unused) | `r_total = r_env + λ_disc · r_disc`; Q/V learn from it |
-| Encoder | per-provider, embedded in `g_provider.py` | **single** `SharedFrozenEncoder` shared across DIPOLE / IQL / disc |
+| Encoder | per-provider, embedded in `g_provider.py` | LPB `SharedFrozenEncoder` remains discriminator-only; Q/V use independent frozen ResNet-50 backbones |
 | GPU layout | inference cuda:0, learner cuda:1 | unchanged; learner thread now runs **3 losses** per tick |
 | Concurrency | 1 daemon learner thread | unchanged (still 1 daemon learner thread) |
 
@@ -27,19 +27,18 @@ The DIPOLE flow policy code (`models/flow.py`) is unchanged. The only hook is `a
 ```txt
 ┌─────────────────────── cuda:1 (learner GPU) ─────────────────────────┐
 │                                                                      │
-│   SharedFrozenEncoder  ←─── owned by trainer, no_grad always         │
-│        │                                                             │
-│        ├─ context for IQL Q/V       (chunk-centric step_batch)       │
+│   SharedFrozenEncoder  ←─── LPB discriminator encoder, no_grad       │
 │        ├─ context for online BCE    (balanced expert/policy batch)   │
-│        └─ context for AdvantageG    (actor_batch on DipoleBatch)     │
+│        └─ context for disc reward / AdvantageG discriminator term   │
 │                                                                      │
-│   IQL learner (Q1, Q2, V, target_V)  ─────┐                          │
-│   OnlineBCEDiscriminator (head only)   ──┐│                          │
-│                                          ││                          │
-│        ┌─────────────────────────────────┤├─────────────┐            │
-│        │  AdvantageGProvider             ↓              │            │
-│        │  G = α·A_norm + β·(−disc_logit_norm)           │            │
-│        └────────────────────────┬─────────────────────  │            │
+│   IQL learner: raw images + proprio + action chunk                   │
+│        ├─ Q1/Q2: frozen ResNet-50 + state MLP + action MLP → Q      │
+│        └─ V/target_V: frozen ResNet-50 + state MLP → V              │
+│                                               │                      │
+│   OnlineBCEDiscriminator (head only)                                  │
+│                   │                                                   │
+│   AdvantageGProvider: G = α·A_norm + β·(−disc_logit_norm)             │
+│                   │                                                   │
 │                                 │                                    │
 │   DIPOLE flow policy training (polarity dual-branch loss)            │
 │                                                                      │
@@ -53,11 +52,11 @@ The DIPOLE flow policy code (`models/flow.py`) is unchanged. The only hook is `a
 
 ### Per-tick step order (single learner thread, cuda:1)
 
-1. Sample `step_batch` (chunk + reward + next_obs + done) and `actor_batch` (raw chunk + context) from the shared replay store.
-2. `no_grad`: re-evaluate `r_disc` on `step_batch` with the **current** disc to avoid stale rewards; overwrite `step_batch.rewards`.
+1. Sample `step_batch` (raw image/state chunk + reward + next_obs + done) from the shared replay store.
+2. `no_grad`: use the LPB encoder only to re-evaluate `r_disc` with the **current** discriminator when no offline LPB annotation is available.
 3. IQL Q loss: Bellman MSE for both critics.
 4. IQL V loss: expectile(`min(Q1, Q2) − V`).
-5. `no_grad`: compute `A` on `actor_batch` and `disc_logit` on its `(context, action_chunk_raw)`; normalize each; combine into G.
+5. `no_grad`: compute `A` from raw image/state/action with ResNet-50 Q/V and `disc_logit` from LPB context; normalize each; combine into G.
 6. DIPOLE flow update with G (replaces existing `LPBV2GProvider.compute_g_for_batch(...)` path).
 7. Sample balanced expert/policy batch from disc replay; one BCE step.
 8. Polyak target V update.
@@ -127,21 +126,21 @@ Entry points:
 
 | Caller | Callee | Input shapes | Output shapes |
 |---|---|---|---|
-| IQL replay → encoder | `SharedFrozenEncoder.encode(image_obs_raw, proprio_raw)` | `(B, V, 3, H, W) ∈ [0,1]`, `(B, D_s)` | `(B, D_ctx)` |
-| IQL replay → disc | `disc.intrinsic_reward(context, action_chunk)` | `(B, D_ctx)`, `(B, H, D_a)` | `(B,)` |
+| IQL replay → IQL | raw observation batch | images `(B, V, 3, H, W) ∈ [0,1]`, proprio `(B, D_s)`, actions `(B, H, D_a)` | `IQLStepBatch` |
+| IQL replay → LPB encoder → disc | `encode_chunk_frames(...)`; `disc.intrinsic_reward(context)` | chunk images/state/actions; latent `(B·H, D_ctx)` | `(B·H,)` |
 | Trainer → IQL | `iql.update(step_batch)` | `IQLStepBatch` | `dict[str, float]` |
 | Trainer → IQL (warmup) | `iql.warmup_value_only(step_batch)` | `IQLStepBatch` | `dict[str, float]` |
 | AdvantageG → IQL | `iql.compute_advantage_for_batch(actor_batch)` | `IQLActorBatch` | `(B,)` |
-| AdvantageG → disc | `disc.score(context, action_chunk).logit` | `(B, D_ctx)`, `(B, H, D_a)` | `(B,)` |
+| AdvantageG → disc | `disc.score(context).logit` | LPB latent `(B, D_ctx)` | `(B,)` |
 | Flow update → G provider | `g_provider.compute_g_for_batch(dipole_batch)` | `DipoleBatch` | `(B,)` |
 | Trainer → disc | `disc.update(disc_batch)` | `DiscriminatorBatch` | `dict[str, float]` |
 | Main → trainer | `trainer.record_transition(...)` | existing signature | `Transition` |
 
 ### Hard prohibitions (all subagents)
 
-- **No encoder ownership inside IQL/disc**: encoder is always injected.
-- **Encoder must stay frozen**: no `encoder.train()`, no gradients through encoder. Any forward must be inside `torch.no_grad()`.
-- **Q-chunk input shape is fixed**: `D_ctx + H·D_a` for Q; `D_ctx` for V. No per-step Q factorization.
+- **LPB encoder remains discriminator-only**: discriminator replay, disc reward and discriminator G term keep using the injected `SharedFrozenEncoder`.
+- **Q/V ResNet-50 backbones stay frozen**: Q1, Q2, V and target_V each own an independent backbone loaded from `data/pretrained/resnet50.pth`; only branch MLPs and critic heads train.
+- **Q/V raw-observation contract is fixed**: Q concatenates multi-view visual, state and action-chunk embeddings; V concatenates visual and state embeddings.
 - **Concurrency is fixed**: one daemon learner thread on cuda:1; no multiprocessing, no DDP.
 - **`DipoleFlowPolicy.update()` signature must not change**: G enters exclusively via `compute_g_for_batch(batch) → (B,)`.
 - **Markdown lives only under `pipeline/docs/`**; no new READMEs anywhere else.
@@ -159,7 +158,11 @@ algorithm:
     g_mode: "advantage"               # "advantage" | "bce_frozen"
   q_learning:
     enabled: true
-    config: {IQLConfig fields}
+    config:
+      resnet_pretrained_path: "data/pretrained/resnet50.pth"
+      state_feature_dim: 256
+      action_feature_dim: 256
+      # plus the remaining IQLConfig fields
     warmup_value_steps: 20000
     warmup_full_steps: 5000
     warmup_ckpt: null                 # if set, skip warmup
@@ -257,6 +260,9 @@ When you finish implementing your part, please update THIS FILE [here](#10-subag
 
 
 ### Subagent-1 · IQL Q-chunking — DONE (2026-05-21)
+
+Historical implementation record. Its LPB-latent Q/V contract and
+schema-v1 payload are superseded by `Q/V ResNet-50 split` below.
 
 **Files touched**
 - `robosuite/pipeline/algorithms/q_learning/common.py` — `IQLStepBatch.to` / `IQLActorBatch.to` (tensor-only device moves, metadata kept by reference).
@@ -781,6 +787,10 @@ step 200 must contain top-level keys `iql_state` and
 
 ### Subagent-10 · Single-frame `OnlineBCEDiscriminator` (lpb_v2-aligned) — DONE (2026-05-24)
 
+Historical implementation record. Its discriminator changes remain active,
+but its statement that Q/V consume `IQLStepBatch.context` is superseded by
+`Q/V ResNet-50 split` below.
+
 Aligns the online BCE discriminator with the reference single-frame head
 in `robosuite/discriminator/lpb_v2/detectors/bce.py`. The head's input
 dim drops from `D_ctx + H·D_a` to `D_ctx`, so warm-start from the lpb v2
@@ -879,3 +889,28 @@ rewards through the same `aggregate_chunk_reward` path that handles
   the per-step encoding makes encoder fps the dominant cost on the
   learner GPU. Cache key candidate: `(storage_index, encoder_id)`.
 
+### Q/V ResNet-50 split — DONE (2026-06-02)
+
+Q/V no longer consume LPB `SharedFrozenEncoder` latents. The LPB encoder is
+retained for discriminator replay, online discriminator reward and the
+discriminator term inside `AdvantageGProvider`.
+
+**Q/V architecture**
+- Q1 and Q2 each own a frozen torchvision ResNet-50 loaded strictly from
+  `data/pretrained/resnet50.pth`. Views share the backbone within one critic
+  and their 2048-d global pooled features are concatenated in policy-camera
+  order. A state MLP and a flatten-chunk action MLP are concatenated before
+  the existing critic MLP.
+- V and target_V each own the same visual/state structure without an action
+  branch. All four ResNet-50 copies stay frozen and in eval mode.
+- `IQLStepBatch` and `IQLActorBatch` carry raw images and proprio instead of
+  LPB context tensors. Replay invokes LPB encoding only when discriminator
+  reward fallback is needed.
+
+**Checkpoint compatibility**
+- Q/V warmup payloads now use `schema_version=2`.
+- Frozen ResNet tensors are not duplicated in Q/V checkpoints. Loading
+  reconstructs each backbone from `resnet_pretrained_path` and strictly loads
+  only the saved trainable branches and heads.
+- Schema-v1 LPB-latent Q/V checkpoints are rejected with an explicit request
+  to rerun Q/V warmup.

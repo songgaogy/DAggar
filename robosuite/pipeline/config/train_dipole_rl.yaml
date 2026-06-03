@@ -47,11 +47,14 @@ algorithm:
       target_polyak: 0.005
       n_step_aggregate: true
       hidden_dims: [512, 512]
+      resnet_pretrained_path: "data/pretrained/resnet50.pth"
+      state_feature_dim: 256
+      action_feature_dim: 256
       grad_clip_norm: 1.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      output_reward_coef: 0
-      disc_reward_coef: 1.0
+      output_reward_coef: 1
+      disc_reward_coef: 0
       update_freq: 1
     warmup_value_steps: 20000
     warmup_full_steps: 10000

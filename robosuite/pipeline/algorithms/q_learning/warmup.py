@@ -500,6 +500,9 @@ def main(cfg: DictConfig) -> None:
 
         iql_cfg_dict = OmegaConf.to_container(q_cfg_block.config, resolve=True)
         iql_cfg_dict["device"] = device
+        iql_cfg_dict["resnet_pretrained_path"] = to_absolute_path(
+            str(iql_cfg_dict["resnet_pretrained_path"])
+        )
         iql_cfg = IQLConfig(**iql_cfg_dict)
 
         capacity = int(getattr(cfg.runtime, "demo_buffer_capacity", 200_000))
@@ -613,8 +616,14 @@ def main(cfg: DictConfig) -> None:
     finally:
         env.close()
 
-    # Build IQL learner and replay sampler.
-    iql = IQLLearner(cfg=iql_cfg, context_dim=encoder.context_dim, action_dim=policy_action_dim)
+    # Build IQL learner and replay sampler. LPB encoder remains discriminator-only.
+    proprio_dim = int(np.asarray(buffer._storage[0].obs["state"]).shape[-1])  # noqa: SLF001
+    iql = IQLLearner(
+        cfg=iql_cfg,
+        camera_names=policy_camera_names,
+        proprio_dim=proprio_dim,
+        action_dim=policy_action_dim,
+    )
     replay = IQLReplayBuffer(base_buffer=buffer, cfg=iql_cfg)
     if not replay.ready(batch_size):
         raise RuntimeError(
@@ -670,9 +679,10 @@ def main(cfg: DictConfig) -> None:
         "cfg": asdict(iql_cfg),
         "encoder_meta": {
             "bce_ckpt": bce_ckpt,
-            "context_dim": int(encoder.context_dim),
             "view_names": list(encoder.view_names),
             "policy_camera_names": list(policy_camera_names),
+            "proprio_dim": int(proprio_dim),
+            "resnet_pretrained_path": str(iql.resnet_pretrained_path),
             "task": task_data_name,
             "task_env": task_name,
             "policy_action_dim": int(policy_action_dim),
@@ -684,7 +694,7 @@ def main(cfg: DictConfig) -> None:
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "LPBV2OfflineScorer(-sigmoid(failure_score - tau))",
         },
-        "schema_version": 1,
+        "schema_version": 2,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")

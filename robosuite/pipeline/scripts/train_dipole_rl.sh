@@ -7,6 +7,7 @@
 #                      (passed to runtime.init_checkpoint)
 # Optional env vars:
 #   LPB_CKPT         — overrides algorithm.discriminator.warm_start_ckpt
+#   RESNET50_CKPT    — overrides Q/V ResNet-50 pretrained checkpoint
 #   IQL_WARMUP_CKPT  — overrides algorithm.q_learning.warmup_ckpt
 #   ALPHA, BETA      — overrides algorithm.advantage_g_provider.{alpha,beta}
 #   G_MODE           — "advantage" | "bce_frozen"
@@ -44,6 +45,7 @@ HYDRA_ARGS=(
   "logging.use_wandb=${LOGGING_USE_WANDB}"
 )
 [[ -n "${LPB_CKPT:-}" ]]              && HYDRA_ARGS+=("algorithm.discriminator.warm_start_ckpt=${LPB_CKPT}")
+[[ -n "${RESNET50_CKPT:-}" ]]         && HYDRA_ARGS+=("algorithm.q_learning.config.resnet_pretrained_path=${RESNET50_CKPT}")
 [[ -n "${IQL_WARMUP_CKPT:-}" ]]       && HYDRA_ARGS+=("algorithm.q_learning.warmup_ckpt=${IQL_WARMUP_CKPT}")
 [[ -n "${ALPHA:-}" ]]                 && HYDRA_ARGS+=("algorithm.advantage_g_provider.alpha=${ALPHA}")
 [[ -n "${BETA:-}" ]]                  && HYDRA_ARGS+=("algorithm.advantage_g_provider.beta=${BETA}")

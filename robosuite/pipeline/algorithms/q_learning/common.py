@@ -1,13 +1,4 @@
-"""Dataclasses shared across the IQL Q-chunking module.
-
-Interface contract (see docs/DIPOLE_RL.md §A):
-- `IQLStepBatch` is the unit consumed by Bellman + expectile losses; rewards
-  are already aggregated as n-step discounted returns over the action chunk
-  and include the discriminator intrinsic term r_disc.
-- `IQLActorBatch` is the unit consumed by `compute_advantage_for_batch` to
-  produce the advantage signal that `AdvantageGProvider` mixes with the
-  discriminator logit.
-"""
+"""Dataclasses shared across the ResNet-50 IQL Q-chunking module."""
 
 from __future__ import annotations
 
@@ -19,16 +10,7 @@ import torch
 
 @dataclass
 class IQLConfig:
-    """Configuration for the IQL learner.
-
-    Notes:
-        action_horizon must match DipoleConfig.action_horizon (Q-chunking
-        assumes the critic sees the full execution chunk).
-        r_disc is sourced from ``OnlineBCEDiscriminator.intrinsic_reward``:
-        ``-sigmoid(failure_score - tau)`` with ``failure_score = -head(z)``
-        (LPB convention). Per-frame values lie in (-1, 0); the replay
-        γ-aggregates them with r_env via ``aggregate_chunk_reward``.
-    """
+    """Configuration for the IQL learner."""
 
     action_horizon: int = 8
     discount: float = 0.99
@@ -40,6 +22,9 @@ class IQLConfig:
 
     n_step_aggregate: bool = True
     hidden_dims: tuple[int, ...] = (512, 512)
+    state_feature_dim: int = 256
+    action_feature_dim: int = 256
+    resnet_pretrained_path: str = "data/pretrained/resnet50.pth"
     grad_clip_norm: float = 1.0
     weight_decay: float = 1e-6
     device: str = "cuda:1"
@@ -54,23 +39,12 @@ class IQLConfig:
 
 @dataclass
 class IQLStepBatch:
-    """Transition-centric batch for Q/V updates.
+    """Transition-centric raw-observation batch for Q/V updates."""
 
-    Shapes:
-        context        (B, D_ctx)   — frozen latent at chunk start s_t
-                                      (Q/V Bellman state; disc also scores
-                                      all H frames inside the replay sampler)
-        next_context   (B, D_ctx)   — frozen encoder latent for s'
-        action_chunk   (B, H, D_a)  — normalized chunk a_{t:t+H}
-        rewards        (B, 1)       — n-step aggregated r_env + λ_disc·r_disc
-        dones          (B, 1)       — 1 if any step in chunk terminated
-        is_online      (B, 1)       — 1 if sampled from online buffer
-        is_intervention(B, 1)       — 1 if first step is an intervention
-        metadata       dict         — debug fields (episode ids, sources)
-    """
-
-    context: torch.Tensor
-    next_context: torch.Tensor
+    image_obs_raw: torch.Tensor
+    proprio_raw: torch.Tensor
+    next_image_obs_raw: torch.Tensor
+    next_proprio_raw: torch.Tensor
     action_chunk: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
@@ -80,8 +54,10 @@ class IQLStepBatch:
 
     def to(self, device: str | torch.device) -> "IQLStepBatch":
         return IQLStepBatch(
-            context=self.context.to(device),
-            next_context=self.next_context.to(device),
+            image_obs_raw=self.image_obs_raw.to(device),
+            proprio_raw=self.proprio_raw.to(device),
+            next_image_obs_raw=self.next_image_obs_raw.to(device),
+            next_proprio_raw=self.next_proprio_raw.to(device),
             action_chunk=self.action_chunk.to(device),
             rewards=self.rewards.to(device),
             dones=self.dones.to(device),
@@ -93,21 +69,17 @@ class IQLStepBatch:
 
 @dataclass
 class IQLActorBatch:
-    """Actor-side batch consumed by AdvantageGProvider.
+    """Actor-side raw-observation batch consumed by ``AdvantageGProvider``."""
 
-    Shapes:
-        context           (B, D_ctx)   — frozen encoder latent for s
-        action_chunk_raw  (B, H, D_a)  — UN-normalized chunk used to score Q
-        metadata          dict         — episode ids, mask flags
-    """
-
-    context: torch.Tensor
+    image_obs_raw: torch.Tensor
+    proprio_raw: torch.Tensor
     action_chunk_raw: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to(self, device: str | torch.device) -> "IQLActorBatch":
         return IQLActorBatch(
-            context=self.context.to(device),
+            image_obs_raw=self.image_obs_raw.to(device),
+            proprio_raw=self.proprio_raw.to(device),
             action_chunk_raw=self.action_chunk_raw.to(device),
             metadata=self.metadata,
         )

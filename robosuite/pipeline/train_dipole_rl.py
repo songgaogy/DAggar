@@ -138,7 +138,8 @@ def _load_iql_warmup_state(
     learner: IQLLearner,
     warmup_ckpt: str,
     *,
-    expected_context_dim: int,
+    expected_camera_names: list[str],
+    expected_proprio_dim: int,
     expected_action_dim: int,
 ) -> None:
     """Load an IQL state-dict ckpt produced by ``algorithms/q_learning/warmup.py``."""
@@ -146,12 +147,22 @@ def _load_iql_warmup_state(
     if not path.exists():
         raise FileNotFoundError(f"IQL warmup ckpt not found: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("schema_version", -1)) != 2:
+        raise ValueError(
+            f"IQL warmup ckpt {path} uses schema_version={payload.get('schema_version')!r}; "
+            "expected schema_version=2 ResNet-50 Q/V state. Re-run Q/V warmup."
+        )
     learner.load_state_dict(payload["iql_state"], strict=True)
     meta = payload.get("encoder_meta", {})
-    if int(meta.get("context_dim", -1)) != int(expected_context_dim):
+    if [str(name) for name in meta.get("policy_camera_names", [])] != list(expected_camera_names):
         raise ValueError(
-            f"IQL warmup ckpt context_dim={meta.get('context_dim')} != "
-            f"shared_encoder.context_dim={expected_context_dim}."
+            f"IQL warmup ckpt policy_camera_names={meta.get('policy_camera_names')} != "
+            f"runtime camera_names={expected_camera_names}."
+        )
+    if int(meta.get("proprio_dim", -1)) != int(expected_proprio_dim):
+        raise ValueError(
+            f"IQL warmup ckpt proprio_dim={meta.get('proprio_dim')} != "
+            f"runtime proprio_dim={expected_proprio_dim}."
         )
     if int(meta.get("policy_action_dim", -1)) != int(expected_action_dim):
         raise ValueError(
@@ -371,12 +382,19 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # per tick.
     policy_action_dim = int(agent.flow_config.action_dim)
     iql_cfg_dict = OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True)
+    iql_cfg_dict["resnet_pretrained_path"] = to_absolute_path(
+        str(iql_cfg_dict["resnet_pretrained_path"])
+    )
     iql_cfg = IQLConfig(**iql_cfg_dict)
     q_learning_enabled = bool(getattr(cfg.algorithm.q_learning, "enabled", True))
+    policy_proprio_dim = int(np.asarray(initial_obs["state"]).shape[-1])
 
     if q_learning_enabled:
         iql_learner = IQLLearner(
-            iql_cfg, context_dim=int(shared_encoder.context_dim), action_dim=policy_action_dim
+            iql_cfg,
+            camera_names=list(agent.camera_names),
+            proprio_dim=policy_proprio_dim,
+            action_dim=policy_action_dim,
         )
         iql_replay = IQLReplayBuffer(agent.online_buffer, iql_cfg)
     else:
@@ -897,7 +915,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         _load_iql_warmup_state(
             iql_learner,
             str(warmup_ckpt_raw),
-            expected_context_dim=int(shared_encoder.context_dim),
+            expected_camera_names=list(agent.camera_names),
+            expected_proprio_dim=policy_proprio_dim,
             expected_action_dim=policy_action_dim,
         )
     else:

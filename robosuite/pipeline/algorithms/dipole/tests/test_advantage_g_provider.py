@@ -52,7 +52,7 @@ class _FakeIQL:
 
     @torch.no_grad()
     def compute_advantage_for_batch(self, actor_batch) -> torch.Tensor:
-        B = int(actor_batch.context.shape[0])
+        B = int(actor_batch.image_obs_raw.shape[0])
         if isinstance(self.advantage_values, torch.Tensor):
             assert self.advantage_values.shape == (B,), (
                 f"fake advantage shape {tuple(self.advantage_values.shape)} != (B={B},)"

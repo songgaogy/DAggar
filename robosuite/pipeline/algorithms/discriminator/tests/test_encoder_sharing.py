@@ -1,13 +1,8 @@
-"""Step-2 verification: a single SharedFrozenEncoder must be shared by
-IQLLearner, OnlineBCEDiscriminator, and AdvantageGProvider.
+"""Verify LPB encoder ownership after Q/V move to independent ResNet-50.
 
 We assert:
-1. id(encoder stored in IQL replay-buffer caller path) ==
-   id(encoder stored in disc) ==
-   id(encoder stored in AdvantageGProvider).
-2. After building all three modules on cuda:1, the additional CUDA memory
-   beyond the encoder alone is bounded (the three trainable heads are
-   small).
+1. OnlineBCEDiscriminator and AdvantageGProvider reuse one SharedFrozenEncoder.
+2. IQL owns independent frozen ResNet-50 visual encoders.
 
 Skips when no CUDA / no LPB BCE checkpoint is available.
 """
@@ -31,6 +26,7 @@ from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
+RESNET50_CKPT = REPO_ROOT / "data" / "pretrained" / "resnet50.pth"
 CKPT_GLOBS = [
     str(REPO_ROOT / "checkpoints" / "lpb_v2" / "bce_viz_robosuite"
         / "*" / "checkpoints" / "bce_head.pth"),
@@ -74,9 +70,12 @@ def test_encoder_id_shared_across_modules(bce_ckpt: str) -> None:
 
     iql_cfg = IQLConfig(
         action_horizon=8, hidden_dims=(64, 64), device=device,
+        resnet_pretrained_path=str(RESNET50_CKPT),
     )
     action_dim = 7
-    iql = IQLLearner(iql_cfg, context_dim=enc.context_dim, action_dim=action_dim)
+    iql = IQLLearner(
+        iql_cfg, camera_names=enc.view_names, proprio_dim=8, action_dim=action_dim
+    )
 
     disc_cfg = DiscriminatorConfig(
         device=device, hidden=64, num_layers=2,
@@ -103,18 +102,9 @@ def test_encoder_id_shared_across_modules(bce_ckpt: str) -> None:
     assert id(disc._encoder_ref) == id(enc)
     assert id(adv.encoder) == id(enc)
 
-    # IQL does NOT keep a direct encoder reference (the trainer feeds
-    # encoder.encode(...) results through the replay buffer). What matters
-    # is that the trainer's single encoder copy is what gets fed in. We
-    # check via the docs §4 contract: there is exactly ONE SharedFrozenEncoder
-    # instance in the active references.
-    seen: set[int] = set()
-    seen.add(id(enc))
-    seen.add(id(disc._encoder_ref))
-    seen.add(id(adv.encoder))
-    assert len(seen) == 1, (
-        f"expected a single shared encoder instance; saw {len(seen)} distinct ids"
-    )
+    assert iql.q1.vis_encoder.backbone is not iql.q2.vis_encoder.backbone
+    assert iql.q1.vis_encoder.backbone is not iql.v.vis_encoder.backbone
+    assert all(not p.requires_grad for p in iql.q1.vis_encoder.backbone.parameters())
 
 
 def test_memory_overhead_under_threshold(bce_ckpt: str) -> None:
@@ -128,9 +118,16 @@ def test_memory_overhead_under_threshold(bce_ckpt: str) -> None:
     torch.cuda.synchronize(device=device)
     encoder_alloc = torch.cuda.memory_allocated(device=device) - base_alloc
 
-    iql_cfg = IQLConfig(action_horizon=8, hidden_dims=(64, 64), device=device)
+    iql_cfg = IQLConfig(
+        action_horizon=8,
+        hidden_dims=(64, 64),
+        device=device,
+        resnet_pretrained_path=str(RESNET50_CKPT),
+    )
     action_dim = 7
-    iql = IQLLearner(iql_cfg, context_dim=enc.context_dim, action_dim=action_dim)
+    iql = IQLLearner(
+        iql_cfg, camera_names=enc.view_names, proprio_dim=8, action_dim=action_dim
+    )
 
     disc_cfg = DiscriminatorConfig(
         device=device, hidden=64, num_layers=2, warm_start_ckpt=None
@@ -151,17 +148,12 @@ def test_memory_overhead_under_threshold(bce_ckpt: str) -> None:
     full_alloc = torch.cuda.memory_allocated(device=device) - base_alloc
 
     overhead = full_alloc - encoder_alloc
-    # Sanity: heads + Q/V are small relative to the LPB v2 encoder. We
-    # bound the heads + optimizers + Q/V at 200 MB; if they ever exceed
-    # this we want a loud failure to investigate.
-    assert overhead < 200 * 1024 * 1024, (
-        f"head+critic overhead {overhead / 1e6:.1f} MB exceeds 200 MB; "
+    # Four frozen ResNet-50 copies plus trainable heads should stay bounded.
+    assert overhead < 600 * 1024 * 1024, (
+        f"ResNet Q/V + head overhead {overhead / 1e6:.1f} MB exceeds 600 MB; "
         f"encoder_alloc={encoder_alloc / 1e6:.1f} MB, full_alloc={full_alloc / 1e6:.1f} MB"
     )
 
-    # The encoder itself dominates (the encoder is the LPB v2 lpb_v2
-    # transformer). The "within 10%" wording in the prompt is a target
-    # not a guarantee — head + Q/V are unavoidable overhead. We log it.
     pct = 100.0 * overhead / max(encoder_alloc, 1)
     print(
         f"[encoder_sharing] encoder={encoder_alloc / 1e6:.1f}MB, "

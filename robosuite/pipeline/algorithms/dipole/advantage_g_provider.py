@@ -18,8 +18,8 @@ Math:
 
 The flow policy then maps G -> w_pos = sigmoid(beta_policy * G + k).
 
-This object owns nothing it doesn't construct: the IQL learner, the
-discriminator, and the encoder are all injected.
+The IQL learner scores raw images / proprio with its own ResNet-50 critics.
+The injected LPB encoder is retained only for the discriminator logit.
 """
 
 from __future__ import annotations
@@ -47,8 +47,8 @@ class AdvantageGProvider:
     Args:
         iql_learner:           the IQL learner; provides advantage.
         discriminator:         online BCE; provides disc_logit.
-        encoder:               shared frozen encoder; used to build context
-                               from `DipoleBatch.image_obs_raw` + `proprio_raw`.
+        encoder:               LPB shared frozen encoder used only to build
+                               discriminator context.
         alpha, beta:           linear mixing coefficients.
         advantage_normalization, disc_normalization:
                                "batch_zscore" | "running_zscore" | "minmax" | "none".
@@ -101,24 +101,22 @@ class AdvantageGProvider:
             (B,) tensor of G values on the same device as
             `batch.action_sequences_raw`.
         """
-        action_chunk_raw = batch.action_sequences_raw.to(
-            device=torch.device(self.encoder.device), dtype=torch.float32
-        )
-        # Encoder is single-frame and consumes the proposed action via
-        # `action_real`. Use the chunk's first step — consistent with the
-        # IQL replay's chunk-start `context` and with the lpb v2 BCE head's
-        # training-time inputs.
+        learner_device = torch.device(self.encoder.device)
+        image_obs_raw = batch.image_obs_raw.to(device=learner_device, dtype=torch.float32)
+        proprio_raw = batch.proprio_raw.to(device=learner_device, dtype=torch.float32)
+        action_chunk_raw = batch.action_sequences_raw.to(device=learner_device, dtype=torch.float32)
+        # LPB discriminator scoring remains single-frame and uses the first
+        # action. IQL receives the raw observation and full action chunk.
         first_action = action_chunk_raw[:, 0, :]
         context = self.encoder.encode(
-            image_obs_raw=batch.image_obs_raw,
-            proprio_raw=batch.proprio_raw,
+            image_obs_raw=image_obs_raw,
+            proprio_raw=proprio_raw,
             action_real=first_action,
         )
 
-        action_chunk_raw = action_chunk_raw.to(device=context.device)
-
         actor_batch = IQLActorBatch(
-            context=context,
+            image_obs_raw=image_obs_raw,
+            proprio_raw=proprio_raw,
             action_chunk_raw=action_chunk_raw,
             metadata={},
         )

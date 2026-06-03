@@ -171,7 +171,7 @@ class DipoleTrainer:
         if (
             self.iql_learner is not None
             and self.iql_replay is not None
-            and self.shared_encoder is not None
+            and (self.discriminator is None or self.shared_encoder is not None)
             and self.iql_replay.ready(self.iql_batch_size)
         ):
             from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
@@ -191,7 +191,8 @@ class DipoleTrainer:
                 with torch.no_grad():
                     adv = self.iql_learner.compute_advantage_for_batch(
                         IQLActorBatch(
-                            context=step_batch.context,
+                            image_obs_raw=step_batch.image_obs_raw,
+                            proprio_raw=step_batch.proprio_raw,
                             action_chunk_raw=step_batch.action_chunk,
                         )
                     )
@@ -238,8 +239,8 @@ class DipoleTrainer:
         """V-only IQL warmup. Disc is treated as frozen here (no `.update()` is
         ever invoked during this loop); we pass it through so r_disc enters the
         reward composition consistently with the online phase."""
-        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
-            raise RuntimeError("pretrain_iql_value requires iql_learner / iql_replay / shared_encoder.")
+        if self.iql_learner is None or self.iql_replay is None:
+            raise RuntimeError("pretrain_iql_value requires iql_learner / iql_replay.")
         out: list[dict[str, float]] = []
         for _ in range(int(num_steps)):
             if not self.iql_replay.ready(self.iql_batch_size):
@@ -258,8 +259,8 @@ class DipoleTrainer:
     def pretrain_iql_full(self, num_steps: int) -> list[dict[str, float]]:
         """Full IQL warmup (Q + V + target polyak). Disc is frozen here — see
         `pretrain_iql_value` docstring."""
-        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
-            raise RuntimeError("pretrain_iql_full requires iql_learner / iql_replay / shared_encoder.")
+        if self.iql_learner is None or self.iql_replay is None:
+            raise RuntimeError("pretrain_iql_full requires iql_learner / iql_replay.")
         out: list[dict[str, float]] = []
         for _ in range(int(num_steps)):
             if not self.iql_replay.ready(self.iql_batch_size):

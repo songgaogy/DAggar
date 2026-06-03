@@ -124,6 +124,11 @@ def load_iql_payload(iql_ckpt: Path) -> dict[str, Any]:
     for key in ("iql_state", "cfg", "encoder_meta"):
         if key not in payload:
             raise KeyError(f"IQL checkpoint {iql_ckpt} is missing required key '{key}'.")
+    if int(payload.get("schema_version", -1)) != 2:
+        raise ValueError(
+            f"IQL checkpoint {iql_ckpt} uses schema_version={payload.get('schema_version')!r}; "
+            "expected schema_version=2 ResNet-50 Q/V state. Re-run Q/V warmup."
+        )
     return payload
 
 
@@ -230,10 +235,18 @@ def build_iql_and_encoder(
         raise KeyError("IQL checkpoint encoder_meta does not define policy_camera_names.")
     encoder.bind_policy_cameras(policy_camera_names)
 
-    action_dim = int(encoder_meta.get("policy_action_dim", payload["iql_state"].get("action_dim", 0)))
+    action_dim = int(encoder_meta.get("policy_action_dim", 0))
     if action_dim <= 0:
-        raise KeyError("IQL checkpoint does not define a positive policy_action_dim/action_dim.")
-    iql = IQLLearner(cfg=iql_cfg, context_dim=int(encoder.context_dim), action_dim=action_dim)
+        raise KeyError("IQL checkpoint does not define a positive policy_action_dim.")
+    proprio_dim = int(encoder_meta.get("proprio_dim", 0))
+    if proprio_dim <= 0:
+        raise KeyError("IQL checkpoint does not define a positive proprio_dim.")
+    iql = IQLLearner(
+        cfg=iql_cfg,
+        camera_names=policy_camera_names,
+        proprio_dim=proprio_dim,
+        action_dim=action_dim,
+    )
     iql.load_state_dict(payload["iql_state"], strict=True)
     iql.q1.eval()
     iql.q2.eval()
@@ -426,6 +439,25 @@ def tensor_to_float(tensor: torch.Tensor, index: int) -> float:
     return float(tensor[index].detach().cpu().item())
 
 
+def raw_observation_tensors(
+    observations: list[dict[str, Any]],
+    *,
+    camera_names: list[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image_np = np.stack(
+        [_stack_views_uint8(obs, camera_names) for obs in observations],
+        axis=0,
+    )
+    proprio_np = np.stack(
+        [np.asarray(obs["state"], dtype=np.float32) for obs in observations],
+        axis=0,
+    )
+    return (
+        _to_image_tensor(np.ascontiguousarray(image_np), "cpu"),
+        torch.from_numpy(np.ascontiguousarray(proprio_np)).float(),
+    )
+
+
 def per_step_training_disc_from_chunks(
     *,
     num_transitions: int,
@@ -613,9 +645,11 @@ def compute_qv_metrics(
         )
         expert_logit_per_frame = -scores_padded
 
-    # Match IQLReplayBuffer: chunk-start context from encode_chunk_frames; s' via
-    # encode(..., action_real=last chunk action). Do NOT use encode() without actions.
-    chunk_ctx_cpu = torch.empty((num_windows, horizon, context_dim), dtype=torch.float32)
+    # LPB latents remain discriminator-only. Q/V consume raw image/state tensors.
+    need_online_disc_context = discriminator is not None and not use_lpb_disc
+    chunk_ctx_cpu: torch.Tensor | None = None
+    if need_online_disc_context:
+        chunk_ctx_cpu = torch.empty((num_windows, horizon, context_dim), dtype=torch.float32)
     disc_step_cpu: torch.Tensor | None = None
     disc_logit_cpu: torch.Tensor | None = None
     if score_with_disc:
@@ -640,12 +674,15 @@ def compute_qv_metrics(
             np.ascontiguousarray(batch_chunk_proprio)
         ).float()
         with torch.no_grad():
-            chunk_ctx = encoder.encode_chunk_frames(
-                chunk_images=chunk_images_tensor,
-                chunk_proprio=chunk_proprio_tensor,
-                chunk_actions=batch_actions,
-            )
-            chunk_ctx_cpu[start_idx:end_idx] = chunk_ctx.detach().cpu()
+            chunk_ctx = None
+            if need_online_disc_context:
+                chunk_ctx = encoder.encode_chunk_frames(
+                    chunk_images=chunk_images_tensor,
+                    chunk_proprio=chunk_proprio_tensor,
+                    chunk_actions=batch_actions,
+                )
+                assert chunk_ctx_cpu is not None
+                chunk_ctx_cpu[start_idx:end_idx] = chunk_ctx.detach().cpu()
             if (
                 use_lpb_disc
                 and disc_step_cpu is not None
@@ -664,7 +701,7 @@ def compute_qv_metrics(
                 disc_step_cpu[start_idx:end_idx] = step_chunk
                 disc_logit_cpu[start_idx:end_idx] = logit_chunk
             elif score_with_disc and disc_step_cpu is not None and disc_logit_cpu is not None:
-                assert discriminator is not None
+                assert discriminator is not None and chunk_ctx is not None
                 flat_ctx = chunk_ctx.reshape(batch_size_local * horizon, -1)
                 r_disc_flat = discriminator.intrinsic_reward(context=flat_ctx)
                 disc_step_cpu[start_idx:end_idx] = r_disc_flat.view(
@@ -674,15 +711,13 @@ def compute_qv_metrics(
                     discriminator.score(context=flat_ctx).logit.view(batch_size_local, horizon).detach().cpu()
                 )
 
-    context_cpu = chunk_ctx_cpu[:, 0, :]
-    next_actions_np = np.ascontiguousarray(action_np[:, -1, :], dtype=np.float32)
-    next_context_cpu = encode_observation_batch(
-        encoder,
-        next_obs,
-        next_actions_np,
+    current_images_cpu, current_proprio_cpu = raw_observation_tensors(
+        current_obs,
         camera_names=camera_names,
-        batch_size=batch_size,
-        device=device,
+    )
+    next_images_cpu, next_proprio_cpu = raw_observation_tensors(
+        next_obs,
+        camera_names=camera_names,
     )
 
     metrics: list[dict[str, float]] = []
@@ -690,8 +725,10 @@ def compute_qv_metrics(
     for start_idx in range(0, num_windows, int(batch_size)):
         end_idx = min(num_windows, start_idx + int(batch_size))
         batch_size_local = end_idx - start_idx
-        context = context_cpu[start_idx:end_idx].to(device)
-        next_context = next_context_cpu[start_idx:end_idx].to(device)
+        current_images = current_images_cpu[start_idx:end_idx].to(device)
+        current_proprio = current_proprio_cpu[start_idx:end_idx].to(device)
+        next_images = next_images_cpu[start_idx:end_idx].to(device)
+        next_proprio = next_proprio_cpu[start_idx:end_idx].to(device)
         actions = actions_cpu[start_idx:end_idx].to(device)
         rewards = rewards_cpu[start_idx:end_idx].to(device)
         dones = dones_cpu[start_idx:end_idx].to(device)
@@ -707,7 +744,7 @@ def compute_qv_metrics(
                         expert_logit_per_frame[starts[start_idx:end_idx]]
                     ).to(device=device, dtype=rewards.dtype)
                 else:
-                    assert discriminator is not None
+                    assert discriminator is not None and chunk_ctx_cpu is not None
                     disc_logit = discriminator.score(
                         context=chunk_ctx_cpu[start_idx:end_idx, 0, :].to(device)
                     ).logit.view(-1)
@@ -719,13 +756,13 @@ def compute_qv_metrics(
                 disc_intrinsic_step0 = torch.zeros_like(disc_reward_horizon)
                 disc_logit = torch.zeros((batch_size_local,), device=device, dtype=rewards.dtype)
 
-            q1 = iql.q1(context, actions)
-            q2 = iql.q2(context, actions)
+            q1 = iql.q1(current_images, current_proprio, actions)
+            q2 = iql.q2(current_images, current_proprio, actions)
             q_min = torch.minimum(q1, q2)
             q_mean = 0.5 * (q1 + q2)
             q_max = torch.maximum(q1, q2)
-            v = iql.v(context)
-            next_v = iql.target_v(next_context)
+            v = iql.v(current_images, current_proprio)
+            next_v = iql.target_v(next_images, next_proprio)
             env_reward_horizon = aggregate_chunk_reward(rewards, discount)
             done_horizon = chunk_done_mask(dones).to(device)
 

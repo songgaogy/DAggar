@@ -12,6 +12,8 @@
 #                        (default: checkpoints/lpb_v2/bce_ckeckpoints/<ENVIRONMENT>/bce_head.pth).
 #   LPB_META_JSON     — operational Youden threshold metadata (default: sibling
 #                        meta.json with key bce_youden_threshold).
+#   RESNET50_CKPT     — Q/V frozen ResNet-50 checkpoint
+#                        (default: data/pretrained/resnet50.pth).
 #   VALUE_STEPS       — V-only warmup loop length (default 20000).
 #   FULL_STEPS        — full IQL update loop length (default 10000).
 #   BATCH_SIZE        — minibatch size (default 128).
@@ -31,7 +33,8 @@ cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
 ENVIRONMENT="PickPlaceCereal"
-NAME="iql_qv_cache-weight0_1"
+NAME="iql_qv_cache-weight1_0"
+OUTPUT_DIR="${ROOT_DIR}/outputs/DIPOLE_rl-v2-res50-qv/${NAME}/${ENVIRONMENT}"
 
 # Canonical per-task LPB v2 BCE layout (see pipeline/docs/IQL_DISCRIMINATOR_REWARD_DEBUG.md):
 #   checkpoints/lpb_v2/bce_ckeckpoints/<TASK>/bce_head.pth
@@ -39,13 +42,13 @@ NAME="iql_qv_cache-weight0_1"
 LPB_CKPT_DIR="${LPB_CKPT_DIR:-${ROOT_DIR}/checkpoints/lpb_v2/bce_ckeckpoints/${ENVIRONMENT}}"
 LPB_CKPT="${LPB_CKPT:-${LPB_CKPT_DIR}/bce_head.pth}"
 LPB_META_JSON="${LPB_META_JSON:-${LPB_CKPT_DIR}/meta.json}"
+RESNET50_CKPT="${RESNET50_CKPT:-${ROOT_DIR}/data/pretrained/resnet50.pth}"
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 
 VALUE_STEPS="${VALUE_STEPS:-20000}"
 FULL_STEPS="${FULL_STEPS:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 DEVICE="${DEVICE:-cuda:1}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_rl/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 INIT_CHECKPOINT="checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
 mkdir -p "${OUTPUT_DIR}"
@@ -69,6 +72,7 @@ HYDRA_OVERRIDES=(
   "data.task_name=${DEMO_TASK_NAME}"
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
   "algorithm.discriminator.warm_start_ckpt=${LPB_CKPT}"
+  "algorithm.q_learning.config.resnet_pretrained_path=${RESNET50_CKPT}"
   "+algorithm.discriminator.config.meta_json_path=${LPB_META_JSON}"
   "algorithm.q_learning.warmup_value_steps=${VALUE_STEPS}"
   "algorithm.q_learning.warmup_full_steps=${FULL_STEPS}"
@@ -106,6 +110,10 @@ if [[ ! -f "${LPB_META_JSON}" ]]; then
   echo "        Expected bce_youden_threshold next to bce_head.pth (not the threshold inside the .pth)." >&2
   exit 1
 fi
+if [[ ! -f "${RESNET50_CKPT}" ]]; then
+  echo "[ERROR] Q/V ResNet-50 checkpoint not found: ${RESNET50_CKPT}" >&2
+  exit 1
+fi
 LPB_TAU="$("${PY}" -c "import json, sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['bce_youden_threshold'])" "${LPB_META_JSON}")"
 
 if [[ "${DEVICE}" == cuda* ]]; then
@@ -122,6 +130,7 @@ echo "[init_iql_qv] output=${OUTPUT_FILE}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"
 echo "[init_iql_qv] lpb_ckpt=${LPB_CKPT}"
 echo "[init_iql_qv] lpb_meta=${LPB_META_JSON} bce_youden_threshold=${LPB_TAU}"
+echo "[init_iql_qv] resnet50_ckpt=${RESNET50_CKPT}"
 
 "${PY}" -m robosuite.pipeline.algorithms.q_learning.warmup "${HYDRA_OVERRIDES[@]}"
 
