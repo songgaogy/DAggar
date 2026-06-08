@@ -14,7 +14,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
+from robosuite.pipeline.algorithms.discriminator.encoder import (
+    SharedFrozenEncoder,
+    _action_inputs_for_chunk_frames,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 CKPT_GLOB = str(
@@ -125,6 +128,20 @@ def test_action_real_affects_latent(enc: SharedFrozenEncoder) -> None:
         "encoder produced identical latents with and without `action_real`; "
         "the kwarg may not be threaded through to inner_encoder.encode_batch."
     )
+
+
+def test_chunk_frame_action_inputs_match_flatten_order() -> None:
+    """Action rows must align with chunk image/proprio flatten order (B-major)."""
+    chunk_actions = torch.arange(2 * 3, dtype=torch.float32).view(2, 3, 1)
+    flat_actions = _action_inputs_for_chunk_frames(
+        chunk_actions,
+        feature_source="transformer",
+        frameskip=1,
+        action_dim_per_step=1,
+        action_input_dim=1,
+    )
+    expected = chunk_actions.reshape(2 * 3, 1)
+    torch.testing.assert_close(flat_actions, expected)
 
 
 def test_encode_chunk_frames_uses_frameskip_window(enc: SharedFrozenEncoder) -> None:

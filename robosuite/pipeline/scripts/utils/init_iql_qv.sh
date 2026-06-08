@@ -16,7 +16,9 @@
 #   FULL_STEPS        — full IQL update loop length (default 10000).
 #   BATCH_SIZE        — minibatch size (default 128).
 #   DEVICE            — learner device (default cuda:1).
-#   OUTPUT_DIR        — per-task output dir (default outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
+#   Q_ENSEMBLE_SIZE   — number of Q critics (default 5).
+#   V_SUBSET_SIZE     — random Q subset size for V update (default 2).
+#   OUTPUT_DIR        — per-task output dir (default outputs/<ROOT_NAME>/iql_qv_cache/<ENVIRONMENT>).
 #   NUM_TRAJECTORIES  — alias for NUM_TRAJECTORIES_EXPERT (legacy).
 #   NUM_TRAJECTORIES_EXPERT / _SUCCESS / _FAIL — per-split HDF5 caps
 #                        (unset = config defaults; <=0 = all).
@@ -30,8 +32,9 @@ cd "$ROOT_DIR"
 
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
+ROOT_NAME="DIPOLE_rl-v1-aug-qv"
 ENVIRONMENT="PickPlaceCereal"
-NAME="iql_qv_cache-weight0_1"
+NAME="iql_qv_cache-weight1_0"
 
 # Canonical per-task LPB v2 BCE layout (see pipeline/docs/IQL_DISCRIMINATOR_REWARD_DEBUG.md):
 #   checkpoints/lpb_v2/bce_ckeckpoints/<TASK>/bce_head.pth
@@ -43,9 +46,11 @@ DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 
 VALUE_STEPS="${VALUE_STEPS:-20000}"
 FULL_STEPS="${FULL_STEPS:-10000}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-256}"
 DEVICE="${DEVICE:-cuda:1}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_rl/${NAME}/${ENVIRONMENT}}"
+Q_ENSEMBLE_SIZE=5
+V_SUBSET_SIZE=2
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${ROOT_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 INIT_CHECKPOINT="checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
 mkdir -p "${OUTPUT_DIR}"
@@ -73,6 +78,8 @@ HYDRA_OVERRIDES=(
   "algorithm.q_learning.warmup_value_steps=${VALUE_STEPS}"
   "algorithm.q_learning.warmup_full_steps=${FULL_STEPS}"
   "algorithm.q_learning.config.device=${DEVICE}"
+  "algorithm.q_learning.config.q_ensemble_size=${Q_ENSEMBLE_SIZE}"
+  "algorithm.q_learning.config.v_subset_size=${V_SUBSET_SIZE}"
   "+warmup.output_path=${OUTPUT_FILE}"
   "+warmup.batch_size=${BATCH_SIZE}"
 )
@@ -118,6 +125,7 @@ fi
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE}"
 echo "[init_iql_qv] value_steps=${VALUE_STEPS} full_steps=${FULL_STEPS} batch=${BATCH_SIZE}"
+echo "[init_iql_qv] q_ensemble=${Q_ENSEMBLE_SIZE} v_subset=${V_SUBSET_SIZE}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"
 echo "[init_iql_qv] lpb_ckpt=${LPB_CKPT}"

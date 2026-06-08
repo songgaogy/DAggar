@@ -4,8 +4,9 @@ Implementation notes:
 - `bellman_q_loss` is plain MSE between predicted Q and detached target.
 - `expectile_v_loss` mirrors baseline awr/models/flow.py:37-39: asymmetric
   L2 weighted by tau if diff > 0 else (1 - tau).
-- `compute_advantage` returns `min(q1, q2) - v` and never propagates
-  gradients back into Q or V (used only for actor-side weighting).
+- `compute_advantage` returns `min(q1, q2) - v` and is kept for legacy
+  two-Q callers.
+- `compute_ensemble_advantage` returns `mean(Q_1..Q_K) - V`.
 """
 
 from __future__ import annotations
@@ -16,11 +17,15 @@ import torch.nn.functional as F
 
 def bellman_q_loss(q_pred: torch.Tensor, target_q: torch.Tensor) -> torch.Tensor:
     """Args:
-        q_pred:   (B, 1) predicted Q values, requires grad.
-        target_q: (B, 1) detached Bellman target.
+        q_pred:   (B, 1) or (K, B, 1) predicted Q values, requires grad.
+        target_q: same shape as q_pred, or broadcast-compatible target.
     Returns:
-        scalar MSE.
+        scalar MSE. For an ensemble, returns the sum of per-critic MSE terms
+        so each critic keeps the same gradient scale as the two-Q v0 learner.
     """
+    if q_pred.dim() == 3:
+        loss = F.mse_loss(q_pred, target_q.expand_as(q_pred), reduction="none")
+        return loss.mean(dim=(1, 2)).sum()
     return F.mse_loss(q_pred, target_q)
 
 
@@ -51,3 +56,19 @@ def compute_advantage(q1: torch.Tensor, q2: torch.Tensor, v: torch.Tensor) -> to
         (B,) flattened advantage.
     """
     return (torch.min(q1, q2) - v).squeeze(-1)
+
+
+def compute_ensemble_advantage(q_values: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Advantage A = mean(Q_1..Q_K) - V for a Q ensemble.
+
+    Args:
+        q_values: shape (K, B, 1).
+        v:        shape (B, 1).
+    Returns:
+        (B,) flattened advantage.
+    """
+    if q_values.dim() != 3:
+        raise ValueError(f"q_values must be (K, B, 1); got {tuple(q_values.shape)}")
+    if q_values.shape[-1] != 1:
+        raise ValueError(f"q_values last dim must be 1; got {tuple(q_values.shape)}")
+    return (q_values.mean(dim=0) - v).squeeze(-1)

@@ -140,7 +140,7 @@ def _action_inputs_for_chunk_frames(
                 action_input_dim=action_input_dim,
             )
         )
-    return torch.cat(rows, dim=0)
+    return torch.stack(rows, dim=1).reshape(B * H, -1).contiguous()
 
 
 def _adapt_action_to_input_dim(

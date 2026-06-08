@@ -99,19 +99,21 @@ class IQLReplayBuffer:
     # Sampling                                                            #
     # ------------------------------------------------------------------ #
 
-    def _gather_chunks(self, batch_size: int) -> tuple[list[list[Any]], list[int]]:
-        """Sample `batch_size` chunk sequences from the base buffer. Returns
-        `(sequences, start_indices)` — sequences is a list of H-length lists
-        of `Transition` objects (held by reference; do not mutate)."""
+    def _sample_start_indices(self, batch_size: int) -> list[int]:
+        """Sample valid chunk start indices from the base buffer."""
         with self._base._lock:  # noqa: SLF001 — intentional access to base cache
             valid_starts = self._base._get_valid_start_indices_locked()  # noqa: SLF001
             if len(valid_starts) == 0:
                 raise ValueError("IQLReplayBuffer: base buffer has no valid sequences.")
             sampled = np.random.randint(0, len(valid_starts), size=int(batch_size))
-            start_indices = [valid_starts[int(i)] for i in sampled]
+            return [valid_starts[int(i)] for i in sampled]
+
+    def _gather_chunks_for_starts(self, start_indices: list[int]) -> list[list[Any]]:
+        """Gather H-step chunk sequences for explicit start indices."""
+        with self._base._lock:  # noqa: SLF001 — intentional access to base cache
             H = int(self.cfg.action_horizon)
             sequences = [self._base._storage[s : s + H] for s in start_indices]  # noqa: SLF001
-        return sequences, start_indices
+        return sequences
 
     def _next_obs_for(self, start: int) -> tuple[Any, bool]:
         """Resolve s' for chunk starting at `start`. Returns (next_obs, forced_done)."""
@@ -127,23 +129,18 @@ class IQLReplayBuffer:
                     return storage[tail_idx].obs, False
             return storage[start + H - 1].next_obs, True
 
-    def sample_step_batch(
+    def _build_step_batch_from_start_indices(
         self,
-        batch_size: int,
+        start_indices: list[int],
         *,
         encoder: "SharedFrozenEncoder",
         discriminator: "OnlineBCEDiscriminator | None" = None,
         device: str = "cuda:1",
     ) -> IQLStepBatch:
-        """Sample `batch_size` chunk windows, encode every frame under no_grad,
-        and synthesize total rewards (env + optional disc intrinsic).
-
-        When transitions carry ``info['lpb_disc_intrinsic']`` (offline warmup
-        LPB benchmark scores), those values are used for ``r_disc``. Otherwise
-        falls back to ``OnlineBCEDiscriminator.intrinsic_reward`` on
-        ``encode_chunk_frames`` latents.
-        """
-        sequences, start_indices = self._gather_chunks(batch_size)
+        """Build an encoded IQL batch for explicit valid chunk starts."""
+        if not start_indices:
+            raise ValueError("IQLReplayBuffer: start_indices must be non-empty.")
+        sequences = self._gather_chunks_for_starts(start_indices)
         camera_names = list(self._base.camera_names)
         H = int(self.cfg.action_horizon)
 
@@ -291,6 +288,97 @@ class IQLReplayBuffer:
         )
         return batch.to(device)
 
+    def sample_step_batch(
+        self,
+        batch_size: int,
+        *,
+        encoder: "SharedFrozenEncoder",
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+    ) -> IQLStepBatch:
+        """Sample `batch_size` chunk windows, encode every frame under no_grad,
+        and synthesize total rewards (env + optional disc intrinsic).
+
+        When transitions carry ``info['lpb_disc_intrinsic']`` (offline warmup
+        LPB benchmark scores), those values are used for ``r_disc``. Otherwise
+        falls back to ``OnlineBCEDiscriminator.intrinsic_reward`` on
+        ``encode_chunk_frames`` latents.
+        """
+        start_indices = self._sample_start_indices(batch_size)
+        return self._build_step_batch_from_start_indices(
+            start_indices,
+            encoder=encoder,
+            discriminator=discriminator,
+            device=device,
+        )
+
+    def preencode_step_cache(
+        self,
+        *,
+        encoder: "SharedFrozenEncoder",
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+        encode_batch_size: int = 64,
+        cache_device: str = "cpu",
+        progress_desc: str | None = None,
+    ) -> "IQLPreencodedReplayCache":
+        """Precompute encoded IQL step tensors for all current valid starts.
+
+        Intended for offline warmup only. Online learning should keep using
+        dynamic replay sampling so current discriminator rewards are re-scored.
+        """
+        with self._base._lock:  # noqa: SLF001
+            valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
+        if not valid_starts:
+            raise ValueError("IQLReplayBuffer: base buffer has no valid sequences to preencode.")
+
+        encode_bs = max(1, int(encode_batch_size))
+        iterator = range(0, len(valid_starts), encode_bs)
+        if progress_desc:
+            from tqdm import tqdm
+
+            iterator = tqdm(
+                iterator,
+                total=(len(valid_starts) + encode_bs - 1) // encode_bs,
+                desc=progress_desc,
+            )
+
+        parts: dict[str, list[torch.Tensor]] = {
+            "context": [],
+            "next_context": [],
+            "action_chunk": [],
+            "rewards": [],
+            "dones": [],
+            "is_online": [],
+            "is_intervention": [],
+        }
+        for start in iterator:
+            batch_starts = valid_starts[start : start + encode_bs]
+            batch = self._build_step_batch_from_start_indices(
+                batch_starts,
+                encoder=encoder,
+                discriminator=discriminator,
+                device=device,
+            ).to(cache_device)
+            parts["context"].append(batch.context.detach())
+            parts["next_context"].append(batch.next_context.detach())
+            parts["action_chunk"].append(batch.action_chunk.detach())
+            parts["rewards"].append(batch.rewards.detach())
+            parts["dones"].append(batch.dones.detach())
+            parts["is_online"].append(batch.is_online.detach())
+            parts["is_intervention"].append(batch.is_intervention.detach())
+
+        return IQLPreencodedReplayCache(
+            context=torch.cat(parts["context"], dim=0),
+            next_context=torch.cat(parts["next_context"], dim=0),
+            action_chunk=torch.cat(parts["action_chunk"], dim=0),
+            rewards=torch.cat(parts["rewards"], dim=0),
+            dones=torch.cat(parts["dones"], dim=0),
+            is_online=torch.cat(parts["is_online"], dim=0),
+            is_intervention=torch.cat(parts["is_intervention"], dim=0),
+            source_size=len(valid_starts),
+        )
+
     def sample_actor_batch(
         self,
         batch_size: int,
@@ -299,7 +387,8 @@ class IQLReplayBuffer:
         device: str = "cuda:1",
     ) -> IQLActorBatch:
         """Sample chunks for actor-side advantage scoring (no rewards needed)."""
-        sequences, start_indices = self._gather_chunks(batch_size)
+        start_indices = self._sample_start_indices(batch_size)
+        sequences = self._gather_chunks_for_starts(start_indices)
         camera_names = list(self._base.camera_names)
 
         s_images: list[np.ndarray] = []
@@ -353,3 +442,75 @@ class IQLReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._base)
+
+
+class IQLPreencodedReplayCache:
+    """Tensor-only replay cache for offline IQL warmup."""
+
+    def __init__(
+        self,
+        *,
+        context: torch.Tensor,
+        next_context: torch.Tensor,
+        action_chunk: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        is_online: torch.Tensor,
+        is_intervention: torch.Tensor,
+        source_size: int,
+    ) -> None:
+        self.context = context.contiguous()
+        self.next_context = next_context.contiguous()
+        self.action_chunk = action_chunk.contiguous()
+        self.rewards = rewards.contiguous()
+        self.dones = dones.contiguous()
+        self.is_online = is_online.contiguous()
+        self.is_intervention = is_intervention.contiguous()
+        self.source_size = int(source_size)
+
+        n = int(self.context.shape[0])
+        for name, tensor in (
+            ("next_context", self.next_context),
+            ("action_chunk", self.action_chunk),
+            ("rewards", self.rewards),
+            ("dones", self.dones),
+            ("is_online", self.is_online),
+            ("is_intervention", self.is_intervention),
+        ):
+            if int(tensor.shape[0]) != n:
+                raise ValueError(
+                    f"IQLPreencodedReplayCache {name} batch dim {tensor.shape[0]} "
+                    f"does not match context batch dim {n}."
+                )
+
+    def sample_step_batch(
+        self,
+        batch_size: int,
+        *,
+        encoder: "SharedFrozenEncoder | None" = None,
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+    ) -> IQLStepBatch:
+        """Sample a cached encoded batch. Encoder/discriminator args are ignored."""
+        del encoder, discriminator
+        if len(self) == 0:
+            raise ValueError("IQLPreencodedReplayCache is empty.")
+        index_device = self.context.device
+        idx = torch.randint(0, len(self), (int(batch_size),), device=index_device)
+        batch = IQLStepBatch(
+            context=self.context.index_select(0, idx),
+            next_context=self.next_context.index_select(0, idx),
+            action_chunk=self.action_chunk.index_select(0, idx),
+            rewards=self.rewards.index_select(0, idx),
+            dones=self.dones.index_select(0, idx),
+            is_online=self.is_online.index_select(0, idx),
+            is_intervention=self.is_intervention.index_select(0, idx),
+            metadata={"source": "preencoded_cache"},
+        )
+        return batch.to(device)
+
+    def ready(self, batch_size: int) -> bool:
+        return len(self) >= int(batch_size)
+
+    def __len__(self) -> int:
+        return int(self.context.shape[0])

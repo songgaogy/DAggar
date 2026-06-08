@@ -40,6 +40,8 @@ class IQLConfig:
 
     n_step_aggregate: bool = True
     hidden_dims: tuple[int, ...] = (512, 512)
+    q_ensemble_size: int = 5
+    v_subset_size: int = 2
     grad_clip_norm: float = 1.0
     weight_decay: float = 1e-6
     device: str = "cuda:1"
@@ -50,6 +52,21 @@ class IQLConfig:
     disc_reward_coef: float = 1.0
     # Gradient steps per learner tick inside DipoleTrainer.train_step (each resamples).
     update_freq: int = 1
+
+    def __post_init__(self) -> None:
+        self.hidden_dims = tuple(int(h) for h in self.hidden_dims)
+        self.q_ensemble_size = int(self.q_ensemble_size)
+        self.v_subset_size = int(self.v_subset_size)
+        if self.q_ensemble_size < 1:
+            raise ValueError(
+                f"IQLConfig.q_ensemble_size must be >= 1, got {self.q_ensemble_size}."
+            )
+        if self.v_subset_size < 1 or self.v_subset_size > self.q_ensemble_size:
+            raise ValueError(
+                "IQLConfig.v_subset_size must satisfy "
+                f"1 <= v_subset_size <= q_ensemble_size; got "
+                f"{self.v_subset_size} and {self.q_ensemble_size}."
+            )
 
 
 @dataclass

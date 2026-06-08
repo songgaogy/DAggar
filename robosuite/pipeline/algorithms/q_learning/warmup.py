@@ -621,6 +621,29 @@ def main(cfg: DictConfig) -> None:
             f"IQL warmup buffer has too few valid chunks ({buffer.num_valid_sequences()}) "
             f"to fill batch_size={batch_size}."
         )
+    train_replay = replay
+    preencode_cache = bool(OmegaConf.select(cfg, "warmup.preencode_cache", default=True))
+    if preencode_cache and (value_steps + full_steps) > 0:
+        preencode_batch_size = max(
+            1,
+            int(OmegaConf.select(cfg, "warmup.preencode_batch_size", default=batch_size)),
+        )
+        cache_device = str(OmegaConf.select(cfg, "warmup.preencode_cache_device", default="cpu"))
+        if cache_device.lower() in {"learner", "device"}:
+            cache_device = str(device)
+        print(
+            f"[warmup] preencoding IQL replay cache: valid_starts={buffer.num_valid_sequences()} "
+            f"encode_batch={preencode_batch_size} cache_device={cache_device}"
+        )
+        train_replay = replay.preencode_step_cache(
+            encoder=encoder,
+            discriminator=None,
+            device=device,
+            encode_batch_size=preencode_batch_size,
+            cache_device=cache_device,
+            progress_desc="[warmup] preencode IQL",
+        )
+        print(f"[warmup] preencoded cache ready: {len(train_replay)} chunks")
 
     lpb_tau = float(lpb_scorer.tau) if lpb_scorer is not None else None
     lpb_tau_source = str(lpb_scorer.tau_source) if lpb_scorer is not None else None
@@ -634,7 +657,7 @@ def main(cfg: DictConfig) -> None:
     # Warmup loops (r_disc from pre-annotated LPB fields; no OnlineBCEDiscriminator).
     print(f"[warmup] starting value-only loop for {value_steps} steps (batch={batch_size})")
     for step in range(value_steps):
-        batch = replay.sample_step_batch(
+        batch = train_replay.sample_step_batch(
             batch_size,
             encoder=encoder,
             discriminator=None,
@@ -650,7 +673,7 @@ def main(cfg: DictConfig) -> None:
 
     print(f"[warmup] starting full IQL update loop for {full_steps} steps")
     for step in range(full_steps):
-        batch = replay.sample_step_batch(
+        batch = train_replay.sample_step_batch(
             batch_size,
             encoder=encoder,
             discriminator=None,

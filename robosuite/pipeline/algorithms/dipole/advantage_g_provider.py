@@ -5,7 +5,7 @@ Implements the exact same `compute_g_for_batch(batch) -> (B,)` contract so
 `DipoleFlowPolicy.update()` is unchanged.
 
 Math:
-    A(s, a)        = min(Q1(s, a), Q2(s, a)) - V(s)
+    A(s, a)        = mean(Q_1(s, a)..Q_K(s, a)) - V(s)
     A_norm         = normalize(A,         mode=advantage_normalization)
     disc_logit     = OnlineBCEDiscriminator.score(s, a).logit
     disc_norm      = normalize(disc_logit, mode=disc_normalization)

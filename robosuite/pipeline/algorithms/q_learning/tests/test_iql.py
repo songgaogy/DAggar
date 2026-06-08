@@ -27,6 +27,7 @@ from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.losses import (
     bellman_q_loss,
     compute_advantage,
+    compute_ensemble_advantage,
     expectile_v_loss,
 )
 
@@ -41,6 +42,8 @@ def _make_cfg(action_horizon: int = 2) -> IQLConfig:
         target_polyak=0.1,
         n_step_aggregate=True,
         hidden_dims=(32, 32),
+        q_ensemble_size=5,
+        v_subset_size=2,
         grad_clip_norm=1.0,
         weight_decay=0.0,
         device="cpu",
@@ -72,6 +75,20 @@ def test_compute_advantage_shape_and_value() -> None:
     assert torch.allclose(adv, torch.tensor([0.5, 0.5, 2.5]))
 
 
+def test_compute_ensemble_advantage_uses_q_mean() -> None:
+    q_values = torch.tensor(
+        [
+            [[1.0], [3.0]],
+            [[2.0], [5.0]],
+            [[4.0], [7.0]],
+        ]
+    )
+    v = torch.tensor([[0.5], [1.0]])
+    adv = compute_ensemble_advantage(q_values, v)
+    assert adv.shape == (2,)
+    assert torch.allclose(adv, torch.tensor([7.0 / 3.0 - 0.5, 5.0 - 1.0]))
+
+
 def test_expectile_v_loss_tau_half_is_quarter_mse() -> None:
     diff = torch.tensor([[1.0], [-2.0], [0.5]])
     # tau = 0.5 -> weight = 0.5 everywhere; loss = 0.5 * mean(diff^2)
@@ -92,6 +109,21 @@ def test_bellman_q_loss_matches_mse() -> None:
     pred = torch.tensor([[1.0], [2.0], [3.0]])
     target = torch.tensor([[1.5], [1.0], [4.0]])
     assert torch.allclose(bellman_q_loss(pred, target), torch.nn.functional.mse_loss(pred, target))
+
+
+def test_bellman_q_loss_sums_ensemble_critics() -> None:
+    pred = torch.tensor(
+        [
+            [[1.0], [2.0], [3.0]],
+            [[2.0], [4.0], [6.0]],
+        ]
+    )
+    target = torch.tensor([[1.5], [1.0], [4.0]])
+    expected = (
+        torch.nn.functional.mse_loss(pred[0], target)
+        + torch.nn.functional.mse_loss(pred[1], target)
+    )
+    assert torch.allclose(bellman_q_loss(pred, target), expected)
 
 
 def test_aggregate_chunk_reward_closed_form() -> None:
@@ -121,21 +153,27 @@ def test_iql_update_step_runs_and_moves_params() -> None:
     # doesn't mask the V update.
     iql.warmup_value_only(batch)
 
-    snapshot_q1 = [p.detach().clone() for p in iql.q1.parameters()]
+    snapshot_q = [
+        [p.detach().clone() for p in critic.parameters()]
+        for critic in iql.q_ensemble
+    ]
     snapshot_v = [p.detach().clone() for p in iql.v.parameters()]
 
     metrics = iql.update(batch)
     assert all(math.isfinite(v) for v in metrics.values()), f"non-finite metric: {metrics}"
 
-    moved_q = any(
-        not torch.equal(before, after)
-        for before, after in zip(snapshot_q1, iql.q1.parameters())
-    )
+    moved_q = [
+        any(
+            not torch.equal(before, after)
+            for before, after in zip(snapshot, critic.parameters())
+        )
+        for snapshot, critic in zip(snapshot_q, iql.q_ensemble)
+    ]
     moved_v = any(
         not torch.equal(before, after)
         for before, after in zip(snapshot_v, iql.v.parameters())
     )
-    assert moved_q, "q1 parameters did not move after update"
+    assert all(moved_q), f"not every Q critic moved after update: {moved_q}"
     assert moved_v, "v parameters did not move after update"
 
 
@@ -143,7 +181,10 @@ def test_iql_warmup_value_only_runs() -> None:
     cfg = _make_cfg(action_horizon=2)
     iql = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
     batch = _make_step_batch(B=8, D_ctx=16, D_a=4, H=2)
-    snapshot_q1 = [p.detach().clone() for p in iql.q1.parameters()]
+    snapshot_q = [
+        [p.detach().clone() for p in critic.parameters()]
+        for critic in iql.q_ensemble
+    ]
     snapshot_v = [p.detach().clone() for p in iql.v.parameters()]
     metrics = iql.warmup_value_only(batch)
     assert all(math.isfinite(v) for v in metrics.values()), f"non-finite metric: {metrics}"
@@ -153,11 +194,14 @@ def test_iql_warmup_value_only_runs() -> None:
     )
     assert moved_v, "v parameters did not move during warmup"
     # Q must NOT move during warmup-value-only.
-    untouched_q = all(
-        torch.equal(before, after)
-        for before, after in zip(snapshot_q1, iql.q1.parameters())
-    )
-    assert untouched_q, "q1 parameters moved during warmup_value_only (should be V-only)"
+    untouched_q = [
+        all(
+            torch.equal(before, after)
+            for before, after in zip(snapshot, critic.parameters())
+        )
+        for snapshot, critic in zip(snapshot_q, iql.q_ensemble)
+    ]
+    assert all(untouched_q), "Q parameters moved during warmup_value_only (should be V-only)"
 
 
 def test_iql_state_dict_roundtrip() -> None:
@@ -169,8 +213,9 @@ def test_iql_state_dict_roundtrip() -> None:
     iql_a.update(batch)
     sd = iql_a.state_dict()
     iql_b.load_state_dict(sd, strict=True)
-    for pa, pb in zip(iql_a.q1.parameters(), iql_b.q1.parameters()):
-        assert torch.equal(pa, pb)
+    for qa, qb in zip(iql_a.q_ensemble, iql_b.q_ensemble):
+        for pa, pb in zip(qa.parameters(), qb.parameters()):
+            assert torch.equal(pa, pb)
     for pa, pb in zip(iql_a.v.parameters(), iql_b.v.parameters()):
         assert torch.equal(pa, pb)
 
@@ -182,3 +227,18 @@ def test_iql_load_state_dict_mismatched_context_dim_raises() -> None:
     sd = iql_a.state_dict()
     with pytest.raises(ValueError, match="context_dim mismatch"):
         iql_c.load_state_dict(sd, strict=True)
+
+
+def test_iql_old_two_q_checkpoint_schema_raises() -> None:
+    cfg = _make_cfg(action_horizon=2)
+    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    sd = iql_a.state_dict()
+    old_sd = dict(sd)
+    old_sd.pop("q_ensemble")
+    old_sd.pop("q_ensemble_size")
+    old_sd.pop("v_subset_size")
+    old_sd["q1"] = iql_a.q1.state_dict()
+    old_sd["q2"] = iql_a.q2.state_dict()
+    with pytest.raises(ValueError, match="old two-Q schema"):
+        iql_b.load_state_dict(old_sd, strict=True)

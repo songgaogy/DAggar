@@ -47,11 +47,13 @@ algorithm:
       target_polyak: 0.005
       n_step_aggregate: true
       hidden_dims: [512, 512]
+      q_ensemble_size: 5
+      v_subset_size: 2
       grad_clip_norm: 1.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      output_reward_coef: 0
-      disc_reward_coef: 1.0
+      output_reward_coef: 1.0
+      disc_reward_coef: 0
       update_freq: 1
     warmup_value_steps: 20000
     warmup_full_steps: 10000
@@ -91,6 +93,9 @@ warmup:
     expert: 0
     success_rollout: 50
     fail_rollout: 50
+  preencode_cache: true
+  preencode_batch_size: 64
+  preencode_cache_device: "cpu"  # "cpu" is conservative; use "learner" for GPU-resident cache.
 
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
