@@ -33,9 +33,9 @@ cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
 # -------------------------------------
-ROOT_NAME="DIPOLE_rl-v3-debug"
+ROOT_NAME="DIPOLE_rl-v3-debug-128"
 ENVIRONMENT="PickPlaceCereal"
-NAME="iql_qv_cache-weight1_0"
+NAME="iql_qv_cache-weight1_0-tau07"
 # -------------------------------------
 
 # Canonical per-task LPB v2 BCE layout (see pipeline/docs/IQL_DISCRIMINATOR_REWARD_DEBUG.md):

@@ -47,7 +47,7 @@ algorithm:
       target_polyak: 0.005
       n_step_aggregate: true
       hidden_dims: [512, 512]
-      compressed_dim: 64
+      compressed_dim: 128
       q_ensemble_size: 5
       v_subset_size: 2
       grad_clip_norm: 1.0
@@ -96,7 +96,7 @@ warmup:
     fail_rollout: 50
   preencode_cache: true
   preencode_batch_size: 64
-  preencode_cache_device: "cpu"  # "cpu" is conservative; use "learner" for GPU-resident cache.
+  preencode_cache_device: "learner"  # "cpu" is conservative; use "learner" for GPU-resident cache.
 
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
