@@ -33,9 +33,16 @@ class IQLLearner:
                        action_dim_per_step). Q input = D_ctx + H * D_a.
     """
 
-    def __init__(self, cfg: IQLConfig, context_dim: int, action_dim: int) -> None:
+    def __init__(
+        self,
+        cfg: IQLConfig,
+        context_dim: int,
+        action_dim: int,
+        compressed_dim: int | None = None,
+    ) -> None:
         self.cfg = cfg
         self.context_dim = int(context_dim)
+        self.compressed_dim = int(cfg.compressed_dim if compressed_dim is None else compressed_dim)
         self.action_dim = int(action_dim)
         device = cfg.device
 
@@ -48,6 +55,7 @@ class IQLLearner:
                     action_dim=self.action_dim,
                     action_horizon=int(cfg.action_horizon),
                     hidden_dims=tuple(cfg.hidden_dims),
+                    compressed_dim=self.compressed_dim,
                 )
                 for _ in range(self.q_ensemble_size)
             ]
@@ -213,6 +221,7 @@ class IQLLearner:
             "v_optim": self.v_optim.state_dict(),
             "cfg": asdict(self.cfg),
             "context_dim": self.context_dim,
+            "compressed_dim": self.compressed_dim,
             "action_dim": self.action_dim,
         }
 
@@ -227,6 +236,11 @@ class IQLLearner:
                 raise ValueError(
                     f"IQLLearner.load_state_dict: action_dim mismatch "
                     f"(ckpt={sd.get('action_dim')}, runtime={self.action_dim})"
+                )
+            if "compressed_dim" in sd and int(sd["compressed_dim"]) != self.compressed_dim:
+                raise ValueError(
+                    f"IQLLearner.load_state_dict: compressed_dim mismatch "
+                    f"(ckpt={sd.get('compressed_dim')}, runtime={self.compressed_dim})"
                 )
         if "q_ensemble" not in sd:
             raise ValueError(

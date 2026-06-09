@@ -128,7 +128,7 @@ def _annotate_offline_demos(
             )
         )
         episode_step += 1
-        if bool(t.done):
+        if bool(t.done) or bool(info.get("is_truncated_boundary", False)):
             episode_index += 1
             episode_step = 0
     return out

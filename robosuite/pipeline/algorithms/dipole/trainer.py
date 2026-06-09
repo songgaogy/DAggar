@@ -105,7 +105,7 @@ class DipoleTrainer:
             if mirror_online:
                 self.agent.store_online_transition(normalized)
             episode_step += 1
-            if bool(transition.done):
+            if bool(transition.done) or bool(info.get("is_truncated_boundary", False)):
                 episode_index += 1
                 episode_step = 0
         self._offline_bootstrap_episodes = int(episode_index if episode_step == 0 else episode_index + 1)

@@ -80,6 +80,14 @@ class QCandidateInputs:
     actions_cpu: torch.Tensor
 
 
+@dataclass
+class WindowSelectionInfo:
+    candidate_windows: int
+    used_windows: int
+    dropped_truncated_boundary_windows: int
+    dropped_mid_terminal_windows: int
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize trained Q-chunking IQL Q/V on HDF5 rollout windows."
@@ -413,11 +421,24 @@ def build_windows(transitions: list[Transition], horizon: int, max_windows: int 
     return windows
 
 
-def next_obs_for_window(transitions: list[Transition], start: int, horizon: int) -> tuple[dict[str, Any], bool]:
+def _is_truncated_boundary(transition: Transition) -> bool:
+    info = transition.info or {}
+    return bool(info.get("is_truncated_boundary", False)) or (
+        str(info.get("episode_terminal_reason", "")).lower() == "truncated"
+    )
+
+
+def next_obs_for_window(
+    transitions: list[Transition], start: int, horizon: int
+) -> tuple[dict[str, Any] | None, bool, bool, bool]:
+    """Return next obs and terminal/truncation flags for an H-step window."""
     next_index = int(start) + int(horizon)
     if next_index < len(transitions):
-        return transitions[next_index].obs, False
-    return transitions[start + horizon - 1].next_obs, True
+        return transitions[next_index].obs, False, True, False
+    last = transitions[start + horizon - 1]
+    if bool(last.done) and not _is_truncated_boundary(last):
+        return last.next_obs, True, False, False
+    return None, False, False, True
 
 
 def encode_observation_batch(
@@ -478,18 +499,22 @@ def per_step_training_disc_from_chunks(
 ) -> PerStepTrainingDisc:
     """Map (W, H) chunk disc tensors to per-frame series (length T).
 
-    Frame ``t`` uses window ``start = min(t, T - H)`` and offset ``h = t - start``,
-    matching the chunk position used when ``t`` is the sliding-window start in
-    ``steps.csv`` (``disc_intrinsic_step0`` at ``step == t``).
+    Frame ``t`` uses the nearest available chunk start not greater than ``t``.
+    Truncated boundary chunks may be absent from ``steps.csv``, so the final
+    frames are clamped to the last available chunk for HUD display only.
     """
     transition_count = int(num_transitions)
-    max_start = max(0, transition_count - int(horizon))
+    if not starts:
+        raise ValueError("per_step_training_disc_from_chunks requires at least one start.")
+    sorted_starts = np.asarray([int(start) for start in starts], dtype=np.int64)
     start_to_wi = {int(start): wi for wi, start in enumerate(starts)}
     intrinsic = np.zeros((transition_count,), dtype=np.float32)
     logit = np.zeros((transition_count,), dtype=np.float32)
     for step in range(transition_count):
-        start = min(int(step), max_start)
-        offset = int(step) - int(start)
+        pos = int(np.searchsorted(sorted_starts, int(step), side="right") - 1)
+        pos = max(0, min(pos, int(sorted_starts.shape[0]) - 1))
+        start = int(sorted_starts[pos])
+        offset = max(0, min(int(step) - int(start), int(horizon) - 1))
         wi = start_to_wi[int(start)]
         intrinsic[step] = float(disc_step_cpu[wi, offset].item())
         logit[step] = float(disc_logit_cpu[wi, offset].item())
@@ -577,7 +602,12 @@ def compute_qv_metrics(
     device: str,
     lpb_failure_scores: np.ndarray | None = None,
     lpb_tau: float | None = None,
-) -> tuple[list[dict[str, float]], PerStepTrainingDisc | None, QCandidateInputs]:
+) -> tuple[
+    list[dict[str, float]],
+    PerStepTrainingDisc | None,
+    QCandidateInputs,
+    WindowSelectionInfo,
+]:
     """Compute per-window Q/V/advantage/TD metrics over the selected demo.
 
     When ``lpb_failure_scores`` is set, ``r_disc`` uses the same LPB benchmark
@@ -586,12 +616,50 @@ def compute_qv_metrics(
     """
     horizon = int(iql_cfg.action_horizon)
     discount = float(iql_cfg.discount)
-    windows = build_windows(transitions, horizon=horizon, max_windows=max_windows)
+    candidate_windows = build_windows(transitions, horizon=horizon, max_windows=max_windows)
+    windows: list[tuple[int, list[Transition]]] = []
+    next_obs: list[dict[str, Any]] = []
+    forced_done_list: list[float] = []
+    has_bootstrap_next_obs_list: list[float] = []
+    true_terminal_list: list[float] = []
+    truncated_boundary_list: list[float] = []
+    dropped_truncated = 0
+    dropped_mid_terminal = 0
+    for start, sequence in candidate_windows:
+        if any(bool(item.done) for item in sequence[:-1]):
+            dropped_mid_terminal += 1
+            continue
+        next_obs_item, forced_done_item, has_bootstrap_item, truncated_boundary = next_obs_for_window(
+            transitions, start, horizon
+        )
+        if truncated_boundary:
+            dropped_truncated += 1
+            continue
+        if next_obs_item is None:
+            raise RuntimeError(f"Window start={start} has neither bootstrap nor terminal next_obs.")
+        windows.append((start, sequence))
+        next_obs.append(next_obs_item)
+        forced_done_list.append(float(forced_done_item))
+        has_bootstrap_next_obs_list.append(float(has_bootstrap_item))
+        true_terminal_list.append(float(forced_done_item))
+        truncated_boundary_list.append(0.0)
+    if not windows:
+        raise RuntimeError(
+            "No valid Q/V windows remain after dropping truncated boundary windows "
+            f"(candidate_windows={len(candidate_windows)})."
+        )
+    window_selection = WindowSelectionInfo(
+        candidate_windows=int(len(candidate_windows)),
+        used_windows=int(len(windows)),
+        dropped_truncated_boundary_windows=int(dropped_truncated),
+        dropped_mid_terminal_windows=int(dropped_mid_terminal),
+    )
     starts = [start for start, _ in windows]
     current_obs = [sequence[0].obs for _, sequence in windows]
-    next_obs_data = [next_obs_for_window(transitions, start, horizon) for start, _ in windows]
-    next_obs = [item[0] for item in next_obs_data]
-    forced_done = np.asarray([float(item[1]) for item in next_obs_data], dtype=np.float32)
+    forced_done = np.asarray(forced_done_list, dtype=np.float32)
+    has_bootstrap_next_obs = np.asarray(has_bootstrap_next_obs_list, dtype=np.float32)
+    is_true_terminal_window = np.asarray(true_terminal_list, dtype=np.float32)
+    is_truncated_boundary_window = np.asarray(truncated_boundary_list, dtype=np.float32)
 
     action_np = np.stack(
         [
@@ -791,6 +859,9 @@ def compute_qv_metrics(
                 "bootstrap_v": tensor_to_float(bootstrap_v, local_idx),
                 "total_reward_horizon": tensor_to_float(total_reward_horizon, local_idx),
                 "done_horizon": tensor_to_float(done_horizon, local_idx),
+                "has_bootstrap_next_obs": float(has_bootstrap_next_obs[global_idx]),
+                "is_true_terminal_window": float(is_true_terminal_window[global_idx]),
+                "is_truncated_boundary_window": float(is_truncated_boundary_window[global_idx]),
                 "q1": tensor_to_float(q1, local_idx),
                 "q2": tensor_to_float(q2, local_idx),
                 "q_min": tensor_to_float(q_min, local_idx),
@@ -836,7 +907,7 @@ def compute_qv_metrics(
         context_cpu=context_cpu.detach().cpu(),
         actions_cpu=actions_cpu.detach().cpu(),
     )
-    return metrics, per_step_disc, q_candidate_inputs
+    return metrics, per_step_disc, q_candidate_inputs, window_selection
 
 
 def write_metrics_csv(path: Path, metrics: list[dict[str, float]]) -> None:
@@ -1501,7 +1572,7 @@ def main() -> None:
             f"(source={discriminator.threshold_source})"
         )
 
-    metrics, per_step_disc, q_candidate_inputs = compute_qv_metrics(
+    metrics, per_step_disc, q_candidate_inputs, window_selection = compute_qv_metrics(
         iql=iql,
         encoder=encoder,
         discriminator=discriminator,
@@ -1635,6 +1706,14 @@ def main() -> None:
         "selected_demo_successful": bool(selected.successful),
         "loaded_transitions": int(len(transitions)),
         "used_windows": int(len(metrics)),
+        "candidate_windows": int(window_selection.candidate_windows),
+        "dropped_truncated_boundary_windows": int(
+            window_selection.dropped_truncated_boundary_windows
+        ),
+        "dropped_mid_terminal_windows": int(window_selection.dropped_mid_terminal_windows),
+        "true_terminal_windows": int(
+            sum(float(row.get("is_true_terminal_window", 0.0)) > 0.5 for row in metrics)
+        ),
         "camera_names": camera_names,
         "image_size": int(image_size),
         "device": str(device),

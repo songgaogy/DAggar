@@ -29,9 +29,9 @@ cd "$ROOT_DIR"
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
 SEED=1
-SPLIT="fail_rollout"
+SPLIT="success_rollout"
 TARGET_PATH="iql_qv_cache-weight1_0"
-ROOT_NAME="DIPOLE_rl-v1-aug-qv"
+ROOT_NAME="DIPOLE_rl-v3-debug"
 # -------------------------------------
 
 

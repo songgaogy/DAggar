@@ -149,13 +149,16 @@ def _annotate_episode_metadata(
         info["episode_namespace"] = demo_source
         info["buffer_role"] = buffer_role
         trans.info = info
-        if bool(trans.done):
+        is_episode_boundary = bool(trans.done) or bool(info.get("is_truncated_boundary", False))
+        if is_episode_boundary:
             current_index += 1
             step_in_episode = 0
         else:
             step_in_episode += 1
-    # If the last transition wasn't marked done (defensive), still bump the counter.
-    if not bool(transitions[-1].done):
+    # If the final transition has no explicit boundary marker, still keep the
+    # next loaded shard from sharing an episode id with this one.
+    last_info = transitions[-1].info or {}
+    if not bool(transitions[-1].done) and not bool(last_info.get("is_truncated_boundary", False)):
         current_index += 1
     return current_index
 

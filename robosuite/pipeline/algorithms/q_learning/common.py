@@ -40,6 +40,7 @@ class IQLConfig:
 
     n_step_aggregate: bool = True
     hidden_dims: tuple[int, ...] = (512, 512)
+    compressed_dim: int = 64
     q_ensemble_size: int = 5
     v_subset_size: int = 2
     grad_clip_norm: float = 1.0
@@ -55,8 +56,13 @@ class IQLConfig:
 
     def __post_init__(self) -> None:
         self.hidden_dims = tuple(int(h) for h in self.hidden_dims)
+        self.compressed_dim = int(self.compressed_dim)
         self.q_ensemble_size = int(self.q_ensemble_size)
         self.v_subset_size = int(self.v_subset_size)
+        if self.compressed_dim < 1:
+            raise ValueError(
+                f"IQLConfig.compressed_dim must be >= 1, got {self.compressed_dim}."
+            )
         if self.q_ensemble_size < 1:
             raise ValueError(
                 f"IQLConfig.q_ensemble_size must be >= 1, got {self.q_ensemble_size}."

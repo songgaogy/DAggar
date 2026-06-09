@@ -530,15 +530,20 @@ def load_hdf5_demos_into_flow_transitions(
                     policy_camera_names=policy_camera_names,
                     camera_aliases=camera_aliases,
                 )
-                is_last_step = step_idx == len(actions) - 1
                 reward, step_success = _sparse_env_step_reward(env, states[step_idx], actions[step_idx], reward_mode=reward_mode)
+                is_last_step = step_idx == len(actions) - 1
+                is_true_terminal = bool(step_success)
+                is_truncated_boundary = bool(is_last_step and not is_true_terminal)
+                terminal_reason = (
+                    "success" if is_true_terminal else ("truncated" if is_truncated_boundary else "")
+                )
                 transitions.append(
                     Transition(
                         obs=obs_images,
                         action=np.asarray(actions[step_idx], dtype=np.float32),
                         reward=float(reward),
                         next_obs=next_obs_images,
-                        done=bool(is_last_step),
+                        done=bool(is_true_terminal),
                         grasp_penalty=None,
                         is_intervention=bool(intervention_labels[step_idx]),
                         info={
@@ -546,11 +551,15 @@ def load_hdf5_demos_into_flow_transitions(
                             "demo_success_attr": bool(demo_success_attr),
                             "demo_name": str(demo_name),
                             "reward_convention": "sparse_success_-1_0",
+                            "episode_terminal_reason": terminal_reason,
+                            "is_truncated_boundary": bool(is_truncated_boundary),
                         },
                         reward_source="env_success",
                         demo_source="offline_demo",
                     )
                 )
+                if is_true_terminal:
+                    break
     return transitions
 
 

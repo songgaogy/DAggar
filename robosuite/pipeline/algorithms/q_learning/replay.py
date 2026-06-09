@@ -24,6 +24,13 @@ def _episode_index_of(transition: Any) -> int:
     return int(info.get("episode_index", -1))
 
 
+def _is_truncated_boundary(transition: Any) -> bool:
+    info = getattr(transition, "info", None) or {}
+    return bool(info.get("is_truncated_boundary", False)) or (
+        str(info.get("episode_terminal_reason", "")).lower() == "truncated"
+    )
+
+
 def _lpb_disc_intrinsic_for_transition(transition: Any) -> float | None:
     """Read precomputed LPB disc reward from ``transition.info`` (warmup / offline)."""
     info = getattr(transition, "info", None) or {}
@@ -99,10 +106,29 @@ class IQLReplayBuffer:
     # Sampling                                                            #
     # ------------------------------------------------------------------ #
 
+    def _has_bootstrap_or_true_terminal_locked(self, start: int) -> bool:
+        H = int(self.cfg.action_horizon)
+        storage = self._base._storage  # noqa: SLF001
+        n = len(storage)
+        first_episode = _episode_index_of(storage[start])
+        tail_idx = int(start) + H
+        if tail_idx < n and _episode_index_of(storage[tail_idx]) == first_episode:
+            return True
+        last = storage[start + H - 1]
+        return bool(last.done) and not _is_truncated_boundary(last)
+
+    def _get_iql_valid_start_indices_locked(self) -> list[int]:
+        valid_starts = self._base._get_valid_start_indices_locked()  # noqa: SLF001
+        return [
+            int(start)
+            for start in valid_starts
+            if self._has_bootstrap_or_true_terminal_locked(int(start))
+        ]
+
     def _sample_start_indices(self, batch_size: int) -> list[int]:
         """Sample valid chunk start indices from the base buffer."""
         with self._base._lock:  # noqa: SLF001 — intentional access to base cache
-            valid_starts = self._base._get_valid_start_indices_locked()  # noqa: SLF001
+            valid_starts = self._get_iql_valid_start_indices_locked()
             if len(valid_starts) == 0:
                 raise ValueError("IQLReplayBuffer: base buffer has no valid sequences.")
             sampled = np.random.randint(0, len(valid_starts), size=int(batch_size))
@@ -127,7 +153,13 @@ class IQLReplayBuffer:
                 tail_episode = _episode_index_of(storage[tail_idx])
                 if tail_episode == first_episode:
                     return storage[tail_idx].obs, False
-            return storage[start + H - 1].next_obs, True
+            last = storage[start + H - 1]
+            if bool(last.done) and not _is_truncated_boundary(last):
+                return last.next_obs, True
+            raise ValueError(
+                "IQLReplayBuffer: requested a truncated boundary chunk without "
+                f"bootstrap next_obs (start={start}, horizon={H})."
+            )
 
     def _build_step_batch_from_start_indices(
         self,
@@ -328,7 +360,7 @@ class IQLReplayBuffer:
         dynamic replay sampling so current discriminator rewards are re-scored.
         """
         with self._base._lock:  # noqa: SLF001
-            valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
+            valid_starts = list(self._get_iql_valid_start_indices_locked())
         if not valid_starts:
             raise ValueError("IQLReplayBuffer: base buffer has no valid sequences to preencode.")
 
@@ -437,7 +469,7 @@ class IQLReplayBuffer:
     def ready(self, batch_size: int) -> bool:
         """True iff enough valid windows exist to sample `batch_size`."""
         with self._base._lock:  # noqa: SLF001
-            valid_starts = self._base._get_valid_start_indices_locked()  # noqa: SLF001
+            valid_starts = self._get_iql_valid_start_indices_locked()
         return len(valid_starts) >= int(batch_size)
 
     def __len__(self) -> int:

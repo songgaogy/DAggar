@@ -41,14 +41,22 @@ def _build_mlp(input_dim: int, hidden_dims: tuple[int, ...], output_dim: int) ->
     return nn.Sequential(*layers)
 
 
+def _build_context_compressor(input_dim: int, output_dim: int) -> nn.Sequential:
+    linear = nn.Linear(int(input_dim), int(output_dim))
+    nn.init.kaiming_normal_(linear.weight, mode="fan_in", nonlinearity="relu")
+    nn.init.zeros_(linear.bias)
+    return nn.Sequential(linear, nn.LayerNorm(int(output_dim)), nn.GELU())
+
+
 class QChunkNetwork(nn.Module):
     """Q(context, a_chunk) -> (B, 1).
 
     Args:
         context_dim: dimensionality D_ctx of the frozen encoder output.
+        compressed_dim: context bottleneck dimensionality before Q concat.
         action_dim: per-step action dimensionality D_a (policy action dim,
             NOT the encoder's internal action_dim_per_step).
-        action_horizon: H — chunk length; input dim is D_ctx + H * D_a.
+        action_horizon: H — chunk length; input dim is compressed_dim + H * D_a.
         hidden_dims: MLP hidden layer widths.
     """
 
@@ -58,14 +66,17 @@ class QChunkNetwork(nn.Module):
         action_dim: int,
         action_horizon: int,
         hidden_dims: tuple[int, ...] = (512, 512),
+        compressed_dim: int = 64,
     ) -> None:
         super().__init__()
         self.context_dim = int(context_dim)
+        self.compressed_dim = int(compressed_dim)
         self.action_dim = int(action_dim)
         self.action_horizon = int(action_horizon)
         self.hidden_dims = tuple(int(h) for h in hidden_dims)
-        self._input_dim = self.context_dim + self.action_dim * self.action_horizon
-        self.net = _build_mlp(self._input_dim, self.hidden_dims, 1)
+        self._input_dim = self.compressed_dim + self.action_dim * self.action_horizon
+        self.compress_net = _build_context_compressor(self.context_dim, self.compressed_dim)
+        self.q_net = _build_mlp(self._input_dim, self.hidden_dims, 1)
 
     def forward(self, context: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
         """Args:
@@ -82,9 +93,10 @@ class QChunkNetwork(nn.Module):
             raise ValueError(
                 f"QChunkNetwork expected action_chunk (B, H, D_a); got {tuple(action_chunk.shape)}"
             )
+        compressed_context = self.compress_net(context)
         B = context.shape[0]
-        x = torch.cat([context, action_chunk.reshape(B, -1)], dim=-1)
-        return self.net(x)
+        x = torch.cat([compressed_context, action_chunk.reshape(B, -1)], dim=-1)
+        return self.q_net(x)
 
 
 class VNetwork(nn.Module):
