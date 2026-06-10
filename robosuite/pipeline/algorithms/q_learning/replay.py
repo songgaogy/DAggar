@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
     lpb_disc_intrinsic_from_failure_score,
@@ -144,6 +145,32 @@ class IQLReplayBuffer:
         ``encode_chunk_frames`` latents.
         """
         sequences, start_indices = self._gather_chunks(batch_size)
+        return self._build_step_batch(
+            sequences,
+            start_indices,
+            encoder=encoder,
+            discriminator=discriminator,
+            device=device,
+        )
+
+    def _build_step_batch(
+        self,
+        sequences: list[list[Any]],
+        start_indices: list[int],
+        *,
+        encoder: "SharedFrozenEncoder",
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+    ) -> IQLStepBatch:
+        """Encode the given chunk ``sequences`` (with their ``start_indices``)
+        and build an :class:`IQLStepBatch`.
+
+        Shared by :meth:`sample_step_batch` (random draw) and
+        :meth:`preencode_step_cache` (deterministic full sweep). Under the
+        frozen encoder this is a pure, deterministic function of its inputs, so
+        the resulting batch is independent of *how* the start indices were
+        chosen — that is what makes the preencode cache results-neutral.
+        """
         camera_names = list(self._base.camera_names)
         H = int(self.cfg.action_horizon)
 
@@ -353,3 +380,167 @@ class IQLReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._base)
+
+    # ------------------------------------------------------------------ #
+    # Pre-encoded cache (warmup acceleration; results-neutral)            #
+    # ------------------------------------------------------------------ #
+
+    def preencode_step_cache(
+        self,
+        *,
+        encoder: "SharedFrozenEncoder",
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+        encode_batch_size: int = 64,
+        cache_device: str = "cpu",
+        progress_desc: str | None = None,
+    ) -> "IQLPreencodedReplayCache":
+        """Encode *every* valid chunk once and return an in-memory cache.
+
+        This is a pure training-speed optimization for the offline warmup
+        setting (frozen encoder, static dataset, static LPB disc rewards). The
+        frozen encoder runs under ``no_grad`` and is deterministic, so the
+        cached tensors are bit-for-bit what :meth:`sample_step_batch` would
+        produce for the same start index. The cache is built in
+        ``_get_valid_start_indices_locked()`` order, so cache row ``i``
+        corresponds to ``valid_starts[i]`` — letting
+        :class:`IQLPreencodedReplayCache` reproduce the same uniform sampling
+        (and hence the same RNG stream and the same training result).
+        """
+        with self._base._lock:  # noqa: SLF001
+            valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
+        if not valid_starts:
+            raise ValueError(
+                "IQLReplayBuffer: base buffer has no valid sequences to preencode."
+            )
+        H = int(self.cfg.action_horizon)
+        encode_bs = max(1, int(encode_batch_size))
+
+        field_names = (
+            "context",
+            "next_context",
+            "action_chunk",
+            "rewards",
+            "dones",
+            "is_online",
+            "is_intervention",
+        )
+        parts: dict[str, list[torch.Tensor]] = {name: [] for name in field_names}
+
+        iterator: Any = range(0, len(valid_starts), encode_bs)
+        if progress_desc is not None:
+            iterator = tqdm(
+                iterator,
+                total=(len(valid_starts) + encode_bs - 1) // encode_bs,
+                desc=progress_desc,
+            )
+        for offset in iterator:
+            batch_starts = valid_starts[offset : offset + encode_bs]
+            with self._base._lock:  # noqa: SLF001
+                sequences = [self._base._storage[s : s + H] for s in batch_starts]  # noqa: SLF001
+            batch = self._build_step_batch(
+                sequences,
+                batch_starts,
+                encoder=encoder,
+                discriminator=discriminator,
+                device=device,
+            )
+            for name in field_names:
+                parts[name].append(getattr(batch, name).detach().to(cache_device))
+
+        return IQLPreencodedReplayCache(
+            context=torch.cat(parts["context"], dim=0),
+            next_context=torch.cat(parts["next_context"], dim=0),
+            action_chunk=torch.cat(parts["action_chunk"], dim=0),
+            rewards=torch.cat(parts["rewards"], dim=0),
+            dones=torch.cat(parts["dones"], dim=0),
+            is_online=torch.cat(parts["is_online"], dim=0),
+            is_intervention=torch.cat(parts["is_intervention"], dim=0),
+            source_size=len(valid_starts),
+        )
+
+
+class IQLPreencodedReplayCache:
+    """In-memory cache of pre-encoded :class:`IQLStepBatch` tensors.
+
+    Built by :meth:`IQLReplayBuffer.preencode_step_cache`. Exposes a
+    ``sample_step_batch`` interface compatible with :class:`IQLReplayBuffer`
+    (it accepts and ignores ``encoder`` / ``discriminator`` so call sites need
+    no change), but samples by indexing into the cached tensors instead of
+    re-running the frozen encoder every step.
+
+    Sampling uses the same ``np.random.randint(0, N, batch_size)`` draw as
+    :meth:`IQLReplayBuffer._gather_chunks`, so against an identical RNG state it
+    selects the same chunks — making cached warmup byte-for-byte equivalent to
+    the live path.
+    """
+
+    def __init__(
+        self,
+        *,
+        context: torch.Tensor,
+        next_context: torch.Tensor,
+        action_chunk: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        is_online: torch.Tensor,
+        is_intervention: torch.Tensor,
+        source_size: int,
+    ) -> None:
+        self.context = context.contiguous()
+        self.next_context = next_context.contiguous()
+        self.action_chunk = action_chunk.contiguous()
+        self.rewards = rewards.contiguous()
+        self.dones = dones.contiguous()
+        self.is_online = is_online.contiguous()
+        self.is_intervention = is_intervention.contiguous()
+        self.source_size = int(source_size)
+
+        n = self.context.shape[0]
+        for name, tensor in (
+            ("next_context", self.next_context),
+            ("action_chunk", self.action_chunk),
+            ("rewards", self.rewards),
+            ("dones", self.dones),
+            ("is_online", self.is_online),
+            ("is_intervention", self.is_intervention),
+        ):
+            if tensor.shape[0] != n:
+                raise ValueError(
+                    f"IQLPreencodedReplayCache {name} batch dim {tensor.shape[0]} "
+                    f"!= context batch dim {n}."
+                )
+
+    def sample_step_batch(
+        self,
+        batch_size: int,
+        *,
+        encoder: "SharedFrozenEncoder | None" = None,
+        discriminator: "OnlineBCEDiscriminator | None" = None,
+        device: str = "cuda:1",
+    ) -> IQLStepBatch:
+        # `encoder` / `discriminator` are accepted for call-site compatibility
+        # and intentionally unused (everything is already encoded).
+        del encoder, discriminator
+        n = self.context.shape[0]
+        if n == 0:
+            raise ValueError("IQLPreencodedReplayCache is empty.")
+        sampled = np.random.randint(0, n, size=int(batch_size))
+        idx = torch.from_numpy(sampled).to(device=self.context.device, dtype=torch.long)
+        batch = IQLStepBatch(
+            context=self.context.index_select(0, idx),
+            next_context=self.next_context.index_select(0, idx),
+            action_chunk=self.action_chunk.index_select(0, idx),
+            rewards=self.rewards.index_select(0, idx),
+            dones=self.dones.index_select(0, idx),
+            is_online=self.is_online.index_select(0, idx),
+            is_intervention=self.is_intervention.index_select(0, idx),
+            metadata={"source": "preencoded_cache"},
+        )
+        return batch.to(device)
+
+    def ready(self, batch_size: int) -> bool:
+        return self.context.shape[0] >= int(batch_size)
+
+    def __len__(self) -> int:
+        return int(self.context.shape[0])

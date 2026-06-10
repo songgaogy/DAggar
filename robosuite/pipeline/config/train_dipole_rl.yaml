@@ -50,8 +50,8 @@ algorithm:
       grad_clip_norm: 1.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      output_reward_coef: 0
-      disc_reward_coef: 1.0
+      output_reward_coef: 1.0
+      disc_reward_coef: 0.0
       update_freq: 1
     warmup_value_steps: 20000
     warmup_full_steps: 10000
@@ -82,6 +82,12 @@ algorithm:
 
 # Used only by ``python -m ...q_learning.warmup`` (init_iql_qv.sh).
 warmup:
+  # Pre-encode every valid chunk once and sample from cached latents during the
+  # warmup loops (frozen encoder => results-neutral; pure speedup). Set false to
+  # re-encode every step (old behavior).
+  preencode_cache: true
+  preencode_batch_size: 64
+  preencode_cache_device: "learner"   # "cpu" | "learner"/"device" (cache on the IQL GPU)
   demo_splits:
     - expert
     - success_rollout

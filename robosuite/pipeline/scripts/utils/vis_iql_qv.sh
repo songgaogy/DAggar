@@ -22,18 +22,19 @@ cd "$ROOT_DIR"
 
 
 ENVIRONMENT="PickPlaceCereal"
-SEED=1
-SPLIT="fail_rollout"    # success_rollout or fail_rollout
-TARGET_PATH="iql_qv_cache-weight0_1"
+SEED=3
+SPLIT="success_rollout"    # success_rollout or fail_rollout
+TARGET_PATH="iql_qv_cache-weight1_0"
+BRANCH_NAME="DIPOLE_rl-v0-kingback"
 
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 LPB_CKPT_DIR="${LPB_CKPT_DIR:-${ROOT_DIR}/checkpoints/lpb_v2/bce_ckeckpoints/${ENVIRONMENT}}"
 LPB_CKPT="${LPB_CKPT:-${LPB_CKPT_DIR}/bce_head.pth}"
 LPB_META_JSON="${LPB_META_JSON:-${LPB_CKPT_DIR}/meta.json}"
-TARGET_DIR="${ROOT_DIR}/outputs/DIPOLE_rl/${TARGET_PATH}/${ENVIRONMENT}"
+TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
 IQL_CKPT="${TARGET_DIR}/iql_state.pt"
-OUTPUT_DIR="${ROOT_DIR}/outputs/DIPOLE_rl/${TARGET_PATH}-vis"
+OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
 DEVICE="${DEVICE:-cuda:0}"
 
 

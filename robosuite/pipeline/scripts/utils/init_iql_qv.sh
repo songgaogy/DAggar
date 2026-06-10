@@ -30,8 +30,11 @@ cd "$ROOT_DIR"
 
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
+# -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="iql_qv_cache-weight0_1"
+NAME="iql_qv_cache-weight1_0"
+BRANCH_NAME="DIPOLE_rl-v0-kingback"
+# -------------------------------------
 
 # Canonical per-task LPB v2 BCE layout (see pipeline/docs/IQL_DISCRIMINATOR_REWARD_DEBUG.md):
 #   checkpoints/lpb_v2/bce_ckeckpoints/<TASK>/bce_head.pth
@@ -45,7 +48,7 @@ VALUE_STEPS="${VALUE_STEPS:-20000}"
 FULL_STEPS="${FULL_STEPS:-10000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 DEVICE="${DEVICE:-cuda:1}"
-OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/DIPOLE_rl/${NAME}/${ENVIRONMENT}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 INIT_CHECKPOINT="checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
 mkdir -p "${OUTPUT_DIR}"
