@@ -88,6 +88,20 @@ class IQLLearner:
         """
         return self.q_ensemble[min(1, self.q_ensemble_size - 1)]
 
+    def set_action_norm_stats(self, mean: Any, std: Any) -> None:
+        """Populate the per-action-dim z-score buffers on every critic.
+
+        Stats are computed once from the offline dataset during warmup (see
+        warmup.py) and travel with the checkpoint as registered buffers, so
+        eval/vis pick them up via load_state_dict. std is floored to avoid
+        divide-by-zero on constant action dims.
+        """
+        m = torch.as_tensor(mean, dtype=torch.float32)
+        s = torch.as_tensor(std, dtype=torch.float32).clamp_min(1e-6)
+        for q in self.q_ensemble:
+            q.action_mean.copy_(m.to(q.action_mean.device))
+            q.action_std.copy_(s.to(q.action_std.device))
+
     # ------------------------------------------------------------------ #
     # Internals                                                            #
     # ------------------------------------------------------------------ #

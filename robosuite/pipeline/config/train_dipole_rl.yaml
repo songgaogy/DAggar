@@ -47,7 +47,7 @@ algorithm:
       target_polyak: 0.005
       n_step_aggregate: true
       hidden_dims: [512, 512]
-      q_ensemble_size: 5
+      q_ensemble_size: 10
       v_subset_size: 2
       grad_clip_norm: 1.0
       weight_decay: 1.0e-6

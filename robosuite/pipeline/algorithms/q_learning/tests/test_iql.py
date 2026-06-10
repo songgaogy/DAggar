@@ -227,3 +227,41 @@ def test_iql_old_two_q_checkpoint_schema_raises() -> None:
     old_sd["q2"] = iql_a.q2.state_dict()
     with pytest.raises(ValueError, match="old two-Q schema"):
         iql_b.load_state_dict(old_sd, strict=True)
+
+
+def test_qchunk_input_dim_is_context_plus_action_embed() -> None:
+    from robosuite.pipeline.algorithms.q_learning.networks import (
+        _ACTION_EMBED_DIM,
+        QChunkNetwork,
+    )
+
+    q = QChunkNetwork(context_dim=16, action_dim=4, action_horizon=2, hidden_dims=(32, 32))
+    assert q._input_dim == 16 + _ACTION_EMBED_DIM
+    # Forward produces (B, 1) and is non-trivial (action_proj is not zero-init,
+    # so the embedding is not identically zero at startup).
+    out = q(torch.randn(5, 16), torch.randn(5, 2, 4))
+    assert out.shape == (5, 1)
+
+
+def test_set_action_norm_stats_populates_all_critics_and_roundtrips() -> None:
+    cfg = _make_cfg(action_horizon=2)
+    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    mean = torch.tensor([0.1, -0.2, 0.3, -0.4])
+    std = torch.tensor([1.0, 2.0, 0.5, 3.0])
+    iql_a.set_action_norm_stats(mean, std)
+    for q in iql_a.q_ensemble:
+        assert torch.allclose(q.action_mean, mean)
+        assert torch.allclose(q.action_std, std)
+
+    # std floor: a zero std becomes 1e-6, never zero.
+    iql_a.set_action_norm_stats(torch.zeros(4), torch.zeros(4))
+    for q in iql_a.q_ensemble:
+        assert torch.all(q.action_std >= 1e-6)
+
+    # Stats travel with the checkpoint as registered buffers.
+    iql_a.set_action_norm_stats(mean, std)
+    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    iql_b.load_state_dict(iql_a.state_dict(), strict=True)
+    for q in iql_b.q_ensemble:
+        assert torch.allclose(q.action_mean, mean)
+        assert torch.allclose(q.action_std, std)

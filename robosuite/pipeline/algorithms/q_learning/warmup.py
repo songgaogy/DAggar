@@ -659,6 +659,22 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[warmup] preencoded cache ready: {len(train_replay)} chunks")
 
+    # Per-action-dim z-score stats over all valid chunk actions, computed once
+    # from the base buffer (robust regardless of preencode_cache). Injected into
+    # every critic's buffers BEFORE training so Q sees normalized actions, and
+    # saved alongside iql_state.pt for explicit load at eval/vis.
+    H_stats = int(iql_cfg.action_horizon)
+    action_samples: list[np.ndarray] = []
+    with buffer._lock:  # noqa: SLF001
+        for s in list(buffer._get_valid_start_indices_locked()):  # noqa: SLF001
+            for item in buffer._storage[s : s + H_stats]:  # noqa: SLF001
+                action_samples.append(np.asarray(item.action, dtype=np.float32).reshape(-1))
+    action_stack = np.stack(action_samples, axis=0)  # (N * H, D_a)
+    action_mean = action_stack.mean(axis=0)
+    action_std = action_stack.std(axis=0) + 1e-6
+    iql.set_action_norm_stats(action_mean, action_std)
+    print(f"[warmup] action_norm: mean={action_mean} std={action_std}")
+
     # Warmup loops (r_disc from pre-annotated LPB fields; no OnlineBCEDiscriminator).
     print(f"[warmup] starting value-only loop for {value_steps} steps (batch={batch_size})")
     for step in range(value_steps):
@@ -716,6 +732,10 @@ def main(cfg: DictConfig) -> None:
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")
+
+    stats_path = output_path.parent / "action_norm_stats.pt"
+    torch.save({"action_mean": action_mean, "action_std": action_std}, stats_path)
+    print(f"[warmup] wrote action_norm stats to {stats_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

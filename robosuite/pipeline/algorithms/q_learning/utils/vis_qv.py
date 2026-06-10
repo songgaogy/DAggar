@@ -1440,6 +1440,18 @@ def main() -> None:
     checkpoint_device = str(dict(payload["cfg"]).get("device", "cpu"))
     device = resolve_device(args.device, checkpoint_device)
     iql, encoder, iql_cfg, encoder_meta = build_iql_and_encoder(payload, device=device)
+
+    # Explicitly apply the offline action z-score stats saved beside the ckpt.
+    # The buffers already arrive via load_state_dict; this is defensive/provenance
+    # so the normalization used at eval matches warmup even for hand-moved ckpts.
+    stats_path = iql_ckpt.parent / "action_norm_stats.pt"
+    if stats_path.exists():
+        stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+        iql.set_action_norm_stats(stats["action_mean"], stats["action_std"])
+        print(f"[vis_qv] applied action_norm from {stats_path}")
+    else:
+        print(f"[vis_qv] no action_norm_stats.pt at {stats_path}; using ckpt buffers")
+
     camera_names = [str(name) for name in encoder_meta["policy_camera_names"]]
     image_size = int(encoder_meta.get("image_size", 128))
     action_dim = int(encoder_meta.get("policy_action_dim", iql.action_dim))

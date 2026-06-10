@@ -43,7 +43,7 @@ class IQLConfig:
     # Q-ensemble: q_ensemble_size critics; the V-target uses min over a random
     # subset of v_subset_size critics (REDQ-style), while the actor advantage
     # uses mean over all critics (see iql.py / losses.py).
-    q_ensemble_size: int = 5
+    q_ensemble_size: int = 10
     v_subset_size: int = 2
     grad_clip_norm: float = 1.0
     weight_decay: float = 1e-6

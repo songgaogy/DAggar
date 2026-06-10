@@ -50,9 +50,11 @@ discriminator (no stale rewards).
 
 ### `networks.py`
 
-- `QChunkNetwork`: `_build_mlp` over `(context_dim + action_dim *
-  action_horizon, hidden_dims..., 1)` with LayerNorm + GELU between
-  hidden layers (mirror baseline awr/models/flow.py:73-111).
+- `QChunkNetwork` (action-sensitive, EXPO-FT-style): context → `LayerNorm
+  → tanh`; action chunk → z-score (per-dim `action_mean`/`action_std`
+  buffers) → `Linear(action_dim*action_horizon → 256) → LayerNorm → tanh`
+  (Kaiming-init, NOT zero-init); then `_build_mlp` over `(context_dim + 256,
+  hidden_dims..., 1)` with LayerNorm + GELU between hidden layers.
 - `VNetwork`: same but input is `context_dim` only.
 - Both apply Kaiming init on hidden layers and zero-init the final layer
   (helps Q/V calibration).
@@ -137,7 +139,9 @@ discriminator (no stale rewards).
 
 ## Contract reminders (hard)
 
-- Q input shape is `(B, D_ctx + H·D_a)`. No per-step Q.
+- Q MLP input shape is `(B, D_ctx + 256)` (context squash + 256-d action
+  embedding; raw inputs are `(B, D_ctx)` context and `(B, H, D_a)` action).
+  No per-step Q.
 - The encoder is INJECTED; never instantiate it here.
 - Every encoder/disc forward is under `torch.no_grad()`.
 - Both samplers must support `replay.ready(batch_size)` so the trainer

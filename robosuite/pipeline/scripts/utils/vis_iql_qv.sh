@@ -27,11 +27,11 @@ PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
 
 
-ENVIRONMENT="PickPlaceCereal"
+ENVIRONMENT="PickPlaceMilk"
 SEED=3
 SPLIT="fail_rollout"    # success_rollout or fail_rollout
-TARGET_PATH="iql_qv_cache-weight1_0-aug"
-BRANCH_NAME="DIPOLE_rl-v0-kingback"
+TARGET_PATH="iql_qv_cache"
+BRANCH_NAME="DIPOLE_rl"
 
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
