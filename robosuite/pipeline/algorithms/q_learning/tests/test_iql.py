@@ -27,6 +27,7 @@ from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.losses import (
     bellman_q_loss,
     compute_advantage,
+    compute_ensemble_advantage,
     expectile_v_loss,
 )
 
@@ -72,6 +73,20 @@ def test_compute_advantage_shape_and_value() -> None:
     assert torch.allclose(adv, torch.tensor([0.5, 0.5, 2.5]))
 
 
+def test_compute_ensemble_advantage_uses_q_mean() -> None:
+    q_values = torch.tensor(
+        [
+            [[1.0], [3.0]],
+            [[2.0], [5.0]],
+            [[4.0], [7.0]],
+        ]
+    )
+    v = torch.tensor([[0.5], [1.0]])
+    adv = compute_ensemble_advantage(q_values, v)
+    assert adv.shape == (2,)
+    assert torch.allclose(adv, torch.tensor([7.0 / 3.0 - 0.5, 5.0 - 1.0]))
+
+
 def test_expectile_v_loss_tau_half_is_quarter_mse() -> None:
     diff = torch.tensor([[1.0], [-2.0], [0.5]])
     # tau = 0.5 -> weight = 0.5 everywhere; loss = 0.5 * mean(diff^2)
@@ -92,6 +107,21 @@ def test_bellman_q_loss_matches_mse() -> None:
     pred = torch.tensor([[1.0], [2.0], [3.0]])
     target = torch.tensor([[1.5], [1.0], [4.0]])
     assert torch.allclose(bellman_q_loss(pred, target), torch.nn.functional.mse_loss(pred, target))
+
+
+def test_bellman_q_loss_sums_ensemble_critics() -> None:
+    pred = torch.tensor(
+        [
+            [[1.0], [2.0], [3.0]],
+            [[2.0], [4.0], [6.0]],
+        ]
+    )
+    target = torch.tensor([[1.5], [1.0], [4.0]])
+    expected = (
+        torch.nn.functional.mse_loss(pred[0], target)
+        + torch.nn.functional.mse_loss(pred[1], target)
+    )
+    assert torch.allclose(bellman_q_loss(pred, target), expected)
 
 
 def test_aggregate_chunk_reward_closed_form() -> None:
@@ -182,3 +212,18 @@ def test_iql_load_state_dict_mismatched_context_dim_raises() -> None:
     sd = iql_a.state_dict()
     with pytest.raises(ValueError, match="context_dim mismatch"):
         iql_c.load_state_dict(sd, strict=True)
+
+
+def test_iql_old_two_q_checkpoint_schema_raises() -> None:
+    cfg = _make_cfg(action_horizon=2)
+    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    sd = iql_a.state_dict()
+    old_sd = dict(sd)
+    old_sd.pop("q_ensemble")
+    old_sd.pop("q_ensemble_size")
+    old_sd.pop("v_subset_size")
+    old_sd["q1"] = iql_a.q1.state_dict()
+    old_sd["q2"] = iql_a.q2.state_dict()
+    with pytest.raises(ValueError, match="old two-Q schema"):
+        iql_b.load_state_dict(old_sd, strict=True)

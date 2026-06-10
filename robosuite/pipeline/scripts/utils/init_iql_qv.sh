@@ -32,7 +32,7 @@ PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="iql_qv_cache-weight1_0"
+NAME="iql_qv_cache-weight1_0-aug"
 BRANCH_NAME="DIPOLE_rl-v0-kingback"
 # -------------------------------------
 

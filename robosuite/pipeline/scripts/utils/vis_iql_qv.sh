@@ -9,10 +9,16 @@
 #   LPB_META_JSON     — Youden threshold metadata (default: sibling meta.json).
 #   OUTPUT_DIR        — IQL warmup output dir (default: outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
 #   IQL_CKPT          — trained IQL state (default: ${OUTPUT_DIR}/iql_state.pt).
-#   SPLIT             — HDF5 subdir split (default fail_rollout).
+#   SPLIT             — HDF5 subdir split (success_rollout | fail_rollout; BON only for success_rollout).
 #   SEED              — demo selection seed (default 42).
 #   DEVICE            — torch device (default cuda:1).
 #   NO_DISC_VIZ       — set to 1 to skip discriminator/ HUD (LPB BCE benchmark path).
+#   Q_DIAG_NOISE_SIGMAS     — comma-separated full-chunk Gaussian sigmas (default 0.05,0.10,0.20).
+#   Q_DIAG_NUM_RANDOM       — uniform random chunks per window (default 16).
+#   Q_DIAG_SINGLE_DIM_SIGMA — Gaussian sigma for one-action-dim perturbation (default 0.20).
+#   Q_DIAG_SINGLE_DIM_N     — number of action dims to perturb; 0 means all dims.
+#   Q_DIAG_SEED             — candidate RNG seed (default: SEED).
+#   MAX_WINDOWS             — optional cap for quick smoke tests.
 
 set -euo pipefail
 
@@ -23,8 +29,8 @@ cd "$ROOT_DIR"
 
 ENVIRONMENT="PickPlaceCereal"
 SEED=3
-SPLIT="success_rollout"    # success_rollout or fail_rollout
-TARGET_PATH="iql_qv_cache-weight1_0"
+SPLIT="fail_rollout"    # success_rollout or fail_rollout
+TARGET_PATH="iql_qv_cache-weight1_0-aug"
 BRANCH_NAME="DIPOLE_rl-v0-kingback"
 
 
@@ -36,6 +42,13 @@ TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
 IQL_CKPT="${TARGET_DIR}/iql_state.pt"
 OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
 DEVICE="${DEVICE:-cuda:0}"
+Q_DIAG_NOISE_SIGMAS="${Q_DIAG_NOISE_SIGMAS:-0.05,0.10,0.20}"
+Q_DIAG_NUM_RANDOM="${Q_DIAG_NUM_RANDOM:-16}"
+Q_DIAG_SINGLE_DIM_SIGMA="${Q_DIAG_SINGLE_DIM_SIGMA:-0.20}"
+Q_DIAG_SINGLE_DIM_N="${Q_DIAG_SINGLE_DIM_N:-0}"
+Q_DIAG_SEED="${Q_DIAG_SEED:-${SEED}}"
+Q_DIAG_ACTION_LOW="${Q_DIAG_ACTION_LOW:--1.0}"
+Q_DIAG_ACTION_HIGH="${Q_DIAG_ACTION_HIGH:-1.0}"
 
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
@@ -68,6 +81,21 @@ echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
 echo "[vis_iql_qv] lpb_ckpt=${LPB_CKPT}"
 echo "[vis_iql_qv] lpb_meta=${LPB_META_JSON} bce_youden_threshold=${LPB_TAU}"
 echo "[vis_iql_qv] device=${DEVICE}"
+echo "[vis_iql_qv] q_diag_noise_sigmas=${Q_DIAG_NOISE_SIGMAS} q_diag_random_n=${Q_DIAG_NUM_RANDOM} single_dim_sigma=${Q_DIAG_SINGLE_DIM_SIGMA} single_dim_n=${Q_DIAG_SINGLE_DIM_N} q_diag_seed=${Q_DIAG_SEED}"
+
+EXTRA_ARGS=()
+if [[ -n "${MAX_WINDOWS:-}" ]]; then
+  EXTRA_ARGS+=(--max-windows "${MAX_WINDOWS}")
+fi
+EXTRA_ARGS+=(
+  --q-candidate-noise-sigmas "${Q_DIAG_NOISE_SIGMAS}"
+  --q-candidate-random-n "${Q_DIAG_NUM_RANDOM}"
+  --q-candidate-single-dim-sigma "${Q_DIAG_SINGLE_DIM_SIGMA}"
+  --q-candidate-single-dim-n "${Q_DIAG_SINGLE_DIM_N}"
+  --q-candidate-seed "${Q_DIAG_SEED}"
+  --q-candidate-action-low "${Q_DIAG_ACTION_LOW}"
+  --q-candidate-action-high "${Q_DIAG_ACTION_HIGH}"
+)
 
 exec "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
   --iql-ckpt "${IQL_CKPT}" \

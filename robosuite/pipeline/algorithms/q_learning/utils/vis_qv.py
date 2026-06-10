@@ -71,6 +71,15 @@ class PerStepTrainingDisc:
         return int(self.bce_logit.shape[0])
 
 
+@dataclass
+class QCandidateInputs:
+    """State/action tensors reused for counterfactual Q scoring."""
+
+    starts: list[int]
+    context_cpu: torch.Tensor
+    actions_cpu: torch.Tensor
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize trained Q-chunking IQL Q/V on HDF5 rollout windows."
@@ -107,6 +116,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disc-viz-border-thickness", type=int, default=10)
     parser.add_argument("--disc-viz-no-flip-vertical", action="store_true")
+    parser.add_argument(
+        "--q-candidate-noise-sigmas",
+        default="0.05,0.10,0.20",
+        help="Comma-separated Gaussian sigmas for full action-chunk perturbation.",
+    )
+    parser.add_argument(
+        "--q-candidate-random-n",
+        type=int,
+        default=16,
+        help="Number of uniform random action chunks to score per window.",
+    )
+    parser.add_argument(
+        "--q-candidate-single-dim-sigma",
+        type=float,
+        default=0.20,
+        help="Gaussian sigma for single-action-dim perturbation diagnostics.",
+    )
+    parser.add_argument(
+        "--q-candidate-single-dim-n",
+        type=int,
+        default=0,
+        help="Number of action dims to perturb one-at-a-time; <=0 means all dims.",
+    )
+    parser.add_argument(
+        "--q-candidate-seed",
+        type=int,
+        default=None,
+        help="RNG seed for candidate action diagnostics. Defaults to --seed.",
+    )
+    parser.add_argument("--q-candidate-action-low", type=float, default=-1.0)
+    parser.add_argument("--q-candidate-action-high", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -536,7 +576,11 @@ def compute_qv_metrics(
     device: str,
     lpb_failure_scores: np.ndarray | None = None,
     lpb_tau: float | None = None,
-) -> tuple[list[dict[str, float]], PerStepTrainingDisc | None]:
+) -> tuple[
+    list[dict[str, float]],
+    PerStepTrainingDisc | None,
+    QCandidateInputs,
+]:
     """Compute per-window Q/V/advantage/TD metrics over the selected demo.
 
     When ``lpb_failure_scores`` is set, ``r_disc`` uses the same LPB benchmark
@@ -789,7 +833,12 @@ def compute_qv_metrics(
             disc_logit_cpu=disc_logit_cpu,
             threshold=float(discriminator.threshold),
         )
-    return metrics, per_step_disc
+    q_candidate_inputs = QCandidateInputs(
+        starts=list(starts),
+        context_cpu=context_cpu.detach().cpu(),
+        actions_cpu=actions_cpu.detach().cpu(),
+    )
+    return metrics, per_step_disc, q_candidate_inputs
 
 
 def write_metrics_csv(path: Path, metrics: list[dict[str, float]]) -> None:
@@ -799,6 +848,399 @@ def write_metrics_csv(path: Path, metrics: list[dict[str, float]]) -> None:
         writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(metrics)
+
+
+def parse_float_csv(value: str) -> list[float]:
+    items: list[float] = []
+    for raw in str(value).split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        items.append(float(item))
+    return items
+
+
+def selected_single_action_dims(action_dim: int, requested: int) -> list[int]:
+    dim = int(action_dim)
+    if dim <= 0:
+        raise ValueError(f"action_dim must be positive, got {action_dim}")
+    count = dim if int(requested) <= 0 else min(dim, int(requested))
+    if count >= dim:
+        return list(range(dim))
+    return sorted({int(x) for x in np.linspace(0, dim - 1, count, dtype=np.int64)})
+
+
+def build_q_candidate_actions(
+    actions_cpu: torch.Tensor,
+    *,
+    noise_sigmas: list[float],
+    random_n: int,
+    single_dim_sigma: float,
+    single_dim_n: int,
+    seed: int,
+    action_low: float,
+    action_high: float,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    base = actions_cpu.detach().cpu().numpy().astype(np.float32, copy=True)
+    if base.ndim != 3:
+        raise ValueError(f"actions_cpu expected (W, H, D), got shape {base.shape}")
+    action_dim = int(base.shape[-1])
+    low = float(action_low)
+    high = float(action_high)
+    if not low < high:
+        raise ValueError(f"q candidate action bounds must satisfy low < high, got {low}, {high}")
+    rng = np.random.default_rng(int(seed))
+
+    candidates: list[np.ndarray] = [base.copy()]
+    specs: list[dict[str, Any]] = [
+        {
+            "candidate_type": "demo",
+            "candidate_group": "demo",
+            "candidate_label": "demo",
+            "noise_sigma": None,
+            "action_dim": None,
+            "random_index": None,
+        }
+    ]
+
+    for sigma in noise_sigmas:
+        sigma_f = float(sigma)
+        if sigma_f <= 0.0:
+            continue
+        noise = rng.normal(loc=0.0, scale=sigma_f, size=base.shape).astype(np.float32)
+        candidates.append(np.clip(base + noise, low, high).astype(np.float32))
+        specs.append(
+            {
+                "candidate_type": "noise",
+                "candidate_group": f"noise_sigma_{sigma_f:g}",
+                "candidate_label": f"noise_sigma_{sigma_f:g}",
+                "noise_sigma": sigma_f,
+                "action_dim": None,
+                "random_index": None,
+            }
+        )
+
+    if float(single_dim_sigma) > 0.0:
+        for dim in selected_single_action_dims(action_dim, int(single_dim_n)):
+            noise = np.zeros_like(base)
+            noise[:, :, int(dim)] = rng.normal(
+                loc=0.0,
+                scale=float(single_dim_sigma),
+                size=base.shape[:2],
+            ).astype(np.float32)
+            candidates.append(np.clip(base + noise, low, high).astype(np.float32))
+            specs.append(
+                {
+                    "candidate_type": "single_dim_noise",
+                    "candidate_group": "single_dim_noise",
+                    "candidate_label": f"single_dim_noise_sigma_{float(single_dim_sigma):g}_dim_{int(dim)}",
+                    "noise_sigma": float(single_dim_sigma),
+                    "action_dim": int(dim),
+                    "random_index": None,
+                }
+            )
+
+    for random_index in range(max(0, int(random_n))):
+        random_action = rng.uniform(low=low, high=high, size=base.shape).astype(np.float32)
+        candidates.append(random_action)
+        specs.append(
+            {
+                "candidate_type": "random_uniform",
+                "candidate_group": "random_uniform",
+                "candidate_label": f"random_uniform_{int(random_index)}",
+                "noise_sigma": None,
+                "action_dim": None,
+                "random_index": int(random_index),
+            }
+        )
+
+    return np.stack(candidates, axis=1), specs
+
+
+def compute_q_candidate_rows(
+    *,
+    iql: IQLLearner,
+    inputs: QCandidateInputs,
+    noise_sigmas: list[float],
+    random_n: int,
+    single_dim_sigma: float,
+    single_dim_n: int,
+    seed: int,
+    action_low: float,
+    action_high: float,
+    batch_size: int,
+    device: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidate_actions, specs = build_q_candidate_actions(
+        inputs.actions_cpu,
+        noise_sigmas=noise_sigmas,
+        random_n=int(random_n),
+        single_dim_sigma=float(single_dim_sigma),
+        single_dim_n=int(single_dim_n),
+        seed=int(seed),
+        action_low=float(action_low),
+        action_high=float(action_high),
+    )
+    num_windows, num_candidates, horizon, action_dim = candidate_actions.shape
+    flat_actions = torch.from_numpy(
+        np.ascontiguousarray(candidate_actions.reshape(num_windows * num_candidates, horizon, action_dim))
+    ).float()
+    flat_context = inputs.context_cpu.repeat_interleave(num_candidates, dim=0).float()
+
+    total = int(flat_actions.shape[0])
+    q_min_flat = np.empty((total,), dtype=np.float32)
+    q_mean_flat = np.empty((total,), dtype=np.float32)
+    q_max_flat = np.empty((total,), dtype=np.float32)
+    q_std_flat = np.empty((total,), dtype=np.float32)
+    eval_batch_size = max(1, int(batch_size))
+    with torch.no_grad():
+        for start in range(0, total, eval_batch_size):
+            end = min(total, start + eval_batch_size)
+            q_values = iql._q_values(
+                flat_context[start:end].to(device),
+                flat_actions[start:end].to(device),
+            )
+            q_min_flat[start:end] = q_values.min(dim=0).values.view(-1).detach().cpu().numpy()
+            q_mean_flat[start:end] = q_values.mean(dim=0).view(-1).detach().cpu().numpy()
+            q_max_flat[start:end] = q_values.max(dim=0).values.view(-1).detach().cpu().numpy()
+            q_std_flat[start:end] = q_values.std(dim=0, unbiased=False).view(-1).detach().cpu().numpy()
+
+    q_min = q_min_flat.reshape(num_windows, num_candidates)
+    q_mean = q_mean_flat.reshape(num_windows, num_candidates)
+    q_max = q_max_flat.reshape(num_windows, num_candidates)
+    q_std = q_std_flat.reshape(num_windows, num_candidates)
+    # Rank candidates by pessimistic Q (min over the full ensemble) so OOD
+    # action overestimation cannot win best-of-n selection.
+    ranks = np.empty_like(q_min, dtype=np.int64)
+    best_indices = np.empty((num_windows,), dtype=np.int64)
+    for window_index in range(num_windows):
+        order = np.argsort(-q_min[window_index], kind="mergesort")
+        best_indices[window_index] = int(order[0])
+        ranks[window_index, order] = np.arange(1, num_candidates + 1, dtype=np.int64)
+
+    rows: list[dict[str, Any]] = []
+    for window_index in range(num_windows):
+        demo_q_min = float(q_min[window_index, 0])
+        for candidate_index, spec in enumerate(specs):
+            row = {
+                "window_index": int(window_index),
+                "step": int(inputs.starts[window_index]),
+                "candidate_index": int(candidate_index),
+                "candidate_rank_by_q_min": int(ranks[window_index, candidate_index]),
+                "is_best": bool(candidate_index == int(best_indices[window_index])),
+                "is_demo": bool(candidate_index == 0),
+                "q_min": float(q_min[window_index, candidate_index]),
+                "q_mean": float(q_mean[window_index, candidate_index]),
+                "q_max": float(q_max[window_index, candidate_index]),
+                "q_std": float(q_std[window_index, candidate_index]),
+                "delta_q_min_vs_demo": float(q_min[window_index, candidate_index] - demo_q_min),
+            }
+            row.update(spec)
+            rows.append(row)
+
+    summary = summarize_q_candidate_rows(
+        rows,
+        num_windows=num_windows,
+        num_candidates=num_candidates,
+        noise_sigmas=noise_sigmas,
+        random_n=int(random_n),
+        single_dim_sigma=float(single_dim_sigma),
+        single_dim_n=int(single_dim_n),
+        action_low=float(action_low),
+        action_high=float(action_high),
+        seed=int(seed),
+    )
+    return rows, summary
+
+
+def summarize_q_candidate_rows(
+    rows: list[dict[str, Any]],
+    *,
+    num_windows: int,
+    num_candidates: int,
+    noise_sigmas: list[float],
+    random_n: int,
+    single_dim_sigma: float,
+    single_dim_n: int,
+    action_low: float,
+    action_high: float,
+    seed: int,
+) -> dict[str, Any]:
+    demo_rows = [row for row in rows if bool(row["is_demo"])]
+    best_rows = [row for row in rows if bool(row["is_best"])]
+    demo_ranks = np.asarray([int(row["candidate_rank_by_q_min"]) for row in demo_rows], dtype=np.int64)
+    best_margin = np.asarray(
+        [
+            max(float(row["delta_q_min_vs_demo"]) for row in rows if int(row["window_index"]) == window_index)
+            for window_index in range(int(num_windows))
+        ],
+        dtype=np.float32,
+    )
+
+    def count_by(key: str, source_rows: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in source_rows:
+            value = str(row[key])
+            counts[value] = counts.get(value, 0) + 1
+        return counts
+
+    def mean_delta_by(key: str) -> dict[str, float]:
+        values: dict[str, list[float]] = {}
+        for row in rows:
+            if bool(row["is_demo"]):
+                continue
+            value = str(row[key])
+            values.setdefault(value, []).append(float(row["delta_q_min_vs_demo"]))
+        return {key_value: float(np.mean(items)) for key_value, items in sorted(values.items())}
+
+    return {
+        "num_windows": int(num_windows),
+        "num_candidates_per_window": int(num_candidates),
+        "ranking_score": "q_min",
+        "noise_sigmas": [float(item) for item in noise_sigmas],
+        "random_n": int(random_n),
+        "single_dim_sigma": float(single_dim_sigma),
+        "single_dim_n": int(single_dim_n),
+        "action_low": float(action_low),
+        "action_high": float(action_high),
+        "seed": int(seed),
+        "demo_rank1_rate": float(np.mean(demo_ranks == 1)) if demo_ranks.size else 0.0,
+        "demo_top3_rate": float(np.mean(demo_ranks <= 3)) if demo_ranks.size else 0.0,
+        "demo_rank_mean": float(np.mean(demo_ranks)) if demo_ranks.size else 0.0,
+        "demo_rank_min": int(demo_ranks.min()) if demo_ranks.size else 0,
+        "demo_rank_max": int(demo_ranks.max()) if demo_ranks.size else 0,
+        "best_margin_q_min_over_demo_mean": float(best_margin.mean()) if best_margin.size else 0.0,
+        "best_margin_q_min_over_demo_max": float(best_margin.max()) if best_margin.size else 0.0,
+        "best_candidate_type_counts": count_by("candidate_type", best_rows),
+        "best_candidate_group_counts": count_by("candidate_group", best_rows),
+        "mean_delta_q_min_by_type": mean_delta_by("candidate_type"),
+        "mean_delta_q_min_by_group": mean_delta_by("candidate_group"),
+    }
+
+
+def write_q_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "window_index",
+        "step",
+        "candidate_index",
+        "candidate_type",
+        "candidate_group",
+        "candidate_label",
+        "candidate_rank_by_q_min",
+        "is_best",
+        "is_demo",
+        "noise_sigma",
+        "action_dim",
+        "random_index",
+        "q_min",
+        "q_mean",
+        "q_max",
+        "q_std",
+        "delta_q_min_vs_demo",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as file_handle:
+        writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _save_q_candidate_rank_hist(path: Path, rows: list[dict[str, Any]]) -> Path:
+    demo_ranks = np.asarray(
+        [int(row["candidate_rank_by_q_min"]) for row in rows if bool(row["is_demo"])],
+        dtype=np.int64,
+    )
+    if demo_ranks.size == 0:
+        raise ValueError("Cannot plot candidate rank histogram with no demo rows.")
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+    bins = np.arange(1, int(demo_ranks.max()) + 3) - 0.5
+    ax.hist(demo_ranks, bins=bins, color="tab:blue", alpha=0.85)
+    ax.set_xlabel("Demo action rank by Q_min")
+    ax.set_ylabel("Windows")
+    ax.set_title("Best-of-n diagnostic: demo action rank")
+    ax.grid(True, alpha=0.3)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path
+
+
+def _save_q_candidate_delta_by_type(path: Path, rows: list[dict[str, Any]]) -> Path:
+    groups: dict[str, list[float]] = {}
+    for row in rows:
+        if bool(row["is_demo"]):
+            continue
+        groups.setdefault(str(row["candidate_group"]), []).append(float(row["delta_q_min_vs_demo"]))
+    if not groups:
+        raise ValueError("Cannot plot candidate deltas with no non-demo candidates.")
+    labels = list(sorted(groups))
+    data = [groups[label] for label in labels]
+    fig, ax = plt.subplots(1, 1, figsize=(max(8, len(labels) * 1.3), 5))
+    ax.boxplot(data, labels=labels, showfliers=False)
+    ax.axhline(0.0, color="black", linewidth=1)
+    ax.set_ylabel("Q_min(candidate) - Q_min(demo)")
+    ax.set_title("Counterfactual action Q deltas")
+    ax.tick_params(axis="x", rotation=30)
+    ax.grid(True, axis="y", alpha=0.3)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path
+
+
+def _save_q_candidate_timeseries(path: Path, rows: list[dict[str, Any]]) -> Path:
+    by_window: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_window.setdefault(int(row["window_index"]), []).append(row)
+    window_ids = sorted(by_window)
+    steps = np.asarray([int(by_window[window_id][0]["step"]) for window_id in window_ids], dtype=np.float32)
+    demo_q = np.asarray(
+        [next(float(row["q_min"]) for row in by_window[window_id] if bool(row["is_demo"])) for window_id in window_ids],
+        dtype=np.float32,
+    )
+    best_rows = [next(row for row in by_window[window_id] if bool(row["is_best"])) for window_id in window_ids]
+    best_q = np.asarray([float(row["q_min"]) for row in best_rows], dtype=np.float32)
+    demo_rank = np.asarray(
+        [
+            next(int(row["candidate_rank_by_q_min"]) for row in by_window[window_id] if bool(row["is_demo"]))
+            for window_id in window_ids
+        ],
+        dtype=np.float32,
+    )
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    axes[0].plot(steps, demo_q, label="demo Q_min", color="tab:blue")
+    axes[0].plot(steps, best_q, label="best candidate Q_min", color="tab:red", alpha=0.8)
+    axes[0].fill_between(steps, demo_q, best_q, color="tab:red", alpha=0.12)
+    axes[0].set_ylabel("Q_min")
+    axes[0].set_title("Best-of-n diagnostic over rollout windows")
+    axes[0].legend(loc="best")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].step(steps, demo_rank, where="post", label="demo rank", color="tab:purple")
+    axes[1].axhline(1.0, color="black", linewidth=1)
+    axes[1].set_ylabel("Rank")
+    axes[1].set_xlabel("Step")
+    axes[1].invert_yaxis()
+    axes[1].legend(loc="best")
+    axes[1].grid(True, alpha=0.3)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    return path
+
+
+def plot_q_candidate_diagnostics(bon_dir: Path, rows: list[dict[str, Any]]) -> dict[str, Path]:
+    bon_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "rank_hist": _save_q_candidate_rank_hist(bon_dir / "rank_hist.png", rows),
+        "delta_by_type": _save_q_candidate_delta_by_type(bon_dir / "delta_by_type.png", rows),
+        "timeseries": _save_q_candidate_timeseries(bon_dir / "timeseries.png", rows),
+    }
 
 
 def write_video(path: Path, transitions: list[Transition], image_keys: list[str], fps: int) -> None:
@@ -987,6 +1429,7 @@ def summarize_metrics(metrics: list[dict[str, float]], iql_cfg: IQLConfig) -> di
 
 def main() -> None:
     args = parse_args()
+    run_bon_diagnostics = str(args.split) == "success_rollout"
     iql_ckpt = Path(to_absolute_path(str(args.iql_ckpt))).resolve()
     payload = load_iql_payload(iql_ckpt)
     task_data_name = resolve_task_data_name(payload, args.task_data_name)
@@ -1050,7 +1493,7 @@ def main() -> None:
             f"(source={discriminator.threshold_source})"
         )
 
-    metrics, per_step_disc = compute_qv_metrics(
+    metrics, per_step_disc, q_candidate_inputs = compute_qv_metrics(
         iql=iql,
         encoder=encoder,
         discriminator=discriminator,
@@ -1084,6 +1527,55 @@ def main() -> None:
         action_horizon=int(iql_cfg.action_horizon),
         per_step_disc=per_step_disc,
     )
+
+    bon_outputs: dict[str, Any] | None = None
+    if run_bon_diagnostics:
+        bon_dir = output_dir / "BON"
+        bon_dir.mkdir(parents=True, exist_ok=True)
+        q_candidate_csv_path = bon_dir / "q_candidates.csv"
+        q_candidate_summary_path = bon_dir / "summary.json"
+        q_candidate_seed = (
+            int(args.seed) if args.q_candidate_seed is None else int(args.q_candidate_seed)
+        )
+        q_candidate_rows, q_candidate_summary = compute_q_candidate_rows(
+            iql=iql,
+            inputs=q_candidate_inputs,
+            noise_sigmas=parse_float_csv(str(args.q_candidate_noise_sigmas)),
+            random_n=int(args.q_candidate_random_n),
+            single_dim_sigma=float(args.q_candidate_single_dim_sigma),
+            single_dim_n=int(args.q_candidate_single_dim_n),
+            seed=q_candidate_seed,
+            action_low=float(args.q_candidate_action_low),
+            action_high=float(args.q_candidate_action_high),
+            batch_size=max(1, int(args.batch_size)),
+            device=device,
+        )
+        write_q_candidate_rows(q_candidate_csv_path, q_candidate_rows)
+        q_candidate_plot_paths = plot_q_candidate_diagnostics(bon_dir, q_candidate_rows)
+        q_candidate_summary["outputs"] = {
+            "candidates_csv": str(q_candidate_csv_path),
+            "summary_json": str(q_candidate_summary_path),
+            "rank_hist_png": str(q_candidate_plot_paths["rank_hist"]),
+            "delta_by_type_png": str(q_candidate_plot_paths["delta_by_type"]),
+            "timeseries_png": str(q_candidate_plot_paths["timeseries"]),
+        }
+        q_candidate_summary_path.write_text(
+            json.dumps(q_candidate_summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        bon_outputs = {
+            "output_dir": str(bon_dir),
+            "candidates_csv": str(q_candidate_csv_path),
+            "summary": str(q_candidate_summary_path),
+            "rank_hist_png": str(q_candidate_plot_paths["rank_hist"]),
+            "delta_by_type_png": str(q_candidate_plot_paths["delta_by_type"]),
+            "timeseries_png": str(q_candidate_plot_paths["timeseries"]),
+        }
+    else:
+        print(
+            f"[vis_qv] skipping Best-of-n Q diagnostics for split={args.split!r} "
+            "(only enabled for success_rollout)."
+        )
 
     disc_viz_outputs = None
     if not bool(args.no_disc_viz):
@@ -1130,6 +1622,7 @@ def main() -> None:
         "task_data_name": task_data_name,
         "task_env": str(encoder_meta.get("task_env", task_data_name)),
         "split": str(args.split),
+        "bon_enabled": bool(run_bon_diagnostics),
         "selected_hdf5": str(selected.hdf5_path),
         "selected_demo_key": selected.demo_key,
         "selected_demo_length": int(selected.length),
@@ -1172,6 +1665,7 @@ def main() -> None:
             "plot_png": str(plot_paths["overlapping"]),
             "plot_png_nonoverlap": str(plot_paths["nonoverlap"]),
             "discriminator": disc_viz_outputs,
+            "bon": bon_outputs,
         },
         "metrics_summary": summarize_metrics(metrics, iql_cfg),
     }
@@ -1187,6 +1681,9 @@ def main() -> None:
         print(f"disc_viz_dir={disc_viz_outputs['output_dir']}")
         print(f"disc_viz_video={disc_viz_outputs['video']}")
         print(f"disc_viz_plot_png={disc_viz_outputs['plot_png']}")
+    if bon_outputs is not None:
+        print(f"bon_dir={bon_outputs['output_dir']}")
+        print(f"bon_candidates_csv={bon_outputs['candidates_csv']}")
     print(f"summary={summary_path}")
 
 

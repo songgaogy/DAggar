@@ -1,8 +1,8 @@
-"""IQL learner with Q-chunking + expectile V.
+"""IQL learner with Q-chunking + Q-ensemble expectile V.
 
-Held by `DipoleTrainer` in RL mode. Owns Q1, Q2, V, target_V and two
-optimizers (Q optimizer over q1.params + q2.params, V optimizer over
-v.params). The encoder is INJECTED — this class never instantiates it.
+Held by `DipoleTrainer` in RL mode. Owns K Q networks, V, target_V and two
+optimizers (Q optimizer over all Q params, V optimizer over v.params). The
+encoder is INJECTED — this class never instantiates it.
 
 Per-tick step ordering (called by the integrated trainer):
     1. iql.update(step_batch) — Bellman Q + expectile V + polyak target.
@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from .common import IQLActorBatch, IQLConfig, IQLStepBatch
-from .losses import bellman_q_loss, compute_advantage, expectile_v_loss
+from .losses import bellman_q_loss, compute_ensemble_advantage, expectile_v_loss
 from .networks import QChunkNetwork, VNetwork
 
 
@@ -39,17 +39,18 @@ class IQLLearner:
         self.action_dim = int(action_dim)
         device = cfg.device
 
-        self.q1: nn.Module = QChunkNetwork(
-            context_dim=self.context_dim,
-            action_dim=self.action_dim,
-            action_horizon=int(cfg.action_horizon),
-            hidden_dims=tuple(cfg.hidden_dims),
-        ).to(device)
-        self.q2: nn.Module = QChunkNetwork(
-            context_dim=self.context_dim,
-            action_dim=self.action_dim,
-            action_horizon=int(cfg.action_horizon),
-            hidden_dims=tuple(cfg.hidden_dims),
+        self.q_ensemble_size = int(cfg.q_ensemble_size)
+        self.v_subset_size = int(cfg.v_subset_size)
+        self.q_ensemble: nn.ModuleList = nn.ModuleList(
+            [
+                QChunkNetwork(
+                    context_dim=self.context_dim,
+                    action_dim=self.action_dim,
+                    action_horizon=int(cfg.action_horizon),
+                    hidden_dims=tuple(cfg.hidden_dims),
+                )
+                for _ in range(self.q_ensemble_size)
+            ]
         ).to(device)
         self.v: nn.Module = VNetwork(
             context_dim=self.context_dim,
@@ -64,7 +65,7 @@ class IQLLearner:
             p.requires_grad_(False)
 
         self.q_optim: torch.optim.Optimizer = torch.optim.AdamW(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
+            self.q_ensemble.parameters(),
             lr=float(cfg.q_lr),
             weight_decay=float(cfg.weight_decay),
         )
@@ -73,6 +74,19 @@ class IQLLearner:
             lr=float(cfg.v_lr),
             weight_decay=float(cfg.weight_decay),
         )
+
+    @property
+    def q1(self) -> nn.Module:
+        """First critic alias kept for visualization/tests."""
+        return self.q_ensemble[0]
+
+    @property
+    def q2(self) -> nn.Module:
+        """Second critic alias kept for visualization/tests.
+
+        When K=1 this intentionally aliases q1.
+        """
+        return self.q_ensemble[min(1, self.q_ensemble_size - 1)]
 
     # ------------------------------------------------------------------ #
     # Internals                                                            #
@@ -85,6 +99,13 @@ class IQLLearner:
             v_next = self.target_v(step_batch.next_context)
             target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
+
+    def _q_values(self, context: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
+        """Return all critic predictions as (K, B, 1)."""
+        return torch.stack(
+            [q(context, action_chunk) for q in self.q_ensemble],
+            dim=0,
+        )
 
     @torch.no_grad()
     def _polyak_update(self) -> None:
@@ -104,19 +125,23 @@ class IQLLearner:
         """
         target_q = self._bootstrap_target(step_batch)
 
-        q1_pred = self.q1(step_batch.context, step_batch.action_chunk)
-        q2_pred = self.q2(step_batch.context, step_batch.action_chunk)
-        q_loss = bellman_q_loss(q1_pred, target_q) + bellman_q_loss(q2_pred, target_q)
+        q_values = self._q_values(step_batch.context, step_batch.action_chunk)
+        q_loss = bellman_q_loss(q_values, target_q.expand_as(q_values))
         self.q_optim.zero_grad(set_to_none=True)
         q_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
+            self.q_ensemble.parameters(),
             float(self.cfg.grad_clip_norm),
         )
         self.q_optim.step()
 
         with torch.no_grad():
-            q_min = torch.min(q1_pred.detach(), q2_pred.detach())
+            subset_idx = torch.randperm(
+                self.q_ensemble_size,
+                device=q_values.device,
+            )[: self.v_subset_size]
+            q_subset = q_values.detach().index_select(0, subset_idx)
+            q_min = q_subset.min(dim=0).values
 
         v_pred = self.v(step_batch.context)
         diff = q_min - v_pred
@@ -129,13 +154,16 @@ class IQLLearner:
         self._polyak_update()
 
         with torch.no_grad():
-            td_error = (q1_pred.detach() - target_q).abs().mean()
+            q_detached = q_values.detach()
+            td_error = (q_detached - target_q.expand_as(q_detached)).abs().mean()
 
         return {
             "q_loss": float(q_loss.detach().item()),
             "v_loss": float(v_loss.detach().item()),
-            "q1_mean": float(q1_pred.detach().mean().item()),
-            "q2_mean": float(q2_pred.detach().mean().item()),
+            "q1_mean": float(q_detached[0].mean().item()),
+            "q2_mean": float(q_detached[min(1, self.q_ensemble_size - 1)].mean().item()),
+            "q_ensemble_mean": float(q_detached.mean().item()),
+            "q_v_subset_min_mean": float(q_min.mean().item()),
             "v_mean": float(v_pred.detach().mean().item()),
             "target_q_mean": float(target_q.detach().mean().item()),
             "td_error_abs_mean": float(td_error.item()),
@@ -166,10 +194,9 @@ class IQLLearner:
     @torch.no_grad()
     def compute_advantage_for_batch(self, actor_batch: IQLActorBatch) -> torch.Tensor:
         """Return A(s, a_chunk) shape (B,). Pure inference, no grads."""
-        q1 = self.q1(actor_batch.context, actor_batch.action_chunk_raw)
-        q2 = self.q2(actor_batch.context, actor_batch.action_chunk_raw)
+        q_values = self._q_values(actor_batch.context, actor_batch.action_chunk_raw)
         v = self.v(actor_batch.context)
-        return compute_advantage(q1, q2, v)
+        return compute_ensemble_advantage(q_values, v)
 
     # ------------------------------------------------------------------ #
     # Persistence                                                         #
@@ -177,8 +204,9 @@ class IQLLearner:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "q1": self.q1.state_dict(),
-            "q2": self.q2.state_dict(),
+            "q_ensemble": self.q_ensemble.state_dict(),
+            "q_ensemble_size": self.q_ensemble_size,
+            "v_subset_size": self.v_subset_size,
             "v": self.v.state_dict(),
             "target_v": self.target_v.state_dict(),
             "q_optim": self.q_optim.state_dict(),
@@ -200,8 +228,18 @@ class IQLLearner:
                     f"IQLLearner.load_state_dict: action_dim mismatch "
                     f"(ckpt={sd.get('action_dim')}, runtime={self.action_dim})"
                 )
-        self.q1.load_state_dict(sd["q1"])
-        self.q2.load_state_dict(sd["q2"])
+        if "q_ensemble" not in sd:
+            raise ValueError(
+                "IQLLearner.load_state_dict: checkpoint uses the old two-Q schema "
+                "(q1/q2). Re-run offline Q-ensemble warmup to produce a new checkpoint."
+            )
+        ckpt_k = int(sd.get("q_ensemble_size", -1))
+        if ckpt_k != self.q_ensemble_size:
+            raise ValueError(
+                f"IQLLearner.load_state_dict: q_ensemble_size mismatch "
+                f"(ckpt={ckpt_k}, runtime={self.q_ensemble_size})"
+            )
+        self.q_ensemble.load_state_dict(sd["q_ensemble"])
         self.v.load_state_dict(sd["v"])
         self.target_v.load_state_dict(sd["target_v"])
         self.q_optim.load_state_dict(sd["q_optim"])
