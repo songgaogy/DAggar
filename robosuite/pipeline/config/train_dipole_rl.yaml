@@ -38,16 +38,19 @@ algorithm:
   q_learning:
     enabled: true
     config:
-      reward_mode: "-1/0"   # "0/1" | "-1/0"
+      reward_mode: "0/1"   # "0/1" | "-1/0"
       action_horizon: ${algorithm.flow.action_horizon}
-      discount: 0.99
-      expectile_tau: 0.7
+      discount: 0.997
+      expectile_tau: 0.9
+      # Critic-target shaping for offline warmup (see IQL Q/V warmup fixes).
+      mc_blend_lambda: 0.5            # y = (1-λ)·TD + λ·MC_return_to_go
+      terminal_undiscounted_reward: true  # terminal chunk reward = 1 (not γ^k)
+      terminal_loss_weight: 10.0     # up-weight terminal (done==1) chunk loss
       q_lr: 3.0e-4
       v_lr: 3.0e-4
       target_polyak: 0.005
       n_step_aggregate: true
       hidden_dims: [512, 512]
-      compressed_dim: 128
       q_ensemble_size: 5
       v_subset_size: 2
       grad_clip_norm: 1.0

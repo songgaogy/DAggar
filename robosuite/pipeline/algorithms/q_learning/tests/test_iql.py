@@ -126,6 +126,37 @@ def test_bellman_q_loss_sums_ensemble_critics() -> None:
     assert torch.allclose(bellman_q_loss(pred, target), expected)
 
 
+def test_bellman_q_loss_weighting_matches_manual() -> None:
+    pred = torch.tensor([[1.0], [2.0], [3.0]])
+    target = torch.tensor([[1.5], [1.0], [4.0]])
+    weights = torch.tensor([[1.0], [1.0], [10.0]])
+    sq = (pred - target).square()
+    expected = (sq * weights).sum() / weights.sum()
+    assert torch.allclose(bellman_q_loss(pred, target, weights=weights), expected)
+    # All-ones weights must reduce to the plain (unweighted) mean.
+    ones = torch.ones_like(target)
+    assert torch.allclose(
+        bellman_q_loss(pred, target, weights=ones), bellman_q_loss(pred, target)
+    )
+
+
+def test_value_target_blends_td_and_mc() -> None:
+    cfg = _make_cfg(action_horizon=2)
+    cfg.mc_blend_lambda = 0.25
+    iql = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    batch = _make_step_batch(B=8, D_ctx=16, D_a=4, H=2)
+    batch.mc_return = torch.full((8, 1), 0.5)
+    td = iql._bootstrap_target(batch)
+    expected = 0.75 * td + 0.25 * batch.mc_return
+    assert torch.allclose(iql._value_target(batch), expected)
+    # lambda == 0 => pure TD; mc_return None => pure TD.
+    cfg.mc_blend_lambda = 0.0
+    assert torch.allclose(iql._value_target(batch), td)
+    cfg.mc_blend_lambda = 0.25
+    batch.mc_return = None
+    assert torch.allclose(iql._value_target(batch), td)
+
+
 def test_aggregate_chunk_reward_closed_form() -> None:
     H = 4
     discount = 0.9

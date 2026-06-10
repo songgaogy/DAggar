@@ -38,11 +38,9 @@ class IQLLearner:
         cfg: IQLConfig,
         context_dim: int,
         action_dim: int,
-        compressed_dim: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.context_dim = int(context_dim)
-        self.compressed_dim = int(cfg.compressed_dim if compressed_dim is None else compressed_dim)
         self.action_dim = int(action_dim)
         device = cfg.device
 
@@ -55,7 +53,6 @@ class IQLLearner:
                     action_dim=self.action_dim,
                     action_horizon=int(cfg.action_horizon),
                     hidden_dims=tuple(cfg.hidden_dims),
-                    compressed_dim=self.compressed_dim,
                 )
                 for _ in range(self.q_ensemble_size)
             ]
@@ -108,12 +105,50 @@ class IQLLearner:
             target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
 
+    def _value_target(self, step_batch: IQLStepBatch) -> torch.Tensor:
+        """Blended critic target y = (1 - λ)·TD + λ·MC_return_to_go.
+
+        Falls back to pure TD when ``mc_return`` is absent or λ == 0.
+        """
+        td = self._bootstrap_target(step_batch)
+        lam = float(self.cfg.mc_blend_lambda)
+        if step_batch.mc_return is None or lam <= 0.0:
+            return td
+        with torch.no_grad():
+            mc = step_batch.mc_return.to(td.device, dtype=td.dtype)
+            return (1.0 - lam) * td + lam * mc
+
+    def _terminal_weights(self, step_batch: IQLStepBatch) -> torch.Tensor | None:
+        """Per-sample loss weight: ``1 + (w-1)·done`` (terminal up-weighting).
+
+        Returns None when ``terminal_loss_weight`` is 1 (no weighting needed).
+        """
+        w = float(self.cfg.terminal_loss_weight)
+        if w == 1.0:
+            return None
+        return 1.0 + (w - 1.0) * step_batch.dones
+
     def _q_values(self, context: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
         """Return all critic predictions as (K, B, 1)."""
         return torch.stack(
             [q(context, action_chunk) for q in self.q_ensemble],
             dim=0,
         )
+
+    def set_action_norm_stats(self, q01: torch.Tensor, q99: torch.Tensor) -> None:
+        """Broadcast per-dim action quantile stats (q01/q99 -> [-1, 1]) to every
+        critic. Saved with the Q ensemble state so the vis path reuses them."""
+        for q in self.q_ensemble:
+            q.set_action_norm_stats(q01, q99)
+
+    @property
+    def action_norm_stats(self) -> dict[str, torch.Tensor]:
+        """Current quantile buffers from the first critic (all share them)."""
+        first = self.q_ensemble[0]
+        return {
+            "act_q01": first.act_q01.detach().cpu().clone(),
+            "act_q99": first.act_q99.detach().cpu().clone(),
+        }
 
     @torch.no_grad()
     def _polyak_update(self) -> None:
@@ -131,10 +166,11 @@ class IQLLearner:
         Returns metrics dict: q_loss, v_loss, q1_mean, q2_mean, v_mean,
         target_q_mean, td_error_abs_mean.
         """
-        target_q = self._bootstrap_target(step_batch)
+        target_q = self._value_target(step_batch)
+        sample_weights = self._terminal_weights(step_batch)
 
         q_values = self._q_values(step_batch.context, step_batch.action_chunk)
-        q_loss = bellman_q_loss(q_values, target_q.expand_as(q_values))
+        q_loss = bellman_q_loss(q_values, target_q.expand_as(q_values), weights=sample_weights)
         self.q_optim.zero_grad(set_to_none=True)
         q_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -153,7 +189,7 @@ class IQLLearner:
 
         v_pred = self.v(step_batch.context)
         diff = q_min - v_pred
-        v_loss = expectile_v_loss(diff, float(self.cfg.expectile_tau))
+        v_loss = expectile_v_loss(diff, float(self.cfg.expectile_tau), weights=sample_weights)
         self.v_optim.zero_grad(set_to_none=True)
         v_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.v.parameters(), float(self.cfg.grad_clip_norm))
@@ -181,9 +217,15 @@ class IQLLearner:
         """V-only pretraining step used during offline warmup before Q is
         well-defined. V regresses toward r + γ^H · (1 - done) · target_v(s')
         directly (no min-of-two-Q)."""
-        target = self._bootstrap_target(step_batch)
+        target = self._value_target(step_batch)
+        sample_weights = self._terminal_weights(step_batch)
         v_pred = self.v(step_batch.context)
-        v_loss = torch.nn.functional.mse_loss(v_pred, target)
+        if sample_weights is None:
+            v_loss = torch.nn.functional.mse_loss(v_pred, target)
+        else:
+            sq = torch.nn.functional.mse_loss(v_pred, target, reduction="none")
+            w = sample_weights.to(sq)
+            v_loss = (sq * w).sum() / w.sum()
         self.v_optim.zero_grad(set_to_none=True)
         v_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.v.parameters(), float(self.cfg.grad_clip_norm))
@@ -221,8 +263,8 @@ class IQLLearner:
             "v_optim": self.v_optim.state_dict(),
             "cfg": asdict(self.cfg),
             "context_dim": self.context_dim,
-            "compressed_dim": self.compressed_dim,
             "action_dim": self.action_dim,
+            "action_norm_stats": self.action_norm_stats,
         }
 
     def load_state_dict(self, sd: dict[str, Any], strict: bool = True) -> None:
@@ -236,11 +278,6 @@ class IQLLearner:
                 raise ValueError(
                     f"IQLLearner.load_state_dict: action_dim mismatch "
                     f"(ckpt={sd.get('action_dim')}, runtime={self.action_dim})"
-                )
-            if "compressed_dim" in sd and int(sd["compressed_dim"]) != self.compressed_dim:
-                raise ValueError(
-                    f"IQLLearner.load_state_dict: compressed_dim mismatch "
-                    f"(ckpt={sd.get('compressed_dim')}, runtime={self.compressed_dim})"
                 )
         if "q_ensemble" not in sd:
             raise ValueError(

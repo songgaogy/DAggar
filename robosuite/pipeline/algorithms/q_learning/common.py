@@ -34,13 +34,22 @@ class IQLConfig:
     discount: float = 0.99
     expectile_tau: float = 0.7
 
+    # Critic-target shaping for offline warmup.
+    # mc_blend_lambda: y = (1 - lambda) * TD + lambda * MC_return_to_go.
+    # terminal_undiscounted_reward: terminal chunk reward = undiscounted env
+    #   reward sum (=1 for a 0/1 success chunk) instead of the in-chunk
+    #   gamma^k discounted value, so terminal Q targets ~1.
+    # terminal_loss_weight: per-sample loss weight on terminal (done==1) chunks.
+    mc_blend_lambda: float = 0.5
+    terminal_undiscounted_reward: bool = True
+    terminal_loss_weight: float = 10.0
+
     q_lr: float = 3e-4
     v_lr: float = 3e-4
     target_polyak: float = 0.005
 
     n_step_aggregate: bool = True
     hidden_dims: tuple[int, ...] = (512, 512)
-    compressed_dim: int = 64
     q_ensemble_size: int = 5
     v_subset_size: int = 2
     grad_clip_norm: float = 1.0
@@ -56,13 +65,8 @@ class IQLConfig:
 
     def __post_init__(self) -> None:
         self.hidden_dims = tuple(int(h) for h in self.hidden_dims)
-        self.compressed_dim = int(self.compressed_dim)
         self.q_ensemble_size = int(self.q_ensemble_size)
         self.v_subset_size = int(self.v_subset_size)
-        if self.compressed_dim < 1:
-            raise ValueError(
-                f"IQLConfig.compressed_dim must be >= 1, got {self.compressed_dim}."
-            )
         if self.q_ensemble_size < 1:
             raise ValueError(
                 f"IQLConfig.q_ensemble_size must be >= 1, got {self.q_ensemble_size}."
@@ -72,6 +76,16 @@ class IQLConfig:
                 "IQLConfig.v_subset_size must satisfy "
                 f"1 <= v_subset_size <= q_ensemble_size; got "
                 f"{self.v_subset_size} and {self.q_ensemble_size}."
+            )
+        self.mc_blend_lambda = float(self.mc_blend_lambda)
+        if not (0.0 <= self.mc_blend_lambda <= 1.0):
+            raise ValueError(
+                f"IQLConfig.mc_blend_lambda must be in [0, 1]; got {self.mc_blend_lambda}."
+            )
+        self.terminal_loss_weight = float(self.terminal_loss_weight)
+        if self.terminal_loss_weight < 1.0:
+            raise ValueError(
+                f"IQLConfig.terminal_loss_weight must be >= 1; got {self.terminal_loss_weight}."
             )
 
 
@@ -89,6 +103,8 @@ class IQLStepBatch:
         dones          (B, 1)       — 1 if any step in chunk terminated
         is_online      (B, 1)       — 1 if sampled from online buffer
         is_intervention(B, 1)       — 1 if first step is an intervention
+        mc_return      (B, 1) | None— MC return-to-go target (terminal chunk = 1,
+                                      gamma^(t_term-t) ramp); None => pure TD.
         metadata       dict         — debug fields (episode ids, sources)
     """
 
@@ -99,6 +115,7 @@ class IQLStepBatch:
     dones: torch.Tensor
     is_online: torch.Tensor
     is_intervention: torch.Tensor
+    mc_return: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to(self, device: str | torch.device) -> "IQLStepBatch":
@@ -110,6 +127,7 @@ class IQLStepBatch:
             dones=self.dones.to(device),
             is_online=self.is_online.to(device),
             is_intervention=self.is_intervention.to(device),
+            mc_return=None if self.mc_return is None else self.mc_return.to(device),
             metadata=self.metadata,
         )
 

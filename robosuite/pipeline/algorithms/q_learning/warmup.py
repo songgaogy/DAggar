@@ -50,6 +50,7 @@ from robosuite.pipeline.algorithms.flow_dagger.common import (
 )
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
 from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
+from robosuite.pipeline.algorithms.q_learning.data_util import compute_action_quantile_stats
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
 from robosuite.pipeline.envs import build_robosuite_env
@@ -618,6 +619,22 @@ def main(cfg: DictConfig) -> None:
 
     # Build IQL learner and replay sampler.
     iql = IQLLearner(cfg=iql_cfg, context_dim=encoder.context_dim, action_dim=policy_action_dim)
+
+    # EXPO-style action normalization: per-dim quantiles (q01/q99 -> [-1, 1])
+    # computed on the offline dataset actions. Stored on the Q ensemble (saved
+    # via state_dict) so the vis path reuses the exact same normalization.
+    action_samples = np.asarray(
+        [np.asarray(trans.action, dtype=np.float32).reshape(-1) for trans in buffer._storage],
+        dtype=np.float32,
+    )
+    act_q01, act_q99 = compute_action_quantile_stats(action_samples, q_low=0.01, q_high=0.99)
+    iql.set_action_norm_stats(act_q01, act_q99)
+    print(
+        f"[warmup] action quantile-norm (q01/q99 -> [-1,1]) over {action_samples.shape[0]} actions: "
+        f"q01={np.array2string(act_q01.numpy(), precision=3)} "
+        f"q99={np.array2string(act_q99.numpy(), precision=3)}"
+    )
+
     replay = IQLReplayBuffer(base_buffer=buffer, cfg=iql_cfg)
     if not replay.ready(batch_size):
         raise RuntimeError(
@@ -710,10 +727,27 @@ def main(cfg: DictConfig) -> None:
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "LPBV2OfflineScorer(-sigmoid(failure_score - tau))",
         },
-        "schema_version": 1,
+        "action_norm_stats": iql.action_norm_stats,
+        "schema_version": 2,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")
+
+    # Sibling action-norm-stat file in the same directory (for inspection /
+    # explicit loading). The stats are also embedded in `payload` above and in
+    # the Q ensemble state, so the vis path picks them up automatically.
+    norm_stats_path = output_path.parent / "action_norm_stats.pt"
+    torch.save(
+        {
+            "act_q01": iql.action_norm_stats["act_q01"],
+            "act_q99": iql.action_norm_stats["act_q99"],
+            "quantiles": (0.01, 0.99),
+            "action_dim": int(policy_action_dim),
+            "iql_state_path": str(output_path),
+        },
+        norm_stats_path,
+    )
+    print(f"[warmup] wrote action norm stats to {norm_stats_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

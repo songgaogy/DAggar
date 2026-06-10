@@ -10,7 +10,11 @@ from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
 )
 
 from .common import IQLActorBatch, IQLConfig, IQLStepBatch
-from .data_util import aggregate_chunk_reward, chunk_done_mask
+from .data_util import (
+    aggregate_chunk_reward,
+    chunk_done_mask,
+    terminal_undiscounted_reward,
+)
 
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
@@ -101,6 +105,60 @@ class IQLReplayBuffer:
                 f"cfg.action_horizon ({cfg.action_horizon}); chunk-window cache "
                 "would otherwise be inconsistent."
             )
+        # MC return-to-go support: per-episode true-terminal step index, cached
+        # against the storage length so it is rebuilt when the buffer grows.
+        self._terminal_step_by_episode: dict[int, int] = {}
+        self._terminal_cache_storage_len: int = -1
+
+    # ------------------------------------------------------------------ #
+    # MC return-to-go                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _terminal_step_by_episode_locked(self) -> dict[int, int]:
+        """Map episode_index -> true-terminal (success) step index.
+
+        A step is a true terminal iff ``done`` and not a truncated boundary.
+        Cached and rebuilt only when ``len(storage)`` changes (static during
+        offline warmup; refreshed if the online buffer grows).
+        """
+        storage = self._base._storage  # noqa: SLF001
+        n = len(storage)
+        if n == self._terminal_cache_storage_len and self._terminal_step_by_episode:
+            return self._terminal_step_by_episode
+        terminal_steps: dict[int, int] = {}
+        for idx in range(n):
+            trans = storage[idx]
+            if bool(trans.done) and not _is_truncated_boundary(trans):
+                ep = _episode_index_of(trans)
+                # Keep the last true-terminal step per episode.
+                terminal_steps[ep] = idx
+        self._terminal_step_by_episode = terminal_steps
+        self._terminal_cache_storage_len = n
+        return terminal_steps
+
+    def _mc_return_for_starts(self, start_indices: list[int]) -> np.ndarray:
+        """MC return-to-go per chunk start: ``gamma^(t_term_start - start)`` with
+        the terminal chunk = 1.0; ``0.0`` for episodes without a true terminal.
+
+        ``t_term_start = success_step - (H - 1)`` so the chunk whose last step is
+        the success step gets exponent 0 (=> 1.0). Consistent with the
+        terminal-undiscounted-reward override.
+        """
+        H = int(self.cfg.action_horizon)
+        gamma = float(self.cfg.discount)
+        with self._base._lock:  # noqa: SLF001
+            storage = self._base._storage  # noqa: SLF001
+            terminal_steps = self._terminal_step_by_episode_locked()
+            mc = np.zeros((len(start_indices), 1), dtype=np.float32)
+            for i, start in enumerate(start_indices):
+                ep = _episode_index_of(storage[int(start)])
+                term_step = terminal_steps.get(ep)
+                if term_step is None:
+                    continue
+                t_term_start = int(term_step) - (H - 1)
+                exponent = max(int(t_term_start) - int(start), 0)
+                mc[i, 0] = gamma ** exponent
+        return mc
 
     # ------------------------------------------------------------------ #
     # Sampling                                                            #
@@ -298,6 +356,17 @@ class IQLReplayBuffer:
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
         dones = chunk_done_mask(done_tensor)
 
+        # Terminal chunk reward override: use the undiscounted env reward (=1 for
+        # a 0/1 success chunk) so terminal Q targets ~1 instead of gamma^k.
+        if bool(self.cfg.terminal_undiscounted_reward):
+            term_reward = terminal_undiscounted_reward(reward_tensor, effective_output_coef)
+            rewards = torch.where(dones > 0.5, term_reward, rewards)
+
+        # MC return-to-go target (terminal chunk = 1, gamma^(t_term-t) ramp).
+        mc_return = torch.from_numpy(self._mc_return_for_starts(list(start_indices))).to(
+            device=rewards.device, dtype=rewards.dtype
+        )
+
         disc_meta: dict[str, float] = {}
         if effective_disc_coef != 0.0 and (use_lpb_disc or discriminator is not None):
             disc_meta["disc_reward_first_frame_mean"] = float(r_disc_per_step[:, 0].mean().item())
@@ -311,6 +380,7 @@ class IQLReplayBuffer:
             dones=dones,
             is_online=is_online_tensor,
             is_intervention=is_intervention_tensor,
+            mc_return=mc_return,
             metadata={
                 "start_indices": start_indices,
                 "episode_ids": episode_ids,
@@ -383,6 +453,7 @@ class IQLReplayBuffer:
             "dones": [],
             "is_online": [],
             "is_intervention": [],
+            "mc_return": [],
         }
         for start in iterator:
             batch_starts = valid_starts[start : start + encode_bs]
@@ -399,6 +470,7 @@ class IQLReplayBuffer:
             parts["dones"].append(batch.dones.detach())
             parts["is_online"].append(batch.is_online.detach())
             parts["is_intervention"].append(batch.is_intervention.detach())
+            parts["mc_return"].append(batch.mc_return.detach())
 
         return IQLPreencodedReplayCache(
             context=torch.cat(parts["context"], dim=0),
@@ -408,6 +480,7 @@ class IQLReplayBuffer:
             dones=torch.cat(parts["dones"], dim=0),
             is_online=torch.cat(parts["is_online"], dim=0),
             is_intervention=torch.cat(parts["is_intervention"], dim=0),
+            mc_return=torch.cat(parts["mc_return"], dim=0),
             source_size=len(valid_starts),
         )
 
@@ -489,6 +562,7 @@ class IQLPreencodedReplayCache:
         dones: torch.Tensor,
         is_online: torch.Tensor,
         is_intervention: torch.Tensor,
+        mc_return: torch.Tensor,
         source_size: int,
     ) -> None:
         self.context = context.contiguous()
@@ -498,6 +572,7 @@ class IQLPreencodedReplayCache:
         self.dones = dones.contiguous()
         self.is_online = is_online.contiguous()
         self.is_intervention = is_intervention.contiguous()
+        self.mc_return = mc_return.contiguous()
         self.source_size = int(source_size)
 
         n = int(self.context.shape[0])
@@ -508,6 +583,7 @@ class IQLPreencodedReplayCache:
             ("dones", self.dones),
             ("is_online", self.is_online),
             ("is_intervention", self.is_intervention),
+            ("mc_return", self.mc_return),
         ):
             if int(tensor.shape[0]) != n:
                 raise ValueError(
@@ -537,6 +613,7 @@ class IQLPreencodedReplayCache:
             dones=self.dones.index_select(0, idx),
             is_online=self.is_online.index_select(0, idx),
             is_intervention=self.is_intervention.index_select(0, idx),
+            mc_return=self.mc_return.index_select(0, idx),
             metadata={"source": "preencoded_cache"},
         )
         return batch.to(device)

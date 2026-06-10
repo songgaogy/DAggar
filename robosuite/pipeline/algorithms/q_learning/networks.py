@@ -7,14 +7,18 @@ discriminator (see docs/DIPOLE_RL.md §C). Callers must invoke encoder
 forwards under `torch.no_grad()` and pass the resulting `context` tensor
 into `QChunkNetwork.forward` / `VNetwork.forward`.
 
-Architecture:
-    Each hidden block is Linear -> LayerNorm -> GELU. Hidden Linears use
-    Kaiming-normal init (mode='fan_in', nonlinearity='relu' as a stand-in
-    for GELU). The final Linear is zero-init for weight + bias to help
-    Q/V calibration at startup.
+Architecture (EXPO-FT aligned):
+    Each hidden block is Linear -> LayerNorm -> ReLU. Hidden Linears use
+    Kaiming-normal init (mode='fan_in', nonlinearity='relu'). The final
+    Linear is zero-init for weight + bias to help Q/V calibration at startup.
 
-    Q: MLP on concat(context, flatten(action_chunk)) -> (B, 1)
-    V: MLP on context                                -> (B, 1)
+    Q: MLP on concat(tanh(context), normalize(flatten(action_chunk))) -> (B, 1).
+       Following EXPO-FT, the context branch is tanh-bounded to [-1, 1] and the
+       action chunk is quantile-normalized (q01/q99 -> [-1, 1]) so the action
+       is scale-matched with the context and the Q does not collapse onto V.
+       There is NO context compression bottleneck — the full D_ctx latent is
+       concatenated directly ("bare concat").
+    V: MLP on context                                -> (B, 1).
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ def _build_mlp(input_dim: int, hidden_dims: tuple[int, ...], output_dim: int) ->
         nn.init.zeros_(linear.bias)
         layers.append(linear)
         layers.append(nn.LayerNorm(int(hidden_dim)))
-        layers.append(nn.GELU())
+        layers.append(nn.ReLU())
         last_dim = int(hidden_dim)
     final = nn.Linear(last_dim, int(output_dim))
     nn.init.zeros_(final.weight)
@@ -41,23 +45,22 @@ def _build_mlp(input_dim: int, hidden_dims: tuple[int, ...], output_dim: int) ->
     return nn.Sequential(*layers)
 
 
-def _build_context_compressor(input_dim: int, output_dim: int) -> nn.Sequential:
-    linear = nn.Linear(int(input_dim), int(output_dim))
-    nn.init.kaiming_normal_(linear.weight, mode="fan_in", nonlinearity="relu")
-    nn.init.zeros_(linear.bias)
-    return nn.Sequential(linear, nn.LayerNorm(int(output_dim)), nn.GELU())
-
-
 class QChunkNetwork(nn.Module):
     """Q(context, a_chunk) -> (B, 1).
 
     Args:
-        context_dim: dimensionality D_ctx of the frozen encoder output.
-        compressed_dim: context bottleneck dimensionality before Q concat.
+        context_dim: dimensionality D_ctx of the frozen encoder output. The full
+            latent is concatenated directly (bare concat; no bottleneck).
         action_dim: per-step action dimensionality D_a (policy action dim,
             NOT the encoder's internal action_dim_per_step).
-        action_horizon: H — chunk length; input dim is compressed_dim + H * D_a.
+        action_horizon: H — chunk length; input dim is D_ctx + H * D_a.
         hidden_dims: MLP hidden layer widths.
+
+    Action normalization:
+        ``act_q01`` / ``act_q99`` are per-dim quantile buffers (default identity,
+        i.e. q01=-1, q99=+1). ``set_action_norm_stats`` is used by the offline
+        warmup to fill them from the dataset; they are saved/loaded via
+        ``state_dict`` so the vis path reuses the exact same normalization.
     """
 
     def __init__(
@@ -66,17 +69,35 @@ class QChunkNetwork(nn.Module):
         action_dim: int,
         action_horizon: int,
         hidden_dims: tuple[int, ...] = (512, 512),
-        compressed_dim: int = 64,
     ) -> None:
         super().__init__()
         self.context_dim = int(context_dim)
-        self.compressed_dim = int(compressed_dim)
         self.action_dim = int(action_dim)
         self.action_horizon = int(action_horizon)
         self.hidden_dims = tuple(int(h) for h in hidden_dims)
-        self._input_dim = self.compressed_dim + self.action_dim * self.action_horizon
-        self.compress_net = _build_context_compressor(self.context_dim, self.compressed_dim)
+        self._input_dim = self.context_dim + self.action_dim * self.action_horizon
         self.q_net = _build_mlp(self._input_dim, self.hidden_dims, 1)
+        # Quantile-norm buffers (q01/q99 -> [-1, 1]); default = identity for
+        # actions already in [-1, 1]. Saved/loaded with the module state.
+        self.register_buffer("act_q01", -torch.ones(self.action_dim))
+        self.register_buffer("act_q99", torch.ones(self.action_dim))
+
+    def set_action_norm_stats(self, q01: torch.Tensor, q99: torch.Tensor) -> None:
+        """Overwrite the action quantile buffers (shape (D_a,))."""
+        q01 = torch.as_tensor(q01, dtype=self.act_q01.dtype, device=self.act_q01.device).reshape(-1)
+        q99 = torch.as_tensor(q99, dtype=self.act_q99.dtype, device=self.act_q99.device).reshape(-1)
+        if q01.numel() != self.action_dim or q99.numel() != self.action_dim:
+            raise ValueError(
+                f"set_action_norm_stats expected (D_a={self.action_dim},); "
+                f"got q01={tuple(q01.shape)} q99={tuple(q99.shape)}"
+            )
+        self.act_q01.copy_(q01)
+        self.act_q99.copy_(q99)
+
+    def _normalize_action(self, action_chunk: torch.Tensor) -> torch.Tensor:
+        """Quantile-normalize the chunk to ~[-1, 1] per action dim."""
+        span = (self.act_q99 - self.act_q01).clamp_min(1e-6)
+        return 2.0 * (action_chunk - self.act_q01) / span - 1.0
 
     def forward(self, context: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
         """Args:
@@ -93,9 +114,10 @@ class QChunkNetwork(nn.Module):
             raise ValueError(
                 f"QChunkNetwork expected action_chunk (B, H, D_a); got {tuple(action_chunk.shape)}"
             )
-        compressed_context = self.compress_net(context)
         B = context.shape[0]
-        x = torch.cat([compressed_context, action_chunk.reshape(B, -1)], dim=-1)
+        ctx = torch.tanh(context)
+        action_norm = self._normalize_action(action_chunk)
+        x = torch.cat([ctx, action_norm.reshape(B, -1)], dim=-1)
         return self.q_net(x)
 
 

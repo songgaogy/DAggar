@@ -796,6 +796,17 @@ def compute_qv_metrics(
 
     metrics: list[dict[str, float]] = []
     bootstrap_discount = float(discount) ** horizon
+    # Mirror IQL training-target shaping so the plotted target/residual match.
+    mc_blend_lambda = float(getattr(iql_cfg, "mc_blend_lambda", 0.0))
+    terminal_undisc = bool(getattr(iql_cfg, "terminal_undiscounted_reward", False))
+    output_reward_coef = float(iql_cfg.output_reward_coef)
+    starts_arr = np.asarray(starts, dtype=np.int64)
+    mc_return_all = np.zeros(num_windows, dtype=np.float32)
+    terminal_window_idx = np.nonzero(is_true_terminal_window > 0.5)[0]
+    if terminal_window_idx.size:
+        t_term_start = int(starts_arr[int(terminal_window_idx[-1])])
+        exps = np.maximum(t_term_start - starts_arr, 0)
+        mc_return_all = (float(discount) ** exps).astype(np.float32)
     for start_idx in range(0, num_windows, int(batch_size)):
         end_idx = min(num_windows, start_idx + int(batch_size))
         batch_size_local = end_idx - start_idx
@@ -840,9 +851,21 @@ def compute_qv_metrics(
             done_horizon = chunk_done_mask(dones).to(device)
 
             total_reward_horizon = float(iql_cfg.output_reward_coef) * env_reward_horizon + float(iql_cfg.disc_reward_coef) * disc_reward_horizon
+            # Terminal chunk reward override (mirror IQL replay): undiscounted env
+            # reward (=1 for a 0/1 success chunk) so the terminal target -> ~1.
+            if terminal_undisc:
+                term_reward = output_reward_coef * rewards.sum(dim=1, keepdim=True)
+                total_reward_horizon = torch.where(
+                    done_horizon > 0.5, term_reward, total_reward_horizon
+                )
             bootstrap_v = bootstrap_discount * (1.0 - done_horizon) * next_v
             td_target = total_reward_horizon + bootstrap_v
-            td_residual = td_target - q_mean
+            # Blended training target y = (1-λ)·TD + λ·MC_return_to_go.
+            mc_return = torch.from_numpy(
+                mc_return_all[start_idx:end_idx]
+            ).to(device=device, dtype=td_target.dtype).unsqueeze(-1)
+            value_target = (1.0 - mc_blend_lambda) * td_target + mc_blend_lambda * mc_return
+            td_residual = value_target - q_mean
             advantage = q_mean - v
             # Chunk Bellman target minus V (same γ^H bootstrap as IQL training).
             advantage_td1 = td_target - v
@@ -870,6 +893,8 @@ def compute_qv_metrics(
                 "v": tensor_to_float(v, local_idx),
                 "next_v": tensor_to_float(next_v, local_idx),
                 "td_target": tensor_to_float(td_target, local_idx),
+                "mc_return": tensor_to_float(mc_return, local_idx),
+                "value_target": tensor_to_float(value_target, local_idx),
                 "td_residual": tensor_to_float(td_residual, local_idx),
                 "advantage": tensor_to_float(advantage, local_idx),
                 "advantage_td1": tensor_to_float(advantage_td1, local_idx),
@@ -1078,29 +1103,31 @@ def compute_q_candidate_rows(
     q_mean = q_mean_flat.reshape(num_windows, num_candidates)
     q_max = q_max_flat.reshape(num_windows, num_candidates)
     q_std = q_std_flat.reshape(num_windows, num_candidates)
-    ranks = np.empty_like(q_mean, dtype=np.int64)
+    # Rank candidates by pessimistic Q (min over the full ensemble) so OOD
+    # action overestimation cannot win best-of-n selection.
+    ranks = np.empty_like(q_min, dtype=np.int64)
     best_indices = np.empty((num_windows,), dtype=np.int64)
     for window_index in range(num_windows):
-        order = np.argsort(-q_mean[window_index], kind="mergesort")
+        order = np.argsort(-q_min[window_index], kind="mergesort")
         best_indices[window_index] = int(order[0])
         ranks[window_index, order] = np.arange(1, num_candidates + 1, dtype=np.int64)
 
     rows: list[dict[str, Any]] = []
     for window_index in range(num_windows):
-        demo_q_mean = float(q_mean[window_index, 0])
+        demo_q_min = float(q_min[window_index, 0])
         for candidate_index, spec in enumerate(specs):
             row = {
                 "window_index": int(window_index),
                 "step": int(inputs.starts[window_index]),
                 "candidate_index": int(candidate_index),
-                "candidate_rank_by_q_mean": int(ranks[window_index, candidate_index]),
+                "candidate_rank_by_q_min": int(ranks[window_index, candidate_index]),
                 "is_best": bool(candidate_index == int(best_indices[window_index])),
                 "is_demo": bool(candidate_index == 0),
                 "q_min": float(q_min[window_index, candidate_index]),
                 "q_mean": float(q_mean[window_index, candidate_index]),
                 "q_max": float(q_max[window_index, candidate_index]),
                 "q_std": float(q_std[window_index, candidate_index]),
-                "delta_q_mean_vs_demo": float(q_mean[window_index, candidate_index] - demo_q_mean),
+                "delta_q_min_vs_demo": float(q_min[window_index, candidate_index] - demo_q_min),
             }
             row.update(spec)
             rows.append(row)
@@ -1135,10 +1162,10 @@ def summarize_q_candidate_rows(
 ) -> dict[str, Any]:
     demo_rows = [row for row in rows if bool(row["is_demo"])]
     best_rows = [row for row in rows if bool(row["is_best"])]
-    demo_ranks = np.asarray([int(row["candidate_rank_by_q_mean"]) for row in demo_rows], dtype=np.int64)
+    demo_ranks = np.asarray([int(row["candidate_rank_by_q_min"]) for row in demo_rows], dtype=np.int64)
     best_margin = np.asarray(
         [
-            max(float(row["delta_q_mean_vs_demo"]) for row in rows if int(row["window_index"]) == window_index)
+            max(float(row["delta_q_min_vs_demo"]) for row in rows if int(row["window_index"]) == window_index)
             for window_index in range(int(num_windows))
         ],
         dtype=np.float32,
@@ -1157,13 +1184,13 @@ def summarize_q_candidate_rows(
             if bool(row["is_demo"]):
                 continue
             value = str(row[key])
-            values.setdefault(value, []).append(float(row["delta_q_mean_vs_demo"]))
+            values.setdefault(value, []).append(float(row["delta_q_min_vs_demo"]))
         return {key_value: float(np.mean(items)) for key_value, items in sorted(values.items())}
 
     return {
         "num_windows": int(num_windows),
         "num_candidates_per_window": int(num_candidates),
-        "ranking_score": "q_mean",
+        "ranking_score": "q_min",
         "noise_sigmas": [float(item) for item in noise_sigmas],
         "random_n": int(random_n),
         "single_dim_sigma": float(single_dim_sigma),
@@ -1176,12 +1203,12 @@ def summarize_q_candidate_rows(
         "demo_rank_mean": float(np.mean(demo_ranks)) if demo_ranks.size else 0.0,
         "demo_rank_min": int(demo_ranks.min()) if demo_ranks.size else 0,
         "demo_rank_max": int(demo_ranks.max()) if demo_ranks.size else 0,
-        "best_margin_q_mean_over_demo_mean": float(best_margin.mean()) if best_margin.size else 0.0,
-        "best_margin_q_mean_over_demo_max": float(best_margin.max()) if best_margin.size else 0.0,
+        "best_margin_q_min_over_demo_mean": float(best_margin.mean()) if best_margin.size else 0.0,
+        "best_margin_q_min_over_demo_max": float(best_margin.max()) if best_margin.size else 0.0,
         "best_candidate_type_counts": count_by("candidate_type", best_rows),
         "best_candidate_group_counts": count_by("candidate_group", best_rows),
-        "mean_delta_q_mean_by_type": mean_delta_by("candidate_type"),
-        "mean_delta_q_mean_by_group": mean_delta_by("candidate_group"),
+        "mean_delta_q_min_by_type": mean_delta_by("candidate_type"),
+        "mean_delta_q_min_by_group": mean_delta_by("candidate_group"),
     }
 
 
@@ -1194,7 +1221,7 @@ def write_q_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         "candidate_type",
         "candidate_group",
         "candidate_label",
-        "candidate_rank_by_q_mean",
+        "candidate_rank_by_q_min",
         "is_best",
         "is_demo",
         "noise_sigma",
@@ -1204,7 +1231,7 @@ def write_q_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         "q_mean",
         "q_max",
         "q_std",
-        "delta_q_mean_vs_demo",
+        "delta_q_min_vs_demo",
     ]
     with path.open("w", newline="", encoding="utf-8") as file_handle:
         writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
@@ -1214,7 +1241,7 @@ def write_q_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _save_q_candidate_rank_hist(path: Path, rows: list[dict[str, Any]]) -> Path:
     demo_ranks = np.asarray(
-        [int(row["candidate_rank_by_q_mean"]) for row in rows if bool(row["is_demo"])],
+        [int(row["candidate_rank_by_q_min"]) for row in rows if bool(row["is_demo"])],
         dtype=np.int64,
     )
     if demo_ranks.size == 0:
@@ -1222,7 +1249,7 @@ def _save_q_candidate_rank_hist(path: Path, rows: list[dict[str, Any]]) -> Path:
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
     bins = np.arange(1, int(demo_ranks.max()) + 3) - 0.5
     ax.hist(demo_ranks, bins=bins, color="tab:blue", alpha=0.85)
-    ax.set_xlabel("Demo action rank by Q_mean")
+    ax.set_xlabel("Demo action rank by Q_min")
     ax.set_ylabel("Windows")
     ax.set_title("Best-of-n diagnostic: demo action rank")
     ax.grid(True, alpha=0.3)
@@ -1238,7 +1265,7 @@ def _save_q_candidate_delta_by_type(path: Path, rows: list[dict[str, Any]]) -> P
     for row in rows:
         if bool(row["is_demo"]):
             continue
-        groups.setdefault(str(row["candidate_group"]), []).append(float(row["delta_q_mean_vs_demo"]))
+        groups.setdefault(str(row["candidate_group"]), []).append(float(row["delta_q_min_vs_demo"]))
     if not groups:
         raise ValueError("Cannot plot candidate deltas with no non-demo candidates.")
     labels = list(sorted(groups))
@@ -1246,7 +1273,7 @@ def _save_q_candidate_delta_by_type(path: Path, rows: list[dict[str, Any]]) -> P
     fig, ax = plt.subplots(1, 1, figsize=(max(8, len(labels) * 1.3), 5))
     ax.boxplot(data, labels=labels, showfliers=False)
     ax.axhline(0.0, color="black", linewidth=1)
-    ax.set_ylabel("Q_mean(candidate) - Q_mean(demo)")
+    ax.set_ylabel("Q_min(candidate) - Q_min(demo)")
     ax.set_title("Counterfactual action Q deltas")
     ax.tick_params(axis="x", rotation=30)
     ax.grid(True, axis="y", alpha=0.3)
@@ -1264,24 +1291,24 @@ def _save_q_candidate_timeseries(path: Path, rows: list[dict[str, Any]]) -> Path
     window_ids = sorted(by_window)
     steps = np.asarray([int(by_window[window_id][0]["step"]) for window_id in window_ids], dtype=np.float32)
     demo_q = np.asarray(
-        [next(float(row["q_mean"]) for row in by_window[window_id] if bool(row["is_demo"])) for window_id in window_ids],
+        [next(float(row["q_min"]) for row in by_window[window_id] if bool(row["is_demo"])) for window_id in window_ids],
         dtype=np.float32,
     )
     best_rows = [next(row for row in by_window[window_id] if bool(row["is_best"])) for window_id in window_ids]
-    best_q = np.asarray([float(row["q_mean"]) for row in best_rows], dtype=np.float32)
+    best_q = np.asarray([float(row["q_min"]) for row in best_rows], dtype=np.float32)
     demo_rank = np.asarray(
         [
-            next(int(row["candidate_rank_by_q_mean"]) for row in by_window[window_id] if bool(row["is_demo"]))
+            next(int(row["candidate_rank_by_q_min"]) for row in by_window[window_id] if bool(row["is_demo"]))
             for window_id in window_ids
         ],
         dtype=np.float32,
     )
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
-    axes[0].plot(steps, demo_q, label="demo Q_mean", color="tab:blue")
-    axes[0].plot(steps, best_q, label="best candidate Q_mean", color="tab:red", alpha=0.8)
+    axes[0].plot(steps, demo_q, label="demo Q_min", color="tab:blue")
+    axes[0].plot(steps, best_q, label="best candidate Q_min", color="tab:red", alpha=0.8)
     axes[0].fill_between(steps, demo_q, best_q, color="tab:red", alpha=0.12)
-    axes[0].set_ylabel("Q_mean")
+    axes[0].set_ylabel("Q_min")
     axes[0].set_title("Best-of-n diagnostic over rollout windows")
     axes[0].legend(loc="best")
     axes[0].grid(True, alpha=0.3)
@@ -1351,6 +1378,8 @@ def _save_qv_timeseries_png(
     v = np.asarray([row["v"] for row in metrics], dtype=np.float32)
     next_v = np.asarray([row["next_v"] for row in metrics], dtype=np.float32)
     td_target = np.asarray([row["td_target"] for row in metrics], dtype=np.float32)
+    mc_return = np.asarray([row.get("mc_return", 0.0) for row in metrics], dtype=np.float32)
+    value_target = np.asarray([row.get("value_target", row["td_target"]) for row in metrics], dtype=np.float32)
     td_residual = np.asarray([row["td_residual"] for row in metrics], dtype=np.float32)
     advantage = np.asarray([row["advantage"] for row in metrics], dtype=np.float32)
     advantage_td1 = np.asarray([row["advantage_td1"] for row in metrics], dtype=np.float32)
@@ -1372,6 +1401,8 @@ def _save_qv_timeseries_png(
     axes[0].grid(True, alpha=0.3)
 
     axes[1].plot(steps, td_target, label="TD target (r + γ^H V')", color="tab:purple")
+    axes[1].plot(steps, value_target, label="value target ((1-λ)TD+λMC)", color="tab:red")
+    axes[1].plot(steps, mc_return, label="MC return-to-go", color="tab:brown", alpha=0.7, linestyle="-.")
     axes[1].plot(steps, q_min, label="Q min", color="tab:blue", alpha=0.75)
     axes[1].plot(steps, bootstrap_v, label="γ^H · V(s')", color="tab:green", alpha=0.65, linestyle="--")
     axes[1].plot(steps, total_rewards, label="chunk r_total", color="tab:gray", alpha=0.65, linestyle=":")

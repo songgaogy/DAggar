@@ -28,10 +28,10 @@ cd "$ROOT_DIR"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEED=2
+SEED=42
 SPLIT="success_rollout"
-TARGET_PATH="iql_qv_cache-weight1_0-tau07"
-ROOT_NAME="DIPOLE_rl-v3-debug-128"
+TARGET_PATH="iql_qv_cache-weight1_0-tau09-01reward"
+ROOT_NAME="DIPOLE_rl-v5"
 # -------------------------------------
 
 
