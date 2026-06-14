@@ -84,6 +84,7 @@ class FlowDaggerPolicy:
         self._inference_shadow_model.eval()
         self._state_lock = threading.RLock()
         self._inference_lock = threading.Lock()
+        self._freeze_visual_batch_norm = False
 
         self.act_mean: np.ndarray | None = None
         self.act_std: np.ndarray | None = None
@@ -113,6 +114,22 @@ class FlowDaggerPolicy:
             device=self.inference_device,
         ).view(1, 1, 3, 1, 1)
         self.sync_inference_policy()
+
+    def set_freeze_visual_batch_norm(self, freeze: bool) -> None:
+        self._freeze_visual_batch_norm = bool(freeze)
+        if self._freeze_visual_batch_norm:
+            self._set_visual_batch_norm_eval(freeze_affine=True)
+
+    def _set_visual_batch_norm_eval(self, *, freeze_affine: bool = False) -> None:
+        image_encoder = getattr(self.model, "image_encoder", None)
+        if image_encoder is None:
+            return
+        for module in image_encoder.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.eval()
+                if freeze_affine:
+                    for param in module.parameters(recurse=False):
+                        param.requires_grad = False
 
     def set_language_instruction(self, language_instruction: str) -> None:
         self.language_instruction = str(language_instruction)
@@ -183,6 +200,8 @@ class FlowDaggerPolicy:
     def update(self, batch: FlowDaggerBatch) -> dict[str, float]:
         batch = batch.to(self.device)
         self.model.train(True)
+        if self._freeze_visual_batch_norm:
+            self._set_visual_batch_norm_eval()
 
         noise = torch.randn_like(batch.action_sequences)
         timesteps = torch.rand(batch.batch_size, device=self.device)
@@ -257,7 +276,10 @@ class FlowDaggerPolicy:
             self.model.load_state_dict(state_dict["model"])
             optimizer_state = state_dict.get("optimizer")
             if optimizer_state is not None:
-                self.optimizer.load_state_dict(optimizer_state)
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                except ValueError as exc:
+                    print(f"[WARN] Skipping incompatible flow optimizer state: {exc}")
             self.set_normalizers(
                 action_mean=state_dict.get("act_mean"),
                 action_std=state_dict.get("act_std"),

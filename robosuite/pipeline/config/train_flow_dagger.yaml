@@ -27,7 +27,7 @@ algorithm:
 
   flow:
     action_horizon: 8
-    execute_horizon: 1
+    execute_horizon: 8
     image_size: ${env.img_height}
     learning_rate: 1.0e-4
     weight_decay: 1.0e-6
@@ -120,6 +120,8 @@ algorithm:
     steps_per_update: 50
     random_steps: 0
     pretrain_steps: 10000
+    # Cap on queued async learner updates; >0 bounds learner lag behind the rollout. 0 = unbounded.
+    max_pending_updates: 8
 
 intervention:
   enabled: true

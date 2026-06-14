@@ -383,6 +383,20 @@ def _center_crop_resize_image(image: np.ndarray, img_height: int, img_width: int
     return np.asarray(crop[ys][:, xs], dtype=np.uint8)
 
 
+def _center_crop_resize_batch(images: np.ndarray, img_height: int, img_width: int) -> np.ndarray:
+    # Vectorized version of _center_crop_resize_image over a leading time axis (T, H, W, C).
+    height, width = images.shape[1:3]
+    crop_size = min(height, width)
+    y0 = (height - crop_size) // 2
+    x0 = (width - crop_size) // 2
+    crop = images[:, y0 : y0 + crop_size, x0 : x0 + crop_size]
+    if crop.shape[1] == img_height and crop.shape[2] == img_width:
+        return np.ascontiguousarray(crop, dtype=np.uint8)
+    ys = np.linspace(0, crop_size - 1, img_height).astype(np.int32)
+    xs = np.linspace(0, crop_size - 1, img_width).astype(np.int32)
+    return np.ascontiguousarray(crop[:, ys][:, :, xs], dtype=np.uint8)
+
+
 def load_hdf5_demos_into_flow_transitions(
     path: str | Path,
     *,
@@ -426,48 +440,42 @@ def load_hdf5_demos_into_flow_transitions(
                 if camera_name not in obs_group:
                     raise KeyError(f"Missing camera '{camera_name}' in {path}:{demo_name}")
 
-            for step_idx in range(len(actions)):
-                next_idx = min(step_idx + 1, len(actions) - 1)
-                raw_obs_images = {
-                    camera_name: _center_crop_resize_image(
-                        np.asarray(obs_group[camera_name]["images"][step_idx], dtype=np.uint8),
-                        img_height=img_height,
-                        img_width=img_width,
-                    )
-                    for camera_name in required_hdf5_camera_names
-                }
-                raw_next_obs_images = {
-                    camera_name: _center_crop_resize_image(
-                        np.asarray(obs_group[camera_name]["images"][next_idx], dtype=np.uint8),
-                        img_height=img_height,
-                        img_width=img_width,
-                    )
-                    for camera_name in required_hdf5_camera_names
-                }
+            num_steps = len(actions)
+            # Vectorized read: pull each camera stream once and crop/resize all frames in one shot,
+            # instead of per-frame HDF5 random reads (the dominant bottleneck).
+            cropped_images = {
+                camera_name: _center_crop_resize_batch(
+                    np.asarray(obs_group[camera_name]["images"][:], dtype=np.uint8),
+                    img_height=img_height,
+                    img_width=img_width,
+                )
+                for camera_name in required_hdf5_camera_names
+            }
+            # Extract + normalize each frame exactly once; next_obs reuses the next frame's obs.
+            frame_obs = []
+            for step_idx in range(num_steps):
                 obs_state = state_extractor.extract(states[step_idx]).astype(np.float32)
-                if step_idx + 1 < len(states):
-                    next_state = state_extractor.extract(states[step_idx + 1]).astype(np.float32)
-                else:
-                    next_state = obs_state.copy()
-                obs_images = normalize_policy_observation(
-                    {**raw_obs_images, "state": obs_state},
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
+                frame_obs.append(
+                    normalize_policy_observation(
+                        {
+                            **{name: cropped_images[name][step_idx] for name in required_hdf5_camera_names},
+                            "state": obs_state,
+                        },
+                        policy_camera_names=policy_camera_names,
+                        camera_aliases=camera_aliases,
+                    )
                 )
-                next_obs_images = normalize_policy_observation(
-                    {**raw_next_obs_images, "state": next_state},
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
-                )
-                is_last_step = step_idx == len(actions) - 1
 
+            for step_idx in range(num_steps):
+                next_idx = min(step_idx + 1, num_steps - 1)
+                is_last_step = step_idx == num_steps - 1
                 reward = 0.0 if successful and is_last_step else -1.0
                 transitions.append(
                     Transition(
-                        obs=obs_images,
+                        obs=frame_obs[step_idx],
                         action=np.asarray(actions[step_idx], dtype=np.float32),
                         reward=float(reward),
-                        next_obs=next_obs_images,
+                        next_obs=frame_obs[next_idx],
                         done=bool(is_last_step),
                         grasp_penalty=None,
                         is_intervention=bool(intervention_labels[step_idx]),
@@ -785,17 +793,10 @@ def main(cfg: DictConfig) -> None:
 
     print(f"[INFO] Loading offline demos from {demo_source_name}...")
     proprio_keys = [str(key) for key in list(cfg.env.proprio_keys or [])]
-    shared_demo_cache_dir = output_root / "_demo_cache"
-    cache_key_parts = [
-        f"h{int(cfg.env.img_height)}",
-        f"w{int(cfg.env.img_width)}",
-        f"cams-{'_'.join(policy_camera_names)}",
-        f"state-{'_'.join(proprio_keys) if proprio_keys else 'auto'}",
-    ]
+    # flow_dagger is imitation learning (not RL): no demo cache (re-read each run),
+    # randomly sample trajectories per run, and skip the -1/0 reward guard.
     transitions = load_demo_paths(
         demo_paths,
-        cache_dir=shared_demo_cache_dir,
-        mirror_cache_dir=checkpoint_dir / "demo_cache",
         hdf5_loader=lambda path, demo_names=None: load_hdf5_demos_into_flow_transitions(
             path,
             policy_camera_names=policy_camera_names,
@@ -809,7 +810,8 @@ def main(cfg: DictConfig) -> None:
             state_extractor=flow_proprio_extractor,
         ),
         max_num_trajectories=max_num_trajectories,
-        cache_key="__".join(cache_key_parts),
+        check_legacy_rewards=False,
+        random_sample=True,
     )
     if len(transitions) == 0:
         raise RuntimeError(

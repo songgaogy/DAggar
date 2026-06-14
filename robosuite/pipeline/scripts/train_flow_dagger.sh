@@ -12,10 +12,16 @@ INTERACTIVE="${INTERACTIVE:-true}"
 VIEWER_ENABLED="${VIEWER_ENABLED:-true}"
 IMAGE_OBS_FPS="${IMAGE_OBS_FPS:-20}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-0}"
-LEARNER_DEVICE="${LEARNER_DEVICE:-cuda:0}"
-INFERENCE_DEVICE="${INFERENCE_DEVICE:-cuda:1}"
+# MuJoCo offscreen camera rendering (EGL/GLFW) runs on GPU 0, so keep the learner — the async
+# update bottleneck — isolated on GPU 1. Inference is lightweight (one ODE-sampled forward every
+# execute_horizon steps) and can share GPU 0 with rendering without throttling the learner.
+LEARNER_DEVICE="${LEARNER_DEVICE:-cuda:1}"
+INFERENCE_DEVICE="${INFERENCE_DEVICE:-cuda:0}"
 ACTION_HORIZON="${ACTION_HORIZON:-8}"
 EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
+# Async learner backpressure: cap queued updates so the learner cannot fall far behind the
+# rollout (avoids stale-progress backlog + end-of-run flush burst). 0 = unbounded (legacy).
+MAX_PENDING_UPDATES="${MAX_PENDING_UPDATES:-8}"
 N_ODE_STEPS=10
 EVAL_EPISODE_MAX_STEPS="${EVAL_EPISODE_MAX_STEPS:-300}"
 INIT_CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
@@ -148,6 +154,7 @@ python -m robosuite.pipeline.train_flow_dagger \
   algorithm.flow.n_ode_steps="${N_ODE_STEPS}" \
   algorithm.trainer.batch_size="${TRAIN_BATCH_SIZE}" \
   algorithm.trainer.steps_per_update="${PUBLISH_INTERVAL}" \
+  algorithm.trainer.max_pending_updates="${MAX_PENDING_UPDATES}" \
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.log_interval="${LOG_INTERVAL}" \
   logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \

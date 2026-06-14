@@ -47,6 +47,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--interactive", action="store_true", help="Open the robosuite viewer during eval.")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic action sampling.")
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
+    parser.add_argument(
+        "--execute-horizon",
+        type=int,
+        default=None,
+        help="Override checkpoint flow_config.execute_horizon for eval.",
+    )
+    parser.add_argument(
+        "--n-ode-steps",
+        type=int,
+        default=None,
+        help="Override checkpoint flow_config.n_ode_steps for eval.",
+    )
     return parser.parse_args()
 
 
@@ -126,21 +138,28 @@ def _resolve_eval_device(payload: dict[str, Any]) -> str:
     return resolve_requested_device(requested, fallback=fallback)
 
 
-def _build_policy(payload: dict[str, Any], *, task_name: str, device: str) -> FlowDaggerPolicy:
+def _build_policy(
+    payload: dict[str, Any],
+    *,
+    task_name: str,
+    device: str,
+    execute_horizon: int | None,
+    n_ode_steps: int | None,
+) -> FlowDaggerPolicy:
     flow_cfg = dict(payload["flow_config"])
     aug_cfg = dict(flow_cfg.get("augmentation", {}) or {})
     config = FlowDaggerConfig(
         action_dim=int(flow_cfg["action_dim"]),
         proprio_dim=int(flow_cfg["proprio_dim"]),
         action_horizon=int(flow_cfg.get("action_horizon", 8)),
-        execute_horizon=int(flow_cfg.get("execute_horizon", 1)),
+        execute_horizon=int(execute_horizon if execute_horizon is not None else flow_cfg.get("execute_horizon", 1)),
         image_size=int(flow_cfg.get("image_size", 128)),
         learning_rate=float(flow_cfg.get("learning_rate", 1e-4)),
         weight_decay=float(flow_cfg.get("weight_decay", 1e-6)),
         grad_clip_norm=float(flow_cfg.get("grad_clip_norm", 1.0)),
         lambda_endpoint=float(flow_cfg.get("lambda_endpoint", 0.5)),
         lambda_smooth=float(flow_cfg.get("lambda_smooth", 0.05)),
-        n_ode_steps=int(flow_cfg.get("n_ode_steps", 8)),
+        n_ode_steps=int(n_ode_steps if n_ode_steps is not None else flow_cfg.get("n_ode_steps", 8)),
         device=str(device),
         inference_device=str(device),
         task_name=str(payload.get("task_name", task_name)),
@@ -253,7 +272,13 @@ def main() -> None:
     env = build_robosuite_env(runtime_cfg)
     proprio_extractor = bind_flow_proprio_extractor(env, env_metadata)
     eval_device = _resolve_eval_device(checkpoint_payload)
-    policy = _build_policy(checkpoint_payload, task_name=args.task_name, device=eval_device)
+    policy = _build_policy(
+        checkpoint_payload,
+        task_name=args.task_name,
+        device=eval_device,
+        execute_horizon=args.execute_horizon,
+        n_ode_steps=args.n_ode_steps,
+    )
 
     output_root = Path(to_absolute_path(args.output_root))
     output_dir = _build_eval_output_dir(output_root, checkpoint_path, args.task_name)

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import random
 import shutil
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import h5py
 import torch
@@ -57,10 +58,12 @@ def save_transition_shard(path: str | Path, transitions: Sequence[Transition]) -
     os.replace(tmp_path, path)
 
 
-def load_transition_shard(path: str | Path) -> list[Transition]:
+def load_transition_shard(path: str | Path, *, check_legacy_rewards: bool = True) -> list[Transition]:
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     transitions = [deserialize_transition(item) for item in payload]
-    _raise_on_legacy_positive_rewards(transitions, path=path)
+    # Reward-free algorithms (e.g. flow_dagger) opt out of the -1/0 sparse-reward guard.
+    if check_legacy_rewards:
+        _raise_on_legacy_positive_rewards(transitions, path=path)
     return transitions
 
 
@@ -96,9 +99,14 @@ def load_demo_paths(
     hdf5_loader=None,
     max_num_trajectories: int | None = None,
     cache_key: str | None = None,
+    check_legacy_rewards: bool = True,
+    random_sample: bool = False,
+    random_seed: int | None = None,
+    selected_demo_callback: Callable[[Path, list[str]], None] | None = None,
 ) -> list[Transition]:
     transitions: list[Transition] = []
     remaining_trajectories = None if max_num_trajectories is None else int(max_num_trajectories)
+    sample_rng = random.Random(random_seed) if random_seed is not None else random.Random()
     if remaining_trajectories is not None and remaining_trajectories <= 0:
         return transitions
 
@@ -114,7 +122,7 @@ def load_demo_paths(
                     "Trajectory-limited demo loading only supports HDF5 expert files. "
                     f"Remove max_num_trajectories or convert {path} to HDF5 input."
                 )
-            transitions.extend(load_transition_shard(path))
+            transitions.extend(load_transition_shard(path, check_legacy_rewards=check_legacy_rewards))
             continue
 
         if suffix in {".hdf5", ".h5"}:
@@ -122,9 +130,14 @@ def load_demo_paths(
                 raise ValueError("An hdf5_loader must be provided to read HDF5 demos.")
             selected_demo_names = list_hdf5_demo_names(path)
             if remaining_trajectories is not None:
-                selected_demo_names = selected_demo_names[:remaining_trajectories]
+                if random_sample and remaining_trajectories < len(selected_demo_names):
+                    selected_demo_names = sample_rng.sample(selected_demo_names, remaining_trajectories)
+                else:
+                    selected_demo_names = selected_demo_names[:remaining_trajectories]
             if not selected_demo_names:
                 continue
+            if selected_demo_callback is not None:
+                selected_demo_callback(path, list(selected_demo_names))
             cache_path = None
             if cache_dir is not None:
                 cache_root = Path(cache_dir)
@@ -137,7 +150,9 @@ def load_demo_paths(
                 cache_path = cache_root / f"{cache_stem}.pt"
                 if cache_path.exists() and cache_path.stat().st_mtime >= path.stat().st_mtime:
                     try:
-                        cached_transitions = load_transition_shard(cache_path)
+                        cached_transitions = load_transition_shard(
+                            cache_path, check_legacy_rewards=check_legacy_rewards
+                        )
                     except (EOFError, RuntimeError, OSError, ValueError, pickle.UnpicklingError) as exc:
                         print(f"[WARN] Ignoring invalid transition cache {cache_path}: {exc}")
                         try:

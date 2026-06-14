@@ -46,6 +46,11 @@ class TrainerConfig:
     steps_per_update: int = 50
     random_steps: int = 0
     pretrain_steps: int = 20_000
+    # Backpressure for async learner updates: when the number of queued (not-yet-applied)
+    # updates reaches this cap, new enqueue requests are skipped instead of piling up. This
+    # bounds learner lag behind the rollout (and avoids a large end-of-run flush burst).
+    # <= 0 disables the cap (legacy unbounded behavior).
+    max_pending_updates: int = 8
 
 
 @dataclass

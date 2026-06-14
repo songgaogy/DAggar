@@ -159,6 +159,7 @@ class FlowDaggerAgent:
             steps_per_update=int(cfg_get(trainer_cfg, "steps_per_update", 50)),
             random_steps=int(cfg_get(trainer_cfg, "random_steps", 0)),
             pretrain_steps=int(cfg_get(trainer_cfg, "pretrain_steps", 20_000)),
+            max_pending_updates=int(cfg_get(trainer_cfg, "max_pending_updates", 8)),
         )
         return cls(
             observation_example=observation_example,

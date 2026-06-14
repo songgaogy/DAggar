@@ -27,6 +27,7 @@ class FlowDaggerTrainer:
         self._async_pending_updates = 0
         self._async_pending_batch_size: int | None = None
         self._async_busy = False
+        self._async_dropped_updates = 0
         self._async_error: BaseException | None = None
 
     def bootstrap_demo_buffer(self, transitions: list[Transition], demo_source: str = "offline_demo") -> None:
@@ -130,10 +131,18 @@ class FlowDaggerTrainer:
         current_step = self.total_env_steps if env_step is None else int(env_step)
         if current_step >= int(self.config.warmup_steps) and self.agent.ready_for_update(batch_size=batch_size):
             self.start_async_worker()
+            max_pending = int(getattr(self.config, "max_pending_updates", 0))
             with self._async_condition:
-                self._async_pending_updates += int(self.config.updates_per_step)
-                self._async_pending_batch_size = None if batch_size is None else int(batch_size)
-                self._async_condition.notify_all()
+                # Backpressure: skip enqueueing when the learner is already saturated so the
+                # queue cannot grow unboundedly behind the rollout. _async_busy counts the
+                # update currently being applied. <= 0 keeps the legacy unbounded behavior.
+                backlog = self._async_pending_updates + int(self._async_busy)
+                if max_pending <= 0 or backlog < max_pending:
+                    self._async_pending_updates += int(self.config.updates_per_step)
+                    self._async_pending_batch_size = None if batch_size is None else int(batch_size)
+                    self._async_condition.notify_all()
+                else:
+                    self._async_dropped_updates += int(self.config.updates_per_step)
         return self.drain_async_metrics()
 
     def start_async_worker(self) -> None:
@@ -225,6 +234,7 @@ class FlowDaggerTrainer:
             "last_published_update": int(self.last_published_update),
             "updates_until_publish": int(self.updates_until_next_publish()),
             "total_pretrain_updates": int(self.total_pretrain_updates),
+            "dropped_updates": int(self._async_dropped_updates),
         }
 
     def updates_until_next_publish(self) -> int:
