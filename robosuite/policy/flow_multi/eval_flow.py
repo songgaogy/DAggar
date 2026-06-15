@@ -1,3 +1,4 @@
+import json
 import os
 
 import hydra
@@ -120,9 +121,9 @@ def main(cfg: DictConfig):
     env_cache = {}
     rng = np.random.default_rng()
 
-    video_dir = to_absolute_path(cfg.eval.video_dir) if cfg.eval.video_dir else None
-    if video_dir is not None:
-        os.makedirs(video_dir, exist_ok=True)
+    output_dir = to_absolute_path(cfg.eval.output_dir) if cfg.eval.output_dir else None
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
 
     def get_task_context(task_name: str):
         if task_name not in env_cache:
@@ -198,13 +199,13 @@ def main(cfg: DictConfig):
     # evaluate each task
     for task_name in list(eval_task_names):
         for episode_idx in range(int(cfg.eval.episodes)):
-            total_reward, step_count, success, frames = rollout(task_name=task_name, record_video=video_dir is not None)
+            total_reward, step_count, success, frames = rollout(task_name=task_name, record_video=output_dir is not None)
             print(
                 f"task={task_name} episode={episode_idx} return={total_reward:.4f} "
                 f"steps={step_count} success={int(success)}"
             )
-            if video_dir is not None and len(frames) > 0:
-                video_path = os.path.join(video_dir, f"{task_name}_episode_{episode_idx}_return_{total_reward:.2f}.mp4")
+            if output_dir is not None and len(frames) > 0:
+                video_path = os.path.join(output_dir, f"{task_name}_episode_{episode_idx}_return_{total_reward:.2f}.mp4")
                 imageio.mimsave(video_path, frames, fps=int(cfg.eval.video_fps))
                 print(f"saved video: {video_path}")
 
@@ -219,11 +220,17 @@ def main(cfg: DictConfig):
             success_count += int(success)
             task_eval_counts[task_name] += 1
             task_success_counts[task_name] += int(success)
+        success_rate = success_count / float(num_eval_episodes)
         print(
             f"checkpoint={cfg.eval.ckpt} tasks={eval_task_names} "
-            f"success_rate={success_count / float(num_eval_episodes):.4f} "
+            f"success_rate={success_rate:.4f} "
             f"({success_count}/{num_eval_episodes})"
         )
+        if output_dir is not None:
+            info_path = os.path.join(output_dir, "info.json")
+            with open(info_path, "w", encoding="utf-8") as f:
+                json.dump({"success_rate": success_rate}, f, indent=4)
+            print(f"saved success_rate to {info_path}")
         for task_name in eval_task_names:
             num_task_episodes = task_eval_counts[task_name]
             if num_task_episodes == 0:

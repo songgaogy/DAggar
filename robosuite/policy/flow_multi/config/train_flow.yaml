@@ -38,6 +38,7 @@ train:
   min_lr: 1e-6
   weight_decay: 1e-6
   grad_clip_norm: 1.0
+  log_freq: 1
   lambda_endpoint: 0.5
   lambda_smooth: 0.05
   ema_decay: 0.999

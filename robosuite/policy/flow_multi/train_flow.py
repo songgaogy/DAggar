@@ -198,6 +198,12 @@ def preprocess_images(images: torch.Tensor, camera_names: list[str], cfg: DictCo
     return (augmented - mean) / std
 
 
+def count_params(model: torch.nn.Module) -> tuple[int, int]:
+    total = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    return trainable, total
+
+
 def maybe_init_wandb(cfg: DictConfig):
     if not bool(cfg.logging.enable_wandb):
         return None
@@ -282,6 +288,9 @@ def main(cfg: DictConfig):
         camera_names=list(cfg.data.camera_names),
     ).to(device)
 
+    num_trainable, num_total = count_params(model)
+    print(f"trainable params: {num_trainable:,} / total params: {num_total:,}")
+
     ema_model = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(float(cfg.train.ema_decay)))
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(
@@ -298,8 +307,9 @@ def main(cfg: DictConfig):
     )
 
     wandb = maybe_init_wandb(cfg)
+    log_freq = int(_cfg_get(cfg.train, "log_freq", 1))
     global_step = 0
-    print("start training flow_multi...")
+    print(f"start training flow_multi... (log_freq={log_freq} epoch(s))")
 
     for epoch in range(int(cfg.train.epochs)):
         model.train()
@@ -316,7 +326,7 @@ def main(cfg: DictConfig):
         loop_start = time.time()
         num_batches = 0
 
-        for iteration, batch in enumerate(batch_iter):
+        for batch in batch_iter:
             num_batches += 1
             images = batch["images"]
             proprio = batch["proprio"]
@@ -363,42 +373,38 @@ def main(cfg: DictConfig):
             running_smooth += float(smooth_loss.item())
             global_step += 1
 
-            if (iteration + 1) % int(cfg.logging.log_every) == 0:
-                avg_loss = running_loss / int(cfg.logging.log_every)
-                avg_flow = running_flow / int(cfg.logging.log_every)
-                avg_endpoint = running_endpoint / int(cfg.logging.log_every)
-                avg_smooth = running_smooth / int(cfg.logging.log_every)
-                elapsed = max(1e-6, time.time() - loop_start)
-                samples_per_second = (int(cfg.train.batch_size) * int(cfg.logging.log_every)) / elapsed
-                print(
-                    f"epoch={epoch:04d} iter={iteration:05d} step={global_step:07d} "
-                    f"loss={avg_loss:.6f} flow={avg_flow:.6f} "
-                    f"endpoint={avg_endpoint:.6f} smooth={avg_smooth:.6f} "
-                    f"samples_per_sec={samples_per_second:.1f}"
-                )
-                if wandb is not None:
-                    wandb.log(
-                        {
-                            "train/loss": avg_loss,
-                            "train/flow_loss": avg_flow,
-                            "train/endpoint_loss": avg_endpoint,
-                            "train/smooth_loss": avg_smooth,
-                            "train/lr": scheduler.get_last_lr()[0],
-                            "train/samples_per_sec": samples_per_second,
-                        },
-                        step=global_step,
-                    )
-                running_loss = 0.0
-                running_flow = 0.0
-                running_endpoint = 0.0
-                running_smooth = 0.0
-                loop_start = time.time()
-
         if num_batches == 0:
             raise RuntimeError(
                 "DataLoader yielded zero training batches. "
                 "Reduce batch_size or change the sampler configuration."
             )
+
+        if (epoch + 1) % log_freq == 0:
+            avg_loss = running_loss / num_batches
+            avg_flow = running_flow / num_batches
+            avg_endpoint = running_endpoint / num_batches
+            avg_smooth = running_smooth / num_batches
+            elapsed = max(1e-6, time.time() - loop_start)
+            samples_per_second = (int(cfg.train.batch_size) * num_batches) / elapsed
+            print(
+                f"epoch={epoch + 1:04d}/{int(cfg.train.epochs):04d} step={global_step:07d} "
+                f"loss={avg_loss:.6f} flow={avg_flow:.6f} "
+                f"endpoint={avg_endpoint:.6f} smooth={avg_smooth:.6f} "
+                f"lr={scheduler.get_last_lr()[0]:.2e} samples_per_sec={samples_per_second:.1f}"
+            )
+            if wandb is not None:
+                wandb.log(
+                    {
+                        "train/loss": avg_loss,
+                        "train/flow_loss": avg_flow,
+                        "train/endpoint_loss": avg_endpoint,
+                        "train/smooth_loss": avg_smooth,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/samples_per_sec": samples_per_second,
+                        "train/epoch": epoch + 1,
+                    },
+                    step=global_step,
+                )
 
         checkpoint = {
             "model": model.state_dict(),

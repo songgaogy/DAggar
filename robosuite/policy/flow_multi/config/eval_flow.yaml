@@ -15,6 +15,6 @@ eval:
   max_steps: 300
   n_ode_steps: 20
   action_horizon: 8
-  video_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask/videos"
+  output_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask/videos"
   video_camera: "agentview"
   video_fps: 20

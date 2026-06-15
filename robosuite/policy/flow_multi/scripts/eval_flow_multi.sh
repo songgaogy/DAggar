@@ -1,20 +1,19 @@
-export CUDA_VISIBLE_DEVICES=1
+#!/usr/bin/env bash
+set -euo pipefail
+
+export CUDA_VISIBLE_DEVICES=0
 export MUJOCO_GL=egl
 
-# eval each task
-# python /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_multi/eval_flow.py \
-#   eval.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt" \
-#   eval.task_name='["PickPlaceBread","PickPlaceCereal","PickPlaceMilk","PickPlaceCan","Stack","Lift"]' \
-#   eval.video_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/video/ep100" \
-#   eval.episodes=0 \
-#   eval.max_steps=500 \
-#   eval.succ_rate=true
+ROOT="/home/dodo/Documents/DAggar/robosuite"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
-python /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_multi/eval_flow.py \
-  eval.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt" \
-  eval.task_name='["PickPlaceMilk"]' \
-  eval.video_dir="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/video/ep100-PickPlaceBread" \
-  eval.episodes=0 \
+cd "${ROOT}"
+
+# Single-task eval example. For epoch x task grid eval, use eval_flow_multi_parallel.sh.
+"${PYTHON_BIN}" "${ROOT}/robosuite/policy/flow_multi/eval_flow.py" \
+  eval.ckpt="checkpoints/multitask_6/policy/flow-10/flow_multi_ep0400.pt" \
+  eval.task_name="PickPlaceBread" \
+  eval.output_dir="${ROOT}/checkpoints/multitask_6/policy/flow-10/results/ep400-PickPlaceBread" \
   eval.max_steps=500 \
   eval.succ_rate=true \
   eval.n_ode_steps=10
