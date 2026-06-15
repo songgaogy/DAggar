@@ -1,9 +1,8 @@
 python /home/dodo/Documents/DAggar/robosuite/robosuite/scripts/collect_human_demonstrations.py \
-    --directory /home/dodo/Documents/DAggar/robosuite/data/suboptimal/NutAssemblyRound \
+    --directory /home/dodo/Documents/DAggar/robosuite/data2/PickPlaceMilk/expert \
     --robots Panda \
-    --environment NutAssemblyRound \
-    --device spacemouse \
-    --max_fr 30
+    --environment PickPlaceMilk \
+    --device spacemouse 
 
 # GR1 views:
 # 'frontview', 'birdview', 'agentview', 'robot0_obs_hands', 'robot0_overshoulder', 'robot0_behindhead', 

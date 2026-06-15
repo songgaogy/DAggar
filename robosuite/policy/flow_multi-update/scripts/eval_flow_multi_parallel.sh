@@ -3,26 +3,29 @@ set -euo pipefail
 
 ROOT="/home/dodo/Documents/DAggar/robosuite"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
-EVAL_SCRIPT="${ROOT}/robosuite/policy/flow_multi/eval_flow.py"
+EVAL_SCRIPT="${ROOT}/robosuite/policy/flow_multi-update/eval_flow.py"
 
 # Checkpoint root for flow-10 training runs.
-CKPT_DIR="${ROOT}/checkpoints/multitask_6/policy/flow-10"
+CKPT_DIR="${ROOT}/checkpoints/multitask_6/policy/flow-update"
 RESULTS_DIR="${CKPT_DIR}/results"
-LOG_DIR="{RESULTS_DIR}/logs"
+LOG_DIR="${RESULTS_DIR}/logs"
 
 # Cartesian product: TRAIN_EPOCHS x TASKS_TO_EVAL.
 TASKS_TO_EVAL=(
-  # "PickPlaceCereal"
-  # "PickPlaceMilk"
-  # "PickPlaceCan"
   "Stack"
   "Lift"
+  "NutAssemblyRound"
+  "NutAssemblySquare"
+  "PickPlaceCereal"
+  "PickPlaceMilk"
+  "PickPlaceCan"
+  "PickPlaceBread"
 )
-TRAIN_EPOCHS=(25 50 100 150 200 300 400)
+TRAIN_EPOCHS=(100 150 200 300 400)
 
 # GPUs and per-GPU concurrency limit.
 GPU_IDS=(0 1)
-MAX_PROC_PER_GPU=3
+MAX_PROC_PER_GPU=4
 MAX_PARALLEL_JOBS=$(( ${#GPU_IDS[@]} * MAX_PROC_PER_GPU ))
 
 # Eval hyperparameters.
