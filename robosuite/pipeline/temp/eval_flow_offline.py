@@ -110,6 +110,7 @@ def parse_args() -> argparse.Namespace:
         help="Base flow-dagger config (defaults to train_flow_offline's canonical config).",
     )
     parser.add_argument("--output", default=None, help="Optional path to write JSON results (default: alongside first ckpt).")
+    parser.add_argument("--postfix", default=None, help="Optional postfix to evaluate.")
     return parser.parse_args()
 
 
@@ -355,7 +356,7 @@ def main() -> None:
     out_path = (
         Path(to_absolute_path(args.output))
         if args.output is not None
-        else checkpoints[0].parent / "eval_success_rate.json"
+        else checkpoints[0].parent / f"eval_success_rate-{args.postfix}.json"
     )
     payload = {
         "env": args.env,

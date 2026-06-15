@@ -55,14 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--freeze-visual-bn",
         dest="freeze_visual_bn",
         action="store_true",
-        default=True,
         help="Keep image-encoder BatchNorm stats fixed during fine-tuning.",
-    )
-    parser.add_argument(
-        "--no-freeze-visual-bn",
-        dest="freeze_visual_bn",
-        action="store_false",
-        help="Allow image-encoder BatchNorm modules to run in train mode.",
     )
     parser.add_argument(
         "--demo-sample-seed",
@@ -70,8 +63,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Seed for random demo subset selection. Defaults to cfg.seed.",
     )
-    parser.add_argument("--device", default=None, help="Override learner device, e.g. cuda:0. Defaults to config.")
+    parser.add_argument("--device", default="cuda:0", help="Override learner device, e.g. cuda:0. Defaults to config.")
     parser.add_argument("--seed", type=int, default=None, help="Override seed. Defaults to config seed (42).")
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="Base flow checkpoint for warm-start (overrides cfg.runtime.init_checkpoint).",
+    )
     parser.add_argument(
         "--config",
         default=str(_DEFAULT_CONFIG),
@@ -79,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-root",
-        default="./outputs/flow_dagger_no-hil",
+        default="./outputs/flow-sft",
         help="Output root; checkpoint is written under <output-root>/<env>[_<postfix>]/.",
     )
     parser.add_argument("--log-interval", type=int, default=100, help="Console / loss-log interval in steps.")
@@ -124,6 +122,8 @@ def build_cfg(args: argparse.Namespace) -> Any:
     if args.device is not None:
         cfg.algorithm.flow.device = str(args.device)
         cfg.algorithm.flow.inference_device = str(args.device)
+    if getattr(args, "init_checkpoint", None) is not None:
+        cfg.runtime.init_checkpoint = to_absolute_path(str(args.init_checkpoint))
     return cfg
 
 

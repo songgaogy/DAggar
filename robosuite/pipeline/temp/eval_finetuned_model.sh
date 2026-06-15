@@ -4,13 +4,14 @@ set -euo pipefail
 cd /home/dodo/Documents/DAggar/robosuite
 
 PYTHON="${PYTHON:-/home/dodo/miniconda3/envs/dagger/bin/python}"
-TASK="PickPlaceBread"
+TASK="NutAssemblyRound"
+SFT_STEPS=10000
 EPISODES="50"
 MAX_STEPS="500"
-DEVICE="cuda:1"
+DEVICE="cuda:0"
 N_ODE_STEPS="10"
 EXECUTE_HORIZON="8"
-CKPT="outputs/flow_dagger_no-hil/PickPlaceBread_expert-pretrain-data/flow_offline_PickPlaceBread_traj00020_steps00010000_at00000000.pt"
+CKPT="outputs/flow-sft/NutAssemblyRound_pretrain-data/flow_offline_NutAssemblyRound_traj00010_steps00010000.pt"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
@@ -38,7 +39,8 @@ case "${CHECKPOINT_FORMAT}" in
       --max-steps "${MAX_STEPS}" \
       --device "${DEVICE}" \
       --execute-horizon "${EXECUTE_HORIZON}" \
-      --n-ode-steps "${N_ODE_STEPS}"
+      --n-ode-steps "${N_ODE_STEPS}" \
+      --postfix "${SFT_STEPS}"
     ;;
   *)
     echo "Unsupported checkpoint format: ${CKPT}" >&2
