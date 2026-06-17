@@ -21,7 +21,7 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/float/real_world_eval/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 mkdir -p "${OUT_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 ACTION_START="${ACTION_START:-7}"
 ACTION_STOP="${ACTION_STOP:-13}"

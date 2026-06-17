@@ -2,11 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------------------------------------------------------------------
-ENV_NAME="PickPlaceBread"
-TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-CHECKPOINT="outputs/flow-DAgger/flow_dagger_PickPlaceBread_2026-06-14_14-17-28/checkpoints/step_00010000_updates_00009303_ep_00041.pt"
+ENV_NAME="NutAssemblySquare"
+CHECKPOINT="outputs/flow-DAgger/flow_dagger_NutAssemblySquare_2026-06-16_21-56-22_30pretrain/checkpoints/step_00015000_updates_00009964_ep_00039.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 VIDEO_OUTPUT="true"
@@ -15,6 +15,7 @@ N_ODE_STEPS=10
 EXECUTE_HORIZON=8
 # -------------------------------------------------------------------------------------------------
 
+TASK_NAME="${TASK_NAME:-$ENV_NAME}"
 EVAL_DETERMINISTIC="false"
 VIDEO_OUTPUT="${VIDEO_OUTPUT:-false}"
 
@@ -43,9 +44,18 @@ if [[ ! -f "${CHECKPOINT}" ]]; then
   exit 1
 fi
 
+CHECKPOINT_DIR="$(dirname "${CHECKPOINT}")"
+if [[ "$(basename "${CHECKPOINT_DIR}")" == "checkpoints" ]]; then
+  RUN_DIR="$(dirname "${CHECKPOINT_DIR}")"
+  OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_DIR}/eval}"
+else
+  echo "[ERROR] CHECKPOINT must live under a run's checkpoints/ directory: ${CHECKPOINT}" >&2
+  exit 1
+fi
+
 echo "[eval] checkpoint=${CHECKPOINT}"
 echo "[eval] env=${ENV_NAME} task=${TASK_NAME} episodes=${EPISODES} video_output=${VIDEO_OUTPUT}"
-echo "[eval] results_dir=${ROOT_DIR}/outputs/flow-DAgger/eval"
+echo "[eval] results_dir=${ROOT_DIR}/${OUTPUT_ROOT}"
 
 PY_ARGS=(
   --checkpoint "${CHECKPOINT}"
@@ -53,7 +63,7 @@ PY_ARGS=(
   --task-name "${TASK_NAME}"
   --episodes "${EPISODES}"
   --episode-max-steps "${EVAL_EPISODE_MAX_STEPS}"
-  --output-root "./outputs/flow-DAgger/eval"
+  --output-root "${OUTPUT_ROOT}"
   --video-output "${VIDEO_OUTPUT}"
   --video-height "${VIDEO_IMAGE_SIZE}"
   --video-width "${VIDEO_IMAGE_SIZE}"

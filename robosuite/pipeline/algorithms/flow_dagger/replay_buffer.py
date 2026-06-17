@@ -298,14 +298,12 @@ class FlowDaggerReplayBuffer:
     def _normalize_transition(self, transition: Transition) -> Transition:
         if transition.reward is None:
             raise ValueError(f"{self.name} requires every transition to contain a reward.")
-        if transition.next_obs is None:
-            raise ValueError(f"{self.name} requires next_obs for every transition.")
         action = to_numpy(transition.action, dtype=np.float32).reshape(-1)
         return Transition(
             obs=self._normalize_observation(transition.obs),
             action=action,
             reward=float(transition.reward),
-            next_obs=self._normalize_observation(transition.next_obs),
+            next_obs=None if transition.next_obs is None else self._normalize_observation(transition.next_obs),
             done=bool(transition.done),
             grasp_penalty=None if transition.grasp_penalty is None else float(transition.grasp_penalty),
             is_intervention=bool(transition.is_intervention),
@@ -351,23 +349,53 @@ class FlowDaggerReplayBuffer:
         return self._rebuild_valid_start_cache_locked()
 
     def _append_valid_start_locked(self) -> None:
-        if self._valid_start_cache is None:
-            self._rebuild_valid_start_cache_locked()
-            return
-        start = len(self._storage) - self.action_horizon
-        if start < 0:
-            return
-        if self._is_valid_sequence_start_locked(start):
-            self._valid_start_cache.append(int(start))
+        self._valid_start_cache = None
 
     def _rebuild_valid_start_cache_locked(self) -> list[int]:
-        valid_starts = []
-        max_start = len(self._storage) - self.action_horizon + 1
-        for start in range(max_start):
-            if self._is_valid_sequence_start_locked(start):
-                valid_starts.append(int(start))
+        valid_starts: list[int] = []
+        horizon = int(self.action_horizon)
+        for fragment_start, fragment_end in self._iter_contiguous_fragments_locked():
+            fragment_len = int(fragment_end) - int(fragment_start) + 1
+            if fragment_len < horizon:
+                continue
+            last_start = int(fragment_end) - horizon + 1
+            for sample_index in range(int(fragment_start), int(fragment_end) + 1):
+                valid_starts.append(int(min(sample_index, last_start)))
         self._valid_start_cache = valid_starts
         return self._valid_start_cache
+
+    def _iter_contiguous_fragments_locked(self):
+        if len(self._storage) == 0:
+            return
+        fragment_start = 0
+        for index in range(1, len(self._storage)):
+            if self._starts_new_fragment_locked(index):
+                yield fragment_start, index - 1
+                fragment_start = index
+        yield fragment_start, len(self._storage) - 1
+
+    def _starts_new_fragment_locked(self, index: int) -> bool:
+        previous = self._storage[int(index) - 1]
+        current = self._storage[int(index)]
+        if bool(previous.done):
+            return True
+
+        previous_info = previous.info or {}
+        current_info = current.info or {}
+        previous_episode = previous_info.get("episode_index", None)
+        current_episode = current_info.get("episode_index", None)
+        previous_step = previous_info.get("episode_step", None)
+        current_step = current_info.get("episode_step", None)
+        if (
+            previous_episode is None
+            or current_episode is None
+            or previous_step is None
+            or current_step is None
+        ):
+            return False
+        if current_episode != previous_episode:
+            return True
+        return int(current_step) != int(previous_step) + 1
 
     def _is_valid_sequence_start_locked(self, start: int) -> bool:
         first = self._storage[start]

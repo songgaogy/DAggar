@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT="/home/dodo/Documents/DAggar/robosuite"
-PYTHON_BIN="/home/dodo/miniconda3/envs/daggar/bin/python"
+PYTHON_BIN="/home/dodo/miniconda3/envs/dagger/bin/python"
 CKPT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow-20/flow_multi_ep0100_20260320_114720.pt"
 NUM_TRAJS=100
 DEVICE="cuda"

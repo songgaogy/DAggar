@@ -42,6 +42,7 @@ class FlowDaggerConfig:
 class TrainerConfig:
     batch_size: int = 64
     warmup_steps: int = 0
+    update_per_step: float = 1.0
     updates_per_step: int = 1
     steps_per_update: int = 50
     random_steps: int = 0

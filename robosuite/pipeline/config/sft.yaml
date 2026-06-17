@@ -1,0 +1,43 @@
+defaults:
+  - _self_
+
+seed: 42
+
+env:
+  environment: ???
+
+data:
+  demo_root: "./data"
+  task_name: null
+  pretrain_split_name: "pretrain_data-20260615_174814"
+  sft_data:
+    expert: 5
+    pretrain_data: 10
+    success_rollout: 0
+    fail_rollout: 0
+  demo_sample_seed: null
+
+train:
+  steps: 10000
+  device: "cuda:0"
+  learning_rate: 3.0e-6
+  ema_decay: 0.999
+  freeze_visual_bn: false
+  train_scope: "all"
+  log_interval: 100
+  save_interval: 2000
+
+runtime:
+  base_flow_config: "./robosuite/pipeline/config/train_flow_dagger.yaml"
+  init_checkpoint: "checkpoints/multitask_6/flow_multi_ep0100.pt"
+
+output:
+  root: "./outputs/flow-sft"
+  postfix: null
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

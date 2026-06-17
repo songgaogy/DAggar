@@ -155,6 +155,9 @@ class FlowDaggerAgent:
         trainer_config = TrainerConfig(
             batch_size=batch_size,
             warmup_steps=int(cfg_get(trainer_cfg, "warmup_steps", cfg_get(cfg, "warmup_steps", 0))),
+            update_per_step=float(
+                cfg_get(trainer_cfg, "update_per_step", cfg_get(trainer_cfg, "updates_per_step", 1))
+            ),
             updates_per_step=int(cfg_get(trainer_cfg, "updates_per_step", 1)),
             steps_per_update=int(cfg_get(trainer_cfg, "steps_per_update", 50)),
             random_steps=int(cfg_get(trainer_cfg, "random_steps", 0)),
@@ -177,6 +180,9 @@ class FlowDaggerAgent:
 
     def reset_policy_state(self) -> None:
         self.core.reset_action_chunk()
+
+    def needs_action_chunk(self) -> bool:
+        return self.core.needs_action_chunk()
 
     def notify_intervention(self) -> None:
         self.core.notify_intervention()

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="/home/dodo/Documents/DAggar/robosuite"
-PYTHON_BIN="/home/dodo/miniconda3/envs/daggar/bin/python"
+PYTHON_BIN="/home/dodo/miniconda3/envs/dagger/bin/python"
 
 GPU=0
 SEED=42

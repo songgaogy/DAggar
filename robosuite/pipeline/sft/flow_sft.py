@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import argparse
 import datetime
 import json
 import time
 from pathlib import Path
 from typing import Any
 
+import hydra
 import numpy as np
 import torch
 from hydra.utils import to_absolute_path
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from robosuite.pipeline.algorithms.flow_dagger import FlowDaggerTrainer
 from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.envs import build_robosuite_env
-from robosuite.pipeline.utils import load_demo_paths, resolve_camera_names
-from robosuite.pipeline.utils.train_utils import resolve_demo_inputs
+from robosuite.pipeline.utils import load_demo_paths, resolve_camera_names, resolve_task_demo_paths
 
 # Reuse the flow-dagger helpers directly so the data/model setup cannot drift.
 from robosuite.pipeline.train_flow_dagger import (
@@ -31,109 +30,82 @@ from robosuite.pipeline.train_flow_dagger import (
 
 # Canonical flow-dagger config. We load it and override only the offline-relevant knobs.
 _DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "train_flow_dagger.yaml"
+_SFT_SPLIT_ORDER = ("expert", "pretrain_data", "success_rollout", "fail_rollout")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", default="PickPlaceBread", help="Robosuite environment / task name.")
-    parser.add_argument(
-        "--num-trajectories",
-        type=int,
-        default=20,
-        help="Number of demo trajectories to fine-tune on (NUM_TRAJECTORIES).",
-    )
-    parser.add_argument("--steps", type=int, default=2000, help="Number of gradient (tuning) steps.")
-    parser.add_argument("--learning-rate", type=float, default=3e-6, help="Offline fine-tune learning rate.")
-    parser.add_argument(
-        "--train-scope",
-        choices=["flow_head", "flow_head_aggregator", "all"],
-        default="flow_head",
-        help="Which model parameters to update during offline fine-tuning.",
-    )
-    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for deployable fine-tuned weights.")
-    parser.add_argument(
-        "--freeze-visual-bn",
-        dest="freeze_visual_bn",
-        action="store_true",
-        help="Keep image-encoder BatchNorm stats fixed during fine-tuning.",
-    )
-    parser.add_argument(
-        "--demo-sample-seed",
-        type=int,
-        default=None,
-        help="Seed for random demo subset selection. Defaults to cfg.seed.",
-    )
-    parser.add_argument("--device", default="cuda:0", help="Override learner device, e.g. cuda:0. Defaults to config.")
-    parser.add_argument("--seed", type=int, default=None, help="Override seed. Defaults to config seed (42).")
-    parser.add_argument(
-        "--init-checkpoint",
-        default=None,
-        help="Base flow checkpoint for warm-start (overrides cfg.runtime.init_checkpoint).",
-    )
-    parser.add_argument(
-        "--config",
-        default=str(_DEFAULT_CONFIG),
-        help="Base flow-dagger config to mimic training settings from.",
-    )
-    parser.add_argument(
-        "--output-root",
-        default="./outputs/flow-sft",
-        help="Output root; checkpoint is written under <output-root>/<env>[_<postfix>]/.",
-    )
-    parser.add_argument("--log-interval", type=int, default=100, help="Console / loss-log interval in steps.")
-    parser.add_argument(
-        "--save-interval",
-        type=int,
-        default=0,
-        help="If >0, also save an intermediate checkpoint every N steps (for tracking the overfitting curve).",
-    )
-    parser.add_argument("--output-postfix", default="", help="Postfix for the output directory: <output-root>/<env>_<postfix>")
-    parser.add_argument(
-        "--data-type",
-        default="expert",
-        help="Demo split under data/<env>/ (maps to cfg.data.demo_split), e.g. expert or expert-pretrain-data.",
-    )
-    return parser.parse_args()
-
-
-def build_cfg(args: argparse.Namespace) -> Any:
+def build_cfg(sft_cfg: DictConfig) -> Any:
     """Load the canonical flow-dagger config and apply offline overrides."""
-    cfg = OmegaConf.load(to_absolute_path(args.config))
+    base_config = getattr(sft_cfg.runtime, "base_flow_config", None) or str(_DEFAULT_CONFIG)
+    cfg = OmegaConf.load(to_absolute_path(str(base_config)))
     OmegaConf.set_struct(cfg, False)
 
     # --- task / data overrides ---------------------------------------------------
-    cfg.env.environment = str(args.env)
-    cfg.data.task_name = str(args.env)
-    cfg.data.demo_split = str(getattr(args, "data_type", "expert"))
-    cfg.data.num_trajectories = int(args.num_trajectories)
+    task_name = str(sft_cfg.env.environment)
+    cfg.env.environment = task_name
+    cfg.data.task_name = str(sft_cfg.data.task_name) if sft_cfg.data.task_name is not None else task_name
+    cfg.data.demo_root = str(sft_cfg.data.demo_root)
+    cfg.data.demo_split = "sft_mixed"
+    cfg.data.sft_data = OmegaConf.to_container(sft_cfg.data.sft_data, resolve=True)
+    cfg.data.pretrain_split_name = str(sft_cfg.data.pretrain_split_name)
+    cfg.data.num_trajectories = int(total_requested_trajectories(sft_cfg))
 
     # --- training overrides ------------------------------------------------------
-    cfg.algorithm.trainer.pretrain_steps = int(args.steps)
-    if getattr(args, "learning_rate", None) is not None:
-        cfg.algorithm.flow.learning_rate = float(args.learning_rate)
+    cfg.algorithm.trainer.pretrain_steps = int(sft_cfg.train.steps)
+    cfg.algorithm.flow.learning_rate = float(sft_cfg.train.learning_rate)
     # No rollout / HIL in this probe.
     cfg.intervention.enabled = False
     cfg.runtime.interactive = False
     cfg.runtime.viewer_enabled = False
     cfg.runtime.online_updates_enabled = False
 
-    if args.seed is not None:
-        cfg.seed = int(args.seed)
-    if args.device is not None:
-        cfg.algorithm.flow.device = str(args.device)
-        cfg.algorithm.flow.inference_device = str(args.device)
-    if getattr(args, "init_checkpoint", None) is not None:
-        cfg.runtime.init_checkpoint = to_absolute_path(str(args.init_checkpoint))
+    if sft_cfg.seed is not None:
+        cfg.seed = int(sft_cfg.seed)
+    if sft_cfg.train.device is not None:
+        cfg.algorithm.flow.device = str(sft_cfg.train.device)
+        cfg.algorithm.flow.inference_device = str(sft_cfg.train.device)
+    if sft_cfg.runtime.init_checkpoint is not None:
+        cfg.runtime.init_checkpoint = to_absolute_path(str(sft_cfg.runtime.init_checkpoint))
     return cfg
 
 
-def resolve_output_dir(output_root: str, task_name: str, postfix: str) -> Path:
+def resolve_sft_split_name(logical_split: str, sft_cfg: DictConfig) -> str:
+    """Map logical SFT data keys to on-disk demo split names."""
+    if logical_split == "pretrain_data":
+        return str(sft_cfg.data.pretrain_split_name)
+    return str(logical_split)
+
+
+def resolve_sft_data_counts(sft_cfg: DictConfig) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    raw_counts = sft_cfg.data.sft_data
+    for split_name in _SFT_SPLIT_ORDER:
+        count = int(getattr(raw_counts, split_name, 0) or 0)
+        if count < 0:
+            raise ValueError(f"data.sft_data.{split_name} must be >= 0, got {count}.")
+        if count > 0:
+            counts[split_name] = count
+    unknown_splits = sorted(set(raw_counts.keys()) - set(_SFT_SPLIT_ORDER))
+    if unknown_splits:
+        raise ValueError(f"Unsupported data.sft_data keys: {unknown_splits}.")
+    if not counts:
+        raise ValueError("At least one data.sft_data split must request >0 trajectories.")
+    return counts
+
+
+def total_requested_trajectories(sft_cfg: DictConfig) -> int:
+    return int(sum(resolve_sft_data_counts(sft_cfg).values()))
+
+
+def resolve_output_dir(output_root: str, task_name: str, postfix: str = None) -> Path:
     """Build <output-root>/<env> or <output-root>/<env>_<postfix> when postfix is set."""
     output_subdir = task_name
-    postfix = str(postfix).strip()
-    if postfix:
-        output_subdir = f"{task_name}_{postfix}"
-    return Path(to_absolute_path(output_root)) / output_subdir
+    if postfix is not None:
+        postfix = str(postfix).strip()
+        if postfix:
+            output_subdir = f"{task_name}_{postfix}"
+        return Path(to_absolute_path(output_root)) / output_subdir
+    else:
+        return Path(to_absolute_path(output_root)) / task_name
 
 
 def build_agent_and_env(cfg: Any, init_payload: dict[str, Any] | None):
@@ -168,6 +140,7 @@ def build_agent_and_env(cfg: Any, init_payload: dict[str, Any] | None):
         use_camera_obs=True,
         renderer="mjviewer",
     )
+    runtime_cfg.env_name = task_name
     env = build_robosuite_env(runtime_cfg)
     proprio_extractor = bind_flow_proprio_extractor(env, flow_env_metadata)
     initial_obs, _ = reset_flow_policy_observation(
@@ -225,6 +198,11 @@ def _set_module_trainable(module: torch.nn.Module, trainable: bool) -> None:
 def configure_finetune_policy(agent, *, train_scope: str, learning_rate: float, freeze_visual_bn: bool) -> dict[str, Any]:
     model = agent.core.model
     scope = str(train_scope)
+    if scope not in {"flow_head", "flow_head_aggregator", "all"}:
+        raise ValueError(
+            "train.train_scope must be one of {'flow_head', 'flow_head_aggregator', 'all'}, "
+            f"got {scope!r}."
+        )
     if scope != "all":
         _set_module_trainable(model, False)
         _set_module_trainable(model.flow_head, True)
@@ -280,9 +258,100 @@ def save_ema_checkpoint(
     agent.write_checkpoint_payload(path, payload)
 
 
-def main() -> None:
-    args = parse_args()
-    cfg = build_cfg(args)
+def load_sft_demo_transitions(
+    cfg: Any,
+    sft_cfg: DictConfig,
+    *,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+    proprio_extractor,
+) -> tuple[list[Any], list[dict[str, Any]], int]:
+    task_data_name = str(cfg.data.task_name or cfg.env.environment)
+    sft_counts = resolve_sft_data_counts(sft_cfg)
+    if sft_cfg.data.demo_sample_seed is not None:
+        base_sample_seed = int(sft_cfg.data.demo_sample_seed)
+    elif getattr(cfg, "seed", None) is not None:
+        base_sample_seed = int(cfg.seed)
+    else:
+        base_sample_seed = 0
+    split_records: list[dict[str, Any]] = []
+    all_transitions: list[Any] = []
+
+    for split_index, (logical_split, requested_trajectories) in enumerate(sft_counts.items()):
+        actual_split = resolve_sft_split_name(logical_split, sft_cfg)
+        demo_paths = resolve_task_demo_paths(
+            task_name=task_data_name,
+            data_root=to_absolute_path(str(sft_cfg.data.demo_root)),
+            split=actual_split,
+        )
+        if not demo_paths:
+            raise FileNotFoundError(
+                f"No demo files found for SFT split '{logical_split}' "
+                f"(resolved split '{actual_split}') under data/{task_data_name}/{actual_split}."
+            )
+
+        selected_demo_records: list[dict[str, Any]] = []
+
+        def _record_selected_demos(path: Path, demo_names: list[str]) -> None:
+            selected_demo_records.append({"path": str(path), "demo_names": list(demo_names)})
+
+        split_sample_seed = int(base_sample_seed + split_index)
+        split_transitions = load_demo_paths(
+            demo_paths,
+            hdf5_loader=lambda path, demo_names=None: load_hdf5_demos_into_flow_transitions(
+                path,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=int(cfg.env.img_height),
+                img_width=int(cfg.env.img_width),
+                proprio_keys=tuple(cfg.env.proprio_keys or []),
+                renderer=str(cfg.env.renderer),
+                control_freq=int(cfg.env.control_freq),
+                demo_names=demo_names,
+                state_extractor=proprio_extractor,
+            ),
+            max_num_trajectories=int(requested_trajectories),
+            check_legacy_rewards=False,
+            random_sample=True,
+            random_seed=split_sample_seed,
+            selected_demo_callback=_record_selected_demos,
+        )
+        if len(split_transitions) == 0:
+            raise RuntimeError(
+                f"SFT split '{logical_split}' loaded zero transitions from resolved split '{actual_split}'."
+            )
+        for transition in split_transitions:
+            if transition.demo_source is None:
+                transition.demo_source = logical_split
+        selected_trajectory_count = int(sum(len(record["demo_names"]) for record in selected_demo_records))
+        if selected_trajectory_count != int(requested_trajectories):
+            raise RuntimeError(
+                f"SFT split '{logical_split}' requested {requested_trajectories} trajectories but selected "
+                f"{selected_trajectory_count} from resolved split '{actual_split}'."
+            )
+        split_record = {
+            "logical_split": logical_split,
+            "resolved_split": actual_split,
+            "requested_trajectories": int(requested_trajectories),
+            "selected_trajectories": selected_trajectory_count,
+            "loaded_transitions": int(len(split_transitions)),
+            "sample_seed": split_sample_seed,
+            "demo_paths": [str(path) for path in demo_paths],
+            "selected_demos": selected_demo_records,
+        }
+        split_records.append(split_record)
+        all_transitions.extend(split_transitions)
+        print(
+            f"[demo] split={logical_split} resolved={actual_split} requested={requested_trajectories} "
+            f"selected={selected_trajectory_count} transitions={len(split_transitions)} seed={split_sample_seed}"
+        )
+
+    return all_transitions, split_records, base_sample_seed
+
+
+@hydra.main(version_base="1.2", config_path="../config", config_name="sft")
+def main(sft_cfg: DictConfig) -> None:
+    cfg = build_cfg(sft_cfg)
 
     if getattr(cfg, "seed", None) is not None:
         seed = int(cfg.seed)
@@ -313,60 +382,35 @@ def main() -> None:
     print("[init] warm-started policy weights and normalizers from checkpoint.")
     finetune_config = configure_finetune_policy(
         agent,
-        train_scope=str(args.train_scope),
-        learning_rate=float(args.learning_rate),
-        freeze_visual_bn=bool(args.freeze_visual_bn),
+        train_scope=str(sft_cfg.train.train_scope),
+        learning_rate=float(sft_cfg.train.learning_rate),
+        freeze_visual_bn=bool(sft_cfg.train.freeze_visual_bn),
     )
-    ema_model = _build_ema_model(agent, ema_decay=float(args.ema_decay))
+    ema_model = _build_ema_model(agent, ema_decay=float(sft_cfg.train.ema_decay))
     print(
         "[train] scope={train_scope} lr={learning_rate:g} trainable_params={trainable_parameter_count} "
         "freeze_visual_bn={freeze_visual_bn} ema_decay={ema_decay:g}".format(
             **finetune_config,
-            ema_decay=float(args.ema_decay),
+            ema_decay=float(sft_cfg.train.ema_decay),
         )
     )
 
-    # --- load demos (N trajectories) and bootstrap the demo buffer ----------------
-    data_type = str(cfg.data.demo_split)
-    demo_source_name, demo_paths, max_num_trajectories = resolve_demo_inputs(cfg)
-    if not demo_paths:
-        raise FileNotFoundError(
-            f"No demo files found for '{demo_source_name}'. Expected hdf5 demos under "
-            f"data/{task_name}/{data_type}."
-        )
-    selected_demo_records: list[dict[str, Any]] = []
-
-    def _record_selected_demos(path: Path, demo_names: list[str]) -> None:
-        selected_demo_records.append({"path": str(path), "demo_names": list(demo_names)})
-
-    demo_sample_seed = int(cfg.seed) if args.demo_sample_seed is None else int(args.demo_sample_seed)
-    transitions = load_demo_paths(
-        demo_paths,
-        hdf5_loader=lambda path, demo_names=None: load_hdf5_demos_into_flow_transitions(
-            path,
-            policy_camera_names=policy_camera_names,
-            camera_aliases=camera_aliases,
-            img_height=int(cfg.env.img_height),
-            img_width=int(cfg.env.img_width),
-            proprio_keys=tuple(cfg.env.proprio_keys or []),
-            renderer=str(cfg.env.renderer),
-            control_freq=int(cfg.env.control_freq),
-            demo_names=demo_names,
-            state_extractor=proprio_extractor,
-        ),
-        max_num_trajectories=max_num_trajectories,
-        check_legacy_rewards=False,
-        random_sample=True,
-        random_seed=demo_sample_seed,
-        selected_demo_callback=_record_selected_demos,
+    # --- load requested SFT splits and bootstrap the demo buffer ------------------
+    transitions, split_records, demo_sample_seed = load_sft_demo_transitions(
+        cfg,
+        sft_cfg,
+        policy_camera_names=policy_camera_names,
+        camera_aliases=camera_aliases,
+        proprio_extractor=proprio_extractor,
     )
     if len(transitions) == 0:
         raise RuntimeError("Demo loading produced zero transitions.")
     trainer.bootstrap_demo_buffer(transitions, demo_source="offline_demo")
     n_demo_episodes = trainer._offline_bootstrap_episodes
+    requested_total_trajectories = total_requested_trajectories(sft_cfg)
     print(
         f"[demo] loaded {len(transitions)} transitions from {n_demo_episodes} "
-        f"trajectories (requested {max_num_trajectories}); demo_buffer={len(agent.demo_buffer)}"
+        f"trajectories (requested {requested_total_trajectories}); demo_buffer={len(agent.demo_buffer)}"
     )
 
     # Normalizers came from the checkpoint (matches flow-dagger "Reusing normalizers from checkpoint").
@@ -382,37 +426,47 @@ def main() -> None:
         )
 
     # --- output paths -------------------------------------------------------------
-    output_dir = resolve_output_dir(args.output_root, task_name, args.output_postfix)
+    postfix = sft_cfg.output.postfix
+    postfix = None if postfix is None else str(postfix).strip()
+    output_dir = resolve_output_dir(str(sft_cfg.output.root), task_name, postfix)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[output] writing to {output_dir}")
-    ckpt_tag = f"flow_offline_{task_name}_traj{int(args.num_trajectories):05d}_steps{int(args.steps):08d}"
+    ckpt_tag = f"flow_offline_{task_name}_traj{requested_total_trajectories:05d}_steps{int(sft_cfg.train.steps):08d}"
     ckpt_path = output_dir / f"{ckpt_tag}.pt"
     loss_log_path = output_dir / f"{ckpt_tag}.loss.jsonl"
-    OmegaConf.save(cfg, output_dir / f"{ckpt_tag}.config.yaml")
+    saved_config = OmegaConf.create(
+        {
+            "sft": OmegaConf.to_container(sft_cfg, resolve=True),
+            "flow_runtime": OmegaConf.to_container(cfg, resolve=True),
+        }
+    )
+    OmegaConf.save(saved_config, output_dir / f"{ckpt_tag}.config.yaml")
 
     metadata = {
         "env_name": task_name,
-        "data_type": data_type,
-        "num_trajectories": int(args.num_trajectories),
+        "data_type": "sft_mixed",
+        "num_trajectories": int(requested_total_trajectories),
+        "sft_data": OmegaConf.to_container(sft_cfg.data.sft_data, resolve=True),
+        "sft_splits": split_records,
         "demo_transition_count": int(len(transitions)),
         "demo_episode_count": int(n_demo_episodes),
-        "pretrain_steps": int(args.steps),
+        "pretrain_steps": int(sft_cfg.train.steps),
         "init_checkpoint": str(init_checkpoint),
         "demo_sample_seed": int(demo_sample_seed),
-        "selected_demos": selected_demo_records,
-        "learning_rate": float(args.learning_rate),
-        "train_scope": str(args.train_scope),
-        "freeze_visual_bn": bool(args.freeze_visual_bn),
-        "ema_decay": float(args.ema_decay),
+        "selected_demos": split_records,
+        "learning_rate": float(sft_cfg.train.learning_rate),
+        "train_scope": str(sft_cfg.train.train_scope),
+        "freeze_visual_bn": bool(sft_cfg.train.freeze_visual_bn),
+        "ema_decay": float(sft_cfg.train.ema_decay),
         "checkpoint_weight_type": "ema",
         "finetune_config": finetune_config,
         "hil": False,
     }
-    print(f"[demo] data_type={data_type} sample_seed={demo_sample_seed} selected={selected_demo_records}")
+    print(f"[demo] data_type=sft_mixed sample_seed={demo_sample_seed} splits={split_records}")
 
     # --- offline fine-tuning loop (mirrors the base_policy builder) ----------------
-    total_steps = int(args.steps)
-    log_interval = max(1, int(args.log_interval))
+    total_steps = int(sft_cfg.train.steps)
+    log_interval = max(1, int(sft_cfg.train.log_interval))
     print(f"[train] starting offline fine-tuning for {total_steps} steps...")
     started_at = time.monotonic()
     with open(loss_log_path, "w") as loss_log:
@@ -421,7 +475,8 @@ def main() -> None:
             + "\n"
         )
         loss_log.flush()
-        if int(args.save_interval) > 0:
+        save_interval = int(sft_cfg.train.save_interval)
+        if save_interval > 0:
             initial_path = output_dir / f"{ckpt_tag}_at{0:08d}.pt"
             save_ema_checkpoint(
                 agent,
@@ -453,7 +508,7 @@ def main() -> None:
                     f"flow={record['flow']:.4f} endpoint={record['endpoint']:.4f} "
                     f"smooth={record['smooth']:.4f} ({sps:.1f} it/s)"
                 )
-            if int(args.save_interval) > 0 and step % int(args.save_interval) == 0 and step != total_steps:
+            if save_interval > 0 and step % save_interval == 0 and step != total_steps:
                 interim_path = output_dir / f"{ckpt_tag}_at{step:08d}.pt"
                 save_ema_checkpoint(
                     agent,

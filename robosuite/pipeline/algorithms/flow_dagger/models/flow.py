@@ -154,16 +154,19 @@ class FlowDaggerPolicy:
         self.current_chunk = None
         self.step_in_chunk = 0
 
+    def needs_action_chunk(self) -> bool:
+        execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
+        return (
+            self.current_chunk is None
+            or self.step_in_chunk >= execute_horizon
+            or self.step_in_chunk >= len(self.current_chunk)
+        )
+
     def notify_intervention(self) -> None:
         self.reset_action_chunk()
 
     def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
-        execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
-        if (
-            self.current_chunk is None
-            or self.step_in_chunk >= execute_horizon
-            or self.step_in_chunk >= len(self.current_chunk)
-        ):
+        if self.needs_action_chunk():
             images = []
             for camera_name in self.camera_names:
                 image = np.asarray(obs[camera_name], dtype=np.uint8)

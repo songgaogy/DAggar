@@ -46,6 +46,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from hydra.utils import to_absolute_path
+from omegaconf import OmegaConf
 
 from robosuite.pipeline.envs import sparse_success_reward
 from robosuite.pipeline.train_flow_dagger import (
@@ -54,8 +55,29 @@ from robosuite.pipeline.train_flow_dagger import (
     reset_flow_policy_observation,
 )
 
-# Reuse the offline trainer's config + env/agent builders so eval setup cannot drift.
-from robosuite.pipeline.temp.train_flow_offline import build_agent_and_env, build_cfg
+# Reuse the offline trainer's env/agent builders so eval setup cannot drift.
+from robosuite.pipeline.sft.flow_sft import _DEFAULT_CONFIG, build_agent_and_env
+
+
+def build_eval_cfg(args: argparse.Namespace) -> Any:
+    """Load the canonical flow-dagger config for headless eval (no SFT overrides)."""
+    base_config = args.config if args.config is not None else str(_DEFAULT_CONFIG)
+    cfg = OmegaConf.load(to_absolute_path(str(base_config)))
+    OmegaConf.set_struct(cfg, False)
+
+    cfg.env.environment = str(args.env)
+    cfg.data.task_name = str(args.env)
+    cfg.intervention.enabled = False
+    cfg.runtime.interactive = False
+    cfg.runtime.viewer_enabled = False
+    cfg.runtime.online_updates_enabled = False
+
+    if args.seed is not None:
+        cfg.seed = int(args.seed)
+    if args.device is not None:
+        cfg.algorithm.flow.device = str(args.device)
+        cfg.algorithm.flow.inference_device = str(args.device)
+    return cfg
 
 
 def parse_args() -> argparse.Namespace:
@@ -228,20 +250,7 @@ def run_episode(
 def main() -> None:
     args = parse_args()
 
-    # Build a config mirroring flow-dagger; reuse the offline trainer's overrides path.
-    cfg_args = argparse.Namespace(
-        env=args.env,
-        num_trajectories=20,  # unused for eval (no demos loaded)
-        steps=0,
-        device=args.device,
-        seed=args.seed,
-        config=args.config if args.config is not None else None,
-    )
-    if cfg_args.config is None:
-        from robosuite.pipeline.temp.train_flow_offline import _DEFAULT_CONFIG
-
-        cfg_args.config = str(_DEFAULT_CONFIG)
-    cfg = build_cfg(cfg_args)
+    cfg = build_eval_cfg(args)
     if args.execute_horizon is not None:
         cfg.algorithm.flow.execute_horizon = int(args.execute_horizon)
     if args.n_ode_steps is not None:

@@ -19,6 +19,7 @@ class FlowDaggerTrainer:
         self.total_publishes = 0
         self.last_published_update = 0
         self.total_pretrain_updates = 0
+        self._update_budget = 0.0
         self._offline_bootstrap_episodes = 0
         self._async_condition = threading.Condition()
         self._async_metrics: deque[dict[str, float]] = deque()
@@ -71,6 +72,9 @@ class FlowDaggerTrainer:
         info: dict[str, Any] | None = None,
         reward_source: str | None = None,
         demo_source: str | None = None,
+        demo_obs=None,
+        demo_next_obs=None,
+        store_demo_transition: bool = True,
         episode_index: int | None = None,
         episode_step: int | None = None,
     ) -> Transition:
@@ -91,7 +95,24 @@ class FlowDaggerTrainer:
             reward_source=reward_source or "env",
             demo_source=demo_source or ("intervention" if is_intervention else None),
         )
-        self.agent.store_transition(transition)
+        self.agent.store_online_transition(transition)
+        if is_intervention and store_demo_transition:
+            if demo_obs is None:
+                self.agent.store_demo_transition(transition)
+            else:
+                demo_transition = Transition(
+                    obs=demo_obs,
+                    action=action,
+                    reward=float(reward),
+                    next_obs=demo_next_obs,
+                    done=done,
+                    grasp_penalty=grasp_penalty,
+                    is_intervention=True,
+                    info=info_payload,
+                    reward_source=reward_source or "env",
+                    demo_source=demo_source or "intervention",
+                )
+                self.agent.store_demo_transition(demo_transition)
         self.total_env_steps += 1
         return transition
 
@@ -119,8 +140,11 @@ class FlowDaggerTrainer:
             return self.drain_async_metrics()
         if not self.agent.ready_for_update(batch_size=batch_size):
             return self.drain_async_metrics()
+        requested_updates = self._consume_update_requests()
+        if requested_updates <= 0:
+            return self.drain_async_metrics()
         metrics_list = []
-        for _ in range(int(self.config.updates_per_step)):
+        for _ in range(requested_updates):
             metrics = self.train_step(batch_size=batch_size)
             published = self._maybe_publish_inference_policy()
             metrics_list.append(self._attach_progress_metrics(metrics, published=published))
@@ -130,6 +154,9 @@ class FlowDaggerTrainer:
         self._raise_async_error()
         current_step = self.total_env_steps if env_step is None else int(env_step)
         if current_step >= int(self.config.warmup_steps) and self.agent.ready_for_update(batch_size=batch_size):
+            requested_updates = self._consume_update_requests()
+            if requested_updates <= 0:
+                return self.drain_async_metrics()
             self.start_async_worker()
             max_pending = int(getattr(self.config, "max_pending_updates", 0))
             with self._async_condition:
@@ -137,12 +164,17 @@ class FlowDaggerTrainer:
                 # queue cannot grow unboundedly behind the rollout. _async_busy counts the
                 # update currently being applied. <= 0 keeps the legacy unbounded behavior.
                 backlog = self._async_pending_updates + int(self._async_busy)
-                if max_pending <= 0 or backlog < max_pending:
-                    self._async_pending_updates += int(self.config.updates_per_step)
+                if max_pending <= 0:
+                    enqueued_updates = requested_updates
+                else:
+                    enqueued_updates = max(0, min(requested_updates, max_pending - backlog))
+                if enqueued_updates > 0:
+                    self._async_pending_updates += enqueued_updates
                     self._async_pending_batch_size = None if batch_size is None else int(batch_size)
                     self._async_condition.notify_all()
-                else:
-                    self._async_dropped_updates += int(self.config.updates_per_step)
+                dropped_updates = requested_updates - enqueued_updates
+                if dropped_updates > 0:
+                    self._async_dropped_updates += dropped_updates
         return self.drain_async_metrics()
 
     def start_async_worker(self) -> None:
@@ -205,7 +237,7 @@ class FlowDaggerTrainer:
                 self._async_thread = None
         self._raise_async_error()
 
-    def state_dict(self) -> dict[str, int]:
+    def state_dict(self) -> dict[str, Any]:
         return {
             "total_env_steps": int(self.total_env_steps),
             "total_updates": int(self.total_updates),
@@ -213,6 +245,7 @@ class FlowDaggerTrainer:
             "last_published_update": int(self.last_published_update),
             "total_pretrain_updates": int(self.total_pretrain_updates),
             "offline_bootstrap_episodes": int(self._offline_bootstrap_episodes),
+            "update_budget": float(self._update_budget),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any] | None) -> None:
@@ -224,6 +257,7 @@ class FlowDaggerTrainer:
         self.last_published_update = int(state_dict.get("last_published_update", self.last_published_update))
         self.total_pretrain_updates = int(state_dict.get("total_pretrain_updates", self.total_pretrain_updates))
         self._offline_bootstrap_episodes = int(state_dict.get("offline_bootstrap_episodes", self._offline_bootstrap_episodes))
+        self._update_budget = float(state_dict.get("update_budget", self._update_budget))
 
     def progress_snapshot(self) -> dict[str, int]:
         return {
@@ -236,6 +270,17 @@ class FlowDaggerTrainer:
             "total_pretrain_updates": int(self.total_pretrain_updates),
             "dropped_updates": int(self._async_dropped_updates),
         }
+
+    def _consume_update_requests(self) -> int:
+        update_per_step = float(getattr(self.config, "update_per_step", getattr(self.config, "updates_per_step", 1)))
+        if update_per_step <= 0.0:
+            return 0
+        self._update_budget += update_per_step
+        requested_updates = int(self._update_budget)
+        if requested_updates <= 0:
+            return 0
+        self._update_budget -= float(requested_updates)
+        return requested_updates
 
     def updates_until_next_publish(self) -> int:
         publish_interval = max(1, int(self.config.steps_per_update))

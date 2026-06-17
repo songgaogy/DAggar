@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 TASK_DATA_NAME="${TASK_DATA_NAME:-PickPlaceCereal}"
 QV_CACHE="${QV_CACHE:-outputs/awr/qv_cache/${TASK_DATA_NAME}.pt}"

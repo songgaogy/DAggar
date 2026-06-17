@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import datetime
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -9,8 +11,10 @@ import hydra
 import h5py
 import numpy as np
 import torch
+import robosuite.macros as macros
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
+from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
 
 from robosuite.pipeline.algorithms.flow_dagger import FlowDaggerTrainer
 from robosuite.pipeline.factory import build_algorithm
@@ -21,15 +25,12 @@ from robosuite.pipeline.envs import (
     build_device,
     build_robosuite_env,
     choose_viewer_backend,
-    compute_grasp_penalty,
-    make_checkpoint_directory,
     snapshot_env_state,
     sparse_success_reward,
 )
 from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
 from robosuite.pipeline.utils import (
     AsyncCheckpointWriter,
-    AsyncTransitionChunkWriter,
     ConsoleLogCapture,
     EMAFpsTracker,
     FixedRateLimiter,
@@ -63,6 +64,12 @@ from robosuite.pipeline.envs.robosuite import build_runtime_config_from_env_info
 
 def resolve_base_policy_directory(output_root: Path) -> Path:
     return output_root / "base_policy"
+
+
+def make_flow_run_directory(root_dir: str | Path, run_name: str) -> Path:
+    run_dir = Path(root_dir) / run_name
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def maybe_set_seed(seed_value: Any) -> None:
@@ -112,10 +119,13 @@ def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
 
     if explicit_run_name is not None:
         run_name = str(explicit_run_name)
-        return run_name, make_checkpoint_directory(output_root, run_name)
+        return run_name, make_flow_run_directory(output_root, run_name)
 
     run_name = f"flow_dagger_{cfg.env.environment}_{now_readable()}"
-    return run_name, make_checkpoint_directory(output_root, run_name)
+    run_name_suffix = getattr(cfg.logging, "run_name_suffix", None)
+    if run_name_suffix is not None and str(run_name_suffix).strip():
+        run_name = f"{run_name}_{str(run_name_suffix).strip().lstrip('_')}"
+    return run_name, make_flow_run_directory(output_root, run_name)
 
 
 def find_latest_resumable_run(output_root: Path, env_name: str) -> Path | None:
@@ -223,6 +233,133 @@ def format_publish_line(metrics: dict[str, float]) -> str:
     )
 
 
+class AsyncDemoTransitionChunkWriter:
+    def __init__(self, output_dir: Path, *, chunk_size: int, event_logger: callable | None = None) -> None:
+        self.output_dir = output_dir
+        self.chunk_size = max(1, int(chunk_size))
+        self.event_logger = event_logger
+        self._condition = threading.Condition()
+        self._pending: deque[Any] = deque()
+        self._thread: threading.Thread | None = None
+        self._stop_requested = False
+        self._flush_requested = False
+        self._busy = False
+        self._error: BaseException | None = None
+        self._chunk_index = 0
+
+    def start(self) -> None:
+        with self._condition:
+            if self._thread is not None:
+                return
+            self._thread = threading.Thread(target=self._worker_loop, name="flow_dagger_demo_writer", daemon=True)
+            self._thread.start()
+
+    def request_transition(self, transition) -> None:
+        self._raise_error()
+        with self._condition:
+            self._pending.append(transition)
+            self._condition.notify_all()
+
+    def flush(self, timeout: float | None = None) -> None:
+        self._raise_error()
+        with self._condition:
+            if self._thread is None:
+                return
+            self._flush_requested = True
+            self._condition.notify_all()
+            end_time = None if timeout is None else time.monotonic() + float(timeout)
+            while self._pending or self._busy or self._flush_requested:
+                self._raise_error()
+                remaining = None if end_time is None else max(0.0, end_time - time.monotonic())
+                if remaining is not None and remaining <= 0.0:
+                    raise TimeoutError("Timed out while waiting for demo transition chunk writer.")
+                self._condition.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
+        self._raise_error()
+
+    def close(self) -> None:
+        with self._condition:
+            thread = self._thread
+            if thread is None:
+                return
+            self._stop_requested = True
+            self._condition.notify_all()
+        thread.join(timeout=10.0)
+        with self._condition:
+            self._thread = None
+        self._raise_error()
+
+    def _worker_loop(self) -> None:
+        batch: list[Any] = []
+        while True:
+            with self._condition:
+                while len(self._pending) == 0 and not self._flush_requested and not self._stop_requested:
+                    self._condition.wait(timeout=0.1)
+                while self._pending:
+                    batch.append(self._pending.popleft())
+                should_flush = self._flush_requested or self._stop_requested
+                if self._stop_requested and len(batch) == 0:
+                    return
+                if should_flush and len(batch) == 0:
+                    self._flush_requested = False
+                    self._condition.notify_all()
+                    continue
+                should_write = len(batch) >= self.chunk_size or (should_flush and len(batch) > 0)
+                if not should_write:
+                    continue
+                self._busy = True
+                self._condition.notify_all()
+            try:
+                while len(batch) >= self.chunk_size or (should_flush and len(batch) > 0):
+                    chunk = batch[: self.chunk_size]
+                    del batch[: len(chunk)]
+                    self._write_chunk(self._chunk_index, chunk)
+                    self._chunk_index += 1
+                    if not should_flush:
+                        break
+            except BaseException as exc:
+                with self._condition:
+                    self._error = exc
+                    self._stop_requested = True
+                    self._busy = False
+                    self._condition.notify_all()
+                return
+            finally:
+                with self._condition:
+                    if should_flush and len(batch) == 0:
+                        self._flush_requested = False
+                    self._busy = False
+                    self._condition.notify_all()
+
+    def _write_chunk(self, chunk_index: int, transitions: list[Any]) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        chunk_path = self.output_dir / f"chunk_{int(chunk_index):08d}.pt"
+        tmp_path = chunk_path.with_name(f".{chunk_path.name}.tmp")
+        payload = {
+            "chunk_index": int(chunk_index),
+            "transition_count": int(len(transitions)),
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "transitions": list(transitions),
+        }
+        torch.save(payload, tmp_path)
+        tmp_path.replace(chunk_path)
+        if self.event_logger is not None:
+            self.event_logger(
+                {
+                    "event": "buffer_chunk_written",
+                    "stream": "demo_chunks",
+                    "chunk_index": int(chunk_index),
+                    "transition_count": int(len(transitions)),
+                    "wall_time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                }
+            )
+
+    def _raise_error(self) -> None:
+        with self._condition:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(f"Demo transition chunk writer failed: {error}") from error
+
+
 def load_init_checkpoint_payload(cfg: DictConfig) -> tuple[Path | None, dict[str, Any] | None]:
     init_checkpoint_cfg = getattr(cfg.runtime, "init_checkpoint", None)
     init_checkpoint = resolve_checkpoint_reference(init_checkpoint_cfg)
@@ -303,6 +440,60 @@ def convert_env_camera_observation(
         )
     converted_obs["state"] = extractor.extract(env.sim.get_state().flatten()).astype(np.float32)
     return converted_obs
+
+
+def extract_flow_state(env, extractor: RobosuiteProprioExtractor) -> np.ndarray:
+    return extractor.extract(env.sim.get_state().flatten()).astype(np.float32)
+
+
+def render_policy_camera_images(
+    env,
+    *,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
+) -> dict[str, np.ndarray]:
+    convention = IMAGE_CONVENTION_MAPPING[macros.IMAGE_CONVENTION]
+    images: dict[str, np.ndarray] = {}
+    for camera_name in policy_camera_names:
+        source_camera = camera_aliases.get(camera_name, camera_name)
+        frame = env.sim.render(
+            height=int(img_height),
+            width=int(img_width),
+            camera_name=source_camera,
+        )
+        frame = np.asarray(frame[::convention], dtype=np.uint8)
+        images[camera_name] = _center_crop_resize_image(
+            frame,
+            img_height=img_height,
+            img_width=img_width,
+        )
+    return images
+
+
+def build_live_policy_observation(
+    env,
+    *,
+    extractor: RobosuiteProprioExtractor,
+    policy_camera_names: list[str],
+    camera_aliases: dict[str, str],
+    img_height: int,
+    img_width: int,
+    include_images: bool,
+) -> dict[str, Any]:
+    obs: dict[str, Any] = {"state": extract_flow_state(env, extractor)}
+    if include_images:
+        obs.update(
+            render_policy_camera_images(
+                env,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=img_height,
+                img_width=img_width,
+            )
+        )
+    return obs
 
 
 def reset_flow_policy_observation(
@@ -536,13 +727,18 @@ def main(cfg: DictConfig) -> None:
             "training_elapsed_sec": 0.0,
         }
     )
-    buffer_save_interval = max(1, int(getattr(cfg.runtime, "buffer_save_interval", 200)))
-    buffer_writer = AsyncTransitionChunkWriter(
-        checkpoint_dir / "buffers",
-        chunk_size=buffer_save_interval,
-        event_logger=runtime_logger.log,
-    )
-    buffer_writer.start()
+    save_demo_buffer = bool(getattr(cfg.runtime, "save_demo_buffer", True))
+    demo_buffer_writer: AsyncDemoTransitionChunkWriter | None = None
+    if save_demo_buffer:
+        buffer_save_interval = max(1, int(getattr(cfg.runtime, "buffer_save_interval", 200)))
+        demo_buffer_writer = AsyncDemoTransitionChunkWriter(
+            checkpoint_dir / "buffers" / "demo_chunks",
+            chunk_size=buffer_save_interval,
+            event_logger=runtime_logger.log,
+        )
+        demo_buffer_writer.start()
+    else:
+        print("[INFO] Intervention demo buffer saving is disabled; only checkpoints will be saved.")
     print(f"[run] {run_name}")
     print(f"[path] {checkpoint_dir}")
     print(
@@ -560,6 +756,9 @@ def main(cfg: DictConfig) -> None:
 
     online_updates_enabled = bool(getattr(cfg.runtime, "online_updates_enabled", True))
     viewer_enabled = bool(cfg.runtime.interactive) and bool(cfg.runtime.viewer_enabled)
+    on_demand_image_obs = bool(getattr(cfg.runtime, "on_demand_image_obs", True))
+    store_non_intervention_images = bool(getattr(cfg.runtime, "store_non_intervention_images", False))
+    store_next_obs_images = bool(getattr(cfg.runtime, "store_next_obs_images", False))
     decoupled_viewer_enabled = viewer_enabled and online_updates_enabled
     rollout_has_renderer = viewer_enabled and (not decoupled_viewer_enabled)
     main_renderer = str(cfg.env.renderer)
@@ -575,32 +774,44 @@ def main(cfg: DictConfig) -> None:
         camera_names=render_camera_names,
         has_renderer=rollout_has_renderer,
         has_offscreen_renderer=True,
-        use_camera_obs=True,
+        use_camera_obs=not on_demand_image_obs,
         renderer=main_renderer,
     )
     if visualize_gripper_markers:
-        print(
-            "[INFO] Disabling gripper visualization markers on the main env because its camera observations "
-            "are feeding the policy."
-        )
+        print("[INFO] Disabling gripper visualization markers on the main env because policy images use its cameras.")
     main_env = build_robosuite_env(main_runtime_cfg)
     main_env = maybe_wrap_visualization(
         main_env,
         enabled=False,
         label="training env",
     )
-    print("[INFO] Using camera observations directly from the main env.")
+    if on_demand_image_obs:
+        print("[INFO] Main env camera observations are disabled; policy images will be rendered on demand.")
+    else:
+        print("[INFO] Using camera observations directly from the main env.")
 
     flow_proprio_extractor = bind_flow_proprio_extractor(main_env, flow_env_metadata)
-    initial_obs, _ = reset_flow_policy_observation(
-        main_env,
-        preserve_mjviewer=rollout_has_renderer,
-        extractor=flow_proprio_extractor,
-        policy_camera_names=policy_camera_names,
-        camera_aliases=camera_aliases,
-        img_height=int(cfg.env.img_height),
-        img_width=int(cfg.env.img_width),
-    )
+    if on_demand_image_obs:
+        _, _ = reset_robosuite_env(main_env, preserve_mjviewer=rollout_has_renderer)
+        initial_obs = build_live_policy_observation(
+            main_env,
+            extractor=flow_proprio_extractor,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+            img_height=int(cfg.env.img_height),
+            img_width=int(cfg.env.img_width),
+            include_images=True,
+        )
+    else:
+        initial_obs, _ = reset_flow_policy_observation(
+            main_env,
+            preserve_mjviewer=rollout_has_renderer,
+            extractor=flow_proprio_extractor,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+            img_height=int(cfg.env.img_height),
+            img_width=int(cfg.env.img_width),
+        )
     if rollout_has_renderer and getattr(main_env, "viewer", None) is not None and hasattr(main_env.viewer, "update"):
         main_env.viewer.update()
 
@@ -717,7 +928,10 @@ def main(cfg: DictConfig) -> None:
         )
     if not online_updates_enabled:
         print("[INFO] Online learner updates are disabled. Policy parameters will stay frozen during rollout.")
-    print("[INFO] Main env camera observations are being used for policy inference.")
+    if on_demand_image_obs:
+        print("[INFO] Policy camera observations are rendered on demand to reduce rollout latency.")
+    else:
+        print("[INFO] Main env camera observations are being used for policy inference.")
     if decoupled_viewer_enabled:
         print(
             "[INFO] Training viewer is decoupled from rollout. "
@@ -785,9 +999,9 @@ def main(cfg: DictConfig) -> None:
             "seed": serialize_seed(getattr(cfg, "seed", None)),
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
-            "buffer_dir": str(checkpoint_dir / "buffers"),
-            "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
-            "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
+            "buffer_dir": str(checkpoint_dir / "buffers") if save_demo_buffer else None,
+            "online_chunk_dir": None,
+            "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks") if save_demo_buffer else None,
         },
     )
 
@@ -881,12 +1095,9 @@ def main(cfg: DictConfig) -> None:
         print(f"[base_policy] initialized from multitask flow checkpoint={initialized_checkpoint}")
 
     if bool(cfg.runtime.load_buffers):
-        online_chunk_dir, demo_chunk_dir = resolve_buffer_chunk_dirs(loaded_checkpoint)
+        _, demo_chunk_dir = resolve_buffer_chunk_dirs(loaded_checkpoint)
         loaded_online_transitions = 0
         loaded_demo_transitions = 0
-        if online_chunk_dir is not None:
-            agent.online_buffer.clear()
-            loaded_online_transitions = load_transition_chunks(agent.online_buffer, online_chunk_dir)
         if demo_chunk_dir is not None:
             loaded_demo_transitions = load_transition_chunks(agent.demo_buffer, demo_chunk_dir)
         if loaded_online_transitions > 0 or loaded_demo_transitions > 0:
@@ -894,6 +1105,10 @@ def main(cfg: DictConfig) -> None:
                 f"[load] chunk_buffers online={loaded_online_transitions} demo={loaded_demo_transitions} "
                 f"from {resolve_checkpoint_run_dir(loaded_checkpoint) / 'buffers'}"
             )
+
+    if not store_non_intervention_images and len(agent.online_buffer) > 0:
+        agent.online_buffer.clear()
+        print("[INFO] Cleared online buffer for state-only Flow-DAgger rollout storage.")
 
     wandb_run = maybe_build_wandb(cfg, run_name=run_name, run_dir=checkpoint_dir)
     device = None
@@ -1063,6 +1278,162 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[ckpt] step={step} pending={pending_updates} queued={step_checkpoint.name}")
 
+    cached_policy_images: dict[str, np.ndarray] | None = None
+
+    def make_live_obs(*, include_images: bool, refresh_images: bool = True) -> dict[str, Any]:
+        nonlocal cached_policy_images
+        obs = {"state": extract_flow_state(env, flow_proprio_extractor)}
+        if not include_images:
+            return obs
+        if refresh_images or cached_policy_images is None:
+            cached_policy_images = render_policy_camera_images(
+                env,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=int(cfg.env.img_height),
+                img_width=int(cfg.env.img_width),
+            )
+        obs.update(cached_policy_images)
+        return obs
+
+    def reset_rollout_observation() -> dict[str, Any]:
+        if on_demand_image_obs:
+            reset_robosuite_env(env, preserve_mjviewer=rollout_has_renderer)
+            return make_live_obs(include_images=True, refresh_images=True)
+        reset_obs, _ = reset_flow_policy_observation(
+            env,
+            preserve_mjviewer=rollout_has_renderer,
+            extractor=flow_proprio_extractor,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+            img_height=int(cfg.env.img_height),
+            img_width=int(cfg.env.img_width),
+        )
+        return reset_obs
+
+    def convert_step_observation(raw_obs: dict[str, Any], *, include_images: bool) -> dict[str, Any]:
+        if on_demand_image_obs:
+            return make_live_obs(include_images=include_images, refresh_images=True)
+        if include_images:
+            return convert_env_camera_observation(
+                raw_obs,
+                env=env,
+                extractor=flow_proprio_extractor,
+                policy_camera_names=policy_camera_names,
+                camera_aliases=camera_aliases,
+                img_height=int(cfg.env.img_height),
+                img_width=int(cfg.env.img_width),
+            )
+        return make_live_obs(include_images=False)
+
+    demo_action_horizon = max(1, int(agent.flow_config.action_horizon))
+    pending_demo_chunk: list[Transition] = []
+    completed_intervention_demo_chunks = 0
+
+    def replace_demo_transition(
+        transition: Transition,
+        *,
+        action=None,
+        reward: float | None = None,
+        next_obs=None,
+        done: bool | None = None,
+        is_intervention: bool | None = None,
+        info: dict[str, Any] | None = None,
+        reward_source: str | None = None,
+        demo_source: str | None = None,
+    ) -> Transition:
+        return Transition(
+            obs=transition.obs,
+            action=transition.action if action is None else action,
+            reward=transition.reward if reward is None else float(reward),
+            next_obs=transition.next_obs if next_obs is None else next_obs,
+            done=bool(transition.done if done is None else done),
+            grasp_penalty=transition.grasp_penalty,
+            is_intervention=bool(transition.is_intervention if is_intervention is None else is_intervention),
+            info=dict(transition.info) if info is None and transition.info is not None else info,
+            reward_source=transition.reward_source if reward_source is None else reward_source,
+            demo_source=transition.demo_source if demo_source is None else demo_source,
+        )
+
+    def emit_completed_demo_chunks(*, step: int, reason: str) -> None:
+        nonlocal completed_intervention_demo_chunks
+        while len(pending_demo_chunk) >= demo_action_horizon:
+            chunk = pending_demo_chunk[:demo_action_horizon]
+            del pending_demo_chunk[:demo_action_horizon]
+            for demo_transition in chunk:
+                agent.store_demo_transition(demo_transition)
+                if demo_buffer_writer is not None:
+                    demo_buffer_writer.request_transition(demo_transition)
+            completed_intervention_demo_chunks += 1
+            runtime_logger.log(
+                {
+                    "event": "intervention_demo_chunk_committed",
+                    "step": int(step),
+                    "reason": str(reason),
+                    "chunk_size": int(demo_action_horizon),
+                    "completed_intervention_demo_chunks": int(completed_intervention_demo_chunks),
+                    "demo_buffer_size": len(agent.demo_buffer),
+                    **event_time_fields(),
+                }
+            )
+
+    def queue_demo_chunk_transition(transition: Transition, *, step: int, reason: str) -> None:
+        pending_demo_chunk.append(agent.demo_buffer.snapshot_transition(transition))
+        emit_completed_demo_chunks(step=step, reason=reason)
+
+    def pad_pending_demo_chunk(*, step: int, reason: str, episode_index: int, episode_step: int) -> None:
+        if len(pending_demo_chunk) == 0:
+            return
+        pad_count = (-len(pending_demo_chunk)) % demo_action_horizon
+        if pad_count == 0:
+            emit_completed_demo_chunks(step=step, reason=reason)
+            return
+
+        for index, transition in enumerate(pending_demo_chunk):
+            if bool(transition.done):
+                pending_demo_chunk[index] = replace_demo_transition(transition, done=False)
+
+        last_transition = pending_demo_chunk[-1]
+        last_info = dict(last_transition.info) if last_transition.info is not None else {}
+        pad_episode_index = int(last_info.get("episode_index", episode_index))
+        last_episode_step = int(last_info.get("episode_step", episode_step - 1))
+        zero_action = np.zeros_like(np.asarray(last_transition.action, dtype=np.float32))
+        pad_obs = last_transition.obs
+        for pad_offset in range(pad_count):
+            pad_info = dict(last_info)
+            pad_info["episode_index"] = int(pad_episode_index)
+            pad_info["episode_step"] = int(last_episode_step + pad_offset + 1)
+            pad_info["flow_dagger_padding"] = True
+            pad_info["flow_dagger_padding_reason"] = str(reason)
+            pending_demo_chunk.append(
+                agent.demo_buffer.snapshot_transition(
+                    Transition(
+                        obs=pad_obs,
+                        action=zero_action,
+                        reward=0.0,
+                        next_obs=None,
+                        done=pad_offset == pad_count - 1,
+                        grasp_penalty=None,
+                        is_intervention=False,
+                        info=pad_info,
+                        reward_source="padding",
+                        demo_source="intervention_zero_pad",
+                    )
+                )
+            )
+
+        runtime_logger.log(
+            {
+                "event": "intervention_demo_chunk_padded",
+                "step": int(step),
+                "reason": str(reason),
+                "pad_count": int(pad_count),
+                "chunk_size": int(demo_action_horizon),
+                **event_time_fields(),
+            }
+        )
+        emit_completed_demo_chunks(step=step, reason=reason)
+
     if loaded_checkpoint is None and initialized_checkpoint is None and start_step == 0:
         completed_pretrain_steps = int(trainer.total_pretrain_updates)
         remaining_pretrain_steps = requested_pretrain_steps - completed_pretrain_steps
@@ -1108,15 +1479,7 @@ def main(cfg: DictConfig) -> None:
 
     # Refresh the rollout episode after model / demo bootstrap so the first episode starts from the
     # same phase as the original flow_multi eval path, which resets immediately before inference.
-    obs, _ = reset_flow_policy_observation(
-        env,
-        preserve_mjviewer=rollout_has_renderer,
-        extractor=flow_proprio_extractor,
-        policy_camera_names=policy_camera_names,
-        camera_aliases=camera_aliases,
-        img_height=int(cfg.env.img_height),
-        img_width=int(cfg.env.img_width),
-    )
+    obs = reset_rollout_observation()
     reset_viewer_preview()
     agent.reset_policy_state()
     policy_gate.force_ready()
@@ -1127,22 +1490,28 @@ def main(cfg: DictConfig) -> None:
     if async_updates and online_updates_enabled:
         trainer.start_async_worker()
 
+    interrupted = False
     try:
         for step in range(start_step, int(cfg.runtime.max_steps)):
             last_step = step
             loop_start = time.monotonic() if control_limiter is None else control_limiter.wait()
             overall_fps_tracker.mark()
 
-            if unthrottled_runtime or policy_gate.ready(loop_start):
+            if (not cached_is_intervention) and (unthrottled_runtime or policy_gate.ready(loop_start)):
                 if step < int(cfg.algorithm.trainer.random_steps):
                     cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
                 else:
+                    if on_demand_image_obs and agent.needs_action_chunk():
+                        obs = make_live_obs(include_images=True, refresh_images=True)
                     cached_policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
+                    if on_demand_image_obs:
+                        obs = make_live_obs(include_images=False)
 
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
             is_intervention = False
             reset_requested = False
             if intervention_runtime is not None and (unthrottled_runtime or spacemouse_gate.ready(loop_start)):
+                was_intervening = cached_is_intervention
                 override_action, sampled_is_intervention, reset_requested = intervention_runtime.maybe_override_action(
                     cached_policy_action
                 )
@@ -1153,25 +1522,26 @@ def main(cfg: DictConfig) -> None:
                 elif sampled_is_intervention:
                     cached_override_action = np.asarray(override_action, dtype=np.float32)
                     cached_is_intervention = True
-                    agent.notify_intervention()
-                    policy_gate.force_ready()
+                    if not was_intervening:
+                        agent.notify_intervention()
                 else:
                     cached_override_action = None
                     cached_is_intervention = False
+                    if was_intervening:
+                        agent.reset_policy_state()
+                        policy_gate.force_ready()
 
             if reset_requested:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
                     break
-                obs, _ = reset_flow_policy_observation(
-                    env,
-                    preserve_mjviewer=rollout_has_renderer,
-                    extractor=flow_proprio_extractor,
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
-                    img_height=int(cfg.env.img_height),
-                    img_width=int(cfg.env.img_width),
+                pad_pending_demo_chunk(
+                    step=step,
+                    reason="device_reset",
+                    episode_index=episode_index,
+                    episode_step=episode_step_index,
                 )
+                obs = reset_rollout_observation()
                 reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
@@ -1191,48 +1561,67 @@ def main(cfg: DictConfig) -> None:
                 env_action = np.asarray(cached_override_action, dtype=np.float32)
                 is_intervention = True
 
-            grasp_penalty = compute_grasp_penalty(env, env_action)
+            needs_demo_chunk_transition = is_intervention or len(pending_demo_chunk) > 0
+            online_obs = make_live_obs(include_images=store_non_intervention_images)
+            demo_obs = make_live_obs(include_images=True, refresh_images=True) if needs_demo_chunk_transition else None
             step_output = env.step(env_action)
             if len(step_output) == 5:
                 raw_next_obs, _, done, truncated, info = step_output
                 done = bool(done or truncated)
             else:
                 raw_next_obs, _, done, info = step_output
-            if isinstance(info, dict) and grasp_penalty is not None:
-                info.setdefault("grasp_penalty", float(grasp_penalty))
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
-            next_obs = convert_env_camera_observation(
+            next_obs = convert_step_observation(
                 raw_next_obs,
-                env=env,
-                extractor=flow_proprio_extractor,
-                policy_camera_names=policy_camera_names,
-                camera_aliases=camera_aliases,
-                img_height=int(cfg.env.img_height),
-                img_width=int(cfg.env.img_width),
+                include_images=store_next_obs_images,
+            )
+            demo_next_obs = (
+                convert_step_observation(raw_next_obs, include_images=True)
+                if needs_demo_chunk_transition and store_next_obs_images
+                else None
             )
             refresh_main_viewer()
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
                 done = True
             done = bool(done or success)
-            recorded_transition = trainer.record_transition(
-                obs=obs,
+            info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
+            info_payload.setdefault("episode_index", int(episode_index))
+            info_payload.setdefault("episode_step", int(episode_step_index))
+            trainer.record_transition(
+                obs=online_obs,
                 action=env_action,
                 next_obs=next_obs,
                 done=done,
                 reward=reward,
-                grasp_penalty=info.get("grasp_penalty") if isinstance(info, dict) else None,
+                grasp_penalty=None,
                 is_intervention=is_intervention,
-                info=dict(info) if isinstance(info, dict) else {"raw_info": info},
+                info=info_payload,
                 reward_source="env_success",
                 demo_source="intervention" if is_intervention else None,
+                demo_obs=demo_obs,
+                demo_next_obs=demo_next_obs,
+                store_demo_transition=False,
                 episode_index=episode_index,
                 episode_step=episode_step_index,
             )
-            serialized_transition = agent.online_buffer.snapshot_transition(recorded_transition)
-            buffer_writer.request_transition(
-                online_transition=serialized_transition,
-                demo_transition=serialized_transition if is_intervention else None,
-            )
+            if needs_demo_chunk_transition and demo_obs is not None:
+                demo_transition = Transition(
+                    obs=demo_obs,
+                    action=env_action,
+                    reward=reward,
+                    next_obs=demo_next_obs,
+                    done=done,
+                    grasp_penalty=None,
+                    is_intervention=is_intervention,
+                    info=info_payload,
+                    reward_source="env_success",
+                    demo_source="intervention" if is_intervention else "intervention_policy_tail",
+                )
+                queue_demo_chunk_transition(
+                    demo_transition,
+                    step=step,
+                    reason="intervention" if is_intervention else "policy_tail",
+                )
             total_transition_count += 1
             episode_transition_count += 1
             episode_step_index += 1
@@ -1280,6 +1669,12 @@ def main(cfg: DictConfig) -> None:
                     )
 
             if done:
+                pad_pending_demo_chunk(
+                    step=step,
+                    reason="episode_end",
+                    episode_index=episode_index,
+                    episode_step=episode_step_index,
+                )
                 episode_payload = {
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),
@@ -1326,15 +1721,7 @@ def main(cfg: DictConfig) -> None:
                 )
                 if episode_pause_sec > 0.0:
                     time.sleep(episode_pause_sec)
-                obs, _ = reset_flow_policy_observation(
-                    env,
-                    preserve_mjviewer=rollout_has_renderer,
-                    extractor=flow_proprio_extractor,
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
-                    img_height=int(cfg.env.img_height),
-                    img_width=int(cfg.env.img_width),
-                )
+                obs = reset_rollout_observation()
                 reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
@@ -1355,7 +1742,18 @@ def main(cfg: DictConfig) -> None:
             if step > 0 and step % int(cfg.logging.checkpoint_interval) == 0:
                 request_checkpoint_save(step)
             maybe_report_runtime(step)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("[INFO] Ctrl+C received. Flushing intervention demo data and latest checkpoint before exit.")
     finally:
+        pad_pending_demo_chunk(
+            step=last_step if last_step >= 0 else 0,
+            reason="shutdown",
+            episode_index=episode_index,
+            episode_step=episode_step_index,
+        )
+        if demo_buffer_writer is not None:
+            demo_buffer_writer.flush(timeout=120.0)
         if async_updates:
             trainer.flush_async_updates()
             flushed_metrics = trainer.drain_async_metrics()
@@ -1374,12 +1772,12 @@ def main(cfg: DictConfig) -> None:
             metadata={"step": int(last_step)},
         )
         checkpoint_writer.flush(timeout=120.0)
-        buffer_writer.flush(timeout=120.0)
         runtime_logger.log(
             {
                 "event": "run_end",
                 "step": int(last_step),
                 "episode_index": int(episode_index),
+                "interrupted": bool(interrupted),
                 "success_count": int(success_count),
                 "total_transition_count": int(total_transition_count),
                 "total_intervention_transitions": int(total_intervention_transitions),
@@ -1410,9 +1808,9 @@ def main(cfg: DictConfig) -> None:
                 "seed": serialize_seed(getattr(cfg, "seed", None)),
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
-                "buffer_dir": str(checkpoint_dir / "buffers"),
-                "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
-                "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
+                "buffer_dir": str(checkpoint_dir / "buffers") if save_demo_buffer else None,
+                "online_chunk_dir": None,
+                "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks") if save_demo_buffer else None,
                 "last_step": int(last_step),
                 "episode_index": int(episode_index),
                 "success_count": int(success_count),
@@ -1447,7 +1845,8 @@ def main(cfg: DictConfig) -> None:
                             runtime_logger.close()
                         finally:
                             try:
-                                buffer_writer.close()
+                                if demo_buffer_writer is not None:
+                                    demo_buffer_writer.close()
                             finally:
                                 console_capture.stop()
 

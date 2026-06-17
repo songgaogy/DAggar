@@ -70,6 +70,20 @@ def discover_all_cameras(env) -> list[str]:
     return sorted(str(name) for name in env.sim.model.camera_names)
 
 
+def render_all_camera_images(env, camera_names: list[str], render_height: int, render_width: int):
+    return {
+        camera_name: np.asarray(
+            env.sim.render(
+                height=render_height,
+                width=render_width,
+                camera_name=camera_name,
+            ),
+            dtype=np.uint8,
+        )
+        for camera_name in camera_names
+    }
+
+
 def resolve_output_dir(task_name: str, keep_mode: str, output_dir: str | None) -> str:
     if output_dir is not None and str(output_dir).strip().lower() not in {"", "none", "null"}:
         return to_absolute_path(str(output_dir))
@@ -91,12 +105,27 @@ def append_demo_to_hdf5(
     all_camera_names: list[str],
     states: list[np.ndarray],
     actions: list[np.ndarray],
+    is_successes: list[bool],
     images_dict: dict[str, list[np.ndarray]],
     render_height: int,
     render_width: int,
     success: bool,
     xml_str: str,
 ):
+    num_steps = int(len(actions))
+    if len(states) != num_steps or len(is_successes) != num_steps:
+        raise ValueError(
+            f"Rollout length mismatch: states={len(states)} actions={num_steps} "
+            f"is_success={len(is_successes)}"
+        )
+    for camera_name in all_camera_names:
+        num_images = len(images_dict.get(camera_name, []))
+        if num_images != num_steps:
+            raise ValueError(
+                f"Rollout image length mismatch for {camera_name}: "
+                f"images={num_images} actions={num_steps}"
+            )
+
     with h5py.File(hdf5_path, "a") as file_handle:
         if "demos" not in file_handle:
             demos_grp = file_handle.create_group("demos")
@@ -109,13 +138,14 @@ def append_demo_to_hdf5(
             demos_grp = file_handle["demos"]
 
         demo_grp = demos_grp.create_group(f"demo_{demo_id:06d}")
-        demo_grp.attrs["length"] = int(len(actions))
+        demo_grp.attrs["length"] = num_steps
         demo_grp.attrs["successful"] = bool(success)
         if len(xml_str) > 0:
             demo_grp.attrs["model_file"] = xml_str
 
         demo_grp.create_dataset("states", data=np.asarray(states))
         demo_grp.create_dataset("actions", data=np.asarray(actions))
+        demo_grp.create_dataset("is_success", data=np.asarray(is_successes, dtype=np.bool_))
 
         obs_grp = demo_grp.create_group("observations")
         empty_images = np.zeros((0, render_height, render_width, 3), dtype=np.uint8)
@@ -144,6 +174,35 @@ def save_rollout_summary(
         f"attempt={attempt_idx} saved={saved_count} keep_mode={keep_mode} "
         f"success={int(success)} steps={step_count}"
     )
+
+
+def pad_success_rollout_to_max_steps(
+    states: list[np.ndarray],
+    actions: list[np.ndarray],
+    is_successes: list[bool],
+    images_dict: dict[str, list[np.ndarray]],
+    max_steps: int,
+    action_dim: int,
+    freeze_state: np.ndarray | None,
+    freeze_images: dict[str, np.ndarray] | None,
+):
+    if len(actions) == 0:
+        raise RuntimeError("Cannot pad a successful rollout with no recorded steps")
+    if len(actions) >= max_steps:
+        return
+
+    pad_state = np.asarray(freeze_state if freeze_state is not None else states[-1]).copy()
+    pad_images = freeze_images or {
+        camera_name: np.asarray(images[-1], dtype=np.uint8).copy()
+        for camera_name, images in images_dict.items()
+    }
+    zero_action = np.zeros((action_dim,), dtype=np.float32)
+    for _ in range(max_steps - len(actions)):
+        states.append(pad_state.copy())
+        actions.append(zero_action.copy())
+        is_successes.append(True)
+        for camera_name, image in pad_images.items():
+            images_dict[camera_name].append(image.copy())
 
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="generate_rollout_data")
@@ -219,6 +278,8 @@ def main(cfg: DictConfig):
         done = False
         success = False
         step_count = 0
+        freeze_state = None
+        freeze_images = None
         try:
             xml_str = env.sim.model.get_xml()
         except Exception:
@@ -226,6 +287,7 @@ def main(cfg: DictConfig):
 
         ep_states = []
         ep_actions = []
+        ep_is_successes = []
         ep_images = {camera_name: [] for camera_name in all_camera_names}
 
         while step_count < int(cfg.generate.max_steps) and not done:
@@ -254,27 +316,50 @@ def main(cfg: DictConfig):
             execute_steps = min(int(cfg.generate.action_horizon), action_horizon)
             for action in action_seq[:execute_steps]:
                 current_state = env.sim.get_state().flatten().copy()
+                success_before_step = bool(success)
                 ep_states.append(current_state)
                 ep_actions.append(np.asarray(action, dtype=np.float32).copy())
+                ep_is_successes.append(success_before_step)
 
-                for camera_name in all_camera_names:
-                    frame = env.sim.render(
-                        height=render_height,
-                        width=render_width,
-                        camera_name=camera_name,
-                    )
-                    ep_images[camera_name].append(np.asarray(frame, dtype=np.uint8))
+                current_images = render_all_camera_images(
+                    env=env,
+                    camera_names=all_camera_names,
+                    render_height=render_height,
+                    render_width=render_width,
+                )
+                for camera_name, frame in current_images.items():
+                    ep_images[camera_name].append(frame)
 
                 obs, _, done, info = env.step(action)
                 step_count += 1
-                success = (
-                    success
-                    or bool(info.get("success", False))
+                step_success = (
+                    bool(info.get("success", False))
                     or bool(info.get("is_success", False))
                     or bool(env._check_success())
                 )
+                success = success or step_success
+                if step_success and freeze_state is None:
+                    freeze_state = env.sim.get_state().flatten().copy()
+                    freeze_images = render_all_camera_images(
+                        env=env,
+                        camera_names=all_camera_names,
+                        render_height=render_height,
+                        render_width=render_width,
+                    )
                 if success or done or step_count >= int(cfg.generate.max_steps):
                     break
+
+        if success:
+            pad_success_rollout_to_max_steps(
+                states=ep_states,
+                actions=ep_actions,
+                is_successes=ep_is_successes,
+                images_dict=ep_images,
+                max_steps=int(cfg.generate.max_steps),
+                action_dim=action_dim,
+                freeze_state=freeze_state,
+                freeze_images=freeze_images,
+            )
 
         save_rollout_summary(
             attempt_idx=attempt_idx,
@@ -294,6 +379,7 @@ def main(cfg: DictConfig):
                 all_camera_names=all_camera_names,
                 states=ep_states,
                 actions=ep_actions,
+                is_successes=ep_is_successes,
                 images_dict=ep_images,
                 render_height=render_height,
                 render_width=render_width,

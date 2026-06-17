@@ -210,7 +210,7 @@ INTERVENTION_ENABLED=false
 If you prefer to run Python directly:
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python -m robosuite.pipeline.train_hil_serl \
+/home/dodo/miniconda3/envs/dagger/bin/python -m robosuite.pipeline.train_hil_serl \
   env.environment=Lift \
   env.robots='[Panda]' \
   data.task_name=PandaLift \
@@ -248,7 +248,7 @@ bash robosuite/pipeline/scripts/eval_hil_serl.sh
 Or directly:
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python -m robosuite.pipeline.train_hil_serl \
+/home/dodo/miniconda3/envs/dagger/bin/python -m robosuite.pipeline.train_hil_serl \
   runtime.max_steps=2000 \
   runtime.interactive=false \
   runtime.eval_deterministic=true \

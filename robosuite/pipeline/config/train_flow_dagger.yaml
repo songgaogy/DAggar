@@ -116,6 +116,7 @@ algorithm:
   trainer:
     batch_size: 64
     warmup_steps: 0
+    update_per_step: 1.0
     updates_per_step: 1
     steps_per_update: 50
     random_steps: 0
@@ -149,6 +150,9 @@ runtime:
   viewer_startup_delay: 0.0
   viewer_reset_warmup_frames: 2
   visualize_gripper_markers: true
+  on_demand_image_obs: true
+  store_non_intervention_images: false
+  store_next_obs_images: false
   control_fps: ${env.control_freq}
   render_fps: ${runtime.control_fps}
   image_obs_fps: ${runtime.control_fps}
@@ -163,14 +167,17 @@ runtime:
   init_checkpoint: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
   use_init_checkpoint_camera_names: true
   use_init_checkpoint_model: true
-  load_buffers: true
+  load_buffers: false
   eval_deterministic: false
   buffer_save_interval: 200
+  save_transition_chunks: false
+  save_demo_buffer: true
   episode_pause_sec: 1.0
 
 logging:
   output_root: "./outputs/flow-DAgger"
   run_name: null
+  run_name_suffix: null
   project: "Flow-DAgger_AIR"
   entity: "songgao-personal"
   use_wandb: true
