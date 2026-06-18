@@ -1,0 +1,222 @@
+wandb_version: 1
+
+_wandb:
+  desc: null
+  value:
+    python_version: 3.10.19
+    cli_version: 0.24.2
+    framework: huggingface
+    huggingface_version: 5.3.0
+    is_jupyter_run: false
+    is_kaggle_kernel: false
+    start_time: 1781445148
+    t:
+      1:
+      - 1
+      - 5
+      - 11
+      - 41
+      - 49
+      - 50
+      - 53
+      2:
+      - 1
+      - 5
+      - 11
+      - 41
+      - 49
+      - 50
+      - 53
+      3:
+      - 4
+      - 16
+      - 42
+      4: 3.10.19
+      5: 0.24.2
+      6: 5.3.0
+      13: linux-x86_64
+    e:
+      yxv2hvawdp3z9akcwpkn9o3dubijs5oa:
+        os: Linux-6.8.0-111-generic-x86_64-with-glibc2.35
+        python: CPython 3.10.19
+        started_at: '2026-06-14T13:52:28.031538Z'
+        args:
+        - data.data_dirs=["/home/dodo/Documents/DAggar/robosuite/data/PickPlaceBread/expert_pretrain_data","/home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/expert_pretrain_data","/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert_pretrain_data","/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert_pretrain_data","/home/dodo/Documents/DAggar/robosuite/data/PandaStack/expert_pretrain_data","/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert_pretrain_data"]
+        - data.camera_names=["agentview","robot0_robotview","robot0_eye_in_hand"]
+        - data.num_traj=20
+        - data.preload_all_demos_to_ram=true
+        - data.use_demo_cache=true
+        - data.use_disk_cache=true
+        - checkpoint.save_dir=/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20-new
+        - train.epochs=400
+        - train.batch_size=256
+        - train.num_workers=16
+        - train.prefetch_factor=8
+        - train.lr=1e-4
+        - train.min_lr=1e-6
+        - train.weight_decay=1e-6
+        - train.grad_clip_norm=1.0
+        - train.device=cuda
+        - checkpoint.save_freq=100
+        program: /home/dodo/Documents/DAggar/robosuite/robosuite/policy/flow_multi/train_flow.py
+        code_path: robosuite/policy/flow_multi/train_flow.py
+        code_path_local: robosuite/policy/flow_multi/train_flow.py
+        git:
+          remote_url: https://github.com/songgaogy/robosuite.git
+          commit: 9d8000eed731262ac20316ba1096d21482b33df7
+        root: /home/dodo/Documents/DAggar/robosuite
+        host: dodo-System-Product-Name
+        executable: /home/dodo/miniconda3/envs/dagger/bin/python
+        cpu_count: 16
+        cpu_count_logical: 32
+        gpu_type: NVIDIA GeForce RTX 4090
+        gpu_count: 2
+        disk:
+          /:
+            total: '982820896768'
+            used: '826586509312'
+        memory:
+          total: '134163664896'
+        gpu_nvidia:
+        - name: NVIDIA GeForce RTX 4090
+          memory_total: '25757220864'
+          cuda_cores: 16384
+          architecture: Ada
+          uuid: GPU-2349bcf6-14e3-ff80-8662-beb18913f3ce
+        - name: NVIDIA GeForce RTX 4090
+          memory_total: '25757220864'
+          cuda_cores: 16384
+          architecture: Ada
+          uuid: GPU-a31f95ae-0bf6-30a5-b4ab-c5f62ae9d283
+        cuda_version: '13.0'
+        writer_id: yxv2hvawdp3z9akcwpkn9o3dubijs5oa
+flow:
+  desc: null
+  value:
+    image_encoder:
+      type: shared_resnet18_spatial_softmax
+      feature_dim: 256
+      pretrained_path: /home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth
+      freeze_backbone: true
+      trainable_stages:
+      - layer3
+      - layer4
+      train_token_projections: true
+      include_spatial_softmax: true
+      layer3_pool_size: 2
+      layer4_pool_size: 2
+    proprio_encoder:
+      type: mlp
+      hidden_dim: 256
+      num_tokens: 2
+    language_encoder:
+      type: clip_text
+      pretrained_name: /home/dodo/Documents/DAggar/robosuite/data/pretrained/clip-vit-base-patch32
+      max_length: 77
+      freeze_backbone: true
+      local_files_only: true
+    modulation:
+      type: film
+      hidden_dim: 512
+      modulate_visual: true
+      modulate_proprio: false
+    fusion:
+      type: transformer
+      feature_dim: 256
+      max_language_tokens: 77
+      num_heads: 8
+      depth: 3
+      dropout: 0.1
+      use_language_adaln: false
+    aggregator:
+      type: attention_pool
+      hidden_dim: 512
+      output_dim: 256
+    head:
+      type: unet_1d
+      hidden_dim: 128
+      time_dim: 128
+      cond_dim: 256
+      channel_mults:
+      - 1
+      - 2
+      - 2
+      - 2
+      dropout: 0.05
+      cross_attention:
+        enabled: true
+        attn_dim: 256
+        num_heads: 4
+        dropout: 0.05
+        mid: true
+        down_layers: []
+        up_layers:
+        - 0
+        - 1
+      action_step_embedding:
+        enabled: true
+        embedding_dim: 64
+seed:
+  desc: null
+  value: 42
+data:
+  desc: null
+  value:
+    data_dir: null
+    data_dirs:
+    - /home/dodo/Documents/DAggar/robosuite/data/PickPlaceBread/expert_pretrain_data
+    - /home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/expert_pretrain_data
+    - /home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert_pretrain_data
+    - /home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert_pretrain_data
+    - /home/dodo/Documents/DAggar/robosuite/data/PandaStack/expert_pretrain_data
+    - /home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert_pretrain_data
+    camera_names:
+    - agentview
+    - robot0_robotview
+    - robot0_eye_in_hand
+    image_size: 128
+    action_horizon: 8
+    stride: 1
+    normalize: true
+    max_demos_per_file: null
+    num_traj: 20
+    num_train_traj: null
+    cache_proprio: true
+    use_demo_cache: true
+    max_cached_demos_per_worker: 2
+    preload_all_demos_to_ram: true
+    use_disk_cache: true
+    task_prompt_map: null
+train:
+  desc: null
+  value:
+    device: cuda
+    batch_size: 256
+    num_workers: 16
+    prefetch_factor: 8
+    epochs: 400
+    lr: 0.0001
+    min_lr: 1.0e-06
+    weight_decay: 1.0e-06
+    grad_clip_norm: 1.0
+    lambda_endpoint: 0.5
+    lambda_smooth: 0.05
+    ema_decay: 0.999
+augmentation:
+  desc: null
+  value:
+    minimal_shift_pad: 2
+    eye_in_hand_crop_scale: 0.88
+logging:
+  desc: null
+  value:
+    enable_wandb: true
+    project: robosuite-flow-multi
+    entity: songgao-personal
+    mode: offline
+    log_every: 100
+checkpoint:
+  desc: null
+  value:
+    save_dir: /home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20-new
+    save_freq: 100

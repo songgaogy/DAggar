@@ -1,0 +1,18 @@
+#!/bin/sh
+# Remove gitignored Python bytecode caches on branch switch.
+# Git only updates tracked files; __pycache__ would otherwise leak across branches.
+
+if [ "$3" != "1" ]; then
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+cd "$repo_root" || exit 0
+
+find . -path ./.git -prune -o -type d -name __pycache__ -print0 2>/dev/null |
+  xargs -0 rm -rf 2>/dev/null
+
+# Drop empty source dirs left behind (e.g. robosuite/pipeline after .py files are removed).
+find ./robosuite -depth -type d -empty -delete 2>/dev/null
+
+exit 0
