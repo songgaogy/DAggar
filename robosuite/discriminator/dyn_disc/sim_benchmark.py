@@ -1,15 +1,15 @@
 """Run the LPB v2 KNN discriminator through the shared benchmark API.
 
 Mirrors data/utils/benchmark/examples/run_lpb_original.py but uses the cleaned
-LPB v2 module under robosuite.discriminator.lpb_v2.
+LPB v2 module under robosuite.discriminator.dyn_disc.
 
 Example:
-    python -m data.utils.benchmark.examples.run_lpb_v2 \
-        --model-ckpt /abs/path/checkpoints/lpb_v2/dynamics/<run_name-timestamp>/checkpoints/model_50.pth \
+    python -m data.utils.benchmark.examples.run_dyn_disc \
+        --model-ckpt /abs/path/checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_50.pth \
         --fail-root  /abs/path/data/utils/fail_rollout \
         --success-root /abs/path/data/utils/success_rollout \
         --tasks PickPlaceCan \
-        --save-json /tmp/lpb_v2_bench.json
+        --save-json /tmp/dyn_disc_bench.json
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 
 from benchmark.robosuite import FailureBenchmark
-from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:
@@ -73,7 +73,7 @@ def _parse_camera_to_view(s):
 
 def main() -> None:
     args = _parse_args()
-    print("[lpb_v2] building FailureBenchmark...", flush=True)
+    print("[dyn_disc] building FailureBenchmark...", flush=True)
     bench = FailureBenchmark(
         fail_labeled_root=args.fail_root,
         success_root=args.success_root,
@@ -84,13 +84,13 @@ def main() -> None:
         metadata_cache_root=args.metadata_cache_root,
         cache_camera_names=args.cache_camera_names,
     )
-    print("[lpb_v2] discovering trajectories (this may take a while on slow disks)...", flush=True)
+    print("[dyn_disc] discovering trajectories (this may take a while on slow disks)...", flush=True)
     trajs = bench.trajectories()
     n_fail = sum(1 for t in trajs if bool(t.is_failure))
     n_succ = sum(1 for t in trajs if not bool(t.is_failure))
     tasks = sorted({str(t.task_name) for t in trajs})
     print(
-        f"[lpb_v2] discovered num_trajectories={len(trajs)} (fail={n_fail}, succ={n_succ}) "
+        f"[dyn_disc] discovered num_trajectories={len(trajs)} (fail={n_fail}, succ={n_succ}) "
         f"tasks={tasks}",
         flush=True,
     )
@@ -112,12 +112,12 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[lpb_v2] starting fit_on_benchmark (encoding success demos)...", flush=True)
+        print("[dyn_disc] starting fit_on_benchmark (encoding success demos)...", flush=True)
         discriminator.fit_on_benchmark(bench.trajectories())
-        print("[lpb_v2] fit done; starting evaluate()...", flush=True)
+        print("[dyn_disc] fit done; starting evaluate()...", flush=True)
         result = bench.evaluate(discriminator)
         print(result.summary())
-        print("[lpb_v2] calibration summary:", discriminator.calibration_summary())
+        print("[dyn_disc] calibration summary:", discriminator.calibration_summary())
         if args.save_json:
             result.save_json(args.save_json)
             print(f"[benchmark] wrote {args.save_json}")

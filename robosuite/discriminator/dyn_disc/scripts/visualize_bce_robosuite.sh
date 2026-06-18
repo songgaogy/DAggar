@@ -6,7 +6,7 @@
 #
 # Required env:
 #   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
-#     bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
 #
 # Optional env (commonly overridden):
 #   TASK, NUM_TRAJS, CAMERA_NAME, LOAD_CKPT (skip fit), FAIL_BANK_PER_TASK,
@@ -48,13 +48,13 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
 RUN_NAME="${RUN_NAME:-viz_bce_${TASK}}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_viz_robosuite-${SPLIT}/${RUN_NAME}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/bce_viz_robosuite-${SPLIT}/${RUN_NAME}-${TIMESTAMP}}"
 PDF_NAME="${PDF_NAME:-bce_v2_scores.pdf}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[bce][viz][robosuite] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     echo "                 Set MODEL_CKPT=/abs/path/to/checkpoints/model_<epoch>.pth." >&2
@@ -125,7 +125,7 @@ if [[ -n "${SAVE_CKPT_DIR:-}" ]]; then
     EXTRA_ARGS+=(--save-ckpt-dir "${SAVE_CKPT_DIR}")
 fi
 
-python -m robosuite.discriminator.lpb_v2.visualization.visualize_bce \
+python -m robosuite.discriminator.dyn_disc.visualization.visualize_bce \
     --kind                  robosuite \
     --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \

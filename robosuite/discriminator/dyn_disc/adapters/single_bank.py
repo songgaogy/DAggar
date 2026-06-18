@@ -20,7 +20,7 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from robosuite.discriminator.lpb_v2.detectors.single_bank_knn import LPBV2Encoder, LPBV2KNN
+from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import LPBV2Encoder, LPBV2KNN
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
@@ -40,7 +40,7 @@ def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.
 class LPBV2BenchmarkDiscriminator:
     """LPB v2 KNN OOD detector exposed through BenchmarkTrajectory API."""
 
-    name = "lpb_v2_knn"
+    name = "dyn_disc_knn"
 
     def __init__(
         self,
@@ -291,7 +291,7 @@ class LPBV2BenchmarkDiscriminator:
 
             if self.verbose_fit:
                 print(
-                    f"[lpb_v2][fit] task={task} "
+                    f"[dyn_disc][fit] task={task} "
                     f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
                     f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
                     f"feature_source={self.feature_source} layer={self.transformer_layer}  "

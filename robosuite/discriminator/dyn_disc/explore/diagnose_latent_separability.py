@@ -40,8 +40,8 @@ from sklearn.metrics import roc_auc_score, roc_curve
 
 from benchmark.core import BenchmarkTrajectory
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
-from robosuite.discriminator.lpb_v2.utils.vis_latent import (
+from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.utils.vis_latent import (
     PHASE_FAILURE_AFTER_GT,
     PHASE_FAILURE_BEFORE_GT,
     PHASE_SUCCESS,
@@ -202,7 +202,7 @@ def _collect_encoded_trajectories(
         )
         encoded.append(item)
         print(
-            f"[lpb_v2][sep] encoded {traj_idx + 1}/{len(trajectories)} "
+            f"[dyn_disc][sep] encoded {traj_idx + 1}/{len(trajectories)} "
             f"{traj.describe()} -> {tuple(item.features.shape)} first_gt={first_gt}",
             flush=True,
         )
@@ -720,7 +720,7 @@ def main() -> None:
     if args.load_cache:
         arrays, meta = _load_latents_cache(args.load_cache)
         print(
-            f"[lpb_v2][sep] loaded cache from {args.load_cache} "
+            f"[dyn_disc][sep] loaded cache from {args.load_cache} "
             f"features={tuple(arrays['features'].shape)}",
             flush=True,
         )
@@ -751,7 +751,7 @@ def main() -> None:
         n_success_traj = int(len(trajectories) - n_fail_traj)
         tasks = sorted({str(traj.task_name) for traj in trajectories})
         print(
-            f"[lpb_v2][sep] discovered {len(trajectories)} trajectories "
+            f"[dyn_disc][sep] discovered {len(trajectories)} trajectories "
             f"(failure={n_fail_traj}, success={n_success_traj}) tasks={tasks}",
             flush=True,
         )
@@ -774,11 +774,11 @@ def main() -> None:
         meta = _build_meta(encoded, args, arrays)
         npz_path, meta_path = _save_latents_cache(out_dir, arrays, meta)
         cache_paths = {"latents": npz_path, "latents_meta": meta_path}
-        print(f"[lpb_v2][sep] wrote {npz_path}", flush=True)
-        print(f"[lpb_v2][sep] wrote {meta_path}", flush=True)
+        print(f"[dyn_disc][sep] wrote {npz_path}", flush=True)
+        print(f"[dyn_disc][sep] wrote {meta_path}", flush=True)
 
     if args.cache_features_only:
-        print("[lpb_v2][sep] --cache-features-only set; skipping analysis.", flush=True)
+        print("[dyn_disc][sep] --cache-features-only set; skipping analysis.", flush=True)
         return
 
     features = arrays["features"]
@@ -788,7 +788,7 @@ def main() -> None:
     n_succ = int(is_success_mask.sum())
     n_fail = int(is_failure_after_mask.sum())
     print(
-        f"[lpb_v2][sep] pooled frame counts: success={n_succ} failure_after_gt={n_fail} "
+        f"[dyn_disc][sep] pooled frame counts: success={n_succ} failure_after_gt={n_fail} "
         f"feature_dim={features.shape[1]}",
         flush=True,
     )
@@ -797,7 +797,7 @@ def main() -> None:
         arrays, train_frac=float(args.mahalanobis_train_frac), seed=int(args.seed)
     )
     print(
-        f"[lpb_v2][sep] rollout-level success split: "
+        f"[dyn_disc][sep] rollout-level success split: "
         f"train_frames={int(train_mask.sum())} eval_frames={int(eval_succ_mask.sum())}",
         flush=True,
     )
@@ -817,7 +817,7 @@ def main() -> None:
     )
     mmd_p = mmd_result.get("p_value")
     print(
-        f"[lpb_v2][sep] MMD pooled: p={mmd_p} mmd2={mmd_result.get('mmd2_biased')}",
+        f"[dyn_disc][sep] MMD pooled: p={mmd_p} mmd2={mmd_result.get('mmd2_biased')}",
         flush=True,
     )
 
@@ -831,7 +831,7 @@ def main() -> None:
             out_dir / "hist.png",
             "Mahalanobis score (pooled)",
         )
-        print(f"[lpb_v2][sep] Mahalanobis pooled AUROC = {mahal['auroc']:.4f}", flush=True)
+        print(f"[dyn_disc][sep] Mahalanobis pooled AUROC = {mahal['auroc']:.4f}", flush=True)
 
     # §3.3 same-task matched-timestep AUROC.
     matched: dict = {}
@@ -851,7 +851,7 @@ def main() -> None:
                 f"Matched-timestep ROC (|Δt|≤{int(args.matched_window)})",
             )
             print(
-                f"[lpb_v2][sep] Matched-timestep AUROC = {matched['auroc']:.4f} "
+                f"[dyn_disc][sep] Matched-timestep AUROC = {matched['auroc']:.4f} "
                 f"(n_pairs={matched.get('n_pairs')})",
                 flush=True,
             )
@@ -916,9 +916,9 @@ def main() -> None:
     summary_path = out_dir / "separability_summary.json"
     with summary_path.open("w") as fp:
         json.dump(_json_safe(summary), fp, indent=2)
-    print(f"[lpb_v2][sep] wrote {summary_path}", flush=True)
+    print(f"[dyn_disc][sep] wrote {summary_path}", flush=True)
     print(
-        "[lpb_v2][sep] gate:",
+        "[dyn_disc][sep] gate:",
         json.dumps(_json_safe(pooled_block["gate"]), sort_keys=True),
         flush=True,
     )

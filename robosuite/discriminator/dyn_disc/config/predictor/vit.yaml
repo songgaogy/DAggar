@@ -1,4 +1,4 @@
-_target_: robosuite.discriminator.lpb_v2.models.vit.ViTPredictor
+_target_: robosuite.discriminator.dyn_disc.models.vit.ViTPredictor
 depth: 6
 heads: 16
 mlp_dim: 2048

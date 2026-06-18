@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # LPB v2 KNN benchmark entry point.
 # Run from repo root:
-#   bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_benchmark.sh
+#   bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
 # Override via env vars, e.g.:
 #   TASKS="PickPlaceCan" DELTA=5.0 \
-#     bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_benchmark.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
 #
 # Required: MODEL_CKPT must point to a trained dynamics checkpoint .pth.
-# Recommended layout (produced by `robosuite.discriminator.lpb_v2.training.train`):
-#   checkpoints/lpb_v2/dynamics/<run_name-timestamp>/{hydra.yaml, normalizer.pth, checkpoints/model_<epoch>.pth}
+# Recommended layout (produced by `robosuite.discriminator.dyn_disc.training.train`):
+#   checkpoints/dyn_disc/dynamics/<run_name-timestamp>/{hydra.yaml, normalizer.pth, checkpoints/model_<epoch>.pth}
 # Point MODEL_CKPT to:
-#   checkpoints/lpb_v2/dynamics/<run_name-timestamp>/checkpoints/model_<epoch>.pth
+#   checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_<epoch>.pth
 
 set -euo pipefail
 
@@ -30,17 +30,17 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
 RUN_NAME="${RUN_NAME:-eval}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/eval/wam-layers/${RUN_NAME}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/eval/wam-layers/${RUN_NAME}-${TIMESTAMP}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
 # You can override this via env var:
-#   MODEL_CKPT=/abs/path/checkpoints/lpb_v2/dynamics/<run_name-timestamp>/checkpoints/model_49.pth bash ...
-MODEL_CKPT="checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth"
+#   MODEL_CKPT=/abs/path/checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_49.pth bash ...
+MODEL_CKPT="checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
-    echo "[lpb_v2] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
+    echo "[dyn_disc] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
 fi
 
@@ -80,7 +80,7 @@ if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${ME
     fi
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.sim_benchmark \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.sim_benchmark \
     --model-ckpt          "${MODEL_CKPT}" \
     --fail-root           "${FAIL_ROOT}" \
     --success-root        "${SUCCESS_ROOT}" \
@@ -100,4 +100,4 @@ fi
     "${EXTRA_ARGS[@]}" \
     "$@"
 
-echo "[lpb_v2] wrote ${SAVE_JSON}"
+echo "[dyn_disc] wrote ${SAVE_JSON}"

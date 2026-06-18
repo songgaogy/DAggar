@@ -1,5 +1,5 @@
-from robosuite.discriminator.lpb_v2.utils.normalizer import SingleFieldLinearNormalizer
-from robosuite.discriminator.lpb_v2.utils.tensor_utils import dict_apply_reduce, dict_apply_split
+from robosuite.discriminator.dyn_disc.utils.normalizer import SingleFieldLinearNormalizer
+from robosuite.discriminator.dyn_disc.utils.tensor_utils import dict_apply_reduce, dict_apply_split
 import numpy as np
 import torch
 

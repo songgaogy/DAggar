@@ -6,7 +6,7 @@ import argparse
 
 from benchmark.core import EvalConfig
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:
@@ -89,7 +89,7 @@ def main() -> None:
     n_succ = len(trajs) - n_fail
     tasks = sorted({str(t.task_name) for t in trajs})
     print(
-        f"[real_world][lpb_v2] discovered {len(trajs)} trajectories "
+        f"[real_world][dyn_disc] discovered {len(trajs)} trajectories "
         f"(failure={n_fail}, success={n_succ}) tasks={tasks}",
         flush=True,
     )
@@ -112,17 +112,17 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[real_world][lpb_v2] fitting success KNN banks...", flush=True)
+        print("[real_world][dyn_disc] fitting success KNN banks...", flush=True)
         discriminator.fit_on_benchmark(trajs)
         result = bench.evaluate(
             discriminator,
             EvalConfig(step_binarize_strategy="provided"),
         )
         print(result.summary())
-        print("[real_world][lpb_v2] calibration summary:", discriminator.calibration_summary())
+        print("[real_world][dyn_disc] calibration summary:", discriminator.calibration_summary())
         if args.save_json:
             result.save_json(args.save_json)
-            print(f"[real_world][lpb_v2] wrote {args.save_json}")
+            print(f"[real_world][dyn_disc] wrote {args.save_json}")
     finally:
         discriminator.close()
 

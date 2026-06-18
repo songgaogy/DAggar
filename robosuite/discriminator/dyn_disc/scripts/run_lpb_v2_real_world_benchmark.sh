@@ -2,7 +2,7 @@
 # LPB v2 KNN benchmark entry point for real-world Agilex data.
 # Required:
 #   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
-#     bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_real_world_benchmark.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_real_world_benchmark.sh
 
 set -euo pipefail
 
@@ -18,15 +18,15 @@ MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-25}"
 MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-25}"
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/real_world_eval/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/real_world_eval/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth"
+MODEL_CKPT="checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
-    echo "[real_world][lpb_v2] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
+    echo "[real_world][dyn_disc] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
 fi
 
@@ -69,7 +69,7 @@ if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.real_world_single_bank \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.real_world_single_bank \
     --model-ckpt          "${MODEL_CKPT}" \
     --fail-root           "${FAIL_ROOT}" \
     --success-root        "${SUCCESS_ROOT}" \
@@ -94,4 +94,4 @@ fi
     "${EXTRA_ARGS[@]}" \
     "$@"
 
-echo "[real_world][lpb_v2] wrote ${SAVE_JSON}"
+echo "[real_world][dyn_disc] wrote ${SAVE_JSON}"

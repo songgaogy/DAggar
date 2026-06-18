@@ -9,7 +9,7 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.discriminator.lpb_v2.models.resnet_encoder import ResNetEncoder
+from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -17,24 +17,24 @@ log = logging.getLogger(__name__)
 
 _TARGET_ALIASES = {
     "dyn_model.models.proprio.ProprioceptiveEmbedding":
-        "robosuite.discriminator.lpb_v2.models.proprio.ProprioceptiveEmbedding",
+        "robosuite.discriminator.dyn_disc.models.proprio.ProprioceptiveEmbedding",
     "dyn_model.models.vit.ViTPredictor":
-        "robosuite.discriminator.lpb_v2.models.vit.ViTPredictor",
+        "robosuite.discriminator.dyn_disc.models.vit.ViTPredictor",
     "dyn_model.models.visual_dyn_model.VisualDynamicsModel":
-        "robosuite.discriminator.lpb_v2.models.visual_dynamics.VisualDynamicsModel",
+        "robosuite.discriminator.dyn_disc.models.visual_dynamics.VisualDynamicsModel",
     "robosuite.discriminator.lpb_original.dyn_model.models.proprio.ProprioceptiveEmbedding":
-        "robosuite.discriminator.lpb_v2.models.proprio.ProprioceptiveEmbedding",
+        "robosuite.discriminator.dyn_disc.models.proprio.ProprioceptiveEmbedding",
     "robosuite.discriminator.lpb_original.dyn_model.models.vit.ViTPredictor":
-        "robosuite.discriminator.lpb_v2.models.vit.ViTPredictor",
+        "robosuite.discriminator.dyn_disc.models.vit.ViTPredictor",
     "robosuite.discriminator.lpb_original.dyn_model.models.visual_dyn_model.VisualDynamicsModel":
-        "robosuite.discriminator.lpb_v2.models.visual_dynamics.VisualDynamicsModel",
+        "robosuite.discriminator.dyn_disc.models.visual_dynamics.VisualDynamicsModel",
 }
 
 
 def _retarget(node: Any) -> Any:
     # Checkpoints store Hydra configs with `_target_` strings that may refer to
     # legacy module paths (lpb_original / dyn_model). Retarget them to the local
-    # lpb_v2 implementations so we can instantiate modules without editing old configs.
+    # dyn_disc implementations so we can instantiate modules without editing old configs.
     # IMPORTANT: `instantiate_local()` is often called on sub-nodes (e.g., cfg.model)
     # that contain interpolations like `${img_size}` pointing to keys in the *parent*
     # config. Once we detach the node into a standalone config, those interpolations
@@ -81,7 +81,7 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
     policy_ckpt_path = getattr(train_cfg, "policy_ckpt_path", None)
     if policy_ckpt_path not in (None, "", "null", "None"):
         raise ValueError(
-            "lpb_v2 does not support diffusion-policy policy_ckpt_path. "
+            "dyn_disc does not support diffusion-policy policy_ckpt_path. "
             "Set policy_ckpt_path/env.policy_ckpt_path to null, or use lpb_original."
         )
 
@@ -99,7 +99,7 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
     # Infer input dimensions for the embedding modules.
     #
     # Priority:
-    #   1) Explicit dims written by `lpb_v2/train.py` (prior_in_chans, action_dim_per_step)
+    #   1) Explicit dims written by `dyn_disc/train.py` (prior_in_chans, action_dim_per_step)
     #   2) env.{proprio_dim, action_dim} from the saved Hydra config
     #   3) Legacy heuristics based on train_data_path (transport/pusht) and defaults
     action_dim = 10 if train_cfg.abs_action else 7
@@ -112,7 +112,7 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
         action_dim = 2
         prior_in_chans = 2
     elif "libero" in train_data_path:
-        raise ValueError("lpb_v2 does not support legacy libero language checkpoints.")
+        raise ValueError("dyn_disc does not support legacy libero language checkpoints.")
 
     if getattr(train_cfg, "env", None) is not None:
         if getattr(train_cfg.env, "proprio_dim", None) is not None:

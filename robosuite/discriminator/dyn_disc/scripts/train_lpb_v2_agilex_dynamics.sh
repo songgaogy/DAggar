@@ -3,7 +3,7 @@
 # Build cache first:
 #   ACTION_STOP=14 bash benchmark/real_world/scripts/build_cache.sh
 # Then run:
-#   bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_agilex_dynamics.sh
+#   bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
 
 set -euo pipefail
 
@@ -45,7 +45,7 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 FRAMESKIP="${FRAMESKIP:-1}"
 RUN_NAME="${RUN_NAME:-agilex_train}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-RUN_DIR="./checkpoints/lpb_v2/dynamics/${RUN_NAME}-${TIMESTAMP}"
+RUN_DIR="./checkpoints/dyn_disc/dynamics/${RUN_NAME}-${TIMESTAMP}"
 
 EXTRA_OVERRIDES=()
 EXTRA_OVERRIDES+=("env.cache_root=${CACHE_ROOT}")
@@ -68,7 +68,7 @@ fi
 
 EXTRA_OVERRIDES+=("$@")
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.training.train \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.training.train \
     env=agilex \
     env.view_names="${VIEW_NAMES}" \
     env.action_dim="${ACTION_DIM}" \

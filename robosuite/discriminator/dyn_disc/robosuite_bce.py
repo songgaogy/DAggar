@@ -21,7 +21,7 @@ from benchmark.core import EvalConfig
 from benchmark.robosuite import FailureBenchmark, RobosuiteBenchmarkTrajectory
 from benchmark.robosuite.loader import discover_trajectories
 
-from robosuite.discriminator.lpb_v2.adapters.bce import BCEBenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:

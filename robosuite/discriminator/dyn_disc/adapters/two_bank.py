@@ -27,11 +27,11 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from robosuite.discriminator.lpb_v2.adapters.single_bank import (
+from robosuite.discriminator.dyn_disc.adapters.single_bank import (
     LPBV2BenchmarkDiscriminator,
     _pad_to_length,
 )
-from robosuite.discriminator.lpb_v2.detectors.two_bank_knn import TwoBankKNN
+from robosuite.discriminator.dyn_disc.detectors.two_bank_knn import TwoBankKNN
 
 
 def _fail_frame_range(num_frames: int, first_gt: Optional[int], last_k: int) -> Optional[range]:
@@ -60,7 +60,7 @@ class TwoBankBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
     plumbing, but swaps the per-task detector for a :class:`TwoBankKNN`.
     """
 
-    name = "lpb_v2_two_bank_knn"
+    name = "dyn_disc_two_bank_knn"
 
     def __init__(
         self,

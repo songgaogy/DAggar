@@ -1,6 +1,6 @@
 # LPB v2 - Latent Dynamics Features for Failure Discrimination
 
-`robosuite.discriminator.lpb_v2` contains a compact LPB/WAM-style pipeline:
+`robosuite.discriminator.dyn_disc` contains a compact LPB/WAM-style pipeline:
 
 1. train a visual dynamics model on demonstration trajectories;
 2. freeze the learned latent encoder;
@@ -21,7 +21,7 @@ All variants reuse the same frozen LPB v2 encoder and benchmark trajectory API.
 ## Repository layout
 
 ```text
-lpb_v2/
+dyn_disc/
   core/
     model_loader.py                # Rebuild/load VisualDynamicsModel checkpoints
   detectors/
@@ -79,7 +79,7 @@ Core dependencies include PyTorch, Hydra/OmegaConf, torchvision, einops, numpy, 
 Entry point:
 
 ```bash
-python -m robosuite.discriminator.lpb_v2.training.train
+python -m robosuite.discriminator.dyn_disc.training.train
 ```
 
 The trainer is Hydra-configured through `config/train.yaml` and `config/env/*.yaml`.
@@ -103,7 +103,7 @@ checkpoints/model_<epoch>.pth
 Real-world Agilex training entrance:
 
 ```bash
-bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_agilex_dynamics.sh
+bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
 ```
 
 Useful overrides:
@@ -113,16 +113,16 @@ TASKS="candy_in_plate duck_in_bowl" \
 EPOCHS=50 \
 BATCH_SIZE=256 \
 FRAMESKIP=1 \
-bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_agilex_dynamics.sh
+bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
 ```
 
-The script assumes a built Agilex cache. It points at `data/.agilex_train_cache` by default and writes under `checkpoints/lpb_v2/dynamics/<run-name>-<timestamp>/`.
+The script assumes a built Agilex cache. It points at `data/.agilex_train_cache` by default and writes under `checkpoints/dyn_disc/dynamics/<run-name>-<timestamp>/`.
 
 Simulator/preprocessed-cache training entrance:
 
 ```bash
 TASK=PickPlaceCan \
-bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_dynamics.sh
+bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
 ```
 
 This script uses `env=preprocessed`, defaults to caches under `data/.lpb_score_preprocessed_cache`, and accepts Hydra overrides through trailing CLI arguments.
@@ -160,7 +160,7 @@ Files:
 - `adapters/single_bank.py`
 - `real_world_single_bank.py`
 - `sim_benchmark.py`
-- `scripts/run_lpb_v2_real_world_benchmark.sh`
+- `scripts/run_dyn_disc_real_world_benchmark.sh`
 
 Workflow:
 
@@ -178,14 +178,14 @@ Run:
 
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_real_world_benchmark.sh
+bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_real_world_benchmark.sh
 ```
 
 Simulator benchmark entrance:
 
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/lpb_v2/scripts/run_lpb_v2_benchmark.sh
+bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
 ```
 
 Important env knobs:
@@ -233,7 +233,7 @@ Run:
 
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/lpb_v2/scripts/run_two_bank_real_world_benchmark.sh
+bash robosuite/discriminator/dyn_disc/scripts/run_two_bank_real_world_benchmark.sh
 ```
 
 Important env knobs:
@@ -301,7 +301,7 @@ Run:
 
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/lpb_v2/scripts/run_bce_real_world_benchmark.sh
+bash robosuite/discriminator/dyn_disc/scripts/run_bce_real_world_benchmark.sh
 ```
 
 Important env knobs:
@@ -334,7 +334,7 @@ Each discriminator variant has a paired visualization entry that renders, for a 
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
 TASK=PickPlaceCereal \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_lpb_v2.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_dyn_disc.sh
 ```
 
 Driver: `visualization/visualize.py`.
@@ -344,7 +344,7 @@ Driver: `visualization/visualize.py`.
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
 TASK=PickPlaceCereal NUM_TRAJS=3 \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
 ```
 
 ### BCE visualization (real-world Agilex)
@@ -352,7 +352,7 @@ TASK=PickPlaceCereal NUM_TRAJS=3 \
 ```bash
 MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
 TASK=candy_in_plate NUM_TRAJS=3 \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_realworld.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_realworld.sh
 ```
 
 Both BCE entrances are thin wrappers around `visualization/visualize_bce.py` (single Python module, dispatched by `--kind {robosuite,realworld}`). They mirror the corresponding `run_bce_*_benchmark.sh` for failure-bank construction and BCE head hyperparameters:
@@ -399,7 +399,7 @@ Output layout:
 Diagnostic entry:
 
 ```bash
-bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bash
+bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
 ```
 
 It can:
@@ -413,14 +413,14 @@ To cache features only:
 
 ```bash
 CACHE_FEATURES_ONLY=1 \
-bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bash
+bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
 ```
 
 To re-analyze a previous cache without GPU encoding:
 
 ```bash
 LOAD_CACHE=/path/to/latents.npz \
-bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bash
+bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
 ```
 
 ---
@@ -428,7 +428,7 @@ bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bas
 ## Public Python API
 
 ```python
-from robosuite.discriminator.lpb_v2 import (
+from robosuite.discriminator.dyn_disc import (
     BCEDiscriminator,
     BCEBenchmarkDiscriminator,
     BCEHead,
@@ -447,12 +447,12 @@ Use the benchmark adapters when working with `benchmark.core.BenchmarkTrajectory
 Recommended explicit imports for new code:
 
 ```python
-from robosuite.discriminator.lpb_v2.adapters import (
+from robosuite.discriminator.dyn_disc.adapters import (
     BCEBenchmarkDiscriminator,
     LPBV2BenchmarkDiscriminator,
     TwoBankBenchmarkDiscriminator,
 )
-from robosuite.discriminator.lpb_v2.detectors import (
+from robosuite.discriminator.dyn_disc.detectors import (
     BCEDiscriminator,
     LPBV2Encoder,
     LPBV2KNN,
@@ -468,7 +468,7 @@ BCE unit tests:
 
 ```bash
 /home/dodo/miniconda3/envs/daggar/bin/python -m pytest \
-  robosuite/discriminator/lpb_v2/tests/test_bce_discriminator.py -v
+  robosuite/discriminator/dyn_disc/tests/test_bce_discriminator.py -v
 ```
 
 The tests cover head shape, synthetic separability, deterministic thresholding, scoring output, disjointness checks, class-balance capping, and state-dict roundtrip.

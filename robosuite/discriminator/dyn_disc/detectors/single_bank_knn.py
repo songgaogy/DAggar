@@ -16,7 +16,7 @@ This matches the original LPB reward semantics (lower min_dist = more
 in-distribution = lower failure score) while letting us emit binary preds.
 
 The dynamics model that produces the encoder + proprio_encoder is loaded
-from a checkpoint via `robosuite.discriminator.lpb_v2.core.model_loader.load_model`.
+from a checkpoint via `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from robosuite.discriminator.lpb_v2.core.model_loader import load_model
-from robosuite.discriminator.lpb_v2.utils.normalizer import LinearNormalizer
+from robosuite.discriminator.dyn_disc.core.model_loader import load_model
+from robosuite.discriminator.dyn_disc.utils.normalizer import LinearNormalizer
 
 
 # --------------------------------------------------------------------------- #
@@ -87,13 +87,13 @@ class DetectionResult:
 def _resolve_dataset_class_path(path: str) -> str:
     mapping = {
         "robosuite.discriminator.lpb_original.datasets.HDF5DynamicsModelDataset":
-            "robosuite.discriminator.lpb_v2.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
+            "robosuite.discriminator.dyn_disc.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
         "robosuite.discriminator.lpb_original.datasets.PreprocessedCacheDynamicsModelDataset":
-            "robosuite.discriminator.lpb_v2.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
+            "robosuite.discriminator.dyn_disc.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
         "robosuite.discriminator.lpb_original.datasets.hdf5_dynamics_dataset.HDF5DynamicsModelDataset":
-            "robosuite.discriminator.lpb_v2.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
+            "robosuite.discriminator.dyn_disc.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
         "robosuite.discriminator.lpb_original.datasets.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset":
-            "robosuite.discriminator.lpb_v2.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
+            "robosuite.discriminator.dyn_disc.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
     }
     return mapping.get(str(path), str(path))
 
@@ -260,7 +260,7 @@ class LPBV2Encoder:
                 rebuilt = ds.get_normalizer()
                 normalizer.load_state_dict(rebuilt.state_dict())
                 print(
-                    "[lpb_v2] WARNING: normalizer.pth not found; rebuilt normalizer from dataset config. "
+                    "[dyn_disc] WARNING: normalizer.pth not found; rebuilt normalizer from dataset config. "
                     "For exact reproducibility, re-export `normalizer.pth` next to the checkpoint."
                 )
             except Exception as e:
@@ -287,7 +287,7 @@ class LPBV2Encoder:
         )
 
         if self.use_crop:
-            from robosuite.discriminator.lpb_v2.data.img_transforms import get_eval_crop_transform_resnet
+            from robosuite.discriminator.dyn_disc.data.img_transforms import get_eval_crop_transform_resnet
             self.img_transform = get_eval_crop_transform_resnet(
                 original_img_size=self.original_img_size,
                 cropped_img_size=self.cropped_img_size,

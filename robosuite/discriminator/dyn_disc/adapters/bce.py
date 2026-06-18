@@ -28,11 +28,11 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from robosuite.discriminator.lpb_v2.adapters.single_bank import (
+from robosuite.discriminator.dyn_disc.adapters.single_bank import (
     LPBV2BenchmarkDiscriminator,
     _pad_to_length,
 )
-from robosuite.discriminator.lpb_v2.detectors.bce import (
+from robosuite.discriminator.dyn_disc.detectors.bce import (
     BCEDiscriminator,
     two_class_youden_threshold,
 )
@@ -44,7 +44,7 @@ _VALID_CALIB_MODES = ("success_percentile", "two_class_youden")
 class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
     """BCE failure detector (GT-labeled prefix/suffix split) over the benchmark API."""
 
-    name = "lpb_v2_bce"
+    name = "dyn_disc_bce"
 
     def __init__(
         self,

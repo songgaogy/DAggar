@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Training entry for the LPB v2 dynamics model on user's data.
 # Run from repo root:
-#   TASK=PickPlaceCan bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_dynamics.sh
+#   TASK=PickPlaceCan bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
 #
 # Required overrides (Hydra):
 #   env.train_data_path  -> built from TASK + rollout roots
@@ -55,7 +55,7 @@ BATCH_SIZE="${BATCH_SIZE:-256}"
 FRAMESKIP="${FRAMESKIP:-1}"
 RUN_NAME="${RUN_NAME:-train}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-RUN_DIR="./checkpoints/lpb_v2/dynamics/${RUN_NAME}-${TIMESTAMP}"
+RUN_DIR="./checkpoints/dyn_disc/dynamics/${RUN_NAME}-${TIMESTAMP}"
 
 
 EXTRA_OVERRIDES=()
@@ -101,7 +101,7 @@ fi
 
 EXTRA_OVERRIDES+=("$@")
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.training.train \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.training.train \
     env=preprocessed \
     env.view_names="${VIEW_NAMES}" \
     env.action_dim="${ACTION_DIM}" \

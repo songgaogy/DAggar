@@ -1,16 +1,16 @@
 """Single-GPU Hydra training entry for the cleaned LPB v2 dynamics model.
 
 This is a stripped-down rewrite of `dyn_model/train.py` that:
-  * reads HDF5 / preprocessed data via robosuite.discriminator.lpb_v2.data
+  * reads HDF5 / preprocessed data via robosuite.discriminator.dyn_disc.data
   * skips Accelerate (single GPU torch loop), keeping the dependency surface small
   * keeps the original LPB model architecture (ResNetEncoder + hydra-instantiated
     proprio/action encoders + ViT predictor + VisualDynamicsModel), so checkpoints
-    are loadable by `robosuite.discriminator.lpb_v2.core.model_loader.load_model`.
+    are loadable by `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
   * saves <run_dir>/{checkpoints/model_<epoch>.pth, hydra.yaml, normalizer.pth}
     in the layout the discriminator expects.
 
 Run from repo root:
-    bash robosuite/discriminator/lpb_v2/scripts/train_lpb_v2_dynamics.sh
+    bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
-from robosuite.discriminator.lpb_v2.core.model_loader import instantiate_local
-from robosuite.discriminator.lpb_v2.models.resnet_encoder import ResNetEncoder
+from robosuite.discriminator.dyn_disc.core.model_loader import instantiate_local
+from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -103,7 +103,7 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
     """Replicates the original LPB model construction with local v2 modules."""
     if cfg.policy_ckpt_path not in (None, "", "null", "None"):
         raise ValueError(
-            "lpb_v2 does not support diffusion-policy policy_ckpt_path. "
+            "dyn_disc does not support diffusion-policy policy_ckpt_path. "
             "Set env.policy_ckpt_path=null or use lpb_original."
         )
     # `ResNetEncoder` already loads torchvision ImageNet ResNet18 weights internally.
@@ -254,7 +254,7 @@ def main(cfg: DictConfig) -> None:
             val_alias = train_alias
         cfg.val_data_path = val_alias
 
-        # Save the actual proprio/action input dims so `lpb_v2.core.model_loader.load_model`
+        # Save the actual proprio/action input dims so `dyn_disc.core.model_loader.load_model`
         # can reconstruct the encoders deterministically.
         cfg.prior_in_chans = int(train_ds.proprio_dim)
         cfg.action_dim_per_step = int(cfg.env.action_dim)

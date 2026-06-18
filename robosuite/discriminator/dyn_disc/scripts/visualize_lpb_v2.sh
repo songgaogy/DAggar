@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # LPB v2 KNN failure-detector visualization entry point.
 # Run from repo root:
-#   bash robosuite/discriminator/lpb_v2/scripts/visualize_lpb_v2.sh
+#   bash robosuite/discriminator/dyn_disc/scripts/visualize_dyn_disc.sh
 # Override via env vars, e.g.:
 #   TASK=PickPlaceCan NUM_TRAJS=3 DELTA=5.0 \
-#     bash robosuite/discriminator/lpb_v2/scripts/visualize_lpb_v2.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/visualize_dyn_disc.sh
 #
 # Required: MODEL_CKPT must point to a trained LPB v2 dynamics checkpoint .pth.
 
@@ -30,17 +30,17 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 
 RUN_NAME="${RUN_NAME:-viz_${TASK}}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/viz/${RUN_NAME}-${TIMESTAMP}}"
-PDF_NAME="${PDF_NAME:-lpb_v2_scores.pdf}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/viz/${RUN_NAME}-${TIMESTAMP}}"
+PDF_NAME="${PDF_NAME:-dyn_disc_scores.pdf}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/train-20260427_014122/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/train-20260427_014122/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
-    echo "[lpb_v2][viz] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
+    echo "[dyn_disc][viz] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     echo "               Set MODEL_CKPT=/abs/path/to/checkpoints/model_<epoch>.pth." >&2
     exit 1
 fi
@@ -71,7 +71,7 @@ if [[ "${NO_DEBUG_SCORE_STATS:-0}" == "1" ]]; then
 fi
 if [[ "${THRESHOLD_SOURCE}" == "fixed" ]]; then
     if [[ -z "${FIXED_THRESHOLD:-}" ]]; then
-        echo "[lpb_v2][viz] ERROR: THRESHOLD_SOURCE=fixed requires FIXED_THRESHOLD." >&2
+        echo "[dyn_disc][viz] ERROR: THRESHOLD_SOURCE=fixed requires FIXED_THRESHOLD." >&2
         exit 1
     fi
     EXTRA_ARGS+=(--fixed-threshold "${FIXED_THRESHOLD}")
@@ -93,7 +93,7 @@ if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${ME
     fi
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualization.visualize \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.visualization.visualize \
     --model-ckpt         "${MODEL_CKPT}" \
     --fail-root          "${FAIL_ROOT}" \
     --success-root       "${SUCCESS_ROOT}" \
@@ -117,4 +117,4 @@ fi
     "${EXTRA_ARGS[@]}" \
     "$@"
 
-echo "[lpb_v2][viz] wrote to ${OUT_DIR}"
+echo "[dyn_disc][viz] wrote to ${OUT_DIR}"

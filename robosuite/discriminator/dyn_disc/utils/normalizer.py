@@ -3,8 +3,8 @@ from typing import Dict, Union
 import numpy as np
 import torch
 import torch.nn as nn
-from robosuite.discriminator.lpb_v2.utils.dict_of_tensor_mixin import DictOfTensorMixin
-from robosuite.discriminator.lpb_v2.utils.tensor_utils import dict_apply
+from robosuite.discriminator.dyn_disc.utils.dict_of_tensor_mixin import DictOfTensorMixin
+from robosuite.discriminator.dyn_disc.utils.tensor_utils import dict_apply
 
 try:
     import zarr

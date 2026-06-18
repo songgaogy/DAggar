@@ -1,17 +1,17 @@
 """Failure-detector visualization for the LPB v2 KNN discriminator.
 
 Usage (from repo root):
-    python -m robosuite.discriminator.lpb_v2.visualization.visualize \
-        --model-ckpt /abs/path/checkpoints/lpb_v2/dynamics/<run>/checkpoints/model_49.pth \
+    python -m robosuite.discriminator.dyn_disc.visualization.visualize \
+        --model-ckpt /abs/path/checkpoints/dyn_disc/dynamics/<run>/checkpoints/model_49.pth \
         --fail-root /abs/path/data/utils/fail_rollout \
         --success-root /abs/path/data/utils/success_rollout \
         --task PickPlaceBread \
         --num-trajs 4 \
-        --out-dir /tmp/lpb_v2_viz
+        --out-dir /tmp/dyn_disc_viz
 
 Outputs:
     <out_dir>/videos/<video_id>.mp4
-    <out_dir>/lpb_v2_scores.pdf
+    <out_dir>/dyn_disc_scores.pdf
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 from benchmark.core import BenchmarkTrajectory
 from benchmark.robosuite import FailureBenchmark
 
-from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 def _percentile_summary(values: np.ndarray) -> str:
@@ -164,7 +164,7 @@ def _compute_success_percentile_thresholds(
             continue
         thresholds[task] = float(np.percentile(pooled, float(percentile)))
         print(
-            f"[lpb_v2][viz][debug] success scores task={task}: "
+            f"[dyn_disc][viz][debug] success scores task={task}: "
             f"{_percentile_summary(pooled)}  p{float(percentile):.1f}={thresholds[task]:.4f}",
             flush=True,
         )
@@ -185,7 +185,7 @@ def _load_benchmark_traj_best_f1_thresholds(path: str) -> dict[str, float]:
     if not thresholds:
         raise ValueError(f"No best_f1_threshold found in benchmark JSON: {path}")
     print(
-        f"[lpb_v2][viz][debug] loaded benchmark trajectory best-F1 thresholds: {thresholds}",
+        f"[dyn_disc][viz][debug] loaded benchmark trajectory best-F1 thresholds: {thresholds}",
         flush=True,
     )
     return thresholds
@@ -498,7 +498,7 @@ class LPBV2Visualizer:
         fail_trajectories: list[BenchmarkTrajectory],
         *,
         out_dir: str,
-        pdf_name: str = "lpb_v2_scores.pdf",
+        pdf_name: str = "dyn_disc_scores.pdf",
     ) -> dict:
         if not fail_trajectories:
             raise RuntimeError("No failure trajectories provided for visualization.")
@@ -514,22 +514,22 @@ class LPBV2Visualizer:
             video_path = os.path.join(videos_dir, f"{safe_id}.mp4")
             self.render_video(traj, viz, video_path)
             print(
-                f"[lpb_v2][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
+                f"[dyn_disc][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
                 f"pred_frames={int(viz.predictions.sum())}  -> {video_path}",
                 flush=True,
             )
             if self.debug_score_stats:
-                print(f"[lpb_v2][viz][debug] {traj.task_name}/{traj.video_id} score_all: {_percentile_summary(viz.step_scores)}", flush=True)
+                print(f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_all: {_percentile_summary(viz.step_scores)}", flush=True)
                 if viz.gt_mask is not None:
                     normal_scores = viz.step_scores[viz.gt_mask == 0]
                     failure_scores = viz.step_scores[viz.gt_mask == 1]
                     print(
-                        f"[lpb_v2][viz][debug] {traj.task_name}/{traj.video_id} score_normal_gt0: "
+                        f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_normal_gt0: "
                         f"{_percentile_summary(normal_scores)}",
                         flush=True,
                     )
                     print(
-                        f"[lpb_v2][viz][debug] {traj.task_name}/{traj.video_id} score_failure_gt1: "
+                        f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_failure_gt1: "
                         f"{_percentile_summary(failure_scores)}",
                         flush=True,
                     )
@@ -538,7 +538,7 @@ class LPBV2Visualizer:
 
         pdf_path = os.path.join(out_dir, pdf_name)
         self.render_pdf(vizs, pdf_path)
-        print(f"[lpb_v2][viz] wrote PDF -> {pdf_path}", flush=True)
+        print(f"[dyn_disc][viz] wrote PDF -> {pdf_path}", flush=True)
 
         return {"videos": video_paths, "pdf": pdf_path}
 
@@ -559,7 +559,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--task", required=True, help="Single task name, e.g. PickPlaceBread")
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--pdf-name", type=str, default="lpb_v2_scores.pdf")
+    parser.add_argument("--pdf-name", type=str, default="dyn_disc_scores.pdf")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--border-thickness", type=int, default=10)
@@ -630,7 +630,7 @@ def main() -> None:
     rng = random.Random(int(args.seed))
     n = min(int(args.num_trajs), len(fail_trajs))
     sampled = rng.sample(fail_trajs, n)
-    print(f"[lpb_v2][viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}", flush=True)
+    print(f"[dyn_disc][viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}", flush=True)
 
     discriminator = LPBV2BenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
@@ -650,7 +650,7 @@ def main() -> None:
         discriminator.fit_on_benchmark(trajs)
         for task, detector in sorted(discriminator._detectors_per_task.items()):
             tau = float(detector.threshold) if detector.threshold is not None else float("nan")
-            print(f"[lpb_v2][viz][debug] detector threshold task={task}: tau={tau:.4f}", flush=True)
+            print(f"[dyn_disc][viz][debug] detector threshold task={task}: tau={tau:.4f}", flush=True)
         threshold_overrides = None
         threshold_source = str(args.threshold_source)
         if threshold_source == "success_percentile":
@@ -684,7 +684,7 @@ def main() -> None:
             pdf_name=str(args.pdf_name),
         )
         print(
-            f"[lpb_v2][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",
+            f"[dyn_disc][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",
             flush=True,
         )
     finally:

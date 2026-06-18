@@ -57,12 +57,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 from benchmark.core import BenchmarkTrajectory
 
-from robosuite.discriminator.lpb_v2.adapters.bce import BCEBenchmarkDiscriminator
-from robosuite.discriminator.lpb_v2.detectors.bce import (
+from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.detectors.bce import (
     BCEDiscriminator,
     two_class_youden_threshold,
 )
-from robosuite.discriminator.lpb_v2.visualization.visualize import (
+from robosuite.discriminator.dyn_disc.visualization.visualize import (
     _draw_border,
     _load_font,
     _pad_to_even,

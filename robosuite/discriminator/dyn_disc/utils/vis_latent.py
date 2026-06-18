@@ -4,12 +4,12 @@ This script only encodes trajectories into latent features.
 It does NOT run KNN fitting or threshold calibration.
 
 Example:
-    python -m robosuite.discriminator.lpb_v2.utils.vis_latent \
-        --model-ckpt checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
+    python -m robosuite.discriminator.dyn_disc.utils.vis_latent \
+        --model-ckpt checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
         --fail-root data/agilex/failure_annotations/out_by_task \
         --success-root data/agilex \
         --tasks candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot \
-        --benchmark-json checkpoints/lpb_v2/real_world_eval/run_20260429_103014/benchmark.json
+        --benchmark-json checkpoints/dyn_disc/real_world_eval/run_20260429_103014/benchmark.json
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 
 from benchmark.core import BenchmarkTrajectory
 from benchmark.real_world import FailureBenchmark
-from robosuite.discriminator.lpb_v2.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
 PHASE_SUCCESS = "success"
@@ -198,7 +198,7 @@ def _collect_latents(
             }
         )
         print(
-            f"[lpb_v2][latent] encoded {traj_idx + 1}/{len(trajectories)} "
+            f"[dyn_disc][latent] encoded {traj_idx + 1}/{len(trajectories)} "
             f"{traj.describe()} -> {tuple(feat.shape)}",
             flush=True,
         )
@@ -313,7 +313,7 @@ def _plot_embedding(
             if img.mode != "RGB":
                 img.convert("RGB").save(out_path)
     except Exception as exc:
-        print(f"[lpb_v2][latent] warning: could not convert {out_path} to RGB PNG: {exc}", flush=True)
+        print(f"[dyn_disc][latent] warning: could not convert {out_path} to RGB PNG: {exc}", flush=True)
 
 
 def main() -> None:
@@ -340,7 +340,7 @@ def main() -> None:
     n_fail = sum(1 for traj in trajs if bool(traj.is_failure))
     n_succ = len(trajs) - n_fail
     print(
-        f"[lpb_v2][latent] discovered {len(trajs)} trajectories "
+        f"[dyn_disc][latent] discovered {len(trajs)} trajectories "
         f"(failure={n_fail}, success={n_succ}) tasks={sorted({str(t.task_name) for t in trajs})}",
         flush=True,
     )
@@ -355,7 +355,7 @@ def main() -> None:
         transformer_layer=int(args.knn_transformer_layer),
     )
     try:
-        print("[lpb_v2][latent] encoding trajectories without KNN fitting...", flush=True)
+        print("[dyn_disc][latent] encoding trajectories without KNN fitting...", flush=True)
         features, labels, traj_meta = _collect_latents(discriminator, trajs)
     finally:
         discriminator.close()
@@ -429,10 +429,10 @@ def main() -> None:
     with open(meta_path, "w") as fp:
         json.dump(summary, fp, indent=2)
 
-    print(f"[lpb_v2][latent] wrote {pca_path}", flush=True)
-    print(f"[lpb_v2][latent] wrote {tsne_path}", flush=True)
-    print(f"[lpb_v2][latent] wrote {npz_path}", flush=True)
-    print(f"[lpb_v2][latent] wrote {meta_path}", flush=True)
+    print(f"[dyn_disc][latent] wrote {pca_path}", flush=True)
+    print(f"[dyn_disc][latent] wrote {tsne_path}", flush=True)
+    print(f"[dyn_disc][latent] wrote {npz_path}", flush=True)
+    print(f"[dyn_disc][latent] wrote {meta_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -4,12 +4,12 @@
 # AUROC on the WAM transformer-layer-1 latent.
 #
 # Typical usage:
-#   MODEL_CKPT=checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
-#     bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bash
+#   MODEL_CKPT=checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
+#     bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
 #
 # To re-analyze a previously cached latents.npz without re-encoding:
 #   LOAD_CACHE=/path/to/latents.npz \
-#     bash robosuite/discriminator/lpb_v2/explore/run_diagnose_latent_separability.bash
+#     bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
 
 set -euo pipefail
 
@@ -23,17 +23,17 @@ SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/agilex}"
 CACHE_ROOT="${CACHE_ROOT:-${REPO_ROOT}/data/.agilex_train_cache}"
 TASKS="${TASKS:-candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
 LOAD_CACHE="${LOAD_CACHE:-}"
 CACHE_FEATURES_ONLY="${CACHE_FEATURES_ONLY:-0}"
 
 if [[ -z "${LOAD_CACHE}" && ! -f "${MODEL_CKPT}" ]]; then
-    echo "[lpb_v2][sep] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
+    echo "[dyn_disc][sep] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
 fi
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/checkpoints/lpb_v2/latent_separability}"
+OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/checkpoints/dyn_disc/latent_separability}"
 OUT_DIR="${OUT_DIR:-${OUT_ROOT}/${RUN_NAME}}"
 mkdir -p "${OUT_DIR}"
 
@@ -98,7 +98,7 @@ if [[ "${CACHE_FEATURES_ONLY}" == "1" ]]; then
     EXTRA_ARGS+=(--cache-features-only)
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.explore.diagnose_latent_separability \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.explore.diagnose_latent_separability \
     --out-dir                        "${OUT_DIR}" \
     --feature-source                 "${FEATURE_SOURCE}" \
     --transformer-layer              "${TRANSFORMER_LAYER}" \
@@ -111,4 +111,4 @@ fi
     "${EXTRA_ARGS[@]}" \
     "$@"
 
-echo "[lpb_v2][sep] wrote outputs to ${OUT_DIR}"
+echo "[dyn_disc][sep] wrote outputs to ${OUT_DIR}"

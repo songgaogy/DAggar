@@ -9,7 +9,7 @@ defaults:
 
 hydra:
   run:
-    dir: ./checkpoints/lpb_v2/dynamics/${run_name}-${now:%Y%m%d_%H%M%S}
+    dir: ./checkpoints/dyn_disc/dynamics/${run_name}-${now:%Y%m%d_%H%M%S}
   job:
     chdir: true
 
@@ -58,7 +58,7 @@ proprio_indices: null
 max_trajectories: null
 
 model:
-  _target_: robosuite.discriminator.lpb_v2.models.visual_dynamics.VisualDynamicsModel
+  _target_: robosuite.discriminator.dyn_disc.models.visual_dynamics.VisualDynamicsModel
   image_size: ${img_size}
   num_hist: ${num_hist}
   num_pred: ${num_pred}

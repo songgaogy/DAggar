@@ -1,12 +1,12 @@
 # LPB v2 Per-Trajectory Visualization
 
-Context and design notes for the discriminator visualization tools under `lpb_v2/visualization/`. The lpb_v2 top-level `../README.md` documents user-facing invocation; this file captures the design rationale, interfaces, and caveats so future edits can stay coherent.
+Context and design notes for the discriminator visualization tools under `dyn_disc/visualization/`. The dyn_disc top-level `../README.md` documents user-facing invocation; this file captures the design rationale, interfaces, and caveats so future edits can stay coherent.
 
 ## What lives here
 
 | File | Purpose |
 | --- | --- |
-| `visualize.py` | Single-bank KNN discriminator visualization (`LPBV2Visualizer`). Original; driven by `scripts/visualize_lpb_v2.sh`. |
+| `visualize.py` | Single-bank KNN discriminator visualization (`LPBV2Visualizer`). Original; driven by `scripts/visualize_dyn_disc.sh`. |
 | `visualize_bce.py` | BCE discriminator visualization (`BCEVisualizer`). Single Python entry, dispatched by `--kind {robosuite,realworld}`. Driven by `scripts/visualize_bce_robosuite.sh` and `scripts/visualize_bce_realworld.sh`. |
 
 Both modules produce the same artifact shapes per run:
@@ -98,23 +98,23 @@ Cold fit + viz, then warm reload of the produced ckpt:
 
 ```bash
 # 1. Cold robosuite run
-MODEL_CKPT=checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth \
+MODEL_CKPT=checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth \
 TASK=PickPlaceCereal NUM_TRAJS=3 \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
 
 # 2. Warm reload (skip training)
 MODEL_CKPT=... \
 LOAD_CKPT=<OUT_DIR_FROM_STEP_1>/checkpoints/bce_head.pth \
 TASK=PickPlaceBread NUM_TRAJS=2 \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_robosuite.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
 
 # 3. Cold real-world run
-MODEL_CKPT=checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
+MODEL_CKPT=checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth \
 TASK=candy_in_plate NUM_TRAJS=3 \
-  bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_realworld.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_realworld.sh
 
 # 4. Regression: original KNN visualizer still works
-bash robosuite/discriminator/lpb_v2/scripts/visualize_lpb_v2.sh
+bash robosuite/discriminator/dyn_disc/scripts/visualize_dyn_disc.sh
 ```
 
 Sanity checks per run:

@@ -17,7 +17,7 @@ from benchmark.core import EvalConfig
 from benchmark.real_world import FailureBenchmark
 from benchmark.real_world.loader import discover_agilex_trajectories
 from benchmark.real_world.trajectory import AgilexBenchmarkTrajectory
-from robosuite.discriminator.lpb_v2.adapters.bce import BCEBenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:

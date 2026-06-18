@@ -5,7 +5,7 @@
 #
 # Required env:
 #   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
-#     bash robosuite/discriminator/lpb_v2/scripts/run_bce_real_world_benchmark.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/run_bce_real_world_benchmark.sh
 
 set -euo pipefail
 
@@ -24,14 +24,14 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"
 # --------------------------------------------------------
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_eval_realworld/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/bce_eval_realworld/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[real_world][bce] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
@@ -101,7 +101,7 @@ if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.real_world_bce \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.real_world_bce \
     --model-ckpt           "${MODEL_CKPT}" \
     --fail-root            "${FAIL_ROOT}" \
     --success-root         "${SUCCESS_ROOT}" \

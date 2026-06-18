@@ -6,7 +6,7 @@
 #
 # Required env:
 #   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
-#     bash robosuite/discriminator/lpb_v2/scripts/visualize_bce_realworld.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_realworld.sh
 #
 # Optional env (commonly overridden):
 #   TASK, NUM_TRAJS, CAMERA_NAME, CAMERA_TO_VIEW, LOAD_CKPT (skip fit),
@@ -38,7 +38,7 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"
 
 RUN_NAME="${RUN_NAME:-viz_bce_${TASK}}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_viz_realworld/${RUN_NAME}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/bce_viz_realworld/${RUN_NAME}-${TIMESTAMP}}"
 PDF_NAME="${PDF_NAME:-bce_v2_scores.pdf}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
@@ -46,7 +46,7 @@ mkdir -p "${MPLCONFIGDIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/agilex_train-20260429_003751/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[bce][viz][realworld] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     echo "                 Set MODEL_CKPT=/abs/path/to/checkpoints/model_<epoch>.pth." >&2
@@ -119,7 +119,7 @@ fi
 
 SPLIT="${SPLIT:-fail_rollout}"
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.visualization.visualize_bce \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.visualization.visualize_bce \
     --kind                  realworld \
     --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \

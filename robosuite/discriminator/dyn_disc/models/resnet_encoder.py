@@ -18,7 +18,7 @@ class ResNetEncoder(torch.nn.Module):
 
         if self.policy_ckpt_path:
             raise ValueError(
-                "lpb_v2 does not support diffusion-policy policy_ckpt_path. "
+                "dyn_disc does not support diffusion-policy policy_ckpt_path. "
                 "Set policy_ckpt_path/env.policy_ckpt_path to null, or use lpb_original."
             )
 

@@ -5,7 +5,7 @@
 #
 # Required env:
 #   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
-#     bash robosuite/discriminator/lpb_v2/scripts/run_bce_robosuite_benchmark.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/run_bce_robosuite_benchmark.sh
 #
 # Layout assumptions (override via env vars):
 #   FAIL_ROOT        = data/utils/fail_rollout            (benchmark eval failures)
@@ -36,14 +36,14 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"
 # --------------------------------------------------------
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb_v2/bce_eval_robosuite/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/bce_eval_robosuite/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
 
-MODEL_CKPT="${MODEL_CKPT:-checkpoints/lpb_v2/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[robosuite][bce] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
@@ -111,7 +111,7 @@ if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${ME
     fi
 fi
 
-"${PYTHON_BIN}" -m robosuite.discriminator.lpb_v2.robosuite_bce \
+"${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.robosuite_bce \
     --model-ckpt           "${MODEL_CKPT}" \
     --fail-root            "${FAIL_ROOT}" \
     --success-root         "${SUCCESS_ROOT}" \

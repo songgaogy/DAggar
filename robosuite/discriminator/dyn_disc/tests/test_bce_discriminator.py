@@ -1,7 +1,7 @@
 """Unit tests for the BCE-WAM discriminator (GT split, BCE loss).
 
 Run with:
-    python -m pytest robosuite/discriminator/lpb_v2/tests/test_bce_discriminator.py -v
+    python -m pytest robosuite/discriminator/dyn_disc/tests/test_bce_discriminator.py -v
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from robosuite.discriminator.lpb_v2.detectors.bce import (
+from robosuite.discriminator.dyn_disc.detectors.bce import (
     BCEDiscriminator,
     BCEHead,
 )
@@ -172,7 +172,7 @@ def test_bce_score_emits_detection_result() -> None:
 def test_assert_disjoint_raises_on_overlap() -> None:
     """The disjointness static method must raise when video_ids overlap."""
     # Import here to avoid forcing benchmark/torchvision setup for the pure-head tests.
-    from robosuite.discriminator.lpb_v2.adapters.bce import BCEBenchmarkDiscriminator
+    from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
 
     eval_trajs = [_StubTraj(video_id="v1"), _StubTraj(video_id="v2")]
     bank_trajs = [_StubTraj(video_id="v3"), _StubTraj(video_id="v1")]  # v1 overlap!
