@@ -283,7 +283,7 @@ Keep existing `lpb/visualize.py` untouched.
 # D³-Disc benchmark driver; mirrors lpb_knn benchmark script layout.
 set -euo pipefail
 
-PYTHON=/home/dodo/miniconda3/envs/daggar/bin/python
+PYTHON=/home/dodo/miniconda3/envs/dagger/bin/python
 POLICY_CKPT=${POLICY_CKPT:-checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}
 CACHE_ROOT=${CACHE_ROOT:-data/.lpb_score_cache}
 FAIL_ROOT=${FAIL_ROOT:-data}       # <task>/fail_rollout/*.hdf5 pattern

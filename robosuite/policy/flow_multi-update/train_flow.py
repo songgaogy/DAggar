@@ -1,6 +1,11 @@
 import datetime
 import os
+import sys
 import time
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 
 import hydra
 import numpy as np
@@ -11,8 +16,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
-from robosuite.policy.flow_multi.utils.datasets import RobosuiteMultiViewFlowDataset
-from robosuite.policy.flow_multi.model import build_flow_policy
+from utils.datasets import RobosuiteMultiViewFlowDataset
+from utils.save_pretrain_data import save_pretrain_demos
+from model import build_flow_policy
 
 
 def _cfg_get(cfg, key: str, default=None):
@@ -233,17 +239,29 @@ def main(cfg: DictConfig):
 
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     save_dir = to_absolute_path(cfg.checkpoint.save_dir)
-    data_dir_cfg = _cfg_get(cfg.data, "data_dir", None)
-    data_dir = None if data_dir_cfg in (None, "null") else to_absolute_path(str(data_dir_cfg))
-    data_dirs_cfg = _cfg_get(cfg.data, "data_dirs", None)
-    data_dirs = None if data_dirs_cfg is None else [to_absolute_path(str(path)) for path in data_dirs_cfg]
-    num_traj_cfg = _cfg_get(cfg.data, "num_traj", None)
-    if num_traj_cfg in (None, "null"):
-        num_traj_cfg = _cfg_get(cfg.data, "num_train_traj", None)
     os.makedirs(save_dir, exist_ok=True)
 
+    # Build per-task data dirs from data_root/<task>/<data_splits>.
+    data_root_cfg = _cfg_get(cfg.data, "data_root", None)
+    data_splits = _cfg_get(cfg.data, "data_splits", None)
+    tasks_cfg = _cfg_get(cfg.data, "tasks", None)
+    if data_root_cfg in (None, "null") or tasks_cfg is None or data_splits in (None, "null"):
+        raise ValueError("cfg.data.data_root, cfg.data.tasks and cfg.data.data_splits must be set")
+    tasks = [str(task) for task in tasks_cfg]
+    data_root = to_absolute_path(str(data_root_cfg))
+    data_dirs = [os.path.join(data_root, task, str(data_splits)) for task in tasks]
+
+    # Per-dir number of training trajectories, keyed by the resolved data dir.
+    num_train_traj_cfg = _cfg_get(cfg.data, "num_train_traj", None)
+    num_train_traj = {}
+    for task, ddir in zip(tasks, data_dirs):
+        count = _cfg_get(num_train_traj_cfg, task, None) if num_train_traj_cfg is not None else None
+        if count not in (None, "null"):
+            num_train_traj[ddir] = int(count)
+    if len(num_train_traj) == 0:
+        num_train_traj = None
+
     dataset = RobosuiteMultiViewFlowDataset(
-        data_dir=data_dir if data_dirs is None else None,
         data_dirs=data_dirs,
         camera_names=list(cfg.data.camera_names),
         action_horizon=int(cfg.data.action_horizon),
@@ -251,14 +269,25 @@ def main(cfg: DictConfig):
         stride=int(cfg.data.stride),
         normalize=bool(cfg.data.normalize),
         max_demos_per_file=cfg.data.max_demos_per_file,
-        num_train_traj=num_traj_cfg,
+        num_train_traj=num_train_traj,
+        seed=int(cfg.seed),
         cache_proprio=bool(cfg.data.cache_proprio),
         use_demo_cache=bool(cfg.data.use_demo_cache),
         max_cached_demos_per_worker=int(cfg.data.max_cached_demos_per_worker),
         preload_all_demos_to_ram=bool(cfg.data.preload_all_demos_to_ram),
         use_disk_cache=bool(cfg.data.use_disk_cache),
-        task_prompt_map=_cfg_get(cfg.data, "task_prompt_map", None),
     )
+
+    if bool(_cfg_get(cfg.data, "save_pretrain_data", False)):
+        save_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_pretrain_demos(
+            demo_meta=dataset.selected_demos,
+            camera_names=list(cfg.data.camera_names),
+            seed=int(cfg.seed),
+            action_horizon=int(cfg.data.action_horizon),
+            stride=int(cfg.data.stride),
+            timestamp=save_timestamp,
+        )
 
     batch_sampler = DemoBatchSampler(
         dataset=dataset,

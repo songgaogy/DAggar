@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 TASKS="${TASKS:-candy_in_plate duck_in_bowl Micky_in_box sausage_in_pot}"
 CACHE_ROOT="${CACHE_ROOT:-data/.agilex_train_cache}"

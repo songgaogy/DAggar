@@ -60,7 +60,7 @@ dyn_disc/
 In this workspace the expected Python environment is:
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python
+/home/dodo/miniconda3/envs/dagger/bin/python
 ```
 
 Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through WandB, use:
@@ -467,7 +467,7 @@ from robosuite.discriminator.dyn_disc.detectors import (
 BCE unit tests:
 
 ```bash
-/home/dodo/miniconda3/envs/daggar/bin/python -m pytest \
+/home/dodo/miniconda3/envs/dagger/bin/python -m pytest \
   robosuite/discriminator/dyn_disc/tests/test_bce_discriminator.py -v
 ```
 

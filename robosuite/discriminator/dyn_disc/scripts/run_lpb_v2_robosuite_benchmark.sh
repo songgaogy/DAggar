@@ -34,7 +34,7 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/eval/wam-layers/${RUN_NAME
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 mkdir -p "${OUT_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # You can override this via env var:
 #   MODEL_CKPT=/abs/path/checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_49.pth bash ...

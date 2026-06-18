@@ -27,7 +27,7 @@ OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/lpb/eval/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 mkdir -p "${OUT_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/daggar/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # Required checkpoint.
 LPB_CKPT="${LPB_CKPT:-${REPO_ROOT}/checkpoints/lpb/dynamics/dynamics_model.pt}"
