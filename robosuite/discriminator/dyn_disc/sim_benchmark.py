@@ -1,7 +1,7 @@
-"""Run the LPB v2 KNN discriminator through the shared benchmark API.
+"""Run the single-bank KNN discriminator through the robosuite benchmark API.
 
-Mirrors data/utils/benchmark/examples/run_lpb_original.py but uses the cleaned
-LPB v2 module under robosuite.discriminator.dyn_disc.
+Uses the current robosuite benchmark (``robosuite.discriminator.utils.robosuite_benchmark``,
+``data/<task>/<split>`` layout) under robosuite.discriminator.dyn_disc.
 
 Example:
     python -m robosuite.discriminator.dyn_disc.sim_benchmark \
