@@ -24,7 +24,7 @@ from robosuite.pipeline.train_flow_dagger import (
     load_init_checkpoint_payload,
     resolve_flow_task_metadata,
 )
-from robosuite.pipeline.utils import resolve_requested_device
+from robosuite.pipeline.utils import EnvRandomReducer, resolve_requested_device
 DEFAULT_OUTPUT_ROOT = "./outputs/flow-DAgger/eval"
 DEFAULT_VIDEO_CAMERA = "agentview"
 DEFAULT_VIDEO_FPS = 20
@@ -45,7 +45,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame height.")
     parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame width.")
     parser.add_argument("--interactive", action="store_true", help="Open the robosuite viewer during eval.")
-    parser.add_argument("--deterministic", action="store_true", help="Use deterministic action sampling.")
+    parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic episode layouts.")
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
+        "--deterministic",
+        dest="deterministic",
+        action="store_true",
+        default=True,
+        help="Use deterministic action sampling (default).",
+    )
+    action_group.add_argument(
+        "--stochastic",
+        dest="deterministic",
+        action="store_false",
+        help="Use stochastic action sampling.",
+    )
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
     parser.add_argument(
         "--execute-horizon",
@@ -270,6 +284,7 @@ def main() -> None:
         renderer=str(resolved_cfg.env.renderer),
     )
     env = build_robosuite_env(runtime_cfg)
+    env_random_reducer = EnvRandomReducer(int(args.seed))
     proprio_extractor = bind_flow_proprio_extractor(env, env_metadata)
     eval_device = _resolve_eval_device(checkpoint_payload)
     policy = _build_policy(
@@ -292,6 +307,7 @@ def main() -> None:
     try:
         progress = tqdm(range(int(args.episodes)), desc=f"Eval {args.task_name}", dynamic_ncols=True)
         for episode_idx in progress:
+            episode_seed = env_random_reducer.prepare_episode(env, int(episode_idx))
             raw_obs, _ = _reset_env(env)
             obs = convert_env_camera_observation(
                 raw_obs,
@@ -358,6 +374,7 @@ def main() -> None:
             success_count += int(episode_success)
             episode_result = {
                 "episode_index": int(episode_idx),
+                "episode_seed": int(episode_seed) if episode_seed is not None else None,
                 "return": float(episode_return),
                 "steps": int(episode_steps),
                 "success": bool(episode_success),
@@ -386,6 +403,9 @@ def main() -> None:
             "task_name": str(args.task_name),
             "episodes": int(args.episodes),
             "episode_max_steps": int(args.episode_max_steps),
+            "seed": int(args.seed),
+            "env_reset_seed_rule": "base_seed+episode_index",
+            "deterministic": bool(args.deterministic),
             "video_output": bool(video_output),
             "video_camera": str(args.video_camera),
             "video_fps": int(args.video_fps),

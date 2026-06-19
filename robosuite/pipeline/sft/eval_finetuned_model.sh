@@ -14,6 +14,8 @@ MAX_STEPS="${MAX_STEPS:-500}"
 DEVICE="${DEVICE:-cuda:0}"
 N_ODE_STEPS="${N_ODE_STEPS:-10}"
 EXECUTE_HORIZON="${EXECUTE_HORIZON:-8}"
+SEED="${SEED:-42}"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-true}"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export CUDA_VISIBLE_DEVICES=0
@@ -24,10 +26,15 @@ PY_ARGS=(
   --episodes "${EPISODES}"
   --max-steps "${MAX_STEPS}"
   --device "${DEVICE}"
+  --seed "${SEED}"
   --execute-horizon "${EXECUTE_HORIZON}"
   --n-ode-steps "${N_ODE_STEPS}"
   --postfix "${SFT_STEPS}"
 )
+
+if [[ "${EVAL_DETERMINISTIC}" != "true" ]]; then
+  PY_ARGS+=(--stochastic)
+fi
 
 if [[ "${VIDEO_OUTPUT}" == "true" ]]; then
   PY_ARGS+=(--save-video)

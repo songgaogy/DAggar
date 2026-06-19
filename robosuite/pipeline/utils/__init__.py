@@ -10,6 +10,7 @@ from .io import (
     save_transition_shard,
     serialize_transition,
 )
+from .determinism import EnvRandomReducer
 from .replay_buffer import HILSERLReplayBuffer
 from .train_utils import (
     AsyncCheckpointWriter,
@@ -49,6 +50,7 @@ from .train_utils import (
 __all__ = [
     "deserialize_transition",
     "ensure_directory",
+    "EnvRandomReducer",
     "HILSERLReplayBuffer",
     "list_hdf5_demo_names",
     "load_demo_paths",

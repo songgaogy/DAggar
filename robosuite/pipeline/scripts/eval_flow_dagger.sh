@@ -13,10 +13,11 @@ VIDEO_OUTPUT="true"
 VIDEO_IMAGE_SIZE=512
 N_ODE_STEPS=10
 EXECUTE_HORIZON=8
+SEED="${SEED:-42}"
 # -------------------------------------------------------------------------------------------------
 
 TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-EVAL_DETERMINISTIC="false"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-true}"
 VIDEO_OUTPUT="${VIDEO_OUTPUT:-false}"
 
 EXTRA_ARGS=("$@")
@@ -54,7 +55,7 @@ else
 fi
 
 echo "[eval] checkpoint=${CHECKPOINT}"
-echo "[eval] env=${ENV_NAME} task=${TASK_NAME} episodes=${EPISODES} video_output=${VIDEO_OUTPUT}"
+echo "[eval] env=${ENV_NAME} task=${TASK_NAME} episodes=${EPISODES} seed=${SEED} deterministic=${EVAL_DETERMINISTIC} video_output=${VIDEO_OUTPUT}"
 echo "[eval] results_dir=${ROOT_DIR}/${OUTPUT_ROOT}"
 
 PY_ARGS=(
@@ -63,6 +64,7 @@ PY_ARGS=(
   --task-name "${TASK_NAME}"
   --episodes "${EPISODES}"
   --episode-max-steps "${EVAL_EPISODE_MAX_STEPS}"
+  --seed "${SEED}"
   --output-root "${OUTPUT_ROOT}"
   --video-output "${VIDEO_OUTPUT}"
   --video-height "${VIDEO_IMAGE_SIZE}"
@@ -71,8 +73,8 @@ PY_ARGS=(
   --n-ode-steps "${N_ODE_STEPS}"
 )
 
-if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
-  PY_ARGS+=(--deterministic)
+if [[ "${EVAL_DETERMINISTIC}" != "true" ]]; then
+  PY_ARGS+=(--stochastic)
 fi
 
 python -m robosuite.pipeline.eval_flow_dagger \

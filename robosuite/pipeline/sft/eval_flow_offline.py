@@ -49,6 +49,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 
 from robosuite.pipeline.envs import sparse_success_reward
+from robosuite.pipeline.utils import EnvRandomReducer
 from robosuite.pipeline.train_flow_dagger import (
     convert_env_camera_observation,
     load_init_checkpoint_payload,
@@ -93,10 +94,19 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Base seed. Episode i is reset under seed+i so all checkpoints see identical task layouts.",
     )
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--deterministic",
+        dest="deterministic",
         action="store_true",
-        help="Use deterministic flow sampling (default stochastic, matching flow-dagger eval).",
+        default=True,
+        help="Use deterministic flow sampling (default).",
+    )
+    action_group.add_argument(
+        "--stochastic",
+        dest="deterministic",
+        action="store_false",
+        help="Use stochastic flow sampling.",
     )
     parser.add_argument(
         "--execute-horizon",
@@ -193,14 +203,14 @@ def run_episode(
     img_width: int,
     max_steps: int,
     deterministic: bool,
-    episode_seed: int,
+    env_random_reducer: EnvRandomReducer,
+    episode_index: int,
     capture_video: bool = False,
     video_camera: str = "agentview",
     video_size: int = 512,
-) -> tuple[bool, int, list[np.ndarray]]:
-    """Run one rollout. Returns (success, episode_length, frames)."""
-    # Seed before reset so object placement is reproducible across checkpoints.
-    np.random.seed(episode_seed)
+) -> tuple[bool, int, list[np.ndarray], int | None]:
+    """Run one rollout. Returns (success, episode_length, frames, episode_seed)."""
+    episode_seed = env_random_reducer.prepare_episode(env, int(episode_index))
     obs, _ = reset_flow_policy_observation(
         env,
         preserve_mjviewer=False,
@@ -244,7 +254,7 @@ def run_episode(
         )
         if success or done:
             break
-    return success, steps, frames
+    return success, steps, frames, episode_seed
 
 
 def main() -> None:
@@ -269,6 +279,7 @@ def main() -> None:
         )
 
     agent, env, proprio_extractor, policy_camera_names, camera_aliases = build_agent_and_env(cfg, init_payload)
+    env_random_reducer = EnvRandomReducer(int(args.seed))
     img_height = int(cfg.env.img_height)
     img_width = int(cfg.env.img_width)
     execute_horizon = int(cfg.algorithm.flow.execute_horizon)
@@ -300,10 +311,11 @@ def main() -> None:
         ckpt_video_dir = video_root / ckpt.stem
         n_success = 0
         lengths: list[int] = []
+        episode_records: list[dict[str, Any]] = []
         n_videos = 0
         started = time.monotonic()
         for ep in range(args.episodes):
-            success, length, frames = run_episode(
+            success, length, frames, episode_seed = run_episode(
                 agent,
                 env,
                 proprio_extractor=proprio_extractor,
@@ -313,13 +325,22 @@ def main() -> None:
                 img_width=img_width,
                 max_steps=int(args.max_steps),
                 deterministic=bool(args.deterministic),
-                episode_seed=int(args.seed) + ep,
+                env_random_reducer=env_random_reducer,
+                episode_index=int(ep),
                 capture_video=bool(args.save_video),
                 video_camera=str(args.video_camera),
                 video_size=int(args.video_size),
             )
             n_success += int(success)
             lengths.append(length)
+            episode_records.append(
+                {
+                    "episode_index": int(ep),
+                    "episode_seed": int(episode_seed) if episode_seed is not None else None,
+                    "success": bool(success),
+                    "length": int(length),
+                }
+            )
             if args.save_video:
                 keep = (
                     args.video_mode == "all"
@@ -346,6 +367,7 @@ def main() -> None:
             "successes": int(n_success),
             "success_rate": float(success_rate),
             "mean_episode_length": float(np.mean(lengths)) if lengths else 0.0,
+            "episode_results": episode_records,
             "elapsed_sec": float(elapsed),
             "videos_saved": int(n_videos),
             "video_dir": str(ckpt_video_dir) if args.save_video and n_videos > 0 else None,

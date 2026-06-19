@@ -6,11 +6,11 @@ ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 # ----------------------------------------------------------------------
 ENVIRONMENT="PickPlaceCereal"
 NUM_TRAJECTORIES=10   # pretraining data
-UPDATE_PER_STEP=0     # 1 env step -> x policy updates
+UPDATE_PER_STEP=0.5     # 1 env step -> x policy updates
 SAVE_FREQ="${SAVE_FREQ:-5000}"        # save checkpoint every x env steps
 DEMO_SPLIT="pretrain_data-20260615_174814"
-# RUN_NAME_SUFFIX="_${NUM_TRAJECTORIES}pretrain_no-update"
-RUN_NAME_SUFFIX="_no-update"
+SEED_VALUE=42
+RUN_NAME_SUFFIX="_${NUM_TRAJECTORIES}pretrain_seed${SEED_VALUE}"
 
 INIT_CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow_multi_ep0100.pt"
 LEARNER_DEVICE="cuda:1"
@@ -49,7 +49,6 @@ BUFFER_SAVE_INTERVAL="${BUFFER_SAVE_INTERVAL:-5000}"
 CHECKPOINT_INTERVAL="${SAVE_FREQ}"
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-300}"
-SEED_VALUE="${SEED:-42}"
 EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-0}"
 
 LOAD="${LOAD:-null}"
@@ -82,10 +81,6 @@ if [[ -n "${LOAD}" && "${LOAD}" != "null" ]]; then
   RESUME=true
 fi
 
-if [[ "${CHECKPOINT}" != "null" && ! -f "${CHECKPOINT}" ]]; then
-  echo "[ERROR] Checkpoint file does not exist: ${CHECKPOINT}" >&2
-  exit 1
-fi
 
 python -m robosuite.pipeline.train_flow_dagger \
   seed="${SEED_VALUE}" \

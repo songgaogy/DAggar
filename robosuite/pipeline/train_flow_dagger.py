@@ -33,6 +33,7 @@ from robosuite.pipeline.utils import (
     AsyncCheckpointWriter,
     ConsoleLogCapture,
     EMAFpsTracker,
+    EnvRandomReducer,
     FixedRateLimiter,
     IntervalGate,
     JsonlEventLogger,
@@ -865,6 +866,9 @@ def main(cfg: DictConfig) -> None:
         )
 
     env = main_env
+    env_random_reducer = EnvRandomReducer(serialize_seed(getattr(cfg, "seed", None)))
+    if env_random_reducer.enabled:
+        print(f"[determinism] env_reset_seed={env_random_reducer.base_seed} rule=base_seed+episode_index")
     obs = initial_obs
     control_fps = resolve_runtime_fps(cfg, "control_fps", float(cfg.env.control_freq))
     render_fps = resolve_runtime_fps(cfg, "render_fps", control_fps)
@@ -997,6 +1001,8 @@ def main(cfg: DictConfig) -> None:
             "resume_enabled": bool(cfg.runtime.resume),
             "load_buffers": bool(cfg.runtime.load_buffers),
             "seed": serialize_seed(getattr(cfg, "seed", None)),
+            "env_reset_seed": env_random_reducer.base_seed,
+            "env_reset_seed_rule": "base_seed+episode_index" if env_random_reducer.enabled else None,
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
             "buffer_dir": str(checkpoint_dir / "buffers") if save_demo_buffer else None,
@@ -1297,6 +1303,16 @@ def main(cfg: DictConfig) -> None:
         return obs
 
     def reset_rollout_observation() -> dict[str, Any]:
+        episode_seed = env_random_reducer.prepare_episode(env, episode_index)
+        runtime_logger.log(
+            {
+                "event": "episode_reset",
+                "step": int(last_step),
+                "episode_index": int(episode_index),
+                "episode_seed": None if episode_seed is None else int(episode_seed),
+                **event_time_fields(),
+            }
+        )
         if on_demand_image_obs:
             reset_robosuite_env(env, preserve_mjviewer=rollout_has_renderer)
             return make_live_obs(include_images=True, refresh_images=True)
@@ -1587,6 +1603,7 @@ def main(cfg: DictConfig) -> None:
             info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
             info_payload.setdefault("episode_index", int(episode_index))
             info_payload.setdefault("episode_step", int(episode_step_index))
+            info_payload.setdefault("episode_seed", env_random_reducer.seed_for_episode(episode_index))
             trainer.record_transition(
                 obs=online_obs,
                 action=env_action,
@@ -1679,6 +1696,7 @@ def main(cfg: DictConfig) -> None:
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),
                     "episode_success": int(success),
+                    "episode_seed": env_random_reducer.seed_for_episode(episode_index),
                     "online_buffer_size": len(agent.online_buffer),
                     "demo_buffer_size": len(agent.demo_buffer),
                 }
@@ -1691,6 +1709,7 @@ def main(cfg: DictConfig) -> None:
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                         "episode_success": bool(success),
+                        "episode_seed": env_random_reducer.seed_for_episode(episode_index),
                         "episode_transition_count": int(episode_transition_count),
                         "episode_intervention_transitions": int(episode_intervention_transitions),
                         "episode_intervention_ratio": (
@@ -1806,6 +1825,8 @@ def main(cfg: DictConfig) -> None:
                 "resume_enabled": bool(cfg.runtime.resume),
                 "load_buffers": bool(cfg.runtime.load_buffers),
                 "seed": serialize_seed(getattr(cfg, "seed", None)),
+                "env_reset_seed": env_random_reducer.base_seed,
+                "env_reset_seed_rule": "base_seed+episode_index" if env_random_reducer.enabled else None,
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
                 "buffer_dir": str(checkpoint_dir / "buffers") if save_demo_buffer else None,
