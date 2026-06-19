@@ -23,6 +23,7 @@ from .trajectory import RobosuiteBenchmarkTrajectory
 DEFAULT_FAIL_SPLIT = "fail_rollout-val-labeled"
 DEFAULT_SUCCESS_SPLIT = "success_rollout-val"
 DEFAULT_BANK_SPLIT = "fail_rollout-labeled"
+DEFAULT_SUCCESS_TRAIN_SPLIT = "success_rollout"
 
 _TASK_ALIASES = {
     "PandaLift": "Lift",
@@ -237,6 +238,22 @@ def discover_failure_bank(
         is_failure=True,
         tasks=tasks,
         max_per_task=max_fail_per_task,
+    )
+
+
+def discover_success_rollouts(
+    data_root: str = "data",
+    tasks: Optional[list[str]] = None,
+    split: str = DEFAULT_SUCCESS_TRAIN_SPLIT,
+    max_success_per_task: Optional[int] = None,
+) -> list[RobosuiteBenchmarkTrajectory]:
+    """Discover success rollout trajectories for the success bank / calibration pool."""
+    return _discover_split(
+        data_root=data_root,
+        split=split,
+        is_failure=False,
+        tasks=tasks,
+        max_per_task=max_success_per_task,
     )
 
 

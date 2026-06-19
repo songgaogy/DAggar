@@ -162,34 +162,49 @@ Files:
 
 Workflow:
 
-1. Split success trajectories per task into success bank and success calibration sets.
-2. Build a KNN memory bank from success-bank latent frames.
+1. Discover the **training** success pool from `success_rollout` and split it per
+   task into a success bank and a success calibration set. This pool is
+   `video_id`-disjoint from the eval success pool (`success_rollout-val`); the
+   runner hard-asserts the invariant.
+2. Build a KNN memory bank from success-bank latent frames. Success trajectories
+   use only their pre-done frames (`is_success == False` prefix, via
+   `prefix_frames_before_done()`); frames after task completion are dropped.
 3. Score each frame by minimum weighted L2 distance to the success bank.
-4. Calibrate a per-task threshold on held-out success frames:
+4. Calibrate a per-task threshold on held-out **training** success frames:
 
 ```text
 tau = percentile(success_calib_scores, 100 - delta)
 pred_t = 1 iff score_t >= tau
 ```
 
-Simulator benchmark entrance:
+At eval time, failure trajectories are scored whole; success trajectories are
+scored only over their pre-done frames, and the post-done region is padded with
+that trajectory's minimum score so idle frames never dominate the aggregation.
+
+Simulator benchmark entrance (important parameters are hardcoded in the script;
+edit them in-place):
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
 bash robosuite/discriminator/dyn_disc/scripts/run_single_bank_robosuite_benchmark.sh
 ```
 
-Important env knobs:
+Important parameters (hardcoded in the script):
 
 ```bash
+MODEL_CKPT=checkpoints/dyn_disc/dynamics/<run>/checkpoint/model_50.pth
 TASKS="PickPlaceCereal"
+SUCCESS_SPLIT="success_rollout-val"     # eval success
+SUCCESS_TRAIN_SPLIT="success_rollout"   # bank + calibration (disjoint from eval)
 MAX_FAIL_PER_TASK=100
 MAX_SUCCESS_PER_TASK=100
-KNN_FEATURE_SOURCE=encoder      # encoder or transformer
-KNN_TRANSFORMER_LAYER=-1
-DELTA=10.0
+TRAIN_MAX_SUCCESS_PER_TASK=100
+KNN_FEATURE_SOURCE=transformer  # encoder or transformer
+KNN_TRANSFORMER_LAYER=1
+DELTA=5.0
 CALIB_FRACTION=0.2
 ```
+
+Output: `checkpoints/dyn_disc/single_bank_eval_robosuite/run_<timestamp>_<TASKS>/benchmark.json`.
 
 ### Two-bank KNN
 
@@ -202,10 +217,14 @@ Files:
 
 Workflow:
 
-1. Build the success bank + success-calibration split from the success eval set.
+1. Build the success bank + success-calibration split from the **training**
+   success pool (`success_rollout`), using only pre-done frames
+   (`is_success == False` prefix). This pool is `video_id`-disjoint from the eval
+   success pool (`success_rollout-val`); the runner hard-asserts the invariant.
 2. Discover a disjoint GT failure bank from a labeled failure split
    (`fail_rollout-labeled`) that is `video_id`-disjoint from the eval failure set.
-3. Slice each failure-bank trajectory from `first_gt_failure_frame()` onward.
+3. Slice each failure-bank trajectory from `first_gt_failure_frame()` onward
+   (failure-side handling is unchanged on this branch).
 4. Score each frame with one of:
 
 ```text
@@ -219,17 +238,22 @@ dsucc_only: score = d_succ
 
 5. Calibrate with `success_percentile` or `two_class_youden`.
 
-Simulator benchmark entrance:
+Simulator benchmark entrance (important parameters are hardcoded in the script;
+edit them in-place):
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
 bash robosuite/discriminator/dyn_disc/scripts/run_two_bank_robosuite_benchmark.sh
 ```
 
-Important env knobs:
+Important parameters (hardcoded in the script):
 
 ```bash
+MODEL_CKPT=checkpoints/dyn_disc/dynamics/<run>/checkpoint/model_50.pth
 TASKS="PickPlaceCereal"
+SUCCESS_SPLIT="success_rollout-val"     # eval success
+SUCCESS_TRAIN_SPLIT="success_rollout"   # success bank + calibration (disjoint from eval)
+FAIL_TRAIN_SPLIT="fail_rollout-labeled" # GT-labeled failure bank source
+TRAIN_MAX_SUCCESS_PER_TASK=100
 FAIL_BANK_PER_TASK=25
 FAIL_BANK_LAST_K=60
 SCORE_MODE=difference           # difference, ratio, dsucc_only
@@ -239,9 +263,11 @@ KNN_FEATURE_SOURCE=transformer
 KNN_TRANSFORMER_LAYER=1
 ```
 
-The runner and the adapter both hard-assert disjointness between eval
-trajectories, failure-bank trajectories, and failure-calibration trajectories by
-`video_id`.
+Output: `checkpoints/dyn_disc/two_bank_eval_robosuite/run_<timestamp>_<TASKS>/benchmark.json`.
+
+Disjointness is hard-asserted by `video_id`: the runner checks train success vs
+eval success, and failure-bank/failure-calib vs the eval failure set; the adapter
+re-asserts the failure bank vs failure-calib invariant.
 
 ---
 

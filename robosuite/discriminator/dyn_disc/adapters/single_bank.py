@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from tqdm import tqdm
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
@@ -36,6 +37,25 @@ def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.
     if n == 0:
         return np.zeros((T,), dtype=dtype)
     pad = np.full((T - n,), arr[-1], dtype=dtype)
+    return np.concatenate([arr, pad], axis=0)
+
+
+def _pad_to_length_with_fill(
+    values: np.ndarray,
+    *,
+    target_len: int,
+    fill_value: float | int,
+    dtype=np.float32,
+) -> np.ndarray:
+    """Pad a prefix-length array to ``target_len`` with a constant fill value."""
+    arr = np.asarray(values, dtype=dtype).reshape(-1)
+    n = int(arr.shape[0])
+    T = int(target_len)
+    if n >= T:
+        return arr[:T].copy()
+    if n == 0:
+        return np.full((T,), fill_value, dtype=dtype)
+    pad = np.full((T - n,), fill_value, dtype=dtype)
     return np.concatenate([arr, pad], axis=0)
 
 
@@ -226,6 +246,27 @@ class SingleBankBenchmarkDiscriminator:
             "t_len": t_len,
         }
 
+    @staticmethod
+    def _truncate_prepared(prepared: Dict[str, Any], frame_end: int) -> Dict[str, Any]:
+        t_end = min(int(frame_end), int(prepared["t_len"]))
+        if t_end <= 0:
+            raise ValueError(f"frame_end must be positive, got {t_end}")
+        return {
+            "view_names": prepared["view_names"],
+            "per_view_chw": {k: v[:t_end] for k, v in prepared["per_view_chw"].items()},
+            "prop": prepared["prop"][:t_end],
+            "act": prepared["act"][:t_end],
+            "t_len": t_end,
+        }
+
+    @staticmethod
+    def _success_prefix_frame_end(trajectory: BenchmarkTrajectory) -> int:
+        """Exclusive end index for pre-done success frames (``is_success`` label)."""
+        prefix_fn = getattr(trajectory, "prefix_frames_before_done", None)
+        if prefix_fn is not None:
+            return int(prefix_fn())
+        return int(trajectory.num_frames)
+
     def _encode_tensors(self, key: tuple, prepared: Dict[str, Any]) -> torch.Tensor:
         view_names: List[str] = prepared["view_names"]
         per_view_chw: Dict[str, np.ndarray] = prepared["per_view_chw"]
@@ -273,13 +314,22 @@ class SingleBankBenchmarkDiscriminator:
         return self._encode_tensors(key, prepared)
 
     @torch.no_grad()
-    def _encode(self, trajectory: BenchmarkTrajectory) -> torch.Tensor:
+    def _encode(
+        self,
+        trajectory: BenchmarkTrajectory,
+        *,
+        frame_end: Optional[int] = None,
+    ) -> torch.Tensor:
         key = self._trajectory_key(trajectory)
+        if frame_end is not None:
+            key = key + (f"end{int(frame_end)}",)
         cached = self._feature_cache.get(key, None)
         if cached is not None:
             return cached
 
         prepared = self._prepare_trajectory_tensors(trajectory)
+        if frame_end is not None:
+            prepared = self._truncate_prepared(prepared, frame_end)
         return self._encode_tensors(key, prepared)
 
     # ------------------------------------------------------------------ #
@@ -287,6 +337,13 @@ class SingleBankBenchmarkDiscriminator:
     # ------------------------------------------------------------------ #
 
     def fit_on_benchmark(self, trajectories: List[BenchmarkTrajectory]) -> None:
+        """Fit per-task KNN banks from TRAINING success rollouts.
+
+        ``trajectories`` must be the training success pool (``success_rollout``),
+        disjoint from the eval success pool (``success_rollout-val``). Only the
+        pre-done frames (``is_success == False`` prefix) of each success
+        trajectory are used to build the bank and calibration sets.
+        """
         task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
         for traj in trajectories:
             if bool(traj.is_failure):
@@ -298,90 +355,99 @@ class SingleBankBenchmarkDiscriminator:
                 "single-bank KNN calibration requires success trajectories per task."
             )
 
-        for task, succ_list in task_to_success.items():
-            if len(succ_list) < 2:
-                raise RuntimeError(
-                    f"Task {task!r} has only {len(succ_list)} success trajectory; "
-                    "need at least 2 for disjoint bank + calibration split."
+        total_encode_trajs = sum(len(v) for v in task_to_success.values())
+        with tqdm(
+            total=total_encode_trajs,
+            desc="[dyn_disc] encoding train success demos",
+            unit="traj",
+            disable=not self.verbose_fit,
+        ) as encode_pbar:
+            for task, succ_list in task_to_success.items():
+                if len(succ_list) < 2:
+                    raise RuntimeError(
+                        f"Task {task!r} has only {len(succ_list)} success trajectory; "
+                        "need at least 2 for disjoint bank + calibration split."
+                    )
+                rng = np.random.default_rng(int(self.seed))
+                perm = rng.permutation(len(succ_list))
+                n_calib = int(round(self.calib_fraction * len(succ_list)))
+                n_calib = max(1, min(len(succ_list) - 1, n_calib))
+                calib_idx = set(perm[:n_calib].tolist())
+                bank_trajs = [t for i, t in enumerate(succ_list) if i not in calib_idx]
+                calib_trajs = [t for i, t in enumerate(succ_list) if i in calib_idx]
+
+                bank_feats: List[torch.Tensor] = []
+                calib_feats: List[torch.Tensor] = []
+                bank_total = 0
+                calib_total = 0
+                for t in bank_trajs:
+                    f = self._encode(t, frame_end=self._success_prefix_frame_end(t))
+                    bank_feats.append(f)
+                    bank_total += int(f.shape[0])
+                    encode_pbar.update(1)
+                for t in calib_trajs:
+                    f = self._encode(t, frame_end=self._success_prefix_frame_end(t))
+                    calib_feats.append(f)
+                    calib_total += int(f.shape[0])
+                    encode_pbar.update(1)
+
+                feat_dim = int(bank_feats[0].shape[1])
+                if self.feature_source == "encoder":
+                    visual_dim = int(self.encoder.visual_emb_dim_total)
+                    proprio_dim = int(self.encoder.proprio_emb_dim)
+                    action_dim = int(self.encoder.action_emb_dim)
+                    visual_weight = float(self.visual_weight)
+                    proprio_weight = float(self.proprio_weight)
+                    action_weight = float(self.action_weight)
+                else:
+                    visual_dim = int(feat_dim)
+                    proprio_dim = 0
+                    action_dim = 0
+                    visual_weight = 1.0
+                    proprio_weight = 1.0
+                    action_weight = 1.0
+
+                if self.verbose_fit:
+                    print(
+                        f"[dyn_disc][fit] task={task} "
+                        f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
+                        f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
+                        f"feature_source={self.feature_source} layer={self.transformer_layer}  "
+                        f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
+                    )
+
+                det = SingleBankKNN(
+                    visual_dim=visual_dim,
+                    proprio_dim=proprio_dim,
+                    action_dim=action_dim,
+                    visual_weight=visual_weight,
+                    proprio_weight=proprio_weight,
+                    action_weight=action_weight,
+                    delta=self.delta,
+                    chunk_size=self.knn_chunk_size,
+                    device=self.device,
                 )
-            rng = np.random.default_rng(int(self.seed))
-            perm = rng.permutation(len(succ_list))
-            n_calib = int(round(self.calib_fraction * len(succ_list)))
-            n_calib = max(1, min(len(succ_list) - 1, n_calib))
-            calib_idx = set(perm[:n_calib].tolist())
-            bank_trajs = [t for i, t in enumerate(succ_list) if i not in calib_idx]
-            calib_trajs = [t for i, t in enumerate(succ_list) if i in calib_idx]
-
-            bank_feats: List[torch.Tensor] = []
-            calib_feats: List[torch.Tensor] = []
-            bank_total = 0
-            calib_total = 0
-            for t in bank_trajs:
-                f = self._encode(t)
-                bank_feats.append(f)
-                bank_total += int(f.shape[0])
-            for t in calib_trajs:
-                f = self._encode(t)
-                calib_feats.append(f)
-                calib_total += int(f.shape[0])
-
-            feat_dim = int(bank_feats[0].shape[1])
-            if self.feature_source == "encoder":
-                visual_dim = int(self.encoder.visual_emb_dim_total)
-                proprio_dim = int(self.encoder.proprio_emb_dim)
-                action_dim = int(self.encoder.action_emb_dim)
-                visual_weight = float(self.visual_weight)
-                proprio_weight = float(self.proprio_weight)
-                action_weight = float(self.action_weight)
-            else:
-                visual_dim = int(feat_dim)
-                proprio_dim = 0
-                action_dim = 0
-                visual_weight = 1.0
-                proprio_weight = 1.0
-                action_weight = 1.0
-
-            if self.verbose_fit:
-                print(
-                    f"[dyn_disc][fit] task={task} "
-                    f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
-                    f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
-                    f"feature_source={self.feature_source} layer={self.transformer_layer}  "
-                    f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
-                )
-
-            det = SingleBankKNN(
-                visual_dim=visual_dim,
-                proprio_dim=proprio_dim,
-                action_dim=action_dim,
-                visual_weight=visual_weight,
-                proprio_weight=proprio_weight,
-                action_weight=action_weight,
-                delta=self.delta,
-                chunk_size=self.knn_chunk_size,
-                device=self.device,
-            )
-            threshold = det.fit(expert_features=bank_feats, calibration_features=calib_feats)
-            self._detectors_per_task[task] = det
-            self._calibration_stats[task] = {
-                "num_success_trajectories": int(len(succ_list)),
-                "num_bank_trajectories": int(len(bank_trajs)),
-                "num_calib_trajectories": int(len(calib_trajs)),
-                "num_bank_steps": int(bank_total),
-                "num_calib_steps": int(calib_total),
-                "threshold_init": float(threshold),
-                "delta_init": float(self.delta),
-                "feat_dim": feat_dim,
-                "visual_dim": visual_dim,
-                "proprio_dim": proprio_dim,
-                "action_dim": action_dim,
-                "action_weight": float(self.action_weight),
-                "feature_source": self.feature_source,
-                "transformer_layer": int(self.transformer_layer),
-                "effective_visual_weight": float(visual_weight),
-                "effective_proprio_weight": float(proprio_weight),
-                "effective_action_weight": float(action_weight),
-            }
+                threshold = det.fit(expert_features=bank_feats, calibration_features=calib_feats)
+                self._detectors_per_task[task] = det
+                self._calibration_stats[task] = {
+                    "num_success_trajectories": int(len(succ_list)),
+                    "num_bank_trajectories": int(len(bank_trajs)),
+                    "num_calib_trajectories": int(len(calib_trajs)),
+                    "num_bank_steps": int(bank_total),
+                    "num_calib_steps": int(calib_total),
+                    "threshold_init": float(threshold),
+                    "delta_init": float(self.delta),
+                    "feat_dim": feat_dim,
+                    "visual_dim": visual_dim,
+                    "proprio_dim": proprio_dim,
+                    "action_dim": action_dim,
+                    "action_weight": float(self.action_weight),
+                    "feature_source": self.feature_source,
+                    "transformer_layer": int(self.transformer_layer),
+                    "effective_visual_weight": float(visual_weight),
+                    "effective_proprio_weight": float(proprio_weight),
+                    "effective_action_weight": float(action_weight),
+                }
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
         task = str(trajectory.task_name)
@@ -393,12 +459,36 @@ class SingleBankBenchmarkDiscriminator:
             )
 
         T = int(trajectory.num_frames)
-        feat = self._encode(trajectory)
-        result = det.score(feat)
+        tau = float(det.threshold) if det.threshold is not None else float("nan")
 
-        step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
-        thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
-        preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        if bool(trajectory.is_failure):
+            feat = self._encode(trajectory)
+            result = det.score(feat)
+            step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
+            thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
+            preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        else:
+            # Success trajectory: score only pre-done frames; pad the post-done
+            # region with this trajectory's own minimum score so idle frames
+            # never dominate the trajectory-level aggregation.
+            t_end = self._success_prefix_frame_end(trajectory)
+            if t_end <= 0:
+                raise ValueError(
+                    f"Success trajectory has no pre-done frames: {trajectory.describe()}"
+                )
+            feat = self._encode(trajectory, frame_end=t_end)
+            result = det.score(feat)
+            real_scores = np.asarray(result.step_scores, dtype=np.float32).reshape(-1)
+            post_done_fill = float(real_scores.min()) if real_scores.size > 0 else 0.0
+            step_scores = _pad_to_length_with_fill(
+                result.step_scores, target_len=T, fill_value=post_done_fill, dtype=np.float32
+            )
+            thresholds = _pad_to_length_with_fill(
+                result.thresholds, target_len=T, fill_value=tau, dtype=np.float32
+            )
+            preds = _pad_to_length_with_fill(
+                result.preds, target_len=T, fill_value=0, dtype=np.int64
+            ).astype(np.int64)
 
         positive = np.where(preds == 1)[0]
         first_failure_frame = int(positive[0]) if positive.size > 0 else None

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 
-from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
+from robosuite.discriminator.utils.robosuite_benchmark import (
+    FailureBenchmark,
+    discover_success_rollouts,
+)
 from robosuite.discriminator.dyn_disc.adapters.single_bank import SingleBankBenchmarkDiscriminator
 
 
@@ -26,7 +29,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default="data",
                         help="Root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
-    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val",
+                        help="Eval success split (held out from bank/calibration).")
+    parser.add_argument("--success-train-split", type=str, default="success_rollout",
+                        help="Training success split for bank + calibration (disjoint from eval).")
     parser.add_argument("--fail-root", type=str, default=None,
                         help="Deprecated; use --data-root/--fail-split.")
     parser.add_argument("--success-root", type=str, default=None,
@@ -63,6 +69,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quiet-fit", action="store_true")
     parser.add_argument("--max-fail-per-task", type=int, default=None)
     parser.add_argument("--max-success-per-task", type=int, default=None)
+    parser.add_argument("--train-max-success-per-task", type=int, default=None,
+                        help="Cap on training success rollouts per task for the bank/calibration pool.")
     return parser.parse_args()
 
 
@@ -91,12 +99,45 @@ def main() -> None:
     trajs = bench.trajectories()
     n_fail = sum(1 for t in trajs if bool(t.is_failure))
     n_succ = sum(1 for t in trajs if not bool(t.is_failure))
-    tasks = sorted({str(t.task_name) for t in trajs})
+    eval_tasks = sorted({str(t.task_name) for t in trajs})
     print(
-        f"[dyn_disc] discovered num_trajectories={len(trajs)} (fail={n_fail}, succ={n_succ}) "
-        f"tasks={tasks}",
+        f"[dyn_disc] discovered eval num_trajectories={len(trajs)} (fail={n_fail}, succ={n_succ}) "
+        f"tasks={eval_tasks}",
         flush=True,
     )
+
+    # Training success pool for the bank + calibration (disjoint from eval success).
+    train_success_trajs = discover_success_rollouts(
+        data_root=args.data_root,
+        tasks=eval_tasks,
+        split=args.success_train_split,
+        max_success_per_task=args.train_max_success_per_task,
+    )
+    train_by_task: dict = {}
+    for t in train_success_trajs:
+        train_by_task[str(t.task_name)] = train_by_task.get(str(t.task_name), 0) + 1
+    print(
+        f"[dyn_disc] train success from {args.success_train_split}: "
+        f"{len(train_success_trajs)} trajectories "
+        + ", ".join(f"{k}={v}" for k, v in sorted(train_by_task.items())),
+        flush=True,
+    )
+    if not train_success_trajs:
+        raise RuntimeError(
+            f"No training success rollouts found in split {args.success_train_split!r} "
+            f"for tasks {eval_tasks}."
+        )
+
+    # HARD disjointness invariant: train success vs eval success by video_id.
+    eval_success_keys = {str(t.video_id) for t in trajs if not bool(t.is_failure)}
+    train_success_keys = {str(t.video_id) for t in train_success_trajs}
+    overlap = sorted(train_success_keys & eval_success_keys)
+    if overlap:
+        raise RuntimeError(
+            "Disjointness invariant violated: train success video_ids appear in "
+            f"eval success set: {overlap}"
+        )
+
     discriminator = SingleBankBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         device=str(args.device),
@@ -115,8 +156,8 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[dyn_disc] starting fit_on_benchmark (encoding success demos)...", flush=True)
-        discriminator.fit_on_benchmark(bench.trajectories())
+        print("[dyn_disc] starting fit_on_benchmark (encoding train success demos)...", flush=True)
+        discriminator.fit_on_benchmark(train_success_trajs)
         print("[dyn_disc] fit done; starting evaluate()...", flush=True)
         result = bench.evaluate(discriminator)
         print(result.summary())

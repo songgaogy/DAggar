@@ -30,6 +30,7 @@ from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 from robosuite.discriminator.dyn_disc.adapters.single_bank import (
     SingleBankBenchmarkDiscriminator,
     _pad_to_length,
+    _pad_to_length_with_fill,
 )
 from robosuite.discriminator.dyn_disc.detectors.two_bank_knn import TwoBankKNN
 
@@ -186,8 +187,19 @@ class TwoBankBenchmarkDiscriminator(SingleBankBenchmarkDiscriminator):
     # ------------------------------------------------------------------ #
 
     def fit_on_benchmark(self, trajectories: List[BenchmarkTrajectory]) -> None:
+        """Fit per-task two-bank detectors from TRAINING success rollouts.
+
+        ``trajectories`` must be the training success pool (``success_rollout``),
+        disjoint from the eval success pool (``success_rollout-val``). Only the
+        pre-done frames (``is_success == False`` prefix) of each success
+        trajectory build the success bank / calibration. The failure bank is
+        unchanged: it comes from ``fail_bank_trajectories`` sliced by
+        ``first_gt_failure_frame``. Disjointness of the failure bank/calib vs the
+        eval failure set is enforced by the runner; here we only re-assert the
+        intra-failure (bank vs calib) invariant as defence-in-depth.
+        """
         self._assert_disjoint(
-            eval_trajs=trajectories,
+            eval_trajs=[],
             fail_bank_trajs=self.fail_bank_trajectories,
             fail_calib_trajs=self.fail_calib_trajectories,
         )
@@ -237,11 +249,11 @@ class TwoBankBenchmarkDiscriminator(SingleBankBenchmarkDiscriminator):
             bank_total = 0
             calib_total = 0
             for t in bank_trajs:
-                f = self._encode(t)
+                f = self._encode(t, frame_end=self._success_prefix_frame_end(t))
                 bank_feats.append(f)
                 bank_total += int(f.shape[0])
             for t in calib_trajs:
-                f = self._encode(t)
+                f = self._encode(t, frame_end=self._success_prefix_frame_end(t))
                 calib_feats.append(f)
                 calib_total += int(f.shape[0])
 
@@ -353,12 +365,35 @@ class TwoBankBenchmarkDiscriminator(SingleBankBenchmarkDiscriminator):
             )
 
         T = int(trajectory.num_frames)
-        feat = self._encode(trajectory)
-        result = det.score(feat)
+        tau = float(det.threshold) if det.threshold is not None else float("nan")
 
-        step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
-        thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
-        preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        if bool(trajectory.is_failure):
+            feat = self._encode(trajectory)
+            result = det.score(feat)
+            step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
+            thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
+            preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        else:
+            # Success trajectory: score only pre-done frames; pad the post-done
+            # region with this trajectory's own minimum score.
+            t_end = self._success_prefix_frame_end(trajectory)
+            if t_end <= 0:
+                raise ValueError(
+                    f"Success trajectory has no pre-done frames: {trajectory.describe()}"
+                )
+            feat = self._encode(trajectory, frame_end=t_end)
+            result = det.score(feat)
+            real_scores = np.asarray(result.step_scores, dtype=np.float32).reshape(-1)
+            post_done_fill = float(real_scores.min()) if real_scores.size > 0 else 0.0
+            step_scores = _pad_to_length_with_fill(
+                result.step_scores, target_len=T, fill_value=post_done_fill, dtype=np.float32
+            )
+            thresholds = _pad_to_length_with_fill(
+                result.thresholds, target_len=T, fill_value=tau, dtype=np.float32
+            )
+            preds = _pad_to_length_with_fill(
+                result.preds, target_len=T, fill_value=0, dtype=np.int64
+            ).astype(np.int64)
 
         positive = np.where(preds == 1)[0]
         first_failure_frame = int(positive[0]) if positive.size > 0 else None

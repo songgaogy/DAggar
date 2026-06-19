@@ -1,8 +1,11 @@
 """Run the two-bank KNN discriminator through the robosuite benchmark API.
 
 Evaluation uses ``data/<task>/fail_rollout-val-labeled`` (failure eval) and
-``data/<task>/success_rollout-val`` (success eval + success bank). The GT
-failure bank is discovered from ``data/<task>/fail_rollout-labeled`` and is
+``data/<task>/success_rollout-val`` (success eval). The success bank +
+calibration are built from the disjoint training split ``data/<task>/success_rollout``
+(hard-asserted ``video_id``-disjoint from the eval success set), using only the
+pre-done frames (``is_success == False`` prefix) of each success trajectory. The
+GT failure bank is discovered from ``data/<task>/fail_rollout-labeled`` and is
 hard-asserted ``video_id``-disjoint from the failure eval set. Each failure-bank
 trajectory is sliced from ``first_gt_failure_frame()`` onward by the adapter.
 
@@ -29,6 +32,7 @@ from robosuite.discriminator.utils.robosuite_benchmark import (
     FailureBenchmark,
     RobosuiteBenchmarkTrajectory,
     discover_failure_bank,
+    discover_success_rollouts,
 )
 
 from robosuite.discriminator.dyn_disc.adapters.two_bank import TwoBankBenchmarkDiscriminator
@@ -43,13 +47,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled",
                         help="Failure eval split.")
     parser.add_argument("--success-split", type=str, default="success_rollout-val",
-                        help="Success eval split (also builds the success bank).")
+                        help="Success eval split (held out from bank/calibration).")
+    parser.add_argument("--success-train-split", type=str, default="success_rollout",
+                        help="Training success split for the success bank + calibration (disjoint from eval).")
     parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled",
                         help="GT-labeled failure split used to build the disjoint failure bank.")
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--max-fail-per-task", type=int, default=None)
     parser.add_argument("--max-success-per-task", type=int, default=None)
+    parser.add_argument("--train-max-success-per-task", type=int, default=None,
+                        help="Cap on training success rollouts per task for the bank/calibration pool.")
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encode-batch-size", type=int, default=32)
@@ -265,6 +273,38 @@ def main() -> None:
             flush=True,
         )
 
+    # Training success pool for the success bank + calibration (disjoint from eval success).
+    train_success_trajs = discover_success_rollouts(
+        data_root=args.data_root,
+        tasks=eval_tasks,
+        split=args.success_train_split,
+        max_success_per_task=args.train_max_success_per_task,
+    )
+    train_by_task: Dict[str, int] = {}
+    for t in train_success_trajs:
+        train_by_task[str(t.task_name)] = train_by_task.get(str(t.task_name), 0) + 1
+    print(
+        f"[robosuite][two_bank] train success from {args.success_train_split}: "
+        f"{len(train_success_trajs)} trajectories "
+        + ", ".join(f"{k}={v}" for k, v in sorted(train_by_task.items())),
+        flush=True,
+    )
+    if not train_success_trajs:
+        raise RuntimeError(
+            f"No training success rollouts found in split {args.success_train_split!r} "
+            f"for tasks {eval_tasks}."
+        )
+
+    # HARD disjointness invariant: train success vs eval success by video_id.
+    eval_success_keys = {str(t.video_id) for t in trajs if not bool(t.is_failure)}
+    train_success_keys = {str(t.video_id) for t in train_success_trajs}
+    succ_overlap = sorted(train_success_keys & eval_success_keys)
+    if succ_overlap:
+        raise RuntimeError(
+            "Disjointness invariant violated: train success video_ids appear in "
+            f"eval success set: {succ_overlap}"
+        )
+
     discriminator = TwoBankBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         fail_bank_trajectories=fail_bank_trajs,
@@ -289,8 +329,8 @@ def main() -> None:
         verbose_fit=not bool(args.quiet_fit),
     )
     try:
-        print("[robosuite][two_bank] fitting two-bank detector...", flush=True)
-        discriminator.fit_on_benchmark(trajs)
+        print("[robosuite][two_bank] fitting two-bank detector (train success bank)...", flush=True)
+        discriminator.fit_on_benchmark(train_success_trajs)
         print("[robosuite][two_bank] fit done; starting evaluate()...", flush=True)
         result = bench.evaluate(
             discriminator,

@@ -9,7 +9,8 @@ Usage (from repo root):
         --out-dir /tmp/dyn_disc_viz
 
 Outputs:
-    <out_dir>/videos/<video_id>.mp4
+    <out_dir>/videos/fail_rollout/<video_id>.mp4
+    <out_dir>/videos/success_rollout/<video_id>.mp4
     <out_dir>/dyn_disc_scores.pdf
 """
 
@@ -355,6 +356,9 @@ class SingleBankVisualizer:
         self,
         vizs: list[PerTrajectoryViz],
         out_path: str,
+        *,
+        n_fail: int | None = None,
+        n_succ: int | None = None,
     ) -> None:
         if not vizs:
             raise RuntimeError("No trajectories to plot.")
@@ -398,7 +402,9 @@ class SingleBankVisualizer:
                 f"visual_dim = {_g('visual_dim')}  proprio_dim = {_g('proprio_dim')}",
                 f"  threshold_init           = {_g('threshold_init')}",
                 "",
-                f"Sampled failure trajectories: {len(vizs)}",
+                f"Sampled failure trajectories: {n_fail if n_fail is not None else 'n/a'}",
+                f"Sampled success trajectories: {n_succ if n_succ is not None else 'n/a'}",
+                f"Total sampled trajectories: {len(vizs)}",
                 "",
                 "Trigger rule: flag when per-frame weighted KNN min L2 "
                 "distance is >= tau.",
@@ -501,47 +507,66 @@ class SingleBankVisualizer:
         self,
         fail_trajectories: list[BenchmarkTrajectory],
         *,
+        success_trajectories: list[BenchmarkTrajectory] | None = None,
         out_dir: str,
         pdf_name: str = "dyn_disc_scores.pdf",
+        fail_video_subdir: str = "fail_rollout",
+        success_video_subdir: str = "success_rollout",
     ) -> dict:
-        if not fail_trajectories:
-            raise RuntimeError("No failure trajectories provided for visualization.")
+        if not fail_trajectories and not success_trajectories:
+            raise RuntimeError("No trajectories provided for visualization.")
 
-        videos_dir = os.path.join(out_dir, "videos")
-        os.makedirs(videos_dir, exist_ok=True)
+        split_groups: list[tuple[str, list[BenchmarkTrajectory]]] = []
+        if fail_trajectories:
+            split_groups.append((fail_video_subdir, fail_trajectories))
+        if success_trajectories:
+            split_groups.append((success_video_subdir, success_trajectories))
 
         vizs: list[PerTrajectoryViz] = []
         video_paths: list[str] = []
-        for traj in fail_trajectories:
-            viz = self._score_trajectory(traj)
-            safe_id = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(traj.video_id))
-            video_path = os.path.join(videos_dir, f"{safe_id}.mp4")
-            self.render_video(traj, viz, video_path)
-            print(
-                f"[dyn_disc][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
-                f"pred_frames={int(viz.predictions.sum())}  -> {video_path}",
-                flush=True,
-            )
-            if self.debug_score_stats:
-                print(f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_all: {_percentile_summary(viz.step_scores)}", flush=True)
-                if viz.gt_mask is not None:
-                    normal_scores = viz.step_scores[viz.gt_mask == 0]
-                    failure_scores = viz.step_scores[viz.gt_mask == 1]
+        videos_root = os.path.join(out_dir, "videos")
+        for subdir, trajs in split_groups:
+            split_dir = os.path.join(videos_root, subdir)
+            os.makedirs(split_dir, exist_ok=True)
+            for traj in trajs:
+                viz = self._score_trajectory(traj)
+                safe_id = "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(traj.video_id))
+                video_path = os.path.join(split_dir, f"{safe_id}.mp4")
+                self.render_video(traj, viz, video_path)
+                print(
+                    f"[dyn_disc][viz] {subdir}/{traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
+                    f"pred_frames={int(viz.predictions.sum())}  -> {video_path}",
+                    flush=True,
+                )
+                if self.debug_score_stats:
                     print(
-                        f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_normal_gt0: "
-                        f"{_percentile_summary(normal_scores)}",
+                        f"[dyn_disc][viz][debug] {subdir}/{traj.task_name}/{traj.video_id} "
+                        f"score_all: {_percentile_summary(viz.step_scores)}",
                         flush=True,
                     )
-                    print(
-                        f"[dyn_disc][viz][debug] {traj.task_name}/{traj.video_id} score_failure_gt1: "
-                        f"{_percentile_summary(failure_scores)}",
-                        flush=True,
-                    )
-            vizs.append(viz)
-            video_paths.append(video_path)
+                    if viz.gt_mask is not None:
+                        normal_scores = viz.step_scores[viz.gt_mask == 0]
+                        failure_scores = viz.step_scores[viz.gt_mask == 1]
+                        print(
+                            f"[dyn_disc][viz][debug] {subdir}/{traj.task_name}/{traj.video_id} "
+                            f"score_normal_gt0: {_percentile_summary(normal_scores)}",
+                            flush=True,
+                        )
+                        print(
+                            f"[dyn_disc][viz][debug] {subdir}/{traj.task_name}/{traj.video_id} "
+                            f"score_failure_gt1: {_percentile_summary(failure_scores)}",
+                            flush=True,
+                        )
+                vizs.append(viz)
+                video_paths.append(video_path)
 
         pdf_path = os.path.join(out_dir, pdf_name)
-        self.render_pdf(vizs, pdf_path)
+        self.render_pdf(
+            vizs,
+            pdf_path,
+            n_fail=len(fail_trajectories) if fail_trajectories else 0,
+            n_succ=len(success_trajectories) if success_trajectories else 0,
+        )
         print(f"[dyn_disc][viz] wrote PDF -> {pdf_path}", flush=True)
 
         return {"videos": video_paths, "pdf": pdf_path}
@@ -729,9 +754,15 @@ def main() -> None:
         raise RuntimeError(f"No success trajectories for task {args.task!r} (needed for fit).")
 
     rng = random.Random(int(args.seed))
-    n = min(int(args.num_trajs), len(fail_trajs))
-    sampled = rng.sample(fail_trajs, n)
-    print(f"[dyn_disc][viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}", flush=True)
+    n_fail = min(int(args.num_trajs), len(fail_trajs))
+    n_succ = min(int(args.num_trajs), len(succ_trajs))
+    sampled_fail = rng.sample(fail_trajs, n_fail)
+    sampled_succ = rng.sample(succ_trajs, n_succ)
+    print(
+        f"[dyn_disc][viz] sampled {n_fail}/{len(fail_trajs)} failure and "
+        f"{n_succ}/{len(succ_trajs)} success trajectories from {args.task}",
+        flush=True,
+    )
 
     if str(args.mode) == "two_bank":
         discriminator = _build_two_bank_discriminator(args, trajs)
@@ -788,7 +819,8 @@ def main() -> None:
             debug_score_stats=not bool(args.no_debug_score_stats),
         )
         out_paths = visualizer.visualize(
-            sampled,
+            sampled_fail,
+            success_trajectories=sampled_succ,
             out_dir=str(args.out_dir),
             pdf_name=str(args.pdf_name),
         )
