@@ -99,14 +99,14 @@ def parse_args() -> argparse.Namespace:
         "--deterministic",
         dest="deterministic",
         action="store_true",
-        default=True,
-        help="Use deterministic flow sampling (default).",
+        default=False,
+        help="Use zero-latent deterministic flow sampling instead of seeded stochastic sampling.",
     )
     action_group.add_argument(
         "--stochastic",
         dest="deterministic",
         action="store_false",
-        help="Use stochastic flow sampling.",
+        help="Use seeded stochastic flow sampling (default).",
     )
     parser.add_argument(
         "--execute-horizon",
@@ -220,6 +220,8 @@ def run_episode(
         img_height=img_height,
         img_width=img_width,
     )
+    if episode_seed is not None:
+        EnvRandomReducer.seed_global(int(episode_seed))
     agent.reset_policy_state()
 
     frames: list[np.ndarray] = []
@@ -394,6 +396,7 @@ def main() -> None:
         "episodes": int(args.episodes),
         "max_steps": int(args.max_steps),
         "deterministic": bool(args.deterministic),
+        "policy_seed_rule": "base_seed+episode_index",
         "action_horizon": action_horizon,
         "execute_horizon": execute_horizon,
         "n_ode_steps": n_ode_steps,

@@ -15,7 +15,7 @@ DEVICE="${DEVICE:-cuda:0}"
 N_ODE_STEPS="${N_ODE_STEPS:-10}"
 EXECUTE_HORIZON="${EXECUTE_HORIZON:-8}"
 SEED="${SEED:-42}"
-EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-true}"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-false}"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export CUDA_VISIBLE_DEVICES=0
@@ -32,8 +32,8 @@ PY_ARGS=(
   --postfix "${SFT_STEPS}"
 )
 
-if [[ "${EVAL_DETERMINISTIC}" != "true" ]]; then
-  PY_ARGS+=(--stochastic)
+if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
+  PY_ARGS+=(--deterministic)
 fi
 
 if [[ "${VIDEO_OUTPUT}" == "true" ]]; then

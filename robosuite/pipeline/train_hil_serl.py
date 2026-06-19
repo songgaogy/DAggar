@@ -551,6 +551,54 @@ def main(cfg: DictConfig) -> None:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
                     break
+                reset_episode_payload = {
+                    "episode_return": float(episode_return),
+                    "episode_length": int(episode_length),
+                    "episode_success": 0,
+                    "is_success": False,
+                    "online_buffer_size": len(agent.online_buffer),
+                    "demo_buffer_size": len(agent.demo_buffer),
+                    "end_reason": "device_reset",
+                }
+                maybe_log(wandb_run, reset_episode_payload, step=step)
+                runtime_logger.log(
+                    {
+                        "event": "episode_end",
+                        "end_reason": "device_reset",
+                        "step": int(step),
+                        "episode_index": int(episode_index),
+                        "episode_return": float(episode_return),
+                        "episode_length": int(episode_length),
+                        "episode_success": False,
+                        "is_success": False,
+                        "episode_transition_count": int(episode_transition_count),
+                        "episode_intervention_transitions": int(episode_intervention_transitions),
+                        "episode_intervention_ratio": (
+                            float(episode_intervention_transitions) / float(episode_transition_count)
+                            if episode_transition_count > 0
+                            else 0.0
+                        ),
+                        "total_transition_count": int(total_transition_count),
+                        "total_intervention_transitions": int(total_intervention_transitions),
+                        "global_intervention_ratio": (
+                            float(total_intervention_transitions) / float(total_transition_count)
+                            if total_transition_count > 0
+                            else 0.0
+                        ),
+                        **event_time_fields(),
+                    }
+                )
+                print(
+                    format_episode_line(
+                        step=step,
+                        episode_index=episode_index,
+                        episode_return=episode_return,
+                        episode_length=episode_length,
+                        success=False,
+                        online_buffer_size=len(agent.online_buffer),
+                        demo_buffer_size=len(agent.demo_buffer),
+                    )
+                )
                 obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=main_has_renderer)
                 refresh_main_viewer()
                 episode_return = 0.0
@@ -653,6 +701,7 @@ def main(cfg: DictConfig) -> None:
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),
                     "episode_success": int(success),
+                    "is_success": bool(success),
                     "online_buffer_size": len(agent.online_buffer),
                     "demo_buffer_size": len(agent.demo_buffer),
                 }
@@ -665,6 +714,7 @@ def main(cfg: DictConfig) -> None:
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                         "episode_success": bool(success),
+                        "is_success": bool(success),
                         "episode_transition_count": int(episode_transition_count),
                         "episode_intervention_transitions": int(episode_intervention_transitions),
                         "episode_intervention_ratio": (

@@ -23,11 +23,12 @@ class EnvRandomReducer:
             return None
         return int(self.base_seed) + int(episode_index)
 
-    def prepare_episode(self, env: Any, episode_index: int) -> int | None:
+    def prepare_episode(self, env: Any, episode_index: int, *, seed_global: bool = True) -> int | None:
         episode_seed = self.seed_for_episode(episode_index)
         if episode_seed is None:
             return None
-        self.seed_global(episode_seed)
+        if seed_global:
+            self.seed_global(episode_seed)
         self.seed_env(env, episode_seed)
         return int(episode_seed)
 

@@ -2,23 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------------------------------------------------------------------
-ENV_NAME="NutAssemblySquare"
-CHECKPOINT="outputs/flow-DAgger/flow_dagger_NutAssemblySquare_2026-06-16_21-56-22_30pretrain/checkpoints/step_00015000_updates_00009964_ep_00039.pt"
+ENV_NAME="PickPlaceCereal"
+CHECKPOINT="outputs/flow-DAgger_deterministic/flow_dagger_PickPlaceCereal_2026-06-19_23-53-28_10pretrain_seed42/checkpoints/step_00015000_updates_00007496_ep_00053.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 VIDEO_OUTPUT="true"
 VIDEO_IMAGE_SIZE=512
 N_ODE_STEPS=10
 EXECUTE_HORIZON=8
-SEED="${SEED:-42}"
+SEED=1
 # -------------------------------------------------------------------------------------------------
 
 TASK_NAME="${TASK_NAME:-$ENV_NAME}"
-EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-true}"
-VIDEO_OUTPUT="${VIDEO_OUTPUT:-false}"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-false}"
 
 EXTRA_ARGS=("$@")
 
@@ -46,13 +45,8 @@ if [[ ! -f "${CHECKPOINT}" ]]; then
 fi
 
 CHECKPOINT_DIR="$(dirname "${CHECKPOINT}")"
-if [[ "$(basename "${CHECKPOINT_DIR}")" == "checkpoints" ]]; then
-  RUN_DIR="$(dirname "${CHECKPOINT_DIR}")"
-  OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_DIR}/eval}"
-else
-  echo "[ERROR] CHECKPOINT must live under a run's checkpoints/ directory: ${CHECKPOINT}" >&2
-  exit 1
-fi
+RUN_DIR="$(dirname "${CHECKPOINT_DIR}")"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${RUN_DIR}/eval_seed${SEED}}"
 
 echo "[eval] checkpoint=${CHECKPOINT}"
 echo "[eval] env=${ENV_NAME} task=${TASK_NAME} episodes=${EPISODES} seed=${SEED} deterministic=${EVAL_DETERMINISTIC} video_output=${VIDEO_OUTPUT}"
@@ -73,16 +67,10 @@ PY_ARGS=(
   --n-ode-steps "${N_ODE_STEPS}"
 )
 
-if [[ "${EVAL_DETERMINISTIC}" != "true" ]]; then
-  PY_ARGS+=(--stochastic)
+if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
+  PY_ARGS+=(--deterministic)
 fi
 
 python -m robosuite.pipeline.eval_flow_dagger \
   "${PY_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
-
-# Examples:
-#   CHECKPOINT=/abs/path/to/latest.pt bash robosuite/pipeline/scripts/eval_flow_dagger.sh
-#   CHECKPOINT=/abs/path/to/latest.pt ENV_NAME=PickPlaceBread TASK_NAME=PickPlaceBread EPISODES=10 \
-#     bash robosuite/pipeline/scripts/eval_flow_dagger.sh
-#   VIDEO_OUTPUT=true bash robosuite/pipeline/scripts/eval_flow_dagger.sh

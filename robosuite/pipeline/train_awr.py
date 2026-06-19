@@ -1454,6 +1454,44 @@ def main(cfg: DictConfig) -> None:
 
                 finalize_pending_episode(episode_index)
                 run_episode_training(step)
+                reset_episode_payload = {
+                    "episode_return": float(episode_return),
+                    "episode_length": int(episode_length),
+                    "episode_success": 0,
+                    "is_success": False,
+                    "online_buffer_size": len(agent.online_buffer),
+                    "demo_buffer_size": len(agent.demo_buffer),
+                    "online_valid_sequences": int(agent.online_buffer.num_valid_sequences()),
+                    "online_ready_steps": int(agent.online_buffer.num_ready_steps()),
+                    "end_reason": "device_reset",
+                }
+                maybe_log(wandb_run, reset_episode_payload, step=step)
+                runtime_logger.log(
+                    {
+                        "event": "episode_end",
+                        "end_reason": "device_reset",
+                        "step": int(step),
+                        "episode_index": int(episode_index),
+                        "episode_return": float(episode_return),
+                        "episode_length": int(episode_length),
+                        "episode_success": False,
+                        "is_success": False,
+                        "episode_transition_count": int(episode_transition_count),
+                        "episode_intervention_transitions": int(episode_intervention_transitions),
+                        **event_time_fields(),
+                    }
+                )
+                print(
+                    format_episode_line(
+                        step=step,
+                        episode_index=episode_index,
+                        episode_return=episode_return,
+                        episode_length=episode_length,
+                        success=False,
+                        online_buffer_size=len(agent.online_buffer),
+                        demo_buffer_size=len(agent.demo_buffer),
+                    )
+                )
                 obs, _ = reset_flow_policy_observation(
                     env,
                     preserve_mjviewer=rollout_has_renderer,
@@ -1631,6 +1669,7 @@ def main(cfg: DictConfig) -> None:
                     "episode_return": float(episode_return),
                     "episode_length": int(episode_length),
                     "episode_success": int(success),
+                    "is_success": bool(success),
                     "online_buffer_size": len(agent.online_buffer),
                     "demo_buffer_size": len(agent.demo_buffer),
                     "online_valid_sequences": int(agent.online_buffer.num_valid_sequences()),
@@ -1645,6 +1684,7 @@ def main(cfg: DictConfig) -> None:
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                         "episode_success": bool(success),
+                        "is_success": bool(success),
                         "episode_transition_count": int(episode_transition_count),
                         "episode_intervention_transitions": int(episode_intervention_transitions),
                         **event_time_fields(),

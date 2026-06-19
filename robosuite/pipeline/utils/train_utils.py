@@ -810,7 +810,7 @@ def format_episode_line(
 ) -> str:
     status = "success" if success else "done"
     return (
-        f"[episode] ep={episode_index} step={step} {status} "
+        f"[episode] ep={episode_index} step={step} {status} is_success={str(bool(success)).lower()} "
         f"return={episode_return:.2f} len={episode_length} "
         f"buffers(on/demo)={online_buffer_size}/{demo_buffer_size}"
     )

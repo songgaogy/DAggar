@@ -51,14 +51,14 @@ def _parse_args() -> argparse.Namespace:
         "--deterministic",
         dest="deterministic",
         action="store_true",
-        default=True,
-        help="Use deterministic action sampling (default).",
+        default=False,
+        help="Use zero-latent deterministic action sampling instead of seeded stochastic sampling.",
     )
     action_group.add_argument(
         "--stochastic",
         dest="deterministic",
         action="store_false",
-        help="Use stochastic action sampling.",
+        help="Use seeded stochastic action sampling (default).",
     )
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
     parser.add_argument(
@@ -318,6 +318,8 @@ def main() -> None:
                 img_height=int(resolved_cfg.env.img_height),
                 img_width=int(resolved_cfg.env.img_width),
             )
+            if episode_seed is not None:
+                EnvRandomReducer.seed_global(int(episode_seed))
             policy.reset_action_chunk()
 
             frames: list[np.ndarray] = []
@@ -405,6 +407,7 @@ def main() -> None:
             "episode_max_steps": int(args.episode_max_steps),
             "seed": int(args.seed),
             "env_reset_seed_rule": "base_seed+episode_index",
+            "policy_seed_rule": "base_seed+episode_index",
             "deterministic": bool(args.deterministic),
             "video_output": bool(video_output),
             "video_camera": str(args.video_camera),
