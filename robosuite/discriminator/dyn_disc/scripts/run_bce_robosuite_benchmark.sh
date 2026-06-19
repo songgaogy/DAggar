@@ -51,7 +51,7 @@ PROPRIO_WEIGHT="${PROPRIO_WEIGHT:-1.0}"
 ACTION_WEIGHT="${ACTION_WEIGHT:-4.0}"
 DELTA="${DELTA:-10.0}"
 KNN_CHUNK_SIZE="${KNN_CHUNK_SIZE:-2048}"
-# Locks the feature space to transformer layer 1 (matches diagnostic + two-bank).
+# Locks the feature space to transformer layer 1.
 KNN_FEATURE_SOURCE="${KNN_FEATURE_SOURCE:-transformer}"
 KNN_TRANSFORMER_LAYER="${KNN_TRANSFORMER_LAYER:-1}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"

@@ -47,7 +47,7 @@ MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
 RUN_NAME="${RUN_NAME:-viz_bce_${TASK}}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/bce_viz_robosuite-${SPLIT}/${RUN_NAME}-${TIMESTAMP}}"
-PDF_NAME="${PDF_NAME:-bce_v2_scores.pdf}"
+PDF_NAME="${PDF_NAME:-bce_scores.pdf}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
@@ -117,7 +117,6 @@ if [[ -n "${SAVE_CKPT_DIR:-}" ]]; then
 fi
 
 python -m robosuite.discriminator.dyn_disc.visualization.visualize_bce \
-    --kind                  robosuite \
     --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \
     --data-root             "${DATA_ROOT}" \

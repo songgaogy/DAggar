@@ -124,8 +124,8 @@ def _select_bank_and_calib(
 ) -> tuple[List[RobosuiteBenchmarkTrajectory], List[RobosuiteBenchmarkTrajectory]]:
     """Deterministically pick fail-bank + fail-calib trajectories per task.
 
-    Unlike the real_world variant, if a task has fewer GT-labeled failure
-    trajectories than ``fail_bank_per_task``, all available are used (no error).
+    If a task has fewer GT-labeled failure trajectories than
+    ``fail_bank_per_task``, all available are used (no error).
     """
     bank_out: List[RobosuiteBenchmarkTrajectory] = []
     calib_out: List[RobosuiteBenchmarkTrajectory] = []

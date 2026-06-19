@@ -1,2 +1,0 @@
-_target_: robosuite.discriminator.dyn_disc.models.resnet_encoder.ResNetEncoder
-policy_ckpt_path: null

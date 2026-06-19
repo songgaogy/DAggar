@@ -98,11 +98,13 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
         )
 
     view_names = _get_view_names(train_cfg)
-    if getattr(train_cfg, "encoder", None) is not None:
-        encoder = instantiate_local(train_cfg.encoder, view_names=view_names)
-    else:
-        from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
-        encoder = ResNetEncoder(policy_ckpt_path=None, view_names=view_names)
+    if getattr(train_cfg, "encoder", None) is None:
+        raise ValueError(
+            "Missing `encoder` config in the saved training config. dyn_disc is "
+            "DINOv3-only; the checkpoint must have been trained with an explicit "
+            "encoder config (config/encoder/dinov3.yaml)."
+        )
+    encoder = instantiate_local(train_cfg.encoder, view_names=view_names)
 
     if "encoder" in result:
         encoder.load_state_dict(result["encoder"])

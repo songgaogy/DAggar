@@ -1,8 +1,8 @@
-"""Failure-detector visualization for the LPB v2 BCE discriminator.
+"""Failure-detector visualization for the dyn_disc BCE discriminator.
 
 Renders per-trajectory MP4 (with HUD + red border on predicted-failure frames)
-and a multi-page PDF summary, mirroring ``visualize.py`` but driven by a fitted
-:class:`BCEBenchmarkDiscriminator` instead of the single-bank KNN.
+and a multi-page PDF summary, driven by a fitted
+:class:`BCEBenchmarkDiscriminator`.
 
 Threshold: the visualizer always reports the **two-class Youden** operating
 point. ``tau`` is recomputed for the sampled task as ``argmax (TPR - FPR)`` on
@@ -11,14 +11,9 @@ GT-suffix frames). It is independent of the detector's own per-task threshold
 (which is set by the runner's ``calib_mode`` choice). To inspect a different
 operating point, change the runner's ``calib_mode`` and re-fit.
 
-Two entry kinds (``--kind``):
-
-  * ``robosuite``  - mirrors ``robosuite_bce.py``: eval trajectories from
-    fail_rollout-val-labeled / success_rollout-val, BCE bank from
-    fail_rollout-labeled.
-  * ``realworld``  - mirrors ``real_world_bce.py``: Agilex layout with proprio
-    field/slice and action slice; bank pool drawn from the same FAIL_ROOT,
-    filtered by video_id against the eval set.
+Robosuite layout (mirrors ``robosuite_bce.py``): eval trajectories from
+fail_rollout-val-labeled / success_rollout-val, BCE bank from
+fail_rollout-labeled.
 
 Use ``--split`` to choose which eval trajectories are rendered:
 
@@ -43,7 +38,7 @@ import numpy as np
 import torch
 
 if "MPLCONFIGDIR" not in os.environ:
-    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-lpb-v2"
+    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-dyn-disc"
     os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import matplotlib
@@ -63,17 +58,57 @@ from robosuite.discriminator.dyn_disc.detectors.bce import (
     BCEDiscriminator,
     two_class_youden_threshold,
 )
-from robosuite.discriminator.dyn_disc.visualization.visualize import (
-    _draw_border,
-    _load_font,
-    _pad_to_even,
-    _percentile_summary,
-)
 
 
 # ---------------------------------------------------------------------- #
-# Helpers                                                                #
+# Rendering helpers                                                      #
 # ---------------------------------------------------------------------- #
+
+
+def _percentile_summary(values: np.ndarray) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return "empty"
+    qs = np.percentile(arr, [0, 50, 90, 95, 99, 100])
+    return (
+        f"min={qs[0]:.3f} p50={qs[1]:.3f} p90={qs[2]:.3f} "
+        f"p95={qs[3]:.3f} p99={qs[4]:.3f} max={qs[5]:.3f}"
+    )
+
+
+def _pad_to_even(img: np.ndarray) -> np.ndarray:
+    """Pad bottom/right when needed because libx264 prefers even H/W."""
+    h, w = int(img.shape[0]), int(img.shape[1])
+    pad_h = h % 2
+    pad_w = w % 2
+    if pad_h == 0 and pad_w == 0:
+        return img
+    return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
+def _draw_border(img: np.ndarray, color: tuple, thickness: int) -> np.ndarray:
+    out = img.copy()
+    t = int(thickness)
+    out[:t, :, :] = color
+    out[-t:, :, :] = color
+    out[:, :t, :] = color
+    out[:, -t:, :] = color
+    return out
+
+
+def _load_font() -> ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, 18)
+            except Exception:
+                continue
+    return ImageFont.load_default()
 
 
 def _parse_camera_to_view(s: Optional[str]) -> Optional[Dict[str, str]]:
@@ -389,7 +424,7 @@ class BCEVisualizer:
         with PdfPages(out_path) as pdf:
             fig, ax = plt.subplots(figsize=(8.5, 6.0))
             ax.axis("off")
-            ax.set_title(f"LPB v2 BCE summary - task={task}", fontsize=14, loc="left")
+            ax.set_title(f"dyn_disc BCE summary - task={task}", fontsize=14, loc="left")
 
             lines = [
                 f"discriminator: {self.discriminator.name}",
@@ -626,25 +661,8 @@ def _select_bank_robosuite(
     return out
 
 
-def _select_bank_realworld(
-    bank_pool_by_task: Dict[str, List],
-    eval_tasks: Sequence[str],
-    fail_bank_per_task: int,
-) -> List:
-    out: List = []
-    for task in sorted(set(eval_tasks)):
-        pool = sorted(bank_pool_by_task.get(task, []), key=lambda t: str(t.video_id))
-        if len(pool) < fail_bank_per_task:
-            raise RuntimeError(
-                f"Task {task!r}: only {len(pool)} disjoint failure trajectories available, "
-                f"but --fail-bank-per-task={fail_bank_per_task}."
-            )
-        out.extend(pool[:fail_bank_per_task])
-    return out
-
-
 # ---------------------------------------------------------------------- #
-# Benchmark + bank-pool construction (per kind)                          #
+# Benchmark + bank-pool construction (robosuite)                         #
 # ---------------------------------------------------------------------- #
 
 
@@ -653,92 +671,43 @@ def _build_benchmark_and_bank(args: argparse.Namespace):
 
     Returns (bench, eval_trajs, fail_bank_trajs).
     """
-    if args.kind == "robosuite":
-        from robosuite.discriminator.utils.robosuite_benchmark import (
-            FailureBenchmark,
-            discover_failure_bank,
-        )
+    from robosuite.discriminator.utils.robosuite_benchmark import (
+        FailureBenchmark,
+        discover_failure_bank,
+    )
 
-        bench = FailureBenchmark(
-            data_root=args.data_root,
-            tasks=[str(args.task)],
-            fail_split=args.fail_split,
-            success_split=args.success_split,
-            max_fail_per_task=args.max_fail_per_task,
-            max_success_per_task=args.max_success_per_task,
-        )
-        trajs = bench.trajectories()
-        if not trajs:
-            raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
+    bench = FailureBenchmark(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        fail_split=args.fail_split,
+        success_split=args.success_split,
+        max_fail_per_task=args.max_fail_per_task,
+        max_success_per_task=args.max_success_per_task,
+    )
+    trajs = bench.trajectories()
+    if not trajs:
+        raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
 
-        eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-        all_fail = discover_failure_bank(
-            data_root=args.data_root,
-            tasks=[str(args.task)],
-            split=args.fail_train_split,
-            max_fail_per_task=None,
-        )
-        all_fail = [t for t in all_fail if bool(t.is_failure)]
-        bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
-        bank_pool_by_task: Dict[str, List] = {}
-        for t in bank_pool:
-            bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
-        eval_tasks = sorted({str(t.task_name) for t in trajs})
-        fail_bank = _select_bank_robosuite(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
-        print(
-            f"[bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-            f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
-            flush=True,
-        )
-        return bench, trajs, fail_bank
-
-    elif args.kind == "realworld":
-        from benchmark.real_world import FailureBenchmark
-        from benchmark.real_world.loader import discover_agilex_trajectories
-
-        proprio_slice = slice(int(args.proprio_start), int(args.proprio_stop))
-        action_slice = slice(int(args.action_start), int(args.action_stop))
-        bench = FailureBenchmark(
-            fail_labeled_root=args.fail_root,
-            success_root=args.success_root,
-            tasks=[str(args.task)],
-            max_fail_per_task=args.max_fail_per_task,
-            max_success_per_task=args.max_success_per_task,
-            cache_root=args.cache_root,
-            proprio_field=args.proprio_field,
-            proprio_slice=proprio_slice,
-            action_slice=action_slice,
-        )
-        trajs = bench.trajectories()
-        if not trajs:
-            raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
-
-        eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-        all_fail = discover_agilex_trajectories(
-            fail_labeled_root=args.fail_root,
-            success_root=args.success_root,
-            tasks=[str(args.task)],
-            max_fail_per_task=None,
-            max_success_per_task=0,
-            proprio_field=args.proprio_field,
-            proprio_slice=proprio_slice,
-            action_slice=action_slice,
-        )
-        all_fail = [t for t in all_fail if bool(t.is_failure)]
-        bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
-        bank_pool_by_task: Dict[str, List] = {}
-        for t in bank_pool:
-            bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
-        eval_tasks = sorted({str(t.task_name) for t in trajs})
-        fail_bank = _select_bank_realworld(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
-        print(
-            f"[bce][viz] realworld eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-            f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
-            flush=True,
-        )
-        return bench, trajs, fail_bank
-
-    raise ValueError(f"unknown --kind {args.kind!r}")
+    eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
+    all_fail = discover_failure_bank(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        split=args.fail_train_split,
+        max_fail_per_task=None,
+    )
+    all_fail = [t for t in all_fail if bool(t.is_failure)]
+    bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
+    bank_pool_by_task: Dict[str, List] = {}
+    for t in bank_pool:
+        bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
+    eval_tasks = sorted({str(t.task_name) for t in trajs})
+    fail_bank = _select_bank_robosuite(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
+    print(
+        f"[bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
+        f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
+        flush=True,
+    )
+    return bench, trajs, fail_bank
 
 
 # ---------------------------------------------------------------------- #
@@ -810,7 +779,6 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", required=True, choices=["robosuite", "realworld"])
     parser.add_argument(
         "--split",
         type=str,
@@ -819,18 +787,16 @@ def _parse_args() -> argparse.Namespace:
         help="Eval split to visualize: fail_rollout (--fail-split) or "
              "success_rollout (--success-split).",
     )
-    parser.add_argument("--model-ckpt", required=True, help="LPB v2 dynamics checkpoint .pth")
+    parser.add_argument("--model-ckpt", required=True, help="dyn_disc DINOv3 dynamics checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
     parser.add_argument("--success-split", type=str, default="success_rollout-val")
     parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
-    parser.add_argument("--fail-root", type=str, default=None)
-    parser.add_argument("--success-root", type=str, default=None)
     parser.add_argument("--task", required=True)
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--pdf-name", type=str, default="bce_v2_scores.pdf")
+    parser.add_argument("--pdf-name", type=str, default="bce_scores.pdf")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--border-thickness", type=int, default=10)
@@ -839,26 +805,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-flip-vertical", action="store_true",
                         help="Disable the default top/bottom flip applied to rendered frames.")
 
-    # robosuite-only
-    parser.add_argument("--fail-train-root", type=str, default=None,
-                        help="Deprecated for robosuite; use --fail-train-split.")
-    parser.add_argument("--success-cache-root", type=str, default=None,
-                        help="Deprecated for robosuite; ignored.")
-    parser.add_argument("--metadata-cache-root", type=str, default=None,
-                        help="Deprecated for robosuite; ignored.")
-    parser.add_argument("--cache-camera-names", nargs="*", default=None,
-                        help="Deprecated for robosuite; ignored.")
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
 
-    # realworld-only
-    parser.add_argument("--cache-root", type=str, default=None)
-    parser.add_argument("--proprio-field", type=str, default="qpos")
-    parser.add_argument("--proprio-start", type=int, default=7)
-    parser.add_argument("--proprio-stop", type=int, default=14)
-    parser.add_argument("--action-start", type=int, default=7)
-    parser.add_argument("--action-stop", type=int, default=14)
-
-    # shared encoder / scoring knobs
+    # encoder / scoring knobs
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encode-batch-size", type=int, default=32)
     parser.add_argument("--camera-to-view", type=str, default=None)
@@ -895,8 +844,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.kind == "realworld" and (not args.fail_root or not args.success_root):
-        raise SystemExit("--fail-root and --success-root are required when --kind realworld")
 
     bench, trajs, fail_bank_trajs = _build_benchmark_and_bank(args)
     sampled = _sample_trajectories_for_viz(

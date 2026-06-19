@@ -1,10 +1,8 @@
+from .adapters.base import DynBenchmarkDiscriminator
 from .adapters.bce import BCEBenchmarkDiscriminator
-from .adapters.single_bank import LPBV2BenchmarkDiscriminator
-from .adapters.two_bank import TwoBankBenchmarkDiscriminator
 from .core.model_loader import load_model
 from .detectors.bce import BCECalibStats, BCEDiscriminator, BCEHead
-from .detectors.single_bank_knn import DetectionResult, LPBV2Encoder, LPBV2KNN, knn_min_l2_dist
-from .detectors.two_bank_knn import TwoBankKNN
+from .detectors.encoder import DetectionResult, DynEncoder
 
 __all__ = [
     "BCEBenchmarkDiscriminator",
@@ -12,11 +10,7 @@ __all__ = [
     "BCEDiscriminator",
     "BCEHead",
     "DetectionResult",
-    "LPBV2BenchmarkDiscriminator",
-    "LPBV2Encoder",
-    "LPBV2KNN",
-    "TwoBankBenchmarkDiscriminator",
-    "TwoBankKNN",
-    "knn_min_l2_dist",
+    "DynBenchmarkDiscriminator",
+    "DynEncoder",
     "load_model",
 ]

@@ -1,9 +1,9 @@
-# Single-GPU HDF5-backed training entrypoint for the LPB v2 dynamics
-# model. Drop-in replacement for `conf/train.yaml` that uses HDF5 data.
+# Single-GPU HDF5-backed training entrypoint for the dyn_disc DINOv3
+# dynamics model.
 defaults:
   - _self_
   - env: hdf5
-  - encoder: resnet
+  - encoder: dinov3
   - action_encoder: proprio
   - proprio_encoder: proprio
   - predictor: vit

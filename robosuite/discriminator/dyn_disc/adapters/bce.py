@@ -1,9 +1,9 @@
 """Benchmark adapter for the BCE-WAM failure discriminator (GT failure split).
 
-Sits on top of :class:`LPBV2BenchmarkDiscriminator` so all the WAM encoding +
-trajectory feature cache is reused unchanged. Replaces the per-task KNN with a
-single shared :class:`BCEDiscriminator` trained on pooled (D_e, D_o) frames,
-plus per-task thresholds.
+Sits on top of :class:`DynBenchmarkDiscriminator` so all the WAM encoding +
+trajectory feature cache is reused unchanged. Adds a single shared
+:class:`BCEDiscriminator` trained on pooled (D_e, D_o) frames, plus per-task
+thresholds.
 
 Training labels use **GT failure timing** only: each failure bank trajectory is
 sliced at ``first_gt_failure_frame()``: prefix ``[0, t*)`` joins ``D_e``,
@@ -11,11 +11,11 @@ suffix ``[t*, T)`` is ``D_o``.
 
 Hard invariants:
   * No ``video_id`` in ``fail_bank_trajectories`` / ``fail_calib_trajectories``
-    may appear in the eval set passed to ``fit_on_benchmark``. Enforced by a
-    duplicate of :meth:`TwoBankBenchmarkDiscriminator._assert_disjoint`.
+    may appear in the eval set passed to ``fit_on_benchmark``. Enforced by
+    :meth:`BCEBenchmarkDiscriminator._assert_disjoint`.
   * ``fit_on_benchmark`` does **not** call ``bench.evaluate(...)`` or compute
     any AUROC / metric over eval trajectories. Evaluation is the caller's job
-    (see ``run_bce_benchmark.py``).
+    (see ``robosuite_bce.py``).
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ import torch
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from robosuite.discriminator.dyn_disc.adapters.single_bank import (
-    LPBV2BenchmarkDiscriminator,
+from robosuite.discriminator.dyn_disc.adapters.base import (
+    DynBenchmarkDiscriminator,
     _pad_to_length,
 )
 from robosuite.discriminator.dyn_disc.detectors.bce import (
@@ -41,7 +41,7 @@ from robosuite.discriminator.dyn_disc.detectors.bce import (
 _VALID_CALIB_MODES = ("success_percentile", "two_class_youden")
 
 
-class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
+class BCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
     """BCE failure detector (GT-labeled prefix/suffix split) over the benchmark API."""
 
     name = "dyn_disc_bce"
@@ -61,7 +61,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         batch_size: int = 512,
         calib_mode: str = "two_class_youden",
         save_ckpt_dir: Optional[str] = None,
-        # forwarded to the single-bank parent for encoding / cache parity
+        # forwarded to the encoding/cache base class for parity
         device: str = "cuda",
         encode_batch_size: int = 32,
         proprio_indices: Optional[Sequence[int]] = None,
@@ -135,7 +135,7 @@ class BCEBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         fail_bank_trajs: Sequence[BenchmarkTrajectory],
         fail_calib_trajs: Sequence[BenchmarkTrajectory],
     ) -> None:
-        """video_id disjointness invariant; mirrors benchmark_two_bank._assert_disjoint."""
+        """video_id disjointness invariant across eval / fail-bank / fail-calib."""
         eval_keys = {str(t.video_id) for t in eval_trajs}
         bank_keys = {str(t.video_id) for t in fail_bank_trajs}
         calib_keys = {str(t.video_id) for t in fail_calib_trajs}

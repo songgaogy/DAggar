@@ -4,7 +4,7 @@
 prefix before ``first_gt_failure_frame()``; ``D_o`` pools suffix frames after
 that cut. One shared MLP head ``g_theta(z)`` is trained with ``BCEWithLogitsLoss``.
 
-Score convention (matches ``LPBV2KNN`` so the benchmark JSON layout is unchanged):
+Score convention (matches the benchmark JSON layout):
 
     g(z)            = head(z)                # expert-likeness logit, higher = more expert
     failure_score   = -g(z)                  # step_scores; higher = more failure
@@ -30,7 +30,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from .single_bank_knn import DetectionResult
+from .encoder import DetectionResult
 
 
 # --------------------------------------------------------------------------- #

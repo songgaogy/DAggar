@@ -1,1 +1,1 @@
-"""Visualization entry points for LPB v2."""
+"""Visualization entry points for dyn_disc."""
