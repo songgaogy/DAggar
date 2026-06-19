@@ -139,8 +139,8 @@ error.txt
 /tmp
 
 # ------------------------------------------------------------
-# allow tracking lpb_v2 config/data (overrides env/ and data/ above)
-!robosuite/discriminator/lpb_v2/config/env/
-!robosuite/discriminator/lpb_v2/config/env/**
-!robosuite/discriminator/lpb_v2/data/
-!robosuite/discriminator/lpb_v2/data/*.py
+# allow tracking dyn_disc config/data (overrides env/ and data/ above)
+!robosuite/discriminator/dyn_disc/config/env/
+!robosuite/discriminator/dyn_disc/config/env/**
+!robosuite/discriminator/dyn_disc/data/
+!robosuite/discriminator/dyn_disc/data/*.py
