@@ -1,4 +1,4 @@
-"""Two-bank KNN OOD discriminator on top of the frozen LPB v2 encoder.
+"""Two-bank KNN OOD discriminator on top of the frozen dyn_disc encoder.
 
 Per-frame score:
 
@@ -14,12 +14,12 @@ Failure prediction: ``pred_t = 1 iff score_t >= tau``.
 
 Calibration of ``tau``:
   * ``success_percentile`` -- ``tau = percentile(success-calib scores, 100 - delta)``,
-    mirroring ``LPBV2KNN.fit``. With ``score_mode='dsucc_only'`` and matching
-    delta/calib_fraction, the result is bitwise-equivalent to ``LPBV2KNN``.
+    mirroring ``SingleBankKNN.fit``. With ``score_mode='dsucc_only'`` and matching
+    delta/calib_fraction, the result is bitwise-equivalent to ``SingleBankKNN``.
   * ``two_class_youden`` -- maximise TPR(tau) - FPR(tau) on a held-out frame
     set that combines success-calib (negatives) and fail-calib (positives).
 
-This file deliberately mirrors the structure of ``LPBV2KNN`` rather than
+This file deliberately mirrors the structure of ``SingleBankKNN`` rather than
 subclassing it: bank handling is different enough that a subclass would
 obscure the math.
 """

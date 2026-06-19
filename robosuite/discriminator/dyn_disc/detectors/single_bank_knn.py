@@ -1,19 +1,18 @@
-"""Faithful port of the original LPB KNN OOD discriminator.
+"""Single-bank KNN OOD discriminator on top of the frozen dyn_disc encoder.
 
-Mirrors `tmp/lpb-main/dyn_model/planner_libero.py:compute_nn_reward` exactly:
+Per-frame score (k=1 nearest neighbour against the success bank):
 
   feature_t  = [encoder(o_t) ; proprio_encoder(s_t) ; action_encoder(a_t)]
                then per-dim weighting: visual * visual_weight,
                proprio * proprio_weight, action * action_weight
-  score_t    = -min_{j} ||feature_t - bank_j||_2     (non-squared L2, k=1)
+  score_t    = min_{j} ||feature_t - bank_j||_2     (non-squared L2, k=1)
 
 For the benchmark we add a thin classification layer on top of `score_t`:
   - Calibrate a percentile threshold `tau` on a disjoint set of success demos:
         tau = np.percentile(calibration min_dist values, 100 - delta)
   - Predict failure at frame t when  min_dist_t  >=  tau.
 
-This matches the original LPB reward semantics (lower min_dist = more
-in-distribution = lower failure score) while letting us emit binary preds.
+Lower min_dist = more in-distribution = lower failure score.
 
 The dynamics model that produces the encoder + proprio_encoder is loaded
 from a checkpoint via `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
@@ -103,8 +102,8 @@ def _resolve_dataset_class_path(path: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-class LPBV2Encoder:
-    """Loads the original LPB dynamics model and exposes (visual+proprio) encoding.
+class DynEncoder:
+    """Loads the dyn_disc dynamics model and exposes (visual+proprio) encoding.
 
     Reads:
       <ckpt_dir>/hydra.yaml       # full training config (used by dyn_model.plan.load_model)
@@ -129,12 +128,12 @@ class LPBV2Encoder:
 
         ckpt_path = Path(model_ckpt)
         if not ckpt_path.exists():
-            raise FileNotFoundError(f"LPB dynamics ckpt not found: {ckpt_path}")
+            raise FileNotFoundError(f"dyn_disc dynamics ckpt not found: {ckpt_path}")
 
         # ------------------------------------------------------------------ #
         # Locate saved Hydra config + normalizer across common layouts.
         #
-        # New (this repo's `lpb_original/train.py`):
+        # New (this repo's `dyn_disc/training/train.py`):
         #   <run_dir>/{hydra.yaml, normalizer.pth, checkpoints/model_*.pth}
         #
         # Legacy (Hydra default output dir):
@@ -171,7 +170,7 @@ class LPBV2Encoder:
         if cfg_path is None:
             tried = "\n  - " + "\n  - ".join(str(p) for p in cfg_candidates[:12])
             raise FileNotFoundError(
-                "Could not locate a Hydra config for the LPB dynamics checkpoint.\n"
+                "Could not locate a Hydra config for the dyn_disc dynamics checkpoint.\n"
                 f"Checkpoint: {ckpt_path}\n"
                 f"Tried (first few):{tried}"
             )
@@ -213,7 +212,7 @@ class LPBV2Encoder:
                 else:
                     train_data_path = str(train_data_path)
 
-                    # Mirror the dataset kwargs used in original LPB training.
+                    # Mirror the dataset kwargs used in dyn_disc training.
                 kwargs: Dict[str, Any] = dict(
                     zarr_path=train_data_path,
                     num_hist=int(getattr(self.cfg, "num_hist")),
@@ -412,15 +411,15 @@ class LPBV2Encoder:
 
 
 # --------------------------------------------------------------------------- #
-# KNN OOD discriminator                                                       #
+# Single-bank KNN OOD discriminator                                           #
 # --------------------------------------------------------------------------- #
 
 
-class LPBV2KNN:
-    """Per-task KNN OOD detector on top of the original LPB encoder.
+class SingleBankKNN:
+    """Per-task single-bank KNN OOD detector on top of the dyn_disc encoder.
 
     Workflow:
-        det = LPBV2KNN(visual_dim, proprio_emb_dim, ...)
+        det = SingleBankKNN(visual_dim, proprio_emb_dim, ...)
         det.fit(expert_features=[(N1, D), ...], calibration_features=[(M1, D), ...])
         det.score_trajectory(features)  -> DetectionResult
     """
@@ -537,7 +536,3 @@ class LPBV2KNN:
         ths = np.full_like(d, self.threshold, dtype=np.float32)
         preds = (d >= self.threshold).astype(np.int64)
         return DetectionResult(step_scores=d, thresholds=ths, preds=preds)
-
-
-LPBOriginalEncoder = LPBV2Encoder
-LPBOriginalKNN = LPBV2KNN

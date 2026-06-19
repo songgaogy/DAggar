@@ -1,4 +1,4 @@
-"""Failure-detector visualization for the LPB v2 KNN discriminator.
+"""Failure-detector visualization for the single-bank KNN discriminator.
 
 Usage (from repo root):
     python -m robosuite.discriminator.dyn_disc.visualization.visualize \
@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 
 if "MPLCONFIGDIR" not in os.environ:
-    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-lpb-v2"
+    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-dyn-disc"
     os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import matplotlib
@@ -39,9 +39,14 @@ import imageio.v2 as imageio
 from PIL import Image, ImageDraw, ImageFont
 
 from benchmark.core import BenchmarkTrajectory
-from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
+from robosuite.discriminator.utils.robosuite_benchmark import (
+    FailureBenchmark,
+    RobosuiteBenchmarkTrajectory,
+    discover_failure_bank,
+)
 
-from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import SingleBankBenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.two_bank import TwoBankBenchmarkDiscriminator
 
 
 def _percentile_summary(values: np.ndarray) -> str:
@@ -143,7 +148,7 @@ def _parse_camera_to_view(s: Optional[str]) -> Optional[dict[str, str]]:
 
 
 def _compute_success_percentile_thresholds(
-    discriminator: LPBV2BenchmarkDiscriminator,
+    discriminator: SingleBankBenchmarkDiscriminator,
     trajectories: list[BenchmarkTrajectory],
     percentile: float,
 ) -> dict[str, float]:
@@ -214,12 +219,12 @@ class PerTrajectoryViz:
 # ---------------------------------------------------------------------- #
 
 
-class LPBV2Visualizer:
-    """Combine a fitted LPB v2 discriminator with video and PDF renderers."""
+class SingleBankVisualizer:
+    """Combine a fitted single-bank discriminator with video and PDF renderers."""
 
     def __init__(
         self,
-        discriminator: LPBV2BenchmarkDiscriminator,
+        discriminator: SingleBankBenchmarkDiscriminator,
         *,
         camera_name: str = "agentview",
         fps: int = 20,
@@ -363,7 +368,7 @@ class LPBV2Visualizer:
         with PdfPages(out_path) as pdf:
             fig, ax = plt.subplots(figsize=(8.5, 5.5))
             ax.axis("off")
-            ax.set_title(f"LPB v2 KNN summary - task={task}", fontsize=14, loc="left")
+            ax.set_title(f"single-bank KNN summary - task={task}", fontsize=14, loc="left")
 
             def _g(key: str, default: str = "n/a"):
                 return per_task.get(key, default)
@@ -395,7 +400,7 @@ class LPBV2Visualizer:
                 "",
                 f"Sampled failure trajectories: {len(vizs)}",
                 "",
-                "Trigger rule: flag when per-frame LPB v2 weighted KNN min L2 "
+                "Trigger rule: flag when per-frame weighted KNN min L2 "
                 "distance is >= tau.",
             ]
             ax.text(
@@ -549,7 +554,7 @@ class LPBV2Visualizer:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-ckpt", required=True, help="Path to an LPB v2 dynamics checkpoint.")
+    parser.add_argument("--model-ckpt", required=True, help="Path to a dyn_disc dynamics checkpoint.")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -564,6 +569,9 @@ def _parse_args() -> argparse.Namespace:
                         help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--cache-camera-names", nargs="*", default=None,
                         help="Deprecated; ignored by the new robosuite benchmark.")
+    parser.add_argument("--mode", type=str, default="single_bank",
+                        choices=["single_bank", "two_bank"],
+                        help="Discriminator to visualize.")
     parser.add_argument("--task", required=True, help="Single task name, e.g. PickPlaceBread")
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
@@ -606,9 +614,96 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-threshold", type=float, default=None)
     parser.add_argument("--no-debug-score-stats", action="store_true")
 
+    # Encoder feature knobs (two-bank defaults to transformer/layer 1).
+    parser.add_argument("--action-weight", type=float, default=1.0)
+    parser.add_argument("--knn-feature-source", type=str, default=None,
+                        choices=["encoder", "transformer"],
+                        help="Default: encoder for single_bank, transformer for two_bank.")
+    parser.add_argument("--knn-transformer-layer", type=int, default=None,
+                        help="Default: -1 for single_bank, 1 for two_bank.")
+
+    # Two-bank-specific knobs (ignored in single_bank mode).
+    parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled",
+                        help="GT-labeled failure split used to build the disjoint failure bank.")
+    parser.add_argument("--fail-bank-per-task", type=int, default=25)
+    parser.add_argument("--fail-bank-last-k", type=int, default=60)
+    parser.add_argument("--fail-calib-per-task", type=int, default=0)
+    parser.add_argument("--score-mode", type=str, default="difference",
+                        choices=["difference", "ratio", "dsucc_only"])
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--calib-mode", type=str, default="success_percentile",
+                        choices=["success_percentile", "two_class_youden"])
+
     parser.add_argument("--max-fail-per-task", type=int, default=None)
     parser.add_argument("--max-success-per-task", type=int, default=None)
     return parser.parse_args()
+
+
+def _build_two_bank_discriminator(args, eval_trajs):
+    """Discover a disjoint GT failure bank and build a TwoBankBenchmarkDiscriminator."""
+    eval_fail_keys = {str(t.video_id) for t in eval_trajs if bool(t.is_failure)}
+    all_fail = discover_failure_bank(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        split=args.fail_train_split,
+        max_fail_per_task=None,
+    )
+    all_fail = [t for t in all_fail if bool(t.is_failure)]
+    bank_pool = sorted(
+        (t for t in all_fail if str(t.video_id) not in eval_fail_keys),
+        key=lambda t: str(t.video_id),
+    )
+    if not bank_pool:
+        raise RuntimeError(
+            f"Task {args.task!r}: no disjoint GT failure trajectories found in "
+            f"split {args.fail_train_split!r} for the failure bank."
+        )
+
+    n_bank = min(len(bank_pool), int(args.fail_bank_per_task))
+    fail_bank_trajs: list[RobosuiteBenchmarkTrajectory] = bank_pool[:n_bank]
+    remaining = bank_pool[n_bank:]
+    fail_calib_trajs: list[RobosuiteBenchmarkTrajectory] = []
+    if int(args.fail_calib_per_task) > 0:
+        fail_calib_trajs = remaining[: int(args.fail_calib_per_task)]
+
+    bank_keys = {str(t.video_id) for t in fail_bank_trajs}
+    calib_keys = {str(t.video_id) for t in fail_calib_trajs}
+    overlap = sorted((bank_keys | calib_keys) & eval_fail_keys)
+    if overlap:
+        raise RuntimeError(
+            f"Disjointness invariant violated: fail-bank/calib video_ids appear in eval set: {overlap}"
+        )
+    print(
+        f"[dyn_disc][viz] DISJOINTNESS OK | two-bank fail bank: {len(fail_bank_trajs)} trajs "
+        f"(calib={len(fail_calib_trajs)}); eval_fail={len(eval_fail_keys)}",
+        flush=True,
+    )
+
+    fsource = args.knn_feature_source or "transformer"
+    flayer = args.knn_transformer_layer if args.knn_transformer_layer is not None else 1
+    return TwoBankBenchmarkDiscriminator(
+        model_ckpt=str(args.model_ckpt),
+        fail_bank_trajectories=fail_bank_trajs,
+        fail_calib_trajectories=fail_calib_trajs,
+        fail_bank_last_k=int(args.fail_bank_last_k),
+        alpha=float(args.alpha),
+        score_mode=str(args.score_mode),
+        calib_mode=str(args.calib_mode),
+        device=str(args.device),
+        encode_batch_size=int(args.encode_batch_size),
+        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
+        camera_to_view=_parse_camera_to_view(args.camera_to_view),
+        visual_weight=float(args.visual_weight),
+        proprio_weight=float(args.proprio_weight),
+        action_weight=float(args.action_weight),
+        delta=float(args.delta),
+        knn_chunk_size=int(args.knn_chunk_size),
+        feature_source=str(fsource),
+        transformer_layer=int(flayer),
+        calib_fraction=float(args.calib_fraction),
+        seed=int(args.seed),
+        verbose_fit=not bool(args.quiet_fit),
+    )
 
 
 def main() -> None:
@@ -638,20 +733,28 @@ def main() -> None:
     sampled = rng.sample(fail_trajs, n)
     print(f"[dyn_disc][viz] sampled {n}/{len(fail_trajs)} failure trajectories from {args.task}", flush=True)
 
-    discriminator = LPBV2BenchmarkDiscriminator(
-        model_ckpt=str(args.model_ckpt),
-        device=str(args.device),
-        encode_batch_size=int(args.encode_batch_size),
-        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
-        camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        delta=float(args.delta),
-        knn_chunk_size=int(args.knn_chunk_size),
-        calib_fraction=float(args.calib_fraction),
-        seed=int(args.seed),
-        verbose_fit=not bool(args.quiet_fit),
-    )
+    if str(args.mode) == "two_bank":
+        discriminator = _build_two_bank_discriminator(args, trajs)
+    else:
+        fsource = args.knn_feature_source or "encoder"
+        flayer = args.knn_transformer_layer if args.knn_transformer_layer is not None else -1
+        discriminator = SingleBankBenchmarkDiscriminator(
+            model_ckpt=str(args.model_ckpt),
+            device=str(args.device),
+            encode_batch_size=int(args.encode_batch_size),
+            proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
+            camera_to_view=_parse_camera_to_view(args.camera_to_view),
+            visual_weight=float(args.visual_weight),
+            proprio_weight=float(args.proprio_weight),
+            action_weight=float(args.action_weight),
+            delta=float(args.delta),
+            knn_chunk_size=int(args.knn_chunk_size),
+            feature_source=str(fsource),
+            transformer_layer=int(flayer),
+            calib_fraction=float(args.calib_fraction),
+            seed=int(args.seed),
+            verbose_fit=not bool(args.quiet_fit),
+        )
     try:
         discriminator.fit_on_benchmark(trajs)
         for task, detector in sorted(discriminator._detectors_per_task.items()):
@@ -675,7 +778,7 @@ def main() -> None:
             threshold_overrides = _load_benchmark_traj_best_f1_thresholds(str(args.benchmark_json))
             threshold_source = f"benchmark_json_traj_best_f1:{args.benchmark_json}"
 
-        visualizer = LPBV2Visualizer(
+        visualizer = SingleBankVisualizer(
             discriminator,
             camera_name=str(args.camera_name),
             fps=int(args.fps),

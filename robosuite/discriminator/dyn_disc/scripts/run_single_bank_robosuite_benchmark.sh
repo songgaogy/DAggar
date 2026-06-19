@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# LPB v2 KNN benchmark entry point.
+# Single-bank KNN benchmark entry point.
 # Run from repo root:
-#   bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
+#   bash robosuite/discriminator/dyn_disc/scripts/run_single_bank_robosuite_benchmark.sh
 # Override via env vars, e.g.:
 #   TASKS="PickPlaceCan" DELTA=5.0 \
-#     bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
+#     bash robosuite/discriminator/dyn_disc/scripts/run_single_bank_robosuite_benchmark.sh
 #
 # Required: MODEL_CKPT must point to a trained dynamics checkpoint .pth.
 # Recommended layout (produced by `robosuite.discriminator.dyn_disc.training.train`):

@@ -1,6 +1,6 @@
 """Benchmark adapter for the two-bank KNN failure detector.
 
-Drop-in extension of :class:`LPBV2BenchmarkDiscriminator` that adds a
+Drop-in extension of :class:`SingleBankBenchmarkDiscriminator` that adds a
 **failure bank** alongside the existing success bank. Per-task workflow:
 
 1. ``fit_on_benchmark(trajectories)`` -- as in the single-bank adapter, split
@@ -28,7 +28,7 @@ import torch
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
 from robosuite.discriminator.dyn_disc.adapters.single_bank import (
-    LPBV2BenchmarkDiscriminator,
+    SingleBankBenchmarkDiscriminator,
     _pad_to_length,
 )
 from robosuite.discriminator.dyn_disc.detectors.two_bank_knn import TwoBankKNN
@@ -53,10 +53,10 @@ def _fail_frame_range(num_frames: int, first_gt: Optional[int], last_k: int) -> 
     return range(g, end)
 
 
-class TwoBankBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
+class TwoBankBenchmarkDiscriminator(SingleBankBenchmarkDiscriminator):
     """Two-bank (success + failure) KNN OOD detector.
 
-    Composes :class:`LPBV2BenchmarkDiscriminator` for all encoding/caching
+    Composes :class:`SingleBankBenchmarkDiscriminator` for all encoding/caching
     plumbing, but swaps the per-task detector for a :class:`TwoBankKNN`.
     """
 
@@ -72,7 +72,7 @@ class TwoBankBenchmarkDiscriminator(LPBV2BenchmarkDiscriminator):
         alpha: float = 1.0,
         score_mode: str = "difference",
         calib_mode: str = "success_percentile",
-        # forwarded to the single-bank parent for parity with LPBV2BenchmarkDiscriminator
+        # forwarded to the single-bank parent for parity with SingleBankBenchmarkDiscriminator
         device: str = "cuda",
         encode_batch_size: int = 32,
         proprio_indices: Optional[Sequence[int]] = None,

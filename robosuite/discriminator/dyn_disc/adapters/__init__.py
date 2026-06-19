@@ -1,9 +1,7 @@
-from .bce import BCEBenchmarkDiscriminator
-from .single_bank import LPBV2BenchmarkDiscriminator
+from .single_bank import SingleBankBenchmarkDiscriminator
 from .two_bank import TwoBankBenchmarkDiscriminator
 
 __all__ = [
-    "BCEBenchmarkDiscriminator",
-    "LPBV2BenchmarkDiscriminator",
+    "SingleBankBenchmarkDiscriminator",
     "TwoBankBenchmarkDiscriminator",
 ]

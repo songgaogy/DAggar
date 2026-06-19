@@ -16,13 +16,13 @@ from __future__ import annotations
 import argparse
 
 from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
-from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import SingleBankBenchmarkDiscriminator
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-ckpt", required=True,
-                        help="Path to an LPB v2/original-compatible dynamics checkpoint.")
+                        help="Path to a dyn_disc dynamics checkpoint.")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -97,7 +97,7 @@ def main() -> None:
         f"tasks={tasks}",
         flush=True,
     )
-    discriminator = LPBV2BenchmarkDiscriminator(
+    discriminator = SingleBankBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),

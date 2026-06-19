@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Training entry for the LPB v2 dynamics model on robosuite HDF5 success data.
+# Training entry for the dyn_disc dynamics model on robosuite HDF5 success data.
 # Run from repo root:
-#   TASK=PickPlaceCan bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
+#   TASK=PickPlaceCan bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_robosuite_dynamics.sh
 #
 # Required overrides (Hydra):
 #   env.train_data_path  -> built from data/<task>/success_rollout
@@ -21,7 +21,7 @@ ACTION_STEPS=8
 DATA_ROOT="${REPO_ROOT}/data"
 TRAIN_SPLIT="success_rollout"
 MAX_TRAJECTORIES_PER_TASK=100           # 0 -> no cap
-TRAIN_ENCODER=0                         # 1 -> finetune ResNet encoder (from ImageNet init)
+TRAIN_ENCODER=0                         # 1 -> finetune the visual encoder
 ENCODER_LR="${ENCODER_LR:-}"             # override training.encoder_lr; default = yaml (1.5e-4 = 30% of predictor_lr)
 VIEW_NAMES="[agentview, robot0_eye_in_hand]"
 VIEW_LOSS_NAMES="[agentview]"
@@ -87,7 +87,7 @@ EXTRA_OVERRIDES+=("hydra.run.dir=${RUN_DIR}")
 EXTRA_OVERRIDES+=('hydra.job.chdir=true')
 
 if [[ "${TRAIN_ENCODER}" == "1" ]]; then
-    # Finetune the ResNet encoder from ImageNet init (do NOT disable use_pretrained_encoder).
+    # Finetune the visual encoder (do NOT disable use_pretrained_encoder).
     EXTRA_OVERRIDES+=("model.train_encoder=true")
     EXTRA_OVERRIDES+=("use_pretrained_encoder=true")
 fi

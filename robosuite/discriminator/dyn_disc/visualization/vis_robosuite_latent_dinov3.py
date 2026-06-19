@@ -14,7 +14,7 @@ if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-dinov3-robosuite-latent"
     os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
-from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.adapters.single_bank import SingleBankBenchmarkDiscriminator
 from robosuite.discriminator.dyn_disc.visualization.vis_latent import (
     PHASE_FAILURE_AFTER_GT,
     PHASE_FAILURE_BEFORE_GT,
@@ -67,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _collect_latents_preloaded(
-    discriminator: LPBV2BenchmarkDiscriminator,
+    discriminator: SingleBankBenchmarkDiscriminator,
     trajectories: list,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict]]:
     preloaded: list[dict] = []
@@ -161,7 +161,7 @@ def main() -> None:
         flush=True,
     )
 
-    discriminator = LPBV2BenchmarkDiscriminator(
+    discriminator = SingleBankBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),

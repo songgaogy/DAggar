@@ -1,20 +1,20 @@
 # Latent Dynamics Features for Failure Discrimination
 
-`robosuite.discriminator.dyn_disc` contains a compact LPB/WAM-style pipeline:
+`robosuite.discriminator.dyn_disc` contains a compact WAM-style pipeline:
 
 1. train a visual dynamics model on demonstration trajectories;
 2. freeze the learned latent encoder;
-3. run lightweight failure discriminators on top of the latent sequence.
+3. run lightweight KNN failure discriminators on top of the latent sequence.
 
-The current folder supports three discriminator variants:
+This branch (`v0-knn`) supports two KNN discriminator variants on a frozen
+DINOv3 encoder:
 
 | Variant | Main class | Idea |
 | --- | --- | --- |
-| Single-bank KNN | `LPBV2BenchmarkDiscriminator` | Build a success feature bank and flag frames far from success demos. |
+| Single-bank KNN | `SingleBankBenchmarkDiscriminator` | Build a success feature bank and flag frames far from success demos. |
 | Two-bank KNN | `TwoBankBenchmarkDiscriminator` | Build success and failure banks, then score each frame by relative distance to both. |
-| BCE head | `BCEBenchmarkDiscriminator` | Train one shared MLP head on expert-like vs failure-suffix latent frames, then calibrate per-task thresholds. |
 
-All variants reuse the same frozen LPB v2 encoder and benchmark trajectory API.
+Both variants reuse the same frozen `DynEncoder` and the benchmark trajectory API.
 
 ---
 
@@ -25,32 +25,23 @@ dyn_disc/
   core/
     model_loader.py                # Rebuild/load VisualDynamicsModel checkpoints
   detectors/
-    single_bank_knn.py             # LPBV2Encoder + single-bank LPBV2KNN
-    two_bank_knn.py                # Two-bank KNN detector
-    bce.py                         # BCEHead + BCEDiscriminator
+    single_bank_knn.py             # DynEncoder + single-bank SingleBankKNN
+    two_bank_knn.py                # Two-bank KNN detector (TwoBankKNN)
   adapters/
     single_bank.py                 # Single-bank benchmark adapter
     two_bank.py                    # Two-bank benchmark adapter
-    bce.py                         # BCE benchmark adapter
-  sim_benchmark.py                 # Simulator FailureBenchmark runner
-  real_world_single_bank.py        # Real-world Agilex single-bank runner
-  real_world_two_bank.py
-  real_world_bce.py
+  sim_benchmark.py                 # Single-bank robosuite FailureBenchmark runner
+  sim_benchmark_two_bank.py        # Two-bank robosuite FailureBenchmark runner
   training/
     train.py                       # Hydra entry for latent dynamics pretraining
   visualization/
-    visualize.py                   # Single-bank KNN per-trajectory visualization
-    visualize_bce.py               # BCE discriminator per-trajectory visualization
-  config/                          # Hydra configs
-  data/                            # HDF5 / preprocessed / Agilex datasets
-  models/                          # ResNet, proprio MLP, ViT predictor, dynamics model
-  utils/                           # Normalization, tensor helpers, latent plotting
-  explore/
-    diagnose_latent_separability.py
-    run_diagnose_latent_separability.bash
+    visualize.py                   # KNN per-trajectory visualization (single + two-bank)
+    vis_robosuite_latent_dinov3.py # Latent-space diagnostic visualization
+  config/                          # Hydra configs (DINOv3 encoder)
+  data/                            # HDF5 / preprocessed datasets
+  models/                          # DINOv3 encoder, proprio MLP, ViT predictor, dynamics model
+  utils/                           # Normalization, tensor helpers
   scripts/                         # Bash entrances for train/eval/vis
-  tests/
-    test_bce_discriminator.py
 ```
 
 ---
@@ -63,13 +54,13 @@ In this workspace the expected Python environment is:
 /home/dodo/miniconda3/envs/dagger/bin/python
 ```
 
-Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through tensorboard, use:
+Bash scripts generally expose this as `PYTHON_BIN`.
 
 Core dependencies include PyTorch, Hydra/OmegaConf, torchvision, einops, numpy, scikit-learn, matplotlib, and the local `benchmark` package.
 
 ---
 
-## Training the LPB v2 dynamics model
+## Training the dynamics model
 
 Entry point:
 
@@ -78,6 +69,8 @@ python -m robosuite.discriminator.dyn_disc.training.train
 ```
 
 The trainer is Hydra-configured through `config/train.yaml` and `config/env/*.yaml`.
+An explicit DINOv3 encoder config is **required** — a missing `encoder:` block is
+an error (there is no implicit fallback encoder on this branch).
 
 Main data backends:
 
@@ -85,82 +78,16 @@ Main data backends:
 | --- | --- |
 | `env=hdf5` | `HDF5DynamicsModelDataset` for robosuite-style rollout HDF5 trees. |
 | `env=preprocessed` | `PreprocessedCacheDynamicsModelDataset` for `.npz` caches. |
-| `env=agilex` | `AgilexCacheDynamicsModelDataset` for real-world Agilex cache data. |
 
 Checkpoint directory contents expected by downstream encoders:
 
 ```text
 hydra.yaml
 normalizer.pth
-checkpoints/model_<epoch>.pth
+checkpoint(s)/model_<epoch>.pth
 ```
 
-Real-world Agilex training entrance:
-
-```bash
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
-```
-
-Useful overrides:
-
-```bash
-TASKS="candy_in_plate duck_in_bowl" \
-EPOCHS=50 \
-BATCH_SIZE=256 \
-FRAMESKIP=1 \
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
-```
-
-The script assumes a built Agilex cache. It points at `data/.agilex_train_cache` by default and writes under `checkpoints/dyn_disc/dynamics/<run-name>-<timestamp>/`.
-
-Simulator/preprocessed-cache training entrance:
-
-```bash
-TASK=PickPlaceCan \
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
-```
-
-This script uses `env=preprocessed`, defaults to caches under `data/.lpb_score_preprocessed_cache`, and accepts Hydra overrides through trailing CLI arguments.
-
-### Visual encoder choice
-
-For discriminator pretraining, prefer a strong frozen self-supervised visual encoder before tuning a supervised ResNet from scratch. A practical priority order is:
-
-1. **Frozen DINOv3 / DINO-style ViT** as the first baseline.
-2. **DINOv3 partial tuning** with LoRA, adapters, or the last 1-2 transformer blocks if the frozen baseline underfits.
-3. **ResNet50 finetune** as a speed / memory ablation, with strict validation monitoring.
-
-The reason is that failure detection is closer to OOD / dynamics-consistency scoring than closed-set image classification. With limited labeled failure data, a finetuned ResNet50 can overfit task, camera, background, or object shortcuts. A frozen DINO-style encoder usually gives more stable features and better transfer across tasks.
-
-If using DINOv3, do not only use the global `CLS` token unless this is an intentional lightweight baseline. Robot failures are often local: missed grasp, object slip, collision, or bad hand-object geometry. These signals can be diluted in one global image vector. Prefer one of:
-
-```text
-Lowest cost:
-  patch_tokens -> mean pool -> one visual token
-
-Recommended:
-  patch_tokens on a dense grid -> spatial pool to 4x4 or 2x2 -> P visual tokens
-
-Highest capacity:
-  full patch_tokens -> P visual tokens
-```
-
-The current `VisualDynamicsModel` already uses the shape:
-
-```text
-z: (B, T, P, D)
-```
-
-With the current ResNet encoder, `P=1` in practice. A DINOv3 encoder should expose `P>1` patch or pooled dense tokens, for example `P=16` from a 4x4 pooled token grid. Then the WAM loss predicts future local visual tokens instead of only a whole-image summary:
-
-```text
-image_t, proprio_t, action_t -> patch_tokens_{t+1}
-loss = MSE(pred_patch_tokens_{t+1}, target_patch_tokens_{t+1})
-```
-
-This preserves spatial evidence that is important for frame-level failure scores. If compute is limited, start with grid-pooled dense tokens rather than full patch tokens.
-
-### DINOv3 WAM dynamics v1
+### DINOv3 WAM dynamics
 
 The robosuite simulation DINOv3 dynamics config is:
 
@@ -168,7 +95,7 @@ The robosuite simulation DINOv3 dynamics config is:
 bash robosuite/discriminator/dyn_disc/scripts/train_dinov3_robosuite_dynamics.sh
 ```
 
-The current v1 setup is intentionally asymmetric:
+The current setup is intentionally asymmetric:
 
 ```text
 source:
@@ -189,22 +116,21 @@ Main choices:
 - action chunk: causal horizon 8, flattened as `7 * 8 = 56`;
 - supervision: no action target loss (`action_loss_weight=0.0`); action is used only as a conditioning input.
 
-The v1 proprio/action encoders are MLPs rather than one-layer projections:
+The proprio/action encoders are MLPs:
 
 ```text
 proprio_encoder: 14 -> 64 -> 64
 action_encoder:  56 -> 128 -> 64
 ```
 
-This avoids the old bottleneck where an 8-step action chunk was compressed from
-56 dimensions to 7 dimensions by a single linear layer. The dynamics predictor is
-kept near a 60M-parameter trainable budget by using a 9-layer ViT predictor.
+The dynamics predictor is kept near a 60M-parameter trainable budget by using a
+9-layer ViT predictor.
 
 ---
 
 ## Feature extraction
 
-`LPBV2Encoder` loads:
+`DynEncoder` loads:
 
 - the dynamics checkpoint;
 - sibling `hydra.yaml`;
@@ -219,7 +145,7 @@ Supported feature spaces:
 | `encoder` | Concatenated `[visual_emb; proprio_emb; action_emb]`. Block weights apply to visual/proprio/action dimensions. |
 | `transformer` | Flattened ViT hidden state at `transformer_layer`. Distances use uniform L2 in benchmark adapters. |
 
-For current real-world scripts, two-bank and BCE default to `feature_source=transformer` and `transformer_layer=1`.
+The two-bank adapter defaults to `feature_source=transformer` and `transformer_layer=1`.
 
 ---
 
@@ -231,9 +157,8 @@ Files:
 
 - `detectors/single_bank_knn.py`
 - `adapters/single_bank.py`
-- `real_world_single_bank.py`
 - `sim_benchmark.py`
-- `scripts/run_dyn_disc_real_world_benchmark.sh`
+- `scripts/run_single_bank_robosuite_benchmark.sh`
 
 Workflow:
 
@@ -247,33 +172,24 @@ tau = percentile(success_calib_scores, 100 - delta)
 pred_t = 1 iff score_t >= tau
 ```
 
-Run:
-
-```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_real_world_benchmark.sh
-```
-
 Simulator benchmark entrance:
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/dyn_disc/scripts/run_dyn_disc_benchmark.sh
+MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
+bash robosuite/discriminator/dyn_disc/scripts/run_single_bank_robosuite_benchmark.sh
 ```
 
 Important env knobs:
 
 ```bash
-TASKS="candy_in_plate duck_in_bowl"
-MAX_FAIL_PER_TASK=25
-MAX_SUCCESS_PER_TASK=25
+TASKS="PickPlaceCereal"
+MAX_FAIL_PER_TASK=100
+MAX_SUCCESS_PER_TASK=100
 KNN_FEATURE_SOURCE=encoder      # encoder or transformer
 KNN_TRANSFORMER_LAYER=-1
 DELTA=10.0
 CALIB_FRACTION=0.2
 ```
-
-Note: the current single-bank scripts assign `MODEL_CKPT` inside the script body. If that assignment is still present, edit it or pass `--model-ckpt` directly to the Python runner.
 
 ### Two-bank KNN
 
@@ -281,13 +197,14 @@ Files:
 
 - `detectors/two_bank_knn.py`
 - `adapters/two_bank.py`
-- `real_world_two_bank.py`
-- `scripts/run_two_bank_real_world_benchmark.sh`
+- `sim_benchmark_two_bank.py`
+- `scripts/run_two_bank_robosuite_benchmark.sh`
 
 Workflow:
 
-1. Build the success bank from success trajectories.
-2. Select a disjoint failure bank from labeled failure trajectories not present in the eval set.
+1. Build the success bank + success-calibration split from the success eval set.
+2. Discover a disjoint GT failure bank from a labeled failure split
+   (`fail_rollout-labeled`) that is `video_id`-disjoint from the eval failure set.
 3. Slice each failure-bank trajectory from `first_gt_failure_frame()` onward.
 4. Score each frame with one of:
 
@@ -302,17 +219,19 @@ dsucc_only: score = d_succ
 
 5. Calibrate with `success_percentile` or `two_class_youden`.
 
-Run:
+Simulator benchmark entrance:
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/dyn_disc/scripts/run_two_bank_real_world_benchmark.sh
+MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
+bash robosuite/discriminator/dyn_disc/scripts/run_two_bank_robosuite_benchmark.sh
 ```
 
 Important env knobs:
 
 ```bash
-FAIL_BANK_PER_TASK=10
+TASKS="PickPlaceCereal"
+FAIL_BANK_PER_TASK=25
+FAIL_BANK_LAST_K=60
 SCORE_MODE=difference           # difference, ratio, dsucc_only
 ALPHA=1.0
 CALIB_MODE=success_percentile   # success_percentile or two_class_youden
@@ -320,181 +239,37 @@ KNN_FEATURE_SOURCE=transformer
 KNN_TRANSFORMER_LAYER=1
 ```
 
-The adapter asserts disjointness between eval trajectories, failure-bank trajectories, and failure-calibration trajectories by `video_id`.
-
-### BCE discriminator
-
-Files:
-
-- `detectors/bce.py`
-- `adapters/bce.py`
-- `real_world_bce.py`
-- `robosuite_bce.py`
-- `scripts/run_bce_real_world_benchmark.sh`
-- `scripts/run_bce_robosuite_benchmark.sh`
-- `tests/test_bce_discriminator.py`
-
-Workflow:
-
-1. Encode success trajectories and split them into train/calibration per task.
-2. For each disjoint failure-bank trajectory, use ground-truth failure timing:
-
-```text
-prefix [0, first_gt_failure_frame)  -> expert-like set D_e
-suffix [first_gt_failure_frame, T)  -> other/failure set D_o
-```
-
-3. Train one shared `BCEHead` with `BCEWithLogitsLoss`.
-4. Convert expert-likeness logits into failure scores:
-
-```text
-g(z) = head(z)                 # larger means more expert-like
-failure_score = -g(z)          # larger means more failure-like
-```
-
-5. Calibrate per-task thresholds. Default is **two-class Youden** (failure-aware):
-
-```text
-tau_task = argmax_t  TPR(t) - FPR(t)
-           over s_succ = success-calib failure scores
-           and  s_fail = fail-bank GT-suffix failure scores
-pred_t = 1 iff failure_score_t >= tau_task
-```
-
-Selectable via `--calib-mode`. The original PU-style alternative is:
-
-```text
-# --calib-mode success_percentile
-tau_task = percentile(success_calib_failure_scores, 100 - delta)
-```
-
-Calibration only affects `pred_t` (and downstream F1 / precision / recall). AUROC and AUPRC are computed from the continuous `step_scores` and are invariant under `calib_mode`.
-
-Run:
-
-```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-bash robosuite/discriminator/dyn_disc/scripts/run_bce_real_world_benchmark.sh
-```
-
-Important env knobs:
-
-```bash
-FAIL_BANK_PER_TASK=25
-HEAD_HIDDEN=256
-HEAD_LAYERS=2
-EPOCHS=20
-LR=3e-4
-WEIGHT_DECAY=1e-4
-BATCH_SIZE=512
-MAX_EXPERT_OTHER_RATIO=1.0     # <=0 disables the D_e cap
-SAVE_CKPT_DIR=/path/to/out/checkpoints
-KNN_FEATURE_SOURCE=transformer
-KNN_TRANSFORMER_LAYER=1
-CALIB_MODE=two_class_youden    # two_class_youden | success_percentile
-```
-
-Hard invariant: `BCEBenchmarkDiscriminator.fit_on_benchmark(...)` trains and calibrates only. It does not call `bench.evaluate(...)` and does not compute AUROC during training. Evaluation happens later in `real_world_bce.py`.
+The runner and the adapter both hard-assert disjointness between eval
+trajectories, failure-bank trajectories, and failure-calibration trajectories by
+`video_id`.
 
 ---
 
 ## Per-trajectory visualization
 
-Each discriminator variant has a paired visualization entry that renders, for a sampled set of failure trajectories, an MP4 (per-frame HUD + red border on predicted-failure frames) plus a multi-page PDF (per-trajectory score curve, calibrated threshold, GT failure segments, summary page).
+Each KNN variant renders, for a sampled set of failure trajectories, an MP4
+(per-frame HUD + red border on predicted-failure frames) plus a multi-page PDF
+(per-trajectory score curve, calibrated threshold, GT failure segments, summary
+page).
 
 ### Single-bank KNN visualization
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
+MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
 TASK=PickPlaceCereal \
-  bash robosuite/discriminator/dyn_disc/scripts/visualize_dyn_disc.sh
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_single_bank_robosuite.sh
 ```
 
-Driver: `visualization/visualize.py`.
-
-### BCE visualization (robosuite-sim)
+### Two-bank KNN visualization
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-TASK=PickPlaceCereal NUM_TRAJS=3 \
-  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
+MODEL_CKPT=/abs/path/to/checkpoint/model_50.pth \
+TASK=PickPlaceCereal \
+  bash robosuite/discriminator/dyn_disc/scripts/visualize_two_bank_robosuite.sh
 ```
 
-### BCE visualization (real-world Agilex)
-
-```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_49.pth \
-TASK=candy_in_plate NUM_TRAJS=3 \
-  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_realworld.sh
-```
-
-Both BCE entrances are thin wrappers around `visualization/visualize_bce.py` (single Python module, dispatched by `--kind {robosuite,realworld}`). They mirror the corresponding `run_bce_*_benchmark.sh` for failure-bank construction and BCE head hyperparameters:
-
-```bash
-FAIL_BANK_PER_TASK=25
-HEAD_HIDDEN=256
-HEAD_LAYERS=2
-EPOCHS=20
-LR=3e-4
-WEIGHT_DECAY=1e-4
-BATCH_SIZE=512
-MAX_EXPERT_OTHER_RATIO=1.0
-FEATURE_SOURCE=transformer
-TRANSFORMER_LAYER=1
-DELTA=10.0
-```
-
-The visualizer always reports the two-class Youden operating point computed from the same `(success-calib, fail-suffix)` failure-score distributions used by `CALIB_MODE=two_class_youden` in the benchmark runner. To inspect a different `tau`, change `CALIB_MODE` in the runner script and rerun — there is no separate viz knob.
-
-By default the script fits a fresh BCE head and writes `bce_head.pth` under `<OUT_DIR>/checkpoints/`. To skip training and reuse a previously fitted head, pass `LOAD_CKPT=/abs/path/to/bce_head.pth` (the per-task thresholds are restored from the ckpt; failure-bank discovery is skipped).
-
-Score / threshold semantics on screen:
-
-```text
-g(z)            = head(z)                # expert-likeness logit
-bce_score       = -g(z)                  # shown in HUD; larger = more failure
-pred_t = 1      iff bce_score_t >= tau_task
-```
-
-Output layout:
-
-```text
-<OUT_DIR>/
-  videos/<video_id>.mp4
-  bce_v2_scores.pdf
-  checkpoints/bce_head.pth    # only on cold fit; absent under LOAD_CKPT
-```
-
----
-
-## Latent separability diagnostic
-
-Diagnostic entry:
-
-```bash
-bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
-```
-
-It can:
-
-- encode all benchmark frames into `latents.npz`;
-- save metadata into `latents_meta.json`;
-- run pooled MMD, Ledoit-Wolf Mahalanobis AUROC, and matched-timestep AUROC;
-- emit `separability_summary.json`, ROC plots, and histograms.
-
-To cache features only:
-
-```bash
-CACHE_FEATURES_ONLY=1 \
-bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
-```
-
-To re-analyze a previous cache without GPU encoding:
-
-```bash
-LOAD_CACHE=/path/to/latents.npz \
-bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.bash
-```
+Both wrap `visualization/visualize.py`; the two-bank path is selected with
+`--mode two_bank`.
 
 ---
 
@@ -502,57 +277,42 @@ bash robosuite/discriminator/dyn_disc/explore/run_diagnose_latent_separability.b
 
 ```python
 from robosuite.discriminator.dyn_disc import (
-    BCEDiscriminator,
-    BCEBenchmarkDiscriminator,
-    BCEHead,
     DetectionResult,
-    LPBV2BenchmarkDiscriminator,
-    LPBV2Encoder,
-    LPBV2KNN,
+    DynEncoder,
+    SingleBankBenchmarkDiscriminator,
+    SingleBankKNN,
     TwoBankBenchmarkDiscriminator,
     TwoBankKNN,
+    knn_min_l2_dist,
     load_model,
 )
 ```
 
-Use the benchmark adapters when working with `benchmark.core.BenchmarkTrajectory`. Use `LPBV2Encoder`, `LPBV2KNN`, `TwoBankKNN`, or `BCEDiscriminator` directly for custom data loaders or online scoring.
+Use the benchmark adapters when working with `benchmark.core.BenchmarkTrajectory`.
+Use `DynEncoder`, `SingleBankKNN`, or `TwoBankKNN` directly for custom data
+loaders or online scoring.
 
 Recommended explicit imports for new code:
 
 ```python
 from robosuite.discriminator.dyn_disc.adapters import (
-    BCEBenchmarkDiscriminator,
-    LPBV2BenchmarkDiscriminator,
+    SingleBankBenchmarkDiscriminator,
     TwoBankBenchmarkDiscriminator,
 )
 from robosuite.discriminator.dyn_disc.detectors import (
-    BCEDiscriminator,
-    LPBV2Encoder,
-    LPBV2KNN,
+    DynEncoder,
+    SingleBankKNN,
     TwoBankKNN,
 )
 ```
 
 ---
 
-## Tests
-
-BCE unit tests:
-
-```bash
-/home/dodo/miniconda3/envs/dagger/bin/python -m pytest \
-  robosuite/discriminator/dyn_disc/tests/test_bce_discriminator.py -v
-```
-
-The tests cover head shape, synthetic separability, deterministic thresholding, scoring output, disjointness checks, class-balance capping, and state-dict roundtrip.
-
----
-
 ## Implementation notes
 
-- Keep checkpoint tensors, `hydra.yaml`, and `normalizer.pth` together. `LPBV2Encoder` depends on that layout.
-- Real-world scripts default to right-arm Agilex slices: `qpos[:, 7:14]` and `action[:, 7:14]`.
-- `camera_to_view` maps real camera names to training view names, for example `cam_high:agentview`.
+- Keep checkpoint tensors, `hydra.yaml`, and `normalizer.pth` together. `DynEncoder` depends on that layout.
+- `camera_to_view` maps real camera names to training view names, for example `agentview:agentview`.
 - Larger `delta` lowers the calibration percentile and usually makes detectors stricter.
-- Failure-bank based methods require usable `first_gt_failure_frame()` annotations.
+- The two-bank failure-bank method requires usable `first_gt_failure_frame()` annotations.
 - The benchmark adapters pad scores/predictions back to `trajectory.num_frames` when encoded feature length is shorter than the raw trajectory length.
+```

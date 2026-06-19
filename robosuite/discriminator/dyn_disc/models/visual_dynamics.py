@@ -97,7 +97,7 @@ class VisualDynamicsModel(nn.Module):
 
         Returns:
             z: (B, T, P, D) token tensor, where P is the visual "patch" count.
-               In this v2 port, the ResNet encoder uses a dummy patch dimension P=1.
+               A non-patch encoder uses a dummy patch dimension P=1.
 
         Note:
             We tile proprio/action embeddings across the patch dimension so the predictor can

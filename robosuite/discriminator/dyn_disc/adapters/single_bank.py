@@ -1,11 +1,11 @@
-"""Benchmark adapter for the cleaned LPB v2 KNN OOD discriminator.
+"""Benchmark adapter for the single-bank KNN OOD discriminator.
 
-Drop-in alternative to `robosuite.discriminator.lpb.lpb_benchmark` but built on
-the original LPB dynamics model + KNN feature definition (see `knn.py`).
+Built on the dyn_disc dynamics model + KNN feature definition (see
+`detectors/single_bank_knn.py`).
 
-Per-task workflow (matches `LPBBenchmarkDiscriminator` in lpb/):
+Per-task workflow:
   1. fit_on_benchmark(trajectories): split per-task success demos into
-     bank + disjoint calibration, encode all frames via the original LPB encoder,
+     bank + disjoint calibration, encode all frames via the dyn_disc encoder,
      build the KNN bank, calibrate the percentile threshold.
   2. score_trajectory(traj): encode the trajectory frame-by-frame, compute
      per-frame min L2 distance to the bank, threshold to produce binary preds.
@@ -22,7 +22,7 @@ from omegaconf import OmegaConf
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
-from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import LPBV2Encoder, LPBV2KNN
+from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import DynEncoder, SingleBankKNN
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
@@ -39,8 +39,8 @@ def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.
     return np.concatenate([arr, pad], axis=0)
 
 
-class LPBV2BenchmarkDiscriminator:
-    """LPB v2 KNN OOD detector exposed through BenchmarkTrajectory API."""
+class SingleBankBenchmarkDiscriminator:
+    """Single-bank KNN OOD detector exposed through BenchmarkTrajectory API."""
 
     name = "dyn_disc_knn"
 
@@ -82,7 +82,7 @@ class LPBV2BenchmarkDiscriminator:
         self.seed = int(seed)
         self.verbose_fit = bool(verbose_fit)
 
-        self.encoder = LPBV2Encoder(
+        self.encoder = DynEncoder(
             model_ckpt=self.model_ckpt,
             device=self.device,
             feature_source=self.feature_source,
@@ -99,7 +99,7 @@ class LPBV2BenchmarkDiscriminator:
             self.camera_to_view = {v: v for v in self.encoder.view_names}
 
         # Per-task state.
-        self._detectors_per_task: Dict[str, LPBV2KNN] = {}
+        self._detectors_per_task: Dict[str, SingleBankKNN] = {}
         self._calibration_stats: Dict[str, dict] = {}
         # Cache encoded trajectories: (file_path, demo_path) -> (T, D) tensor.
         self._feature_cache: Dict[tuple, torch.Tensor] = {}
@@ -295,7 +295,7 @@ class LPBV2BenchmarkDiscriminator:
 
         if not task_to_success:
             raise RuntimeError(
-                "LPB-original KNN calibration requires success trajectories per task."
+                "single-bank KNN calibration requires success trajectories per task."
             )
 
         for task, succ_list in task_to_success.items():
@@ -350,7 +350,7 @@ class LPBV2BenchmarkDiscriminator:
                     f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
                 )
 
-            det = LPBV2KNN(
+            det = SingleBankKNN(
                 visual_dim=visual_dim,
                 proprio_dim=proprio_dim,
                 action_dim=action_dim,
@@ -448,5 +448,3 @@ class LPBV2BenchmarkDiscriminator:
         except Exception:
             pass
 
-
-LPBOriginalBenchmarkDiscriminator = LPBV2BenchmarkDiscriminator

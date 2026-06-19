@@ -1,11 +1,11 @@
-"""Single-GPU Hydra training entry for the cleaned LPB v2 dynamics model.
+"""Single-GPU Hydra training entry for the dyn_disc dynamics model.
 
-This is a stripped-down rewrite of `dyn_model/train.py` that:
+This trains a WAM-style latent dynamics model that:
   * reads HDF5 / preprocessed data via robosuite.discriminator.dyn_disc.data
   * skips Accelerate (single GPU torch loop), keeping the dependency surface small
-  * keeps the original LPB model architecture (ResNetEncoder + hydra-instantiated
-    proprio/action encoders + ViT predictor + VisualDynamicsModel), so checkpoints
-    are loadable by `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
+  * uses a DINOv3 visual encoder + hydra-instantiated proprio/action encoders +
+    ViT predictor + VisualDynamicsModel, so checkpoints are loadable by
+    `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
   * saves <run_dir>/{checkpoints/model_<epoch>.pth, hydra.yaml, normalizer.pth}
     in the layout the discriminator expects.
 
@@ -121,13 +121,15 @@ def _instantiate_dataset(cfg: DictConfig, train: bool):
 def _instantiate_encoder(cfg: DictConfig):
     encoder_cfg = getattr(cfg, "encoder", None)
     if encoder_cfg is None:
-        from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
-        return ResNetEncoder(policy_ckpt_path=None, view_names=list(cfg.view_names))
+        raise ValueError(
+            "dyn_disc requires an explicit DINOv3 encoder config; none found "
+            "(expected an `encoder:` block, e.g. config/encoder/dinov3.yaml)."
+        )
     return instantiate_local(encoder_cfg, view_names=list(cfg.view_names))
 
 
 def _build_model(cfg: DictConfig, dataset, device: torch.device):
-    """Replicates the original LPB model construction with local v2 modules."""
+    """Builds the dyn_disc dynamics model (DINOv3 encoder + ViT predictor)."""
     if cfg.policy_ckpt_path not in (None, "", "null", "None"):
         raise ValueError(
             "dyn_disc does not support diffusion-policy policy_ckpt_path. "
