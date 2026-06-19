@@ -10,7 +10,7 @@ proprio/action slicing, and the batched ``_encode`` path. Subclasses (e.g.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -226,6 +226,19 @@ class DynBenchmarkDiscriminator:
             "t_len": t_len,
         }
 
+    @staticmethod
+    def _truncate_prepared(prepared: Dict[str, Any], frame_end: int) -> Dict[str, Any]:
+        t_end = min(int(frame_end), int(prepared["t_len"]))
+        if t_end <= 0:
+            raise ValueError(f"frame_end must be positive, got {t_end}")
+        return {
+            "view_names": prepared["view_names"],
+            "per_view_chw": {k: v[:t_end] for k, v in prepared["per_view_chw"].items()},
+            "prop": prepared["prop"][:t_end],
+            "act": prepared["act"][:t_end],
+            "t_len": t_end,
+        }
+
     def _encode_tensors(self, key: tuple, prepared: Dict[str, Any]) -> torch.Tensor:
         view_names: List[str] = prepared["view_names"]
         per_view_chw: Dict[str, np.ndarray] = prepared["per_view_chw"]
@@ -273,14 +286,53 @@ class DynBenchmarkDiscriminator:
         return self._encode_tensors(key, prepared)
 
     @torch.no_grad()
-    def _encode(self, trajectory: BenchmarkTrajectory) -> torch.Tensor:
+    def _encode(
+        self,
+        trajectory: BenchmarkTrajectory,
+        *,
+        frame_end: Optional[int] = None,
+    ) -> torch.Tensor:
         key = self._trajectory_key(trajectory)
+        if frame_end is not None:
+            key = key + (f"end{int(frame_end)}",)
         cached = self._feature_cache.get(key, None)
         if cached is not None:
             return cached
 
         prepared = self._prepare_trajectory_tensors(trajectory)
+        if frame_end is not None:
+            prepared = self._truncate_prepared(prepared, frame_end)
         return self._encode_tensors(key, prepared)
+
+    @torch.no_grad()
+    def _encode_trajectories(
+        self,
+        trajectories: Sequence[BenchmarkTrajectory],
+        *,
+        desc: str = "encode",
+    ) -> List[torch.Tensor]:
+        """Encode trajectories sequentially; show a tqdm bar when verbose_fit."""
+        if not trajectories:
+            return []
+
+        iterable: Iterable[BenchmarkTrajectory] = trajectories
+        if self.verbose_fit:
+            try:
+                from tqdm import tqdm
+
+                iterable = tqdm(
+                    trajectories,
+                    desc=desc,
+                    unit="traj",
+                    dynamic_ncols=True,
+                )
+            except ImportError:
+                pass
+
+        out: List[torch.Tensor] = []
+        for traj in iterable:
+            out.append(self._encode(traj))
+        return out
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #

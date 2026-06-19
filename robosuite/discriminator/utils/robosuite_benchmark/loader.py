@@ -23,6 +23,7 @@ from .trajectory import RobosuiteBenchmarkTrajectory
 DEFAULT_FAIL_SPLIT = "fail_rollout-val-labeled"
 DEFAULT_SUCCESS_SPLIT = "success_rollout-val"
 DEFAULT_BANK_SPLIT = "fail_rollout-labeled"
+DEFAULT_SUCCESS_TRAIN_SPLIT = "success_rollout"
 
 _TASK_ALIASES = {
     "PandaLift": "Lift",
@@ -138,6 +139,7 @@ def _discover_split(
     max_per_task: Optional[int],
     require_success_counterpart: bool = False,
     success_split: str = DEFAULT_SUCCESS_SPLIT,
+    require_failure_mask: bool = True,
 ) -> list[RobosuiteBenchmarkTrajectory]:
     allowed = _task_filter(tasks)
     out: list[RobosuiteBenchmarkTrajectory] = []
@@ -168,7 +170,7 @@ def _discover_split(
                     if num_frames <= 0:
                         continue
                     failure_segments: list[dict] = []
-                    if is_failure:
+                    if is_failure and require_failure_mask:
                         if "annotations" not in g or "failure_frame_mask" not in g["annotations"]:
                             continue
                         mask = np.asarray(g["annotations"]["failure_frame_mask"][:], dtype=np.uint8)
@@ -237,6 +239,28 @@ def discover_failure_bank(
         is_failure=True,
         tasks=tasks,
         max_per_task=max_fail_per_task,
+        require_failure_mask=True,
+    )
+
+
+def discover_success_rollouts(
+    data_root: str = "data",
+    tasks: Optional[list[str]] = None,
+    split: str = DEFAULT_SUCCESS_TRAIN_SPLIT,
+    max_success_per_task: Optional[int] = None,
+) -> list[RobosuiteBenchmarkTrajectory]:
+    """Discover success rollouts for the BCE train positive / calibration pools.
+
+    Distinct from the eval success split so training never sees eval frames.
+    Only states/actions/observations are required; failure masks are irrelevant.
+    """
+    return _discover_split(
+        data_root=data_root,
+        split=split,
+        is_failure=False,
+        tasks=tasks,
+        max_per_task=max_success_per_task,
+        require_failure_mask=False,
     )
 
 

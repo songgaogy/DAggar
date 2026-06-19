@@ -206,7 +206,12 @@ Files:
 
 Workflow:
 
-1. Encode success trajectories and split them into train/calibration per task.
+1. Encode **train** success trajectories (from a split disjoint from the eval
+   success split) and split them into train/calibration per task. Only the
+   pre-done frames are used: each success trajectory is truncated at the first
+   `is_success==True` frame (`prefix_frames_before_done()`), so post-done idle
+   frames never enter `D_e` or calibration. The eval success split is used only
+   by `bench.evaluate`, never for training (no train/val contamination).
 2. For each disjoint failure-bank trajectory, use ground-truth failure timing:
 
 ```text
@@ -240,10 +245,24 @@ tau_task = percentile(success_calib_failure_scores, 100 - delta)
 
 Calibration only affects `pred_t` (and downstream F1 / precision / recall). AUROC and AUPRC are computed from the continuous `step_scores` and are invariant under `calib_mode`.
 
-Run (robosuite):
+Data splits (per task):
+
+```text
+success_rollout            BCE train positives + calibration (pre-done frames)
+success_rollout-val        benchmark eval success           (pre-done frames)
+fail_rollout-labeled       GT-labeled failure bank (D_e/D_o via failure timing)
+fail_rollout-val-labeled   benchmark eval failures
+```
+
+The train and eval success splits are disjoint; the runner hard-asserts
+`train_success ∩ eval_success == ∅` (and the fail bank is disjoint from the eval
+failures by `video_id`).
+
+Run (robosuite) — important parameters are set directly inside the script
+(`MODEL_CKPT`, `TASKS`, the four splits, head/calibration knobs); edit them
+there rather than relying on env overrides:
 
 ```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_50.pth \
 bash robosuite/discriminator/dyn_disc/scripts/run_bce_robosuite_benchmark.sh
 ```
 
@@ -255,26 +274,25 @@ python -m robosuite.discriminator.dyn_disc.robosuite_bce \
   --data-root data --tasks PickPlaceCereal \
   --fail-split fail_rollout-val-labeled \
   --success-split success_rollout-val \
+  --success-train-split success_rollout \
   --fail-train-split fail_rollout-labeled \
+  --train-max-success-per-task 50 \
   --epochs 20 --fail-bank-per-task 25 --calib-mode two_class_youden
 ```
 
-Important env knobs:
+Peripheral env knobs (still overridable; important ones are hardcoded in-script):
 
 ```bash
-FAIL_BANK_PER_TASK=25
-HEAD_HIDDEN=256
-HEAD_LAYERS=2
 EPOCHS=20
 LR=3e-4
 WEIGHT_DECAY=1e-4
 BATCH_SIZE=512
-MAX_EXPERT_OTHER_RATIO=1.0     # <=0 disables the D_e cap
+DELTA=10.0
 SAVE_CKPT_DIR=/path/to/out/checkpoints
-KNN_FEATURE_SOURCE=transformer
-KNN_TRANSFORMER_LAYER=1
-CALIB_MODE=two_class_youden    # two_class_youden | success_percentile
 ```
+
+Outputs are written under
+`checkpoints/dyn_disc/bce_eval_robosuite/run_<timestamp>_<TASKS>/`.
 
 Hard invariant: `BCEBenchmarkDiscriminator.fit_on_benchmark(...)` trains and calibrates only. It does not call `bench.evaluate(...)` and does not compute AUROC during training. Evaluation happens later in `robosuite_bce.py`.
 
@@ -284,29 +302,23 @@ Hard invariant: `BCEBenchmarkDiscriminator.fit_on_benchmark(...)` trains and cal
 
 The BCE visualization entry renders, for a sampled set of trajectories, an MP4 (per-frame HUD + red border on predicted-failure frames) plus a multi-page PDF (per-trajectory score curve, calibrated threshold, GT failure segments, summary page).
 
-```bash
-MODEL_CKPT=/abs/path/to/checkpoints/model_50.pth \
-TASK=PickPlaceCereal NUM_TRAJS=3 \
-  bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
-```
-
-The script is a thin wrapper around `visualization/visualize_bce.py` and mirrors `run_bce_robosuite_benchmark.sh` for failure-bank construction and BCE head hyperparameters:
+Important parameters (`MODEL_CKPT`, `TASK`, `SPLIT`, `NUM_TRAJS`, the four splits,
+head knobs) are set directly inside the script — edit them there:
 
 ```bash
-FAIL_BANK_PER_TASK=25
-HEAD_HIDDEN=256
-HEAD_LAYERS=2
-EPOCHS=20
-LR=3e-4
-WEIGHT_DECAY=1e-4
-BATCH_SIZE=512
-MAX_EXPERT_OTHER_RATIO=1.0
-FEATURE_SOURCE=transformer
-TRANSFORMER_LAYER=1
-DELTA=10.0
+bash robosuite/discriminator/dyn_disc/scripts/visualize_bce_robosuite.sh
 ```
 
-The visualizer always reports the two-class Youden operating point computed from the same `(success-calib, fail-suffix)` failure-score distributions used by `CALIB_MODE=two_class_youden` in the benchmark runner. To inspect a different `tau`, change `CALIB_MODE` in the runner script and rerun — there is no separate viz knob.
+`SPLIT` selects the eval pool: `fail_rollout`, `success_rollout`, or `both`
+(default). With `SPLIT=both`, `NUM_TRAJS=5` renders **5 failure and 5 success**
+trajectories (i.e. `NUM_TRAJS` per pool). Success trajectories are scored only on
+their pre-done (`is_success==False`) prefix; post-done frames are padded with a
+low failure score so they never trigger a prediction.
+
+The script mirrors `run_bce_robosuite_benchmark.sh` for failure-bank
+construction, the disjoint train success split, and BCE head hyperparameters.
+
+The visualizer always reports the two-class Youden operating point computed from the same `(train success-calib, fail-suffix)` failure-score distributions used by `CALIB_MODE=two_class_youden` in the benchmark runner. To inspect a different `tau`, change `CALIB_MODE` in the runner script and rerun — there is no separate viz knob.
 
 By default the script fits a fresh BCE head and writes `bce_head.pth` under `<OUT_DIR>/checkpoints/`. To skip training and reuse a previously fitted head, pass `LOAD_CKPT=/abs/path/to/bce_head.pth` (the per-task thresholds are restored from the ckpt; failure-bank discovery is skipped).
 

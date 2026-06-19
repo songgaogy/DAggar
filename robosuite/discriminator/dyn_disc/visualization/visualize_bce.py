@@ -13,12 +13,14 @@ operating point, change the runner's ``calib_mode`` and re-fit.
 
 Robosuite layout (mirrors ``robosuite_bce.py``): eval trajectories from
 fail_rollout-val-labeled / success_rollout-val, BCE bank from
-fail_rollout-labeled.
+fail_rollout-labeled, train success from success_rollout (disjoint from eval).
+Success rollouts are scored only on their pre-done (is_success=False) prefix.
 
 Use ``--split`` to choose which eval trajectories are rendered:
 
-  * ``fail_rollout``    - sample from ``--fail-split`` (default)
+  * ``fail_rollout``    - sample from ``--fail-split``
   * ``success_rollout`` - sample from ``--success-split`` (``is_failure=False``)
+  * ``both``            - sample ``--num-trajs`` from each pool (default)
 
 Outputs:
     <out_dir>/videos/<video_id>.mp4
@@ -197,26 +199,29 @@ def _compute_fail_suffix_failure_scores_per_task(
 
 def _compute_success_calib_failure_scores_per_task(
     discriminator: BCEBenchmarkDiscriminator,
-    eval_trajs: Sequence[BenchmarkTrajectory],
+    train_success_trajs: Sequence[BenchmarkTrajectory],
     *,
     seed: int,
     calib_fraction: float,
 ) -> Dict[str, np.ndarray]:
     """Re-derive the success train/calib split used by the adapter and score
-    the calib slice through the fitted head.
+    the calib slice (pre-done frames only) through the fitted head.
+
+    Uses the disjoint TRAIN success pool -- never the eval success split.
 
     Replication note: must match the rng + split rule in
     ``BCEBenchmarkDiscriminator.fit_on_benchmark`` (NumPy ``default_rng(seed)``,
     ``calib_fraction``, per-task ``permutation``, ``n_calib =
-    max(1, min(N-1, round(calib_fraction*N)))``). Changes to either side must
-    be mirrored here, otherwise ``youden`` will mix train + calib frames.
+    max(1, min(N-1, round(calib_fraction*N)))``) and the pre-done prefix slice.
+    Changes to either side must be mirrored here, otherwise ``youden`` will mix
+    train + calib frames.
     """
     if discriminator._shared_detector is None:
         raise RuntimeError(
             "Cannot compute success-calib scores: BCE head is not fitted/loaded."
         )
     task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
-    for t in eval_trajs:
+    for t in train_success_trajs:
         if bool(t.is_failure):
             continue
         task_to_success.setdefault(str(t.task_name), []).append(t)
@@ -234,7 +239,12 @@ def _compute_success_calib_failure_scores_per_task(
         calib_trajs = [t for i, t in enumerate(succ_list) if i in calib_idx]
         if not calib_trajs:
             continue
-        feats_list = [discriminator._encode(t) for t in calib_trajs]
+        feats_list = [
+            discriminator._encode(
+                t, frame_end=discriminator._success_prefix_frame_end(t)
+            )
+            for t in calib_trajs
+        ]
         catf = torch.cat(
             [f.to(torch.float32).reshape(-1, f.shape[-1]) for f in feats_list], dim=0,
         )
@@ -608,7 +618,19 @@ def _sample_trajectories_for_viz(
     num_trajs: int,
     seed: int,
 ) -> List[BenchmarkTrajectory]:
-    """Sample trajectories from the eval benchmark for MP4/PDF rendering."""
+    """Sample trajectories from the eval benchmark for MP4/PDF rendering.
+
+    ``split='both'`` samples ``num_trajs`` failures *and* ``num_trajs`` successes.
+    """
+    if split == "both":
+        fail = _sample_trajectories_for_viz(
+            trajs, task=task, split="fail_rollout", num_trajs=num_trajs, seed=seed,
+        )
+        succ = _sample_trajectories_for_viz(
+            trajs, task=task, split="success_rollout", num_trajs=num_trajs, seed=seed,
+        )
+        return fail + succ
+
     if split == "success_rollout":
         pool = [t for t in trajs if not bool(t.is_failure) and str(t.task_name) == str(task)]
         kind = "success"
@@ -616,7 +638,9 @@ def _sample_trajectories_for_viz(
         pool = [t for t in trajs if bool(t.is_failure) and str(t.task_name) == str(task)]
         kind = "failure"
     else:
-        raise ValueError(f"unknown split {split!r}; expected success_rollout or fail_rollout")
+        raise ValueError(
+            f"unknown split {split!r}; expected fail_rollout, success_rollout, or both"
+        )
 
     if not pool:
         raise RuntimeError(
@@ -667,13 +691,14 @@ def _select_bank_robosuite(
 
 
 def _build_benchmark_and_bank(args: argparse.Namespace):
-    """Build the eval FailureBenchmark plus the disjoint failure bank pool.
+    """Build the eval FailureBenchmark, disjoint failure bank, and train success.
 
-    Returns (bench, eval_trajs, fail_bank_trajs).
+    Returns (bench, eval_trajs, fail_bank_trajs, train_success_trajs).
     """
     from robosuite.discriminator.utils.robosuite_benchmark import (
         FailureBenchmark,
         discover_failure_bank,
+        discover_success_rollouts,
     )
 
     bench = FailureBenchmark(
@@ -702,12 +727,20 @@ def _build_benchmark_and_bank(args: argparse.Namespace):
         bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
     eval_tasks = sorted({str(t.task_name) for t in trajs})
     fail_bank = _select_bank_robosuite(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
+
+    train_success = discover_success_rollouts(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        split=args.success_train_split,
+        max_success_per_task=None,
+    )
     print(
         f"[bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-        f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
+        f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)} "
+        f"train_success={len(train_success)}",
         flush=True,
     )
-    return bench, trajs, fail_bank
+    return bench, trajs, fail_bank, train_success
 
 
 # ---------------------------------------------------------------------- #
@@ -782,16 +815,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         type=str,
-        default="fail_rollout",
-        choices=["success_rollout", "fail_rollout"],
-        help="Eval split to visualize: fail_rollout (--fail-split) or "
-             "success_rollout (--success-split).",
+        default="both",
+        choices=["success_rollout", "fail_rollout", "both"],
+        help="Eval pool to visualize: fail_rollout, success_rollout, or both "
+             "(both samples --num-trajs from each).",
     )
     parser.add_argument("--model-ckpt", required=True, help="dyn_disc DINOv3 dynamics checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
-    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val",
+                        help="Eval success split (benchmark test only).")
+    parser.add_argument("--success-train-split", type=str, default="success_rollout",
+                        help="Train success split for BCE positives + calibration.")
     parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
     parser.add_argument("--task", required=True)
     parser.add_argument("--num-trajs", type=int, default=4)
@@ -845,7 +881,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    bench, trajs, fail_bank_trajs = _build_benchmark_and_bank(args)
+    bench, trajs, fail_bank_trajs, train_success_trajs = _build_benchmark_and_bank(args)
     sampled = _sample_trajectories_for_viz(
         trajs,
         task=str(args.task),
@@ -893,7 +929,10 @@ def main() -> None:
             _bootstrap_from_ckpt(discriminator, str(args.load_ckpt))
         else:
             print("[bce][viz] fitting BCE head on benchmark...", flush=True)
-            discriminator.fit_on_benchmark(trajs)
+            discriminator.fit_on_benchmark(
+                trajs,
+                train_success_trajectories=train_success_trajs,
+            )
 
         if str(args.task) not in discriminator._detectors_per_task:
             available = sorted(discriminator._detectors_per_task)
@@ -912,7 +951,7 @@ def main() -> None:
             discriminator, fail_bank_trajs,
         )
         calib_scores = _compute_success_calib_failure_scores_per_task(
-            discriminator, trajs,
+            discriminator, train_success_trajs,
             seed=int(args.seed),
             calib_fraction=float(args.calib_fraction),
         )

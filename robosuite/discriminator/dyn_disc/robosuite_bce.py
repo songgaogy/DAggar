@@ -21,6 +21,7 @@ from robosuite.discriminator.utils.robosuite_benchmark import (
     FailureBenchmark,
     RobosuiteBenchmarkTrajectory,
     discover_failure_bank,
+    discover_success_rollouts,
 )
 
 from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
@@ -32,8 +33,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=str, default="data",
                         help="Root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
-    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val",
+                        help="Eval success split (benchmark test only).")
+    parser.add_argument("--success-train-split", type=str, default="success_rollout",
+                        help="Train success split for BCE positives + calibration. "
+                             "Kept disjoint from --success-split.")
     parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
+    parser.add_argument("--train-max-success-per-task", type=int, default=None,
+                        help="Max success trajectories per task from --success-train-split.")
     parser.add_argument("--fail-root", type=str, default=None,
                         help="Deprecated; use --data-root/--fail-split.")
     parser.add_argument("--success-root", type=str, default=None,
@@ -195,6 +202,28 @@ def main() -> None:
         flush=True,
     )
 
+    # Discover the disjoint TRAIN success pool (BCE positives + calibration).
+    train_max_success = (
+        None
+        if args.train_max_success_per_task is None or int(args.train_max_success_per_task) <= 0
+        else int(args.train_max_success_per_task)
+    )
+    train_success_trajs = discover_success_rollouts(
+        data_root=args.data_root,
+        tasks=eval_tasks,
+        split=args.success_train_split,
+        max_success_per_task=train_max_success,
+    )
+    train_by_task: Dict[str, int] = {}
+    for t in train_success_trajs:
+        train_by_task[str(t.task_name)] = train_by_task.get(str(t.task_name), 0) + 1
+    print(
+        f"[robosuite][bce] train success from {args.success_train_split}: "
+        f"{len(train_success_trajs)} trajectories "
+        + ", ".join(f"{k}={v}" for k, v in sorted(train_by_task.items())),
+        flush=True,
+    )
+
     # Discover ALL GT-labeled failure trajectories from the train labeled split.
     all_fail = discover_failure_bank(
         data_root=args.data_root,
@@ -292,7 +321,10 @@ def main() -> None:
         # fit bce model
         print("[robosuite][bce] training BCE head (GT split; no eval during training)...",
               flush=True)
-        discriminator.fit_on_benchmark(trajs)
+        discriminator.fit_on_benchmark(
+            trajs,
+            train_success_trajectories=train_success_trajs,
+        )
 
         print("[robosuite][bce] training complete; running bench.evaluate(...)", flush=True)
         result = bench.evaluate(
@@ -314,7 +346,9 @@ def main() -> None:
                 "data_root": str(args.data_root),
                 "fail_train_split": str(args.fail_train_split),
                 "fail_eval_split": str(args.fail_split),
-                "success_split": str(args.success_split),
+                "success_eval_split": str(args.success_split),
+                "success_train_split": str(args.success_train_split),
+                "train_max_success_per_task": train_max_success,
                 "max_expert_other_ratio": (
                     None if float(args.max_expert_other_ratio) <= 0.0
                     else float(args.max_expert_other_ratio)
