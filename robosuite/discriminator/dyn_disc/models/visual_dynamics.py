@@ -18,6 +18,8 @@ class VisualDynamicsModel(nn.Module):
         train_encoder=True,
         train_predictor=False,
         view_names=['view1'],
+        source_view_names=None,
+        target_view_names=None,
         use_layernorm=True,
         language_encoder=None,
         action_loss_weight=0.0,
@@ -32,11 +34,15 @@ class VisualDynamicsModel(nn.Module):
         self.train_encoder = train_encoder
         self.train_predictor = train_predictor
         self.view_names = view_names
+        self.source_view_names = list(source_view_names) if source_view_names is not None else list(view_names)
+        self.target_view_names = list(target_view_names) if target_view_names is not None else list(view_names)
         self.language_encoder = language_encoder
         self.proprio_dim = proprio_dim
         self.action_dim = action_dim
         self.action_loss_weight = float(action_loss_weight)
-        self.emb_dim = self.encoder.emb_dim * len(self.view_names) + (self.action_dim + self.proprio_dim)
+        self.source_visual_dim = self.encoder.emb_dim * len(self.source_view_names)
+        self.target_visual_dim = self.encoder.emb_dim * len(self.target_view_names)
+        self.emb_dim = self.source_visual_dim + (self.action_dim + self.proprio_dim)
 
         print(f"proprio encoder: {proprio_encoder}")
         print(f"action encoder: {action_encoder}")
@@ -44,6 +50,8 @@ class VisualDynamicsModel(nn.Module):
         print(f"action_dim: {action_dim}, after repeat: {self.action_dim}")
         print(f"action_loss_weight: {self.action_loss_weight}")
         print(f"emb_dim: {self.emb_dim}")
+        print(f"source_view_names: {self.source_view_names}")
+        print(f"target_view_names: {self.target_view_names}")
         print(f'image_size: {image_size}')
 
         print("Model emb_dim: ", self.emb_dim)
@@ -56,10 +64,10 @@ class VisualDynamicsModel(nn.Module):
             self.per_view_norm = nn.ModuleDict({
                 view_name: nn.LayerNorm(self.encoder.emb_dim, elementwise_affine=False)
                 for view_name in view_names
-            }).to("cuda")
-            if len(view_names) > 1: 
-                total_dim = self.encoder.emb_dim * len(view_names)
-                self.fusion_norm = nn.LayerNorm(total_dim, elementwise_affine=False).to("cuda")
+            })
+            if len(self.source_view_names) > 1: 
+                total_dim = self.encoder.emb_dim * len(self.source_view_names)
+                self.fusion_norm = nn.LayerNorm(total_dim, elementwise_affine=False)
 
     def train(self, mode=True):
         super().train(mode)
@@ -123,7 +131,7 @@ class VisualDynamicsModel(nn.Module):
         return proprio
 
     def encode_obs(self, obs):
-        visual_embs = self.encode_obs_visual(obs['visual'])
+        visual_embs = self.encode_obs_visual(obs['visual'], view_names=self.source_view_names)
         proprio = obs['proprio']
         proprio_emb = self.encode_proprio(proprio)
         res = {"visual": visual_embs, "proprio": proprio_emb}
@@ -131,16 +139,22 @@ class VisualDynamicsModel(nn.Module):
             res['language'] = obs['language']
         return res
 
-    def encode_obs_visual(self, obs_visual):
+    def encode_obs_visual(self, obs_visual, view_names=None):
+        view_names = self.source_view_names if view_names is None else list(view_names)
         view_embs = self.encoder(obs_visual)
-        for view_name in self.view_names:
+        for view_name in view_names:
             if hasattr(self, "per_view_norm"):
                 view_embs[view_name] = self.per_view_norm[view_name](view_embs[view_name])
-        visual_embs = torch.cat([view_embs[view_name] for view_name in self.view_names], dim=-1)
-        if hasattr(self, "fusion_norm"):
+        visual_embs = torch.cat([view_embs[view_name] for view_name in view_names], dim=-1)
+        if hasattr(self, "fusion_norm") and view_names == self.source_view_names:
             visual_embs = self.fusion_norm(visual_embs)
             
         return visual_embs
+
+    def _build_z(self, visual_embs, proprio_emb, act_emb):
+        proprio_tiled = repeat(proprio_emb.unsqueeze(2), "b t 1 a -> b t f a", f=visual_embs.shape[2])
+        act_tiled = repeat(act_emb.unsqueeze(2), "b t 1 a -> b t f a", f=visual_embs.shape[2])
+        return torch.cat([visual_embs, proprio_tiled, act_tiled], dim=3)
 
     def predict(self, z):
         T = z.shape[1]
@@ -169,25 +183,38 @@ class VisualDynamicsModel(nn.Module):
     def forward(self, obs, act):
         loss = 0.0
         loss_components = {}
-        z = self.encode(obs, act)
+        view_embs = self.encoder(obs["visual"])
+        for view_name in self.view_names:
+            if hasattr(self, "per_view_norm"):
+                view_embs[view_name] = self.per_view_norm[view_name](view_embs[view_name])
+
+        source_visual = torch.cat([view_embs[v] for v in self.source_view_names], dim=-1)
+        if hasattr(self, "fusion_norm"):
+            source_visual = self.fusion_norm(source_visual)
+        target_visual = torch.cat([view_embs[v] for v in self.target_view_names], dim=-1)
+
+        proprio_emb = self.encode_proprio(obs["proprio"])
+        act_emb = self.encode_act(act)
+        z = self._build_z(source_visual, proprio_emb, act_emb)
+        z_target = self._build_z(target_visual, proprio_emb, act_emb)
         # Time alignment:
         # - z_src uses the first `num_hist` frames.
         # - z_tgt starts at index `num_pred` so its length matches z_pred's length (= num_hist).
         #   This mirrors the original LPB codepath and is intentionally not `num_hist:`.
         z_src = z[:, : self.num_hist, :, :]
-        z_tgt = z[:, self.num_pred :, :, :]
+        z_tgt = z_target[:, self.num_pred :, :, :]
         if 'language' in obs:
             z_tgt = z_tgt[..., :-32]    
 
         z_pred = self.predict(z_src)
 
         z_visual_loss = self.emb_criterion(
-            z_pred[:, :, :, :-(self.proprio_dim + self.action_dim)], \
-            z_tgt[:, :, :, :-(self.proprio_dim + self.action_dim)].detach()
+            z_pred[:, :, :, :self.target_visual_dim], \
+            z_tgt[:, :, :, :self.target_visual_dim].detach()
         )
         z_proprio_loss = self.emb_criterion(
-            z_pred[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim], 
-            z_tgt[:, :, :, -(self.proprio_dim + self.action_dim): -self.action_dim].detach()
+            z_pred[:, :, :, self.target_visual_dim: self.target_visual_dim + self.proprio_dim], 
+            z_tgt[:, :, :, self.target_visual_dim: self.target_visual_dim + self.proprio_dim].detach()
         )
         z_loss = self.emb_criterion(
             z_pred[:, :, :, :-self.action_dim], 
@@ -198,7 +225,9 @@ class VisualDynamicsModel(nn.Module):
             z_tgt[:, :, :, -self.action_dim:].detach()
         )
 
-        loss = loss + z_loss + self.action_loss_weight * z_action_loss
+        loss = loss + z_loss
+        if self.action_loss_weight > 0:
+            loss = loss + self.action_loss_weight * z_action_loss
         loss_components["z_loss"] = z_loss
         loss_components["z_visual_loss"] = z_visual_loss
         loss_components["z_proprio_loss"] = z_proprio_loss

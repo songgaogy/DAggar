@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
-from omegaconf import OmegaConf
+from omegaconf import ListConfig, OmegaConf
 
 from robosuite.discriminator.dyn_disc.core.model_loader import load_model
 from robosuite.discriminator.dyn_disc.utils.normalizer import LinearNormalizer
@@ -207,10 +207,15 @@ class LPBV2Encoder:
                 env = self.cfg.env
                 dataset_class_path = str(getattr(env, "dataset_class"))
                 DatasetCls = get_class(_resolve_dataset_class_path(dataset_class_path))
+                train_data_path = getattr(env, "train_data_path")
+                if isinstance(train_data_path, ListConfig):
+                    train_data_path = OmegaConf.to_container(train_data_path, resolve=True)
+                else:
+                    train_data_path = str(train_data_path)
 
                     # Mirror the dataset kwargs used in original LPB training.
                 kwargs: Dict[str, Any] = dict(
-                    zarr_path=str(getattr(env, "train_data_path")),
+                    zarr_path=train_data_path,
                     num_hist=int(getattr(self.cfg, "num_hist")),
                     num_pred=int(getattr(self.cfg, "num_pred")),
                     frameskip=int(getattr(self.cfg, "frameskip")),
@@ -253,6 +258,10 @@ class LPBV2Encoder:
                     kwargs["num_fail"] = int(getattr(env, "num_fail"))
                 if getattr(self.cfg, "proprio_indices", None):
                     kwargs["proprio_indices"] = list(getattr(self.cfg, "proprio_indices"))
+                if getattr(self.cfg, "proprio_map", None):
+                    kwargs["proprio_map"] = OmegaConf.to_container(
+                        getattr(self.cfg, "proprio_map"), resolve=True
+                    )
                 if getattr(self.cfg, "max_trajectories", None):
                     kwargs["max_trajectories"] = int(getattr(self.cfg, "max_trajectories"))
 
@@ -272,12 +281,14 @@ class LPBV2Encoder:
         self.normalizer = normalizer.to(self.device)
 
         self.view_names: List[str] = list(self.cfg.env.view_names)
+        self.source_view_names: List[str] = list(getattr(self.cfg, "source_view_names", self.view_names))
         self.original_img_size: int = int(self.cfg.env.original_img_size)
         self.cropped_img_size: int = int(self.cfg.env.cropped_img_size)
         self.use_crop: bool = bool(getattr(self.cfg, "use_crop", True))
         self.proprio_emb_dim: int = int(self.cfg.env.proprio_emb_dim)
         self.action_emb_dim: int = int(self.cfg.env.action_emb_dim)
-        self.visual_emb_dim_total: int = int(self.model.encoder.emb_dim) * len(self.view_names)
+        self.num_patches: int = int(getattr(self.model.encoder, "num_patches", 1))
+        self.visual_emb_dim_total: int = int(self.model.encoder.emb_dim) * len(self.source_view_names) * self.num_patches
         self.frameskip: int = int(getattr(self.cfg, "frameskip", 1))
         self.action_dim_per_step: int = int(
             getattr(self.cfg, "action_dim_per_step", getattr(self.cfg.env, "action_dim", 7))
@@ -323,6 +334,12 @@ class LPBV2Encoder:
             flat = flat[:, : self.action_input_dim]
         return flat.astype(np.float32, copy=False)
 
+    def _normalize_flat_actions(self, actions: torch.Tensor, batch_size: int) -> torch.Tensor:
+        action_in = actions.to(self.device, dtype=torch.float32, non_blocking=True)
+        action_in = action_in.view(batch_size, self.frameskip, self.action_dim_per_step)
+        action_in = self.normalizer["act"].normalize(action_in)
+        return action_in.reshape(batch_size, 1, self.action_input_dim)
+
     @torch.no_grad()
     def encode_batch(
         self,
@@ -345,9 +362,10 @@ class LPBV2Encoder:
         visual_in: Dict[str, torch.Tensor] = {}
         for v in self.view_names:
             x = images_per_view[v].to(self.device, non_blocking=True)
-            x = self.normalizer[v].normalize(x)  # per-view image normalize
-            x = self.img_transform(x.view(-1, 3, self.original_img_size, self.original_img_size))
-            x = x.view(B, 1, 3, self.cropped_img_size, self.cropped_img_size)  # add T=1
+            if not bool(getattr(self.model.encoder, "normalizes_images", False)):
+                x = self.normalizer[v].normalize(x)  # per-view image normalize
+                x = self.img_transform(x.view(-1, 3, self.original_img_size, self.original_img_size))
+            x = x.view(B, 1, 3, x.shape[-2], x.shape[-1])  # add T=1
             visual_in[v] = x
 
         proprio_in = self.normalizer["state"].normalize(proprio.to(self.device, non_blocking=True))
@@ -359,10 +377,7 @@ class LPBV2Encoder:
         if self.feature_source == "transformer":
             if actions is None:
                 raise ValueError("actions are required when feature_source='transformer'")
-            action_in = actions.to(self.device, non_blocking=True)
-            if action_in.dim() == 2:
-                action_in = action_in.unsqueeze(1)  # (B, 1, A)
-            action_in = self.normalizer["act"].normalize(action_in)
+            action_in = self._normalize_flat_actions(actions, B)
             act_emb = self.model.encode_act(action_in)
             visual_emb = enc["visual"]
             proprio_emb = enc["proprio"]
@@ -389,10 +404,7 @@ class LPBV2Encoder:
         if p.dim() > 2:
             p = p.reshape(p.shape[0], -1)
 
-        action_in = actions.to(self.device, dtype=torch.float32, non_blocking=True)
-        action_in = action_in.view(B, self.frameskip, self.action_dim_per_step)
-        action_in = self.normalizer["act"].normalize(action_in)
-        action_in = action_in.reshape(B, 1, self.action_input_dim)
+        action_in = self._normalize_flat_actions(actions, B)
         a = self.model.encode_act(action_in).squeeze(1)
         if a.dim() > 2:
             a = a.reshape(a.shape[0], -1)

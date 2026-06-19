@@ -1,9 +1,8 @@
-"""Run the BCE-WAM discriminator (GT failure split) on the robosuite benchmark.
+"""Run the BCE-WAM discriminator on the new robosuite benchmark layout.
 
-Mirrors ``real_world_bce.py`` but swaps in :class:`benchmark.robosuite.FailureBenchmark`
-and pulls the GT-labeled failure trajectories used for BCE training from a
-*separate* root (``data/utils/fail_labeled_train`` by default), disjoint from
-the benchmark eval set under ``data/utils/fail_rollout``.
+Evaluation uses ``data/<task>/fail_rollout-val-labeled`` and
+``data/<task>/success_rollout-val``. The BCE failure bank is built from
+``data/<task>/fail_rollout-labeled``.
 
 Hard constraint: training and evaluation are separated -- ``fit_on_benchmark``
 does no evaluation, and ``bench.evaluate`` is invoked here *after* the head is
@@ -18,8 +17,11 @@ import os
 from typing import Dict, List, Optional, Sequence
 
 from benchmark.core import EvalConfig
-from benchmark.robosuite import FailureBenchmark, RobosuiteBenchmarkTrajectory
-from benchmark.robosuite.loader import discover_trajectories
+from robosuite.discriminator.utils.robosuite_benchmark import (
+    FailureBenchmark,
+    RobosuiteBenchmarkTrajectory,
+    discover_failure_bank,
+)
 
 from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
 
@@ -27,18 +29,21 @@ from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscrimina
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-ckpt", required=True)
-    parser.add_argument("--fail-root", required=True,
-                        help="Benchmark eval failure root (e.g. data/utils/fail_rollout)")
-    parser.add_argument("--success-root", required=True,
-                        help="Benchmark success root (e.g. data/utils/success_rollout)")
-    parser.add_argument("--fail-train-root", required=True,
-                        help="GT-labeled failure root used to build D_e/D_o for the BCE head "
-                             "(e.g. data/utils/fail_labeled_train). Must be disjoint by video_id "
-                             "from --fail-root.")
+    parser.add_argument("--data-root", type=str, default="data",
+                        help="Root containing data/<task>/<split> directories.")
+    parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
+    parser.add_argument("--fail-root", type=str, default=None,
+                        help="Deprecated; use --data-root/--fail-split.")
+    parser.add_argument("--success-root", type=str, default=None,
+                        help="Deprecated; use --data-root/--success-split.")
+    parser.add_argument("--fail-train-root", type=str, default=None,
+                        help="Deprecated; use --data-root/--fail-train-split.")
     parser.add_argument("--success-cache-root", type=str, default=None,
-                        help="Optional LPB preprocessed cache root for success trajectories.")
+                        help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--metadata-cache-root", type=str, default=None,
-                        help="Optional LPB metadata cache root used to identify success cache entries.")
+                        help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--cache-camera-names", nargs="*", default=None)
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
@@ -172,16 +177,12 @@ def main() -> None:
     args = _parse_args()
     print("[robosuite][bce] building FailureBenchmark...", flush=True)
     bench = FailureBenchmark(
-        fail_labeled_root=args.fail_root,
-        success_root=args.success_root,
+        data_root=args.data_root,
         tasks=args.tasks,
+        fail_split=args.fail_split,
+        success_split=args.success_split,
         max_fail_per_task=args.max_fail_per_task,
         max_success_per_task=args.max_success_per_task,
-        success_cache_root=args.success_cache_root,
-        metadata_cache_root=args.metadata_cache_root,
-        cache_camera_names=(
-            tuple(args.cache_camera_names) if args.cache_camera_names else None
-        ),
     )
     trajs = bench.trajectories()
     eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
@@ -194,13 +195,12 @@ def main() -> None:
         flush=True,
     )
 
-    # Discover ALL GT-labeled failure trajectories from the SEPARATE training root.
-    all_fail = discover_trajectories(
-        fail_labeled_root=args.fail_train_root,
-        success_root="",
+    # Discover ALL GT-labeled failure trajectories from the train labeled split.
+    all_fail = discover_failure_bank(
+        data_root=args.data_root,
         tasks=args.tasks,
+        split=args.fail_train_split,
         max_fail_per_task=None,
-        max_success_per_task=0,
     )
     all_fail = [t for t in all_fail if bool(t.is_failure)]
     # video_id disjointness against eval set (defence-in-depth: train root should
@@ -208,7 +208,7 @@ def main() -> None:
     bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
     dropped = len(all_fail) - len(bank_pool)
     print(
-        f"[robosuite][bce] GT-failure discovery from {args.fail_train_root}: "
+        f"[robosuite][bce] GT-failure discovery from {args.fail_train_split}: "
         f"all_fail={len(all_fail)} eval_fail={len(eval_fail_keys)} "
         f"bank_pool={len(bank_pool)} (dropped {dropped} as video_id overlap)",
         flush=True,
@@ -311,9 +311,10 @@ def main() -> None:
             manifest = {
                 "labeling": "gt_failure_split",
                 "loss": "bce",
-                "fail_train_root": str(args.fail_train_root),
-                "fail_eval_root": str(args.fail_root),
-                "success_root": str(args.success_root),
+                "data_root": str(args.data_root),
+                "fail_train_split": str(args.fail_train_split),
+                "fail_eval_split": str(args.fail_split),
+                "success_split": str(args.success_split),
                 "max_expert_other_ratio": (
                     None if float(args.max_expert_other_ratio) <= 0.0
                     else float(args.max_expert_other_ratio)

@@ -4,10 +4,9 @@ Mirrors data/utils/benchmark/examples/run_lpb_original.py but uses the cleaned
 LPB v2 module under robosuite.discriminator.dyn_disc.
 
 Example:
-    python -m data.utils.benchmark.examples.run_dyn_disc \
+    python -m robosuite.discriminator.dyn_disc.sim_benchmark \
         --model-ckpt /abs/path/checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_50.pth \
-        --fail-root  /abs/path/data/utils/fail_rollout \
-        --success-root /abs/path/data/utils/success_rollout \
+        --data-root /abs/path/data \
         --tasks PickPlaceCan \
         --save-json /tmp/dyn_disc_bench.json
 """
@@ -16,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 
-from benchmark.robosuite import FailureBenchmark
+from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
 from robosuite.discriminator.dyn_disc.adapters.single_bank import LPBV2BenchmarkDiscriminator
 
 
@@ -24,14 +23,20 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-ckpt", required=True,
                         help="Path to an LPB v2/original-compatible dynamics checkpoint.")
-    parser.add_argument("--fail-root", required=True, help="data/utils/fail_rollout")
-    parser.add_argument("--success-root", required=True, help="data/utils/success_rollout")
+    parser.add_argument("--data-root", type=str, default="data",
+                        help="Root containing data/<task>/<split> directories.")
+    parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--fail-root", type=str, default=None,
+                        help="Deprecated; use --data-root/--fail-split.")
+    parser.add_argument("--success-root", type=str, default=None,
+                        help="Deprecated; use --data-root/--success-split.")
     parser.add_argument("--success-cache-root", type=str, default=None,
-                        help="Optional LPB preprocessed cache root for success trajectories.")
+                        help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--metadata-cache-root", type=str, default=None,
-                        help="Optional LPB metadata cache root used to identify success cache entries.")
+                        help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--cache-camera-names", nargs="*", default=None,
-                        help="Camera names for cache view slots, e.g. agentview birdview frontview.")
+                        help="Deprecated; ignored by the new robosuite benchmark.")
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
 
@@ -75,14 +80,12 @@ def main() -> None:
     args = _parse_args()
     print("[dyn_disc] building FailureBenchmark...", flush=True)
     bench = FailureBenchmark(
-        fail_labeled_root=args.fail_root,
-        success_root=args.success_root,
+        data_root=args.data_root,
         tasks=args.tasks,
+        fail_split=args.fail_split,
+        success_split=args.success_split,
         max_fail_per_task=args.max_fail_per_task,
         max_success_per_task=args.max_success_per_task,
-        success_cache_root=args.success_cache_root,
-        metadata_cache_root=args.metadata_cache_root,
-        cache_camera_names=args.cache_camera_names,
     )
     print("[dyn_disc] discovering trajectories (this may take a while on slow disks)...", flush=True)
     trajs = bench.trajectories()

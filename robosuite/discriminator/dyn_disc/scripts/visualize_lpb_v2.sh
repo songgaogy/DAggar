@@ -13,11 +13,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
-SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
-SUCCESS_CACHE_ROOT="${SUCCESS_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
-METADATA_CACHE_ROOT="${METADATA_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
-CACHE_CAMERA_NAMES="${CACHE_CAMERA_NAMES:-agentview birdview frontview}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
 
 TASK="${TASK:-PickPlaceCereal}"
 NUM_TRAJS="${NUM_TRAJS:-3}"
@@ -85,18 +83,11 @@ fi
 if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
-if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${METADATA_CACHE_ROOT}" ]]; then
-    EXTRA_ARGS+=(--success-cache-root "${SUCCESS_CACHE_ROOT}")
-    EXTRA_ARGS+=(--metadata-cache-root "${METADATA_CACHE_ROOT}")
-    if [[ -n "${CACHE_CAMERA_NAMES}" ]]; then
-        EXTRA_ARGS+=(--cache-camera-names ${CACHE_CAMERA_NAMES})
-    fi
-fi
-
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.visualization.visualize \
     --model-ckpt         "${MODEL_CKPT}" \
-    --fail-root          "${FAIL_ROOT}" \
-    --success-root       "${SUCCESS_ROOT}" \
+    --data-root          "${DATA_ROOT}" \
+    --fail-split         "${FAIL_SPLIT}" \
+    --success-split      "${SUCCESS_SPLIT}" \
     --task               "${TASK}" \
     --num-trajs          "${NUM_TRAJS}" \
     --out-dir            "${OUT_DIR}" \

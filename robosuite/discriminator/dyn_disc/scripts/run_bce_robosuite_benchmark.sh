@@ -8,12 +8,9 @@
 #     bash robosuite/discriminator/dyn_disc/scripts/run_bce_robosuite_benchmark.sh
 #
 # Layout assumptions (override via env vars):
-#   FAIL_ROOT        = data/utils/fail_rollout            (benchmark eval failures)
-#   SUCCESS_ROOT     = data/utils/success_rollout         (benchmark success)
-#   FAIL_TRAIN_ROOT  = data/utils/fail_labeled_train      (GT-labeled failures for BCE training)
-#
-# FAIL_TRAIN_ROOT is disjoint from FAIL_ROOT by construction; the runner also
-# enforces video_id disjointness as defence-in-depth.
+#   DATA_ROOT/<task>/fail_rollout-labeled      (BCE failure bank)
+#   DATA_ROOT/<task>/fail_rollout-val-labeled  (benchmark eval failures)
+#   DATA_ROOT/<task>/success_rollout-val       (benchmark eval success)
 
 set -euo pipefail
 
@@ -21,13 +18,11 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
-SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
-FAIL_TRAIN_ROOT="${FAIL_TRAIN_ROOT:-${REPO_ROOT}/data/utils/fail_labeled_train}"
-SUCCESS_CACHE_ROOT="${SUCCESS_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
-METADATA_CACHE_ROOT="${METADATA_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
-CACHE_CAMERA_NAMES="${CACHE_CAMERA_NAMES:-agentview birdview frontview}"
-TASKS="${TASKS:-PickPlaceBread PickPlaceCan PickPlaceCereal PickPlaceMilk}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
+FAIL_TRAIN_SPLIT="${FAIL_TRAIN_SPLIT:-fail_rollout-labeled}"
+TASKS="${TASKS:-}"
 
 # --------------------------------------------------------
 # for evaluation
@@ -74,7 +69,7 @@ BATCH_SIZE="${BATCH_SIZE:-512}"
 # Balance: MAX_EXPERT_OTHER_RATIO caps |D_e| <= ratio * |D_o|. <=0 disables.
 MAX_EXPERT_OTHER_RATIO="${MAX_EXPERT_OTHER_RATIO:-1.0}"
 
-# Failure pool: drawn from FAIL_TRAIN_ROOT, disjoint from FAIL_ROOT by construction.
+# Failure pool: drawn from DATA_ROOT/<task>/FAIL_TRAIN_SPLIT.
 # If a task has fewer GT-labeled failures than FAIL_BANK_PER_TASK, all are used.
 FAIL_BANK_PER_TASK="${FAIL_BANK_PER_TASK:-25}"
 
@@ -103,20 +98,16 @@ fi
 if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
-if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${METADATA_CACHE_ROOT}" ]]; then
-    EXTRA_ARGS+=(--success-cache-root "${SUCCESS_CACHE_ROOT}")
-    EXTRA_ARGS+=(--metadata-cache-root "${METADATA_CACHE_ROOT}")
-    if [[ -n "${CACHE_CAMERA_NAMES}" ]]; then
-        EXTRA_ARGS+=(--cache-camera-names ${CACHE_CAMERA_NAMES})
-    fi
+if [[ -n "${TASKS}" ]]; then
+    EXTRA_ARGS+=(--tasks ${TASKS})
 fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.robosuite_bce \
     --model-ckpt           "${MODEL_CKPT}" \
-    --fail-root            "${FAIL_ROOT}" \
-    --success-root         "${SUCCESS_ROOT}" \
-    --fail-train-root      "${FAIL_TRAIN_ROOT}" \
-    --tasks                ${TASKS} \
+    --data-root            "${DATA_ROOT}" \
+    --fail-split           "${FAIL_SPLIT}" \
+    --success-split        "${SUCCESS_SPLIT}" \
+    --fail-train-split     "${FAIL_TRAIN_SPLIT}" \
     --save-json            "${SAVE_JSON}" \
     --save-ckpt-dir        "${SAVE_CKPT_DIR}" \
     --device               "${DEVICE}" \

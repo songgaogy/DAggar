@@ -1,4 +1,4 @@
-# LPB v2 - Latent Dynamics Features for Failure Discrimination
+# Latent Dynamics Features for Failure Discrimination
 
 `robosuite.discriminator.dyn_disc` contains a compact LPB/WAM-style pipeline:
 
@@ -63,12 +63,7 @@ In this workspace the expected Python environment is:
 /home/dodo/miniconda3/envs/dagger/bin/python
 ```
 
-Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through WandB, use:
-
-```bash
-export WANDB_MODE=offline
-export WANDB_NAME=songgao-personal
-```
+Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through tensorboard, use:
 
 Core dependencies include PyTorch, Hydra/OmegaConf, torchvision, einops, numpy, scikit-learn, matplotlib, and the local `benchmark` package.
 
@@ -126,6 +121,84 @@ bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
 ```
 
 This script uses `env=preprocessed`, defaults to caches under `data/.lpb_score_preprocessed_cache`, and accepts Hydra overrides through trailing CLI arguments.
+
+### Visual encoder choice
+
+For discriminator pretraining, prefer a strong frozen self-supervised visual encoder before tuning a supervised ResNet from scratch. A practical priority order is:
+
+1. **Frozen DINOv3 / DINO-style ViT** as the first baseline.
+2. **DINOv3 partial tuning** with LoRA, adapters, or the last 1-2 transformer blocks if the frozen baseline underfits.
+3. **ResNet50 finetune** as a speed / memory ablation, with strict validation monitoring.
+
+The reason is that failure detection is closer to OOD / dynamics-consistency scoring than closed-set image classification. With limited labeled failure data, a finetuned ResNet50 can overfit task, camera, background, or object shortcuts. A frozen DINO-style encoder usually gives more stable features and better transfer across tasks.
+
+If using DINOv3, do not only use the global `CLS` token unless this is an intentional lightweight baseline. Robot failures are often local: missed grasp, object slip, collision, or bad hand-object geometry. These signals can be diluted in one global image vector. Prefer one of:
+
+```text
+Lowest cost:
+  patch_tokens -> mean pool -> one visual token
+
+Recommended:
+  patch_tokens on a dense grid -> spatial pool to 4x4 or 2x2 -> P visual tokens
+
+Highest capacity:
+  full patch_tokens -> P visual tokens
+```
+
+The current `VisualDynamicsModel` already uses the shape:
+
+```text
+z: (B, T, P, D)
+```
+
+With the current ResNet encoder, `P=1` in practice. A DINOv3 encoder should expose `P>1` patch or pooled dense tokens, for example `P=16` from a 4x4 pooled token grid. Then the WAM loss predicts future local visual tokens instead of only a whole-image summary:
+
+```text
+image_t, proprio_t, action_t -> patch_tokens_{t+1}
+loss = MSE(pred_patch_tokens_{t+1}, target_patch_tokens_{t+1})
+```
+
+This preserves spatial evidence that is important for frame-level failure scores. If compute is limited, start with grid-pooled dense tokens rather than full patch tokens.
+
+### DINOv3 WAM dynamics v1
+
+The robosuite simulation DINOv3 dynamics config is:
+
+```bash
+bash robosuite/discriminator/dyn_disc/scripts/train_dinov3_robosuite_dynamics.sh
+```
+
+The current v1 setup is intentionally asymmetric:
+
+```text
+source:
+  agentview_t, robot0_eye_in_hand_t, proprio_t, action[t:t+7]
+
+target:
+  agentview_{t+8}, proprio_{t+8}
+```
+
+Main choices:
+
+- visual encoder: frozen DINOv3 ViT-B/16 from `data/pretrained/dinov3-vitb16-pretrain-lvd1689m_80M`;
+- visual tokens: DINO patch tokens spatially pooled to a 4x4 grid, so `P=16`;
+- visual projection: DINO hidden tokens are projected to `382` dimensions;
+- source views: `agentview` and `robot0_eye_in_hand`;
+- target view: `agentview` only;
+- proprio: Panda `qpos[7] + qvel[7]`, selected per robosuite task through `proprio_map`;
+- action chunk: causal horizon 8, flattened as `7 * 8 = 56`;
+- supervision: no action target loss (`action_loss_weight=0.0`); action is used only as a conditioning input.
+
+The v1 proprio/action encoders are MLPs rather than one-layer projections:
+
+```text
+proprio_encoder: 14 -> 64 -> 64
+action_encoder:  56 -> 128 -> 64
+```
+
+This avoids the old bottleneck where an 8-step action chunk was compressed from
+56 dimensions to 7 dimensions by a single linear layer. The dynamics predictor is
+kept near a 60M-parameter trainable budget by using a 9-layer ViT predictor.
 
 ---
 

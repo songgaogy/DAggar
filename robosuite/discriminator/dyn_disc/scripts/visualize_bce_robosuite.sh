@@ -13,9 +13,9 @@
 #   MAX_FAIL_PER_TASK, MAX_SUCCESS_PER_TASK
 #
 # Layout assumptions (override via env vars):
-#   FAIL_ROOT        = data/utils/fail_rollout            (benchmark eval failures)
-#   SUCCESS_ROOT     = data/utils/success_rollout         (benchmark success)
-#   FAIL_TRAIN_ROOT  = data/utils/fail_labeled_train      (GT-labeled failures used to train BCE)
+#   DATA_ROOT/<task>/fail_rollout-labeled      (BCE failure bank)
+#   DATA_ROOT/<task>/fail_rollout-val-labeled  (benchmark eval failures)
+#   DATA_ROOT/<task>/success_rollout-val       (benchmark eval success)
 
 set -euo pipefail
 
@@ -23,17 +23,15 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
-SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
-FAIL_TRAIN_ROOT="${FAIL_TRAIN_ROOT:-${REPO_ROOT}/data/utils/fail_labeled_train}"
-SUCCESS_CACHE_ROOT="${SUCCESS_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
-METADATA_CACHE_ROOT="${METADATA_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
-CACHE_CAMERA_NAMES="${CACHE_CAMERA_NAMES:-agentview birdview frontview}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
+FAIL_TRAIN_SPLIT="${FAIL_TRAIN_SPLIT:-fail_rollout-labeled}"
 
 # -------------------------------------------------
-TASK="PickPlaceMilk"
-SPLIT="success_rollout"     # success_rollout or fail_rollout
-NUM_TRAJS=3
+TASK="${TASK:-PickPlaceMilk}"
+SPLIT="${SPLIT:-success_rollout}"     # success_rollout or fail_rollout
+NUM_TRAJS="${NUM_TRAJS:-3}"
 SEED="${SEED:-0}"
 FPS="${FPS:-20}"
 BORDER_THICKNESS="${BORDER_THICKNESS:-10}"
@@ -107,13 +105,6 @@ fi
 if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
-if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${METADATA_CACHE_ROOT}" ]]; then
-    EXTRA_ARGS+=(--success-cache-root "${SUCCESS_CACHE_ROOT}")
-    EXTRA_ARGS+=(--metadata-cache-root "${METADATA_CACHE_ROOT}")
-    if [[ -n "${CACHE_CAMERA_NAMES}" ]]; then
-        EXTRA_ARGS+=(--cache-camera-names ${CACHE_CAMERA_NAMES})
-    fi
-fi
 if [[ -n "${LOAD_CKPT:-}" ]]; then
     if [[ ! -f "${LOAD_CKPT}" ]]; then
         echo "[bce][viz][robosuite] ERROR: LOAD_CKPT not found: ${LOAD_CKPT}" >&2
@@ -129,9 +120,10 @@ python -m robosuite.discriminator.dyn_disc.visualization.visualize_bce \
     --kind                  robosuite \
     --split                 "${SPLIT}" \
     --model-ckpt            "${MODEL_CKPT}" \
-    --fail-root             "${FAIL_ROOT}" \
-    --success-root          "${SUCCESS_ROOT}" \
-    --fail-train-root       "${FAIL_TRAIN_ROOT}" \
+    --data-root             "${DATA_ROOT}" \
+    --fail-split            "${FAIL_SPLIT}" \
+    --success-split         "${SUCCESS_SPLIT}" \
+    --fail-train-split      "${FAIL_TRAIN_SPLIT}" \
     --task                  "${TASK}" \
     --num-trajs             "${NUM_TRAJS}" \
     --out-dir               "${OUT_DIR}" \

@@ -13,10 +13,12 @@ Per-task workflow (matches `LPBBenchmarkDiscriminator` in lpb/):
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
@@ -86,6 +88,10 @@ class LPBV2BenchmarkDiscriminator:
             feature_source=self.feature_source,
             transformer_layer=self.transformer_layer,
         )
+        cfg_map = getattr(self.encoder.cfg, "proprio_map", None)
+        self.proprio_map = (
+            OmegaConf.to_container(cfg_map, resolve=True) if cfg_map is not None else {}
+        ) or {}
 
         # If user did not provide a camera->view map, default to a 1:1 identity
         # over the encoder's view_names (assume cameras are named the same).
@@ -97,6 +103,8 @@ class LPBV2BenchmarkDiscriminator:
         self._calibration_stats: Dict[str, dict] = {}
         # Cache encoded trajectories: (file_path, demo_path) -> (T, D) tensor.
         self._feature_cache: Dict[tuple, torch.Tensor] = {}
+        # Optional list populated with per-call encode_batch() latencies (seconds).
+        self.batch_infer_times: Optional[List[float]] = None
 
     # ------------------------------------------------------------------ #
     # Encoding helpers                                                   #
@@ -123,9 +131,19 @@ class LPBV2BenchmarkDiscriminator:
             f"No camera mapped to view {view!r}. Camera->view map: {self.camera_to_view}"
         )
 
-    def _slice_proprio(self, states: np.ndarray, target_dim: Optional[int]) -> np.ndarray:
+    def _slice_proprio(
+        self,
+        states: np.ndarray,
+        target_dim: Optional[int],
+        task_name: Optional[str] = None,
+    ) -> np.ndarray:
         if self.proprio_indices is not None:
             states = states[:, self.proprio_indices]
+        elif task_name and self.proprio_map:
+            task_cfg = self.proprio_map.get(str(task_name), {})
+            indices = task_cfg.get("indices") if isinstance(task_cfg, dict) else None
+            if indices:
+                states = states[:, np.asarray(indices, dtype=np.int64)]
         if target_dim is None:
             return states.astype(np.float32, copy=False)
         d = int(states.shape[1])
@@ -147,6 +165,113 @@ class LPBV2BenchmarkDiscriminator:
         pad = np.zeros((actions.shape[0], target_dim - d), dtype=np.float32)
         return np.concatenate([actions.astype(np.float32, copy=False), pad], axis=1)
 
+    def _prepare_trajectory_tensors(self, trajectory: BenchmarkTrajectory) -> Dict[str, Any]:
+        view_names = self.encoder.view_names
+        cameras_needed = [self._resolve_camera(v) for v in view_names]
+        images_by_cam = trajectory.load_images(cameras=cameras_needed)
+        states = np.asarray(trajectory.load_states(), dtype=np.float32)
+        actions = np.asarray(trajectory.load_actions(), dtype=np.float32)
+
+        cam_lens = [int(images_by_cam[c].shape[0]) for c in cameras_needed]
+        t_len = int(min([states.shape[0], actions.shape[0]] + cam_lens))
+        if t_len <= 0:
+            raise ValueError(f"Empty trajectory: {trajectory.describe()}")
+
+        target_proprio_dim = None
+        try:
+            target_proprio_dim = int(self.encoder.model.proprio_encoder.in_chans)
+        except Exception:
+            target_proprio_dim = None
+
+        prop = self._slice_proprio(
+            states[:t_len],
+            target_dim=target_proprio_dim,
+            task_name=str(trajectory.task_name),
+        )
+        if self.feature_source == "encoder":
+            act = self.encoder.prepare_actions(actions[:t_len], t_len=t_len)
+        else:
+            target_action_dim = None
+            try:
+                target_action_dim = int(self.encoder.model.action_encoder.in_chans)
+            except Exception:
+                target_action_dim = None
+            act = self._slice_action(actions[:t_len], target_dim=target_action_dim)
+
+        h = self.encoder.original_img_size
+        per_view_chw: Dict[str, np.ndarray] = {}
+        for view in view_names:
+            cam = self._resolve_camera(view)
+            imgs = np.asarray(images_by_cam[cam][:t_len])
+            if imgs.shape[1] != h or imgs.shape[2] != h:
+                t_imgs = torch.from_numpy(imgs.astype(np.float32))
+                if t_imgs.max() > 1.5:
+                    t_imgs = t_imgs / 255.0
+                t_imgs = t_imgs.permute(0, 3, 1, 2)
+                t_imgs = torch.nn.functional.interpolate(
+                    t_imgs, size=(h, h), mode="bilinear", align_corners=False
+                )
+                per_view_chw[view] = t_imgs.numpy()
+            else:
+                arr = imgs.astype(np.float32)
+                if arr.max() > 1.5:
+                    arr = arr / 255.0
+                per_view_chw[view] = np.transpose(arr, (0, 3, 1, 2))
+
+        return {
+            "view_names": view_names,
+            "per_view_chw": per_view_chw,
+            "prop": prop,
+            "act": act,
+            "t_len": t_len,
+        }
+
+    def _encode_tensors(self, key: tuple, prepared: Dict[str, Any]) -> torch.Tensor:
+        view_names: List[str] = prepared["view_names"]
+        per_view_chw: Dict[str, np.ndarray] = prepared["per_view_chw"]
+        prop: np.ndarray = prepared["prop"]
+        act: np.ndarray = prepared["act"]
+        t_len: int = int(prepared["t_len"])
+
+        feats: List[torch.Tensor] = []
+        bs = self.encode_batch_size
+        for start in range(0, t_len, bs):
+            end = min(start + bs, t_len)
+            batch_imgs = {
+                v: torch.from_numpy(per_view_chw[v][start:end]) for v in view_names
+            }
+            batch_prop = torch.from_numpy(prop[start:end])
+            batch_act = torch.from_numpy(act[start:end])
+            if self.batch_infer_times is not None:
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+            f = self.encoder.encode_batch(batch_imgs, batch_prop, actions=batch_act)
+            if self.batch_infer_times is not None:
+                if self.device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                self.batch_infer_times.append(float(time.perf_counter() - t0))
+            feats.append(f.detach().cpu())
+
+        out = torch.cat(feats, dim=0)
+        self._feature_cache[key] = out
+        return out
+
+    def preload_trajectory(self, trajectory: BenchmarkTrajectory) -> Dict[str, Any]:
+        return self._prepare_trajectory_tensors(trajectory)
+
+    @torch.no_grad()
+    def encode_preloaded(
+        self,
+        trajectory: BenchmarkTrajectory,
+        prepared: Dict[str, Any],
+    ) -> torch.Tensor:
+        key = self._trajectory_key(trajectory)
+        cached = self._feature_cache.get(key, None)
+        if cached is not None:
+            return cached
+        return self._encode_tensors(key, prepared)
+
     @torch.no_grad()
     def _encode(self, trajectory: BenchmarkTrajectory) -> torch.Tensor:
         key = self._trajectory_key(trajectory)
@@ -154,81 +279,8 @@ class LPBV2BenchmarkDiscriminator:
         if cached is not None:
             return cached
 
-        view_names = self.encoder.view_names
-        cameras_needed = [self._resolve_camera(v) for v in view_names]
-        images_by_cam = trajectory.load_images(cameras=cameras_needed)
-        states = np.asarray(trajectory.load_states(), dtype=np.float32)
-        actions = np.asarray(trajectory.load_actions(), dtype=np.float32)
-
-        # IMPORTANT: benchmark trajectories can have minor length mismatches across
-        # (states, actions, per-camera images). We always truncate to the shortest so each
-        # encoded feature corresponds to a real frame for all modalities.
-        cam_lens = [int(images_by_cam[c].shape[0]) for c in cameras_needed]
-        T = int(min([states.shape[0], actions.shape[0]] + cam_lens))
-        if T <= 0:
-            raise ValueError(f"Empty trajectory: {trajectory.describe()}")
-
-        # Determine target proprio dim from the encoder's proprio_encoder.
-        # The proprio_encoder.in_chans is set at load time to match training.
-        target_proprio_dim = None
-        try:
-            target_proprio_dim = int(self.encoder.model.proprio_encoder.in_chans)
-        except Exception:
-            target_proprio_dim = None
-
-        # Proprio slicing/padding must match the training-time proprio encoder input.
-        prop = self._slice_proprio(states[:T], target_dim=target_proprio_dim)
-        if self.feature_source == "encoder":
-            act = self.encoder.prepare_actions(actions[:T], t_len=T)
-        else:
-            # transformer features expect per-step actions (not flattened windows)
-            target_action_dim = None
-            try:
-                target_action_dim = int(self.encoder.model.action_encoder.in_chans)
-            except Exception:
-                target_action_dim = None
-            act = self._slice_action(actions[:T], target_dim=target_action_dim)
-
-        # Pre-build per-view image arrays (T, 3, H, W) at original_img_size,
-        # converted to float in [0, 1].
-        H = self.encoder.original_img_size
-        per_view_chw: Dict[str, np.ndarray] = {}
-        for v in view_names:
-            cam = self._resolve_camera(v)
-            imgs = np.asarray(images_by_cam[cam][:T])
-            if imgs.shape[1] != H or imgs.shape[2] != H:
-                # Resize via torch later in a tight batched loop; do it now per traj
-                # keeping things simple: fall back to torch interpolate.
-                t_imgs = torch.from_numpy(imgs.astype(np.float32))
-                if t_imgs.max() > 1.5:
-                    t_imgs = t_imgs / 255.0
-                t_imgs = t_imgs.permute(0, 3, 1, 2)
-                t_imgs = torch.nn.functional.interpolate(
-                    t_imgs, size=(H, H), mode="bilinear", align_corners=False
-                )
-                per_view_chw[v] = t_imgs.numpy()
-            else:
-                arr = imgs.astype(np.float32)
-                if arr.max() > 1.5:
-                    arr = arr / 255.0
-                per_view_chw[v] = np.transpose(arr, (0, 3, 1, 2))
-
-        feats: List[torch.Tensor] = []
-        bs = self.encode_batch_size
-        for start in range(0, T, bs):
-            end = min(start + bs, T)
-            batch_imgs = {
-                v: torch.from_numpy(per_view_chw[v][start:end]) for v in view_names
-            }
-            batch_prop = torch.from_numpy(prop[start:end])
-            # encode_batch applies the same normalization/cropping used during dynamics training.
-            batch_act = torch.from_numpy(act[start:end])
-            f = self.encoder.encode_batch(batch_imgs, batch_prop, actions=batch_act)
-            feats.append(f.detach().cpu())
-
-        out = torch.cat(feats, dim=0)
-        self._feature_cache[key] = out
-        return out
+        prepared = self._prepare_trajectory_tensors(trajectory)
+        return self._encode_tensors(key, prepared)
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #

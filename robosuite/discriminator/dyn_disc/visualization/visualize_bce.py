@@ -13,16 +13,17 @@ operating point, change the runner's ``calib_mode`` and re-fit.
 
 Two entry kinds (``--kind``):
 
-  * ``robosuite``  - mirrors ``robosuite_bce.py``: separate FAIL_TRAIN_ROOT for
-    GT-labeled failure pool, optional preprocessed success cache.
+  * ``robosuite``  - mirrors ``robosuite_bce.py``: eval trajectories from
+    fail_rollout-val-labeled / success_rollout-val, BCE bank from
+    fail_rollout-labeled.
   * ``realworld``  - mirrors ``real_world_bce.py``: Agilex layout with proprio
     field/slice and action slice; bank pool drawn from the same FAIL_ROOT,
     filtered by video_id against the eval set.
 
 Use ``--split`` to choose which eval trajectories are rendered:
 
-  * ``fail_rollout``    - sample from ``--fail-root`` (default)
-  * ``success_rollout`` - sample from ``--success-root`` (``is_failure=False``)
+  * ``fail_rollout``    - sample from ``--fail-split`` (default)
+  * ``success_rollout`` - sample from ``--success-split`` (``is_failure=False``)
 
 Outputs:
     <out_dir>/videos/<video_id>.mp4
@@ -653,32 +654,29 @@ def _build_benchmark_and_bank(args: argparse.Namespace):
     Returns (bench, eval_trajs, fail_bank_trajs).
     """
     if args.kind == "robosuite":
-        from benchmark.robosuite import FailureBenchmark
-        from benchmark.robosuite.loader import discover_trajectories
+        from robosuite.discriminator.utils.robosuite_benchmark import (
+            FailureBenchmark,
+            discover_failure_bank,
+        )
 
         bench = FailureBenchmark(
-            fail_labeled_root=args.fail_root,
-            success_root=args.success_root,
+            data_root=args.data_root,
             tasks=[str(args.task)],
+            fail_split=args.fail_split,
+            success_split=args.success_split,
             max_fail_per_task=args.max_fail_per_task,
             max_success_per_task=args.max_success_per_task,
-            success_cache_root=args.success_cache_root,
-            metadata_cache_root=args.metadata_cache_root,
-            cache_camera_names=(
-                tuple(args.cache_camera_names) if args.cache_camera_names else None
-            ),
         )
         trajs = bench.trajectories()
         if not trajs:
             raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
 
         eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-        all_fail = discover_trajectories(
-            fail_labeled_root=args.fail_train_root,
-            success_root="",
+        all_fail = discover_failure_bank(
+            data_root=args.data_root,
             tasks=[str(args.task)],
+            split=args.fail_train_split,
             max_fail_per_task=None,
-            max_success_per_task=0,
         )
         all_fail = [t for t in all_fail if bool(t.is_failure)]
         bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
@@ -818,12 +816,17 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="fail_rollout",
         choices=["success_rollout", "fail_rollout"],
-        help="Eval split to visualize: fail_rollout (--fail-root) or "
-             "success_rollout (--success-root).",
+        help="Eval split to visualize: fail_rollout (--fail-split) or "
+             "success_rollout (--success-split).",
     )
     parser.add_argument("--model-ckpt", required=True, help="LPB v2 dynamics checkpoint .pth")
-    parser.add_argument("--fail-root", required=True)
-    parser.add_argument("--success-root", required=True)
+    parser.add_argument("--data-root", type=str, default="data",
+                        help="Robosuite data root containing data/<task>/<split> directories.")
+    parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
+    parser.add_argument("--success-split", type=str, default="success_rollout-val")
+    parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
+    parser.add_argument("--fail-root", type=str, default=None)
+    parser.add_argument("--success-root", type=str, default=None)
     parser.add_argument("--task", required=True)
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
@@ -838,10 +841,13 @@ def _parse_args() -> argparse.Namespace:
 
     # robosuite-only
     parser.add_argument("--fail-train-root", type=str, default=None,
-                        help="Required when --kind robosuite. Separate GT-labeled failure root.")
-    parser.add_argument("--success-cache-root", type=str, default=None)
-    parser.add_argument("--metadata-cache-root", type=str, default=None)
-    parser.add_argument("--cache-camera-names", nargs="*", default=None)
+                        help="Deprecated for robosuite; use --fail-train-split.")
+    parser.add_argument("--success-cache-root", type=str, default=None,
+                        help="Deprecated for robosuite; ignored.")
+    parser.add_argument("--metadata-cache-root", type=str, default=None,
+                        help="Deprecated for robosuite; ignored.")
+    parser.add_argument("--cache-camera-names", nargs="*", default=None,
+                        help="Deprecated for robosuite; ignored.")
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
 
     # realworld-only
@@ -889,8 +895,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.kind == "robosuite" and not args.fail_train_root:
-        raise SystemExit("--fail-train-root is required when --kind robosuite")
+    if args.kind == "realworld" and (not args.fail_root or not args.success_root):
+        raise SystemExit("--fail-root and --success-root are required when --kind realworld")
 
     bench, trajs, fail_bank_trajs = _build_benchmark_and_bank(args)
     sampled = _sample_trajectories_for_viz(

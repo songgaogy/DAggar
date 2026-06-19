@@ -18,12 +18,10 @@ export CUDA_VISIBLE_DEVICES=0
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-FAIL_ROOT="${FAIL_ROOT:-${REPO_ROOT}/data/utils/fail_rollout}"
-SUCCESS_ROOT="${SUCCESS_ROOT:-${REPO_ROOT}/data/utils/success_rollout}"
-SUCCESS_CACHE_ROOT="${SUCCESS_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_preprocessed_cache}"
-METADATA_CACHE_ROOT="${METADATA_CACHE_ROOT:-${REPO_ROOT}/data/.lpb_score_cache}"
-CACHE_CAMERA_NAMES="${CACHE_CAMERA_NAMES:-agentview birdview frontview}"
-TASKS="${TASKS:-PickPlaceBread PickPlaceCan PickPlaceCereal PickPlaceMilk}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
+TASKS="${TASKS:-}"
 
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-100}"
 MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-100}"
@@ -38,7 +36,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # You can override this via env var:
 #   MODEL_CKPT=/abs/path/checkpoints/dyn_disc/dynamics/<run_name-timestamp>/checkpoints/model_49.pth bash ...
-MODEL_CKPT="checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/train-20260428_210501/checkpoints/model_49.pth}"
 if [[ ! -f "${MODEL_CKPT}" ]]; then
     echo "[dyn_disc] ERROR: MODEL_CKPT not found: ${MODEL_CKPT}" >&2
     exit 1
@@ -72,19 +70,15 @@ fi
 if [[ -n "${CAMERA_TO_VIEW:-}" ]]; then
     EXTRA_ARGS+=(--camera-to-view "${CAMERA_TO_VIEW}")
 fi
-if [[ "${USE_SUCCESS_CACHE:-1}" == "1" && -d "${SUCCESS_CACHE_ROOT}" && -d "${METADATA_CACHE_ROOT}" ]]; then
-    EXTRA_ARGS+=(--success-cache-root "${SUCCESS_CACHE_ROOT}")
-    EXTRA_ARGS+=(--metadata-cache-root "${METADATA_CACHE_ROOT}")
-    if [[ -n "${CACHE_CAMERA_NAMES}" ]]; then
-        EXTRA_ARGS+=(--cache-camera-names ${CACHE_CAMERA_NAMES})
-    fi
+if [[ -n "${TASKS}" ]]; then
+    EXTRA_ARGS+=(--tasks ${TASKS})
 fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.sim_benchmark \
     --model-ckpt          "${MODEL_CKPT}" \
-    --fail-root           "${FAIL_ROOT}" \
-    --success-root        "${SUCCESS_ROOT}" \
-    --tasks               ${TASKS} \
+    --data-root           "${DATA_ROOT}" \
+    --fail-split          "${FAIL_SPLIT}" \
+    --success-split       "${SUCCESS_SPLIT}" \
     --save-json           "${SAVE_JSON}" \
     --device              "${DEVICE}" \
     --encode-batch-size   "${ENCODE_BATCH_SIZE}" \

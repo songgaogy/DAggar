@@ -9,8 +9,6 @@ import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
-
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
@@ -64,6 +62,20 @@ def _get_view_names(train_cfg: DictConfig):
     return list(view_names)
 
 
+def _get_source_view_names(train_cfg: DictConfig):
+    view_names = getattr(train_cfg, "source_view_names", None)
+    if view_names is None:
+        view_names = _get_view_names(train_cfg)
+    return list(view_names)
+
+
+def _get_target_view_names(train_cfg: DictConfig):
+    view_names = getattr(train_cfg, "target_view_names", None)
+    if view_names is None:
+        view_names = _get_view_names(train_cfg)
+    return list(view_names)
+
+
 def _get_train_path(train_cfg: DictConfig) -> str:
     path = getattr(train_cfg, "train_data_path", None)
     if path is None and getattr(train_cfg, "env", None) is not None:
@@ -86,7 +98,11 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
         )
 
     view_names = _get_view_names(train_cfg)
-    encoder = ResNetEncoder(policy_ckpt_path=None, view_names=view_names)
+    if getattr(train_cfg, "encoder", None) is not None:
+        encoder = instantiate_local(train_cfg.encoder, view_names=view_names)
+    else:
+        from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
+        encoder = ResNetEncoder(policy_ckpt_path=None, view_names=view_names)
 
     if "encoder" in result:
         encoder.load_state_dict(result["encoder"])
@@ -148,13 +164,16 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
     else:
         raise ValueError("Proprio encoder not found in model checkpoint")
 
+    source_view_names = _get_source_view_names(train_cfg)
+    target_view_names = _get_target_view_names(train_cfg)
+    source_visual_dim = encoder.emb_dim * len(source_view_names)
+    target_visual_dim = encoder.emb_dim * len(target_view_names)
     predictor = instantiate_local(
         train_cfg.predictor,
-        num_patches=1,
+        num_patches=int(getattr(encoder, "num_patches", 1)),
         num_frames=train_cfg.num_hist,
-        dim=encoder.emb_dim * len(view_names)
-        + (proprio_encoder.emb_dim + action_encoder.emb_dim),
-        visual_dim=encoder.emb_dim * len(view_names),
+        dim=source_visual_dim + (proprio_encoder.emb_dim + action_encoder.emb_dim),
+        visual_dim=target_visual_dim,
         proprio_dim=train_cfg.proprio_emb_dim,
         action_dim=train_cfg.action_emb_dim,
     )
@@ -173,8 +192,11 @@ def load_model(model_ckpt: Path, train_cfg: DictConfig, device: torch.device):
         proprio_dim=train_cfg.proprio_emb_dim,
         action_dim=train_cfg.action_emb_dim,
         view_names=view_names,
+        source_view_names=source_view_names,
+        target_view_names=target_view_names,
         use_layernorm=train_cfg.use_layernorm,
         language_encoder=None,
+        action_loss_weight=OmegaConf.select(train_cfg, "action_loss_weight", default=0.0),
     )
     if train_cfg.has_predictor:
         if hasattr(model, "per_view_norm") and "per_view_norm" in result:
