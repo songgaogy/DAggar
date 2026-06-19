@@ -1,34 +1,22 @@
-"""Failure-detector visualization for the LPB v2 BCE discriminator.
+"""Failure-detector visualization for the nnPU (PU-BCE) discriminator (robosuite).
 
 Renders per-trajectory MP4 (with HUD + red border on predicted-failure frames)
-and a multi-page PDF summary, mirroring ``visualize.py`` but driven by a fitted
-:class:`BCEBenchmarkDiscriminator` instead of the single-bank KNN.
+and a multi-page PDF summary, driven by a fitted
+:class:`PUBCEBenchmarkDiscriminator`.
 
-Threshold: the visualizer always reports the **two-class Youden** operating
-point. ``tau`` is recomputed for the sampled task as ``argmax (TPR - FPR)`` on
-the empirical failure-score distributions of (success-calib frames, fail-bank
-GT-suffix frames). It is independent of the detector's own per-task threshold
-(which is set by the runner's ``calib_mode`` choice). To inspect a different
-operating point, change the runner's ``calib_mode`` and re-fit.
-
-Two entry kinds (``--kind``):
-
-  * ``robosuite``  - mirrors ``robosuite_bce.py``: eval trajectories from
-    fail_rollout-val-labeled / success_rollout-val, BCE bank from
-    fail_rollout-labeled.
-  * ``realworld``  - mirrors ``real_world_bce.py``: Agilex layout with proprio
-    field/slice and action slice; bank pool drawn from the same FAIL_ROOT,
-    filtered by video_id against the eval set.
+Threshold: the visualizer uses the detector's own per-task **success_percentile**
+threshold (``tau = percentile(success-calib failure scores, 100 - delta)``). No
+GT failure timing / two-class Youden is available in this branch (it would need
+failure labels). The HUD shows ``failure_score = -g(z)`` and that tau.
 
 Use ``--split`` to choose which eval trajectories are rendered:
-
   * ``fail_rollout``    - sample from ``--fail-split`` (default)
   * ``success_rollout`` - sample from ``--success-split`` (``is_failure=False``)
 
 Outputs:
     <out_dir>/videos/<video_id>.mp4
     <out_dir>/<pdf-name>.pdf
-    <out_dir>/checkpoints/bce_head.pth  (only when fitting; absent under --load-ckpt)
+    <out_dir>/checkpoints/pu_bce_head.pth  (only when fitting; absent under --load-ckpt)
 """
 
 from __future__ import annotations
@@ -43,7 +31,7 @@ import numpy as np
 import torch
 
 if "MPLCONFIGDIR" not in os.environ:
-    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-lpb-v2"
+    os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-dyn-disc"
     os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
 import matplotlib
@@ -58,22 +46,59 @@ from PIL import Image, ImageDraw, ImageFont
 
 from benchmark.core import BenchmarkTrajectory
 
-from robosuite.discriminator.dyn_disc.adapters.bce import BCEBenchmarkDiscriminator
-from robosuite.discriminator.dyn_disc.detectors.bce import (
-    BCEDiscriminator,
-    two_class_youden_threshold,
-)
-from robosuite.discriminator.dyn_disc.visualization.visualize import (
-    _draw_border,
-    _load_font,
-    _pad_to_even,
-    _percentile_summary,
-)
+from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
+from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
 
 
 # ---------------------------------------------------------------------- #
-# Helpers                                                                #
+# Self-contained rendering helpers                                        #
 # ---------------------------------------------------------------------- #
+
+
+def _percentile_summary(values: np.ndarray) -> str:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return "empty"
+    qs = np.percentile(arr, [0, 50, 90, 95, 99, 100])
+    return (
+        f"min={qs[0]:.3f} p50={qs[1]:.3f} p90={qs[2]:.3f} "
+        f"p95={qs[3]:.3f} p99={qs[4]:.3f} max={qs[5]:.3f}"
+    )
+
+
+def _pad_to_even(img: np.ndarray) -> np.ndarray:
+    """Pad bottom/right when needed because libx264 prefers even H/W."""
+    h, w = int(img.shape[0]), int(img.shape[1])
+    pad_h = h % 2
+    pad_w = w % 2
+    if pad_h == 0 and pad_w == 0:
+        return img
+    return np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+
+
+def _draw_border(img: np.ndarray, color: tuple, thickness: int) -> np.ndarray:
+    out = img.copy()
+    t = int(thickness)
+    out[:t, :, :] = color
+    out[-t:, :, :] = color
+    out[:, :t, :] = color
+    out[:, -t:, :] = color
+    return out
+
+
+def _load_font() -> ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, 18)
+            except Exception:
+                continue
+    return ImageFont.load_default()
 
 
 def _parse_camera_to_view(s: Optional[str]) -> Optional[Dict[str, str]]:
@@ -90,7 +115,7 @@ def _safe_id(s: str) -> str:
     return "".join(c if (c.isalnum() or c in "._-") else "_" for c in str(s))
 
 
-def _overlay_hud_bce(
+def _overlay_hud_pu(
     img: np.ndarray,
     *,
     score: float,
@@ -109,7 +134,7 @@ def _overlay_hud_bce(
 
     lines = [
         f"frame {frame_idx + 1}/{total}",
-        f"bce_score={score:.3f}  tau={threshold:.3f}",
+        f"failure_score=-g(z)={score:.3f}  tau={threshold:.3f}",
         f"PRED: {'FAIL' if pred_fail else 'OK  '}   "
         + (f"GT: {'FAIL' if gt_fail else 'OK  '}" if gt_fail is not None else ""),
     ]
@@ -123,89 +148,6 @@ def _overlay_hud_bce(
         draw.text((8, y), text, fill=color, font=font)
         y += 28
     return np.asarray(pil)
-
-
-# ---------------------------------------------------------------------- #
-# Per-task failure-score arrays used by Youden                           #
-# ---------------------------------------------------------------------- #
-
-
-def _compute_fail_suffix_failure_scores_per_task(
-    discriminator: BCEBenchmarkDiscriminator,
-    fail_bank_trajs: Sequence[BenchmarkTrajectory],
-) -> Dict[str, np.ndarray]:
-    """Score each fail-bank trajectory's GT-failure suffix and concat per task.
-
-    Mirrors the suffix slice used by ``BCEBenchmarkDiscriminator.fit_on_benchmark``:
-    ``suffix = features[first_gt_failure_frame:]``. Skips trajectories with no
-    usable GT cut (mirrors the adapter's ``skipped_no_gt`` rule).
-    """
-    if discriminator._shared_detector is None:
-        raise RuntimeError(
-            "Cannot compute fail-suffix scores: BCE head is not fitted/loaded."
-        )
-    per_task: Dict[str, List[np.ndarray]] = {}
-    for t in fail_bank_trajs:
-        t_star = t.first_gt_failure_frame()
-        if t_star is None:
-            continue
-        feat = discriminator._encode(t)
-        T = int(feat.shape[0])
-        t_star_int = int(t_star)
-        if t_star_int <= 0 or t_star_int >= T:
-            continue
-        suffix = feat[t_star_int:]
-        g = discriminator._shared_detector._logits_np(suffix)
-        per_task.setdefault(str(t.task_name), []).append((-g).astype(np.float32))
-    return {k: np.concatenate(v, axis=0) for k, v in per_task.items() if v}
-
-
-def _compute_success_calib_failure_scores_per_task(
-    discriminator: BCEBenchmarkDiscriminator,
-    eval_trajs: Sequence[BenchmarkTrajectory],
-    *,
-    seed: int,
-    calib_fraction: float,
-) -> Dict[str, np.ndarray]:
-    """Re-derive the success train/calib split used by the adapter and score
-    the calib slice through the fitted head.
-
-    Replication note: must match the rng + split rule in
-    ``BCEBenchmarkDiscriminator.fit_on_benchmark`` (NumPy ``default_rng(seed)``,
-    ``calib_fraction``, per-task ``permutation``, ``n_calib =
-    max(1, min(N-1, round(calib_fraction*N)))``). Changes to either side must
-    be mirrored here, otherwise ``youden`` will mix train + calib frames.
-    """
-    if discriminator._shared_detector is None:
-        raise RuntimeError(
-            "Cannot compute success-calib scores: BCE head is not fitted/loaded."
-        )
-    task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
-    for t in eval_trajs:
-        if bool(t.is_failure):
-            continue
-        task_to_success.setdefault(str(t.task_name), []).append(t)
-
-    rng = np.random.default_rng(int(seed))
-    out: Dict[str, np.ndarray] = {}
-    for task in sorted(task_to_success):
-        succ_list = task_to_success[task]
-        if len(succ_list) < 2:
-            continue
-        perm = rng.permutation(len(succ_list))
-        n_calib = int(round(float(calib_fraction) * len(succ_list)))
-        n_calib = max(1, min(len(succ_list) - 1, n_calib))
-        calib_idx = set(perm[:n_calib].tolist())
-        calib_trajs = [t for i, t in enumerate(succ_list) if i in calib_idx]
-        if not calib_trajs:
-            continue
-        feats_list = [discriminator._encode(t) for t in calib_trajs]
-        catf = torch.cat(
-            [f.to(torch.float32).reshape(-1, f.shape[-1]) for f in feats_list], dim=0,
-        )
-        g = discriminator._shared_detector._logits_np(catf)
-        out[task] = (-g).astype(np.float32)
-    return out
 
 
 # ---------------------------------------------------------------------- #
@@ -232,19 +174,17 @@ class PerTrajectoryViz:
 # ---------------------------------------------------------------------- #
 
 
-class BCEVisualizer:
-    """Combine a fitted BCE benchmark discriminator with video + PDF renderers."""
+class PUBCEVisualizer:
+    """Combine a fitted PU-BCE benchmark discriminator with video + PDF renderers."""
 
     def __init__(
         self,
-        discriminator: BCEBenchmarkDiscriminator,
+        discriminator: PUBCEBenchmarkDiscriminator,
         *,
         camera_name: str = "agentview",
         fps: int = 20,
         border_thickness: int = 10,
         border_color_fail: tuple = (255, 0, 0),
-        threshold_overrides: Optional[Dict[str, float]] = None,
-        threshold_source: str = "youden",
         debug_score_stats: bool = True,
         flip_vertical: bool = True,
     ) -> None:
@@ -253,23 +193,11 @@ class BCEVisualizer:
         self.fps = int(fps)
         self.border_thickness = int(border_thickness)
         self.border_color_fail = tuple(int(c) for c in border_color_fail)
-        self.threshold_overrides = dict(threshold_overrides) if threshold_overrides else {}
-        self.threshold_source = str(threshold_source)
         self.debug_score_stats = bool(debug_score_stats)
         self.flip_vertical = bool(flip_vertical)
         self._font = _load_font()
 
     def _task_threshold(self, task: str) -> float:
-        if task in self.threshold_overrides:
-            return float(self.threshold_overrides[task])
-        if "__global__" in self.threshold_overrides:
-            return float(self.threshold_overrides["__global__"])
-        detector = self.discriminator._detectors_per_task.get(task, None)
-        if detector is None:
-            return float("nan")
-        return float(detector.thresholds.get(task, float("nan")))
-
-    def _detector_threshold(self, task: str) -> float:
         detector = self.discriminator._detectors_per_task.get(task, None)
         if detector is None:
             return float("nan")
@@ -287,12 +215,7 @@ class BCEVisualizer:
         if thresholds is None:
             thresholds = np.full_like(out.step_scores, out.aux.get("threshold", float("nan")))
 
-        threshold = self._task_threshold(str(traj.task_name))
-        if np.isfinite(threshold):
-            predictions = (np.asarray(out.step_scores, dtype=np.float32) >= threshold).astype(np.int64)
-        else:
-            predictions = np.asarray(out.predictions, dtype=np.int64)
-
+        predictions = np.asarray(out.predictions, dtype=np.int64)
         positive = np.where(predictions == 1)[0]
         first_pred = int(positive[0]) if positive.size > 0 else None
 
@@ -347,7 +270,7 @@ class BCEVisualizer:
                 canvas = img
                 if pred_fail:
                     canvas = _draw_border(canvas, self.border_color_fail, self.border_thickness)
-                canvas = _overlay_hud_bce(
+                canvas = _overlay_hud_pu(
                     canvas,
                     score=float(viz.step_scores[t]),
                     threshold=float(threshold),
@@ -389,7 +312,7 @@ class BCEVisualizer:
         with PdfPages(out_path) as pdf:
             fig, ax = plt.subplots(figsize=(8.5, 6.0))
             ax.axis("off")
-            ax.set_title(f"LPB v2 BCE summary - task={task}", fontsize=14, loc="left")
+            ax.set_title(f"dyn_disc PU-BCE (nnPU) summary - task={task}", fontsize=14, loc="left")
 
             lines = [
                 f"discriminator: {self.discriminator.name}",
@@ -400,23 +323,21 @@ class BCEVisualizer:
                 f"transformer_layer: {summary.get('transformer_layer', 'n/a')}",
                 f"delta (FA budget %): {summary.get('delta', 'n/a')}  "
                 f"calib_fraction: {summary.get('calib_fraction', 'n/a')}",
-                f"encode_batch_size: {summary.get('encode_batch_size', 'n/a')}",
+                f"calib_mode: {summary.get('calib_mode', 'success_percentile')}",
                 "",
-                "BCE head:",
-                f"  feat_dim     = {_g(glob, 'feat_dim')}  "
+                "nnPU head:",
+                f"  feat_dim   = {_g(glob, 'feat_dim')}  "
                 f"head_hidden = {_g(glob, 'head_hidden')}  "
                 f"head_layers = {_g(glob, 'head_layers')}",
-                f"  epochs       = {_g(glob, 'epochs')}  lr = {_g(glob, 'lr')}  "
-                f"weight_decay = {_g(glob, 'weight_decay')}  "
+                f"  pi_p       = {_g(glob, 'pi_p')}  "
+                f"loss_surrogate = {_g(glob, 'loss_surrogate')}  "
+                f"nn_correction = {_g(glob, 'nn_correction')}",
+                f"  epochs     = {_g(glob, 'epochs')}  lr = {_g(glob, 'lr')}  "
                 f"batch_size = {_g(glob, 'batch_size')}",
-                f"  max_expert_other_ratio = {_g(glob, 'max_expert_other_ratio')}",
-                f"  num_fail_bank_trajectories = {_g(glob, 'num_fail_bank_trajectories')}  "
-                f"skipped_no_gt = {_g(glob, 'num_fail_bank_skipped_no_gt')}",
+                f"  num_unlabeled_fail_trajectories = {_g(glob, 'num_unlabeled_fail_trajectories')}",
                 f"  loaded_from_ckpt = {_g(glob, 'loaded_from_ckpt')}",
                 "",
-                f"visualized threshold source: {self.threshold_source}",
-                f"visualized threshold tau   : {threshold:.4f}",
-                f"detector threshold tau     : {self._detector_threshold(task):.4f}",
+                f"threshold tau (success_percentile) = {threshold:.4f}",
                 "",
                 "Calibration (success pool, per task):",
                 f"  num_success_trajectories       = {_g(per_task, 'num_success_trajectories')}",
@@ -424,8 +345,7 @@ class BCEVisualizer:
                 f"num_calib_success_trajectories = {_g(per_task, 'num_calib_success_trajectories')}",
                 f"  num_train_success_frames       = {_g(per_task, 'num_train_success_frames')}  "
                 f"num_calib_success_frames       = {_g(per_task, 'num_calib_success_frames')}",
-                f"  num_fail_prefix_frames         = {_g(per_task, 'num_fail_prefix_frames')}  "
-                f"num_fail_other_frames          = {_g(per_task, 'num_fail_other_frames')}",
+                f"  num_unlabeled_fail_frames      = {_g(per_task, 'num_unlabeled_fail_frames')}",
                 f"  calib_score_min  = {_g(per_task, 'calib_score_min')}  "
                 f"calib_score_max  = {_g(per_task, 'calib_score_max')}",
                 f"  calib_score_mean = {_g(per_task, 'calib_score_mean')}  "
@@ -433,7 +353,7 @@ class BCEVisualizer:
                 "",
                 f"Sampled {split} trajectories: {len(vizs)}",
                 "",
-                "Trigger rule: flag when bce_failure_score = -head_logit(z) >= tau.",
+                "Trigger rule: flag when failure_score = -head_logit(z) >= tau.",
             ]
             ax.text(0.01, 0.97, "\n".join(lines), fontsize=9, family="monospace", va="top", ha="left")
             pdf.savefig(fig)
@@ -446,7 +366,7 @@ class BCEVisualizer:
         T = int(viz.num_frames)
         t = np.arange(T)
         fig, ax = plt.subplots(figsize=(10.0, 4.5))
-        ax.plot(t, viz.step_scores, color="#1f77b4", lw=1.4, label="BCE failure score (-logit)")
+        ax.plot(t, viz.step_scores, color="#1f77b4", lw=1.4, label="PU failure score (-logit)")
         if np.isfinite(threshold):
             ax.axhline(threshold, color="red", lw=1.2, ls="--", label=f"tau={threshold:.3f}")
 
@@ -473,7 +393,7 @@ class BCEVisualizer:
 
         ax.set_xlim(0, max(T - 1, 1))
         ax.set_xlabel("frame")
-        ax.set_ylabel("BCE failure score (-logit)")
+        ax.set_ylabel("PU failure score (-logit)")
         ax.set_title(f"[{viz.task_name}] {viz.video_id}  (T={T})", fontsize=11, loc="left")
         ax.grid(True, alpha=0.2)
 
@@ -528,13 +448,13 @@ class BCEVisualizer:
             video_path = os.path.join(videos_dir, f"{_safe_id(traj.video_id)}.mp4")
             self.render_video(traj, viz, video_path)
             print(
-                f"[bce][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
+                f"[pu_bce][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
                 f"pred_frames={int(viz.predictions.sum())}  -> {video_path}",
                 flush=True,
             )
             if self.debug_score_stats:
                 print(
-                    f"[bce][viz][debug] {traj.task_name}/{traj.video_id} score_all: "
+                    f"[pu_bce][viz][debug] {traj.task_name}/{traj.video_id} score_all: "
                     f"{_percentile_summary(viz.step_scores)}",
                     flush=True,
                 )
@@ -542,12 +462,12 @@ class BCEVisualizer:
                     normal = viz.step_scores[viz.gt_mask == 0]
                     failure = viz.step_scores[viz.gt_mask == 1]
                     print(
-                        f"[bce][viz][debug] {traj.task_name}/{traj.video_id} score_normal_gt0: "
+                        f"[pu_bce][viz][debug] {traj.task_name}/{traj.video_id} score_normal_gt0: "
                         f"{_percentile_summary(normal)}",
                         flush=True,
                     )
                     print(
-                        f"[bce][viz][debug] {traj.task_name}/{traj.video_id} score_failure_gt1: "
+                        f"[pu_bce][viz][debug] {traj.task_name}/{traj.video_id} score_failure_gt1: "
                         f"{_percentile_summary(failure)}",
                         flush=True,
                     )
@@ -556,12 +476,12 @@ class BCEVisualizer:
 
         pdf_path = os.path.join(out_dir, pdf_name)
         self.render_pdf(vizs, pdf_path, split=split)
-        print(f"[bce][viz] wrote PDF -> {pdf_path}", flush=True)
+        print(f"[pu_bce][viz] wrote PDF -> {pdf_path}", flush=True)
         return {"videos": video_paths, "pdf": pdf_path}
 
 
 # ---------------------------------------------------------------------- #
-# Eval-trajectory sampling for visualization                               #
+# Eval-trajectory sampling                                                #
 # ---------------------------------------------------------------------- #
 
 
@@ -573,7 +493,6 @@ def _sample_trajectories_for_viz(
     num_trajs: int,
     seed: int,
 ) -> List[BenchmarkTrajectory]:
-    """Sample trajectories from the eval benchmark for MP4/PDF rendering."""
     if split == "success_rollout":
         pool = [t for t in trajs if not bool(t.is_failure) and str(t.task_name) == str(task)]
         kind = "success"
@@ -591,172 +510,91 @@ def _sample_trajectories_for_viz(
     n = min(int(num_trajs), len(pool))
     sampled = rng.sample(pool, n)
     print(
-        f"[bce][viz] sampled {n}/{len(pool)} {split} trajectories from {task}",
+        f"[pu_bce][viz] sampled {n}/{len(pool)} {split} trajectories from {task}",
         flush=True,
     )
     return sampled
 
 
 # ---------------------------------------------------------------------- #
-# Bank-pool selection (mirrors the runner helpers)                       #
+# Unlabeled-pool selection (mirrors the runner)                          #
 # ---------------------------------------------------------------------- #
 
 
-def _select_bank_robosuite(
-    bank_pool_by_task: Dict[str, List],
+def _select_unlabeled(
+    pool_by_task: Dict[str, List],
     eval_tasks: Sequence[str],
-    fail_bank_per_task: int,
+    unlabeled_per_task: int,
 ) -> List:
     out: List = []
     for task in sorted(set(eval_tasks)):
-        pool = sorted(bank_pool_by_task.get(task, []), key=lambda t: str(t.video_id))
-        n_take = min(len(pool), int(fail_bank_per_task))
+        pool = sorted(pool_by_task.get(task, []), key=lambda t: str(t.video_id))
+        n_take = min(len(pool), int(unlabeled_per_task))
         if n_take == 0:
             raise RuntimeError(
-                f"Task {task!r}: zero GT-labeled failure trajectories available; "
-                f"check --fail-train-root and --tasks."
+                f"Task {task!r}: zero failure trajectories available; "
+                f"check --fail-train-split and --task."
             )
-        if n_take < int(fail_bank_per_task):
+        if n_take < int(unlabeled_per_task):
             print(
-                f"[bce][viz] task={task}: only {n_take} GT failure trajectories "
-                f"(< --fail-bank-per-task={fail_bank_per_task}); using all.",
+                f"[pu_bce][viz] task={task}: only {n_take} failure trajectories "
+                f"(< --unlabeled-per-task={unlabeled_per_task}); using all.",
                 flush=True,
             )
         out.extend(pool[:n_take])
     return out
 
 
-def _select_bank_realworld(
-    bank_pool_by_task: Dict[str, List],
-    eval_tasks: Sequence[str],
-    fail_bank_per_task: int,
-) -> List:
-    out: List = []
-    for task in sorted(set(eval_tasks)):
-        pool = sorted(bank_pool_by_task.get(task, []), key=lambda t: str(t.video_id))
-        if len(pool) < fail_bank_per_task:
-            raise RuntimeError(
-                f"Task {task!r}: only {len(pool)} disjoint failure trajectories available, "
-                f"but --fail-bank-per-task={fail_bank_per_task}."
-            )
-        out.extend(pool[:fail_bank_per_task])
-    return out
+def _build_benchmark_and_pool(args: argparse.Namespace):
+    """Build the eval FailureBenchmark plus the disjoint unlabeled failure pool."""
+    from robosuite.discriminator.utils.robosuite_benchmark import (
+        FailureBenchmark,
+        discover_failure_bank,
+    )
+
+    bench = FailureBenchmark(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        fail_split=args.fail_split,
+        success_split=args.success_split,
+        max_fail_per_task=args.max_fail_per_task,
+        max_success_per_task=args.max_success_per_task,
+    )
+    trajs = bench.trajectories()
+    if not trajs:
+        raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
+
+    eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
+    all_fail = discover_failure_bank(
+        data_root=args.data_root,
+        tasks=[str(args.task)],
+        split=args.fail_train_split,
+        max_fail_per_task=None,
+    )
+    all_fail = [t for t in all_fail if bool(t.is_failure)]
+    pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
+    pool_by_task: Dict[str, List] = {}
+    for t in pool:
+        pool_by_task.setdefault(str(t.task_name), []).append(t)
+    eval_tasks = sorted({str(t.task_name) for t in trajs})
+    unlabeled = _select_unlabeled(pool_by_task, eval_tasks, int(args.unlabeled_per_task))
+    print(
+        f"[pu_bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
+        f"pool={len(pool)} unlabeled_used={len(unlabeled)}",
+        flush=True,
+    )
+    return bench, trajs, unlabeled
 
 
 # ---------------------------------------------------------------------- #
-# Benchmark + bank-pool construction (per kind)                          #
+# Load nnPU head from disk without re-fitting                            #
 # ---------------------------------------------------------------------- #
 
 
-def _build_benchmark_and_bank(args: argparse.Namespace):
-    """Build the eval FailureBenchmark plus the disjoint failure bank pool.
-
-    Returns (bench, eval_trajs, fail_bank_trajs).
-    """
-    if args.kind == "robosuite":
-        from robosuite.discriminator.utils.robosuite_benchmark import (
-            FailureBenchmark,
-            discover_failure_bank,
-        )
-
-        bench = FailureBenchmark(
-            data_root=args.data_root,
-            tasks=[str(args.task)],
-            fail_split=args.fail_split,
-            success_split=args.success_split,
-            max_fail_per_task=args.max_fail_per_task,
-            max_success_per_task=args.max_success_per_task,
-        )
-        trajs = bench.trajectories()
-        if not trajs:
-            raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
-
-        eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-        all_fail = discover_failure_bank(
-            data_root=args.data_root,
-            tasks=[str(args.task)],
-            split=args.fail_train_split,
-            max_fail_per_task=None,
-        )
-        all_fail = [t for t in all_fail if bool(t.is_failure)]
-        bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
-        bank_pool_by_task: Dict[str, List] = {}
-        for t in bank_pool:
-            bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
-        eval_tasks = sorted({str(t.task_name) for t in trajs})
-        fail_bank = _select_bank_robosuite(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
-        print(
-            f"[bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-            f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
-            flush=True,
-        )
-        return bench, trajs, fail_bank
-
-    elif args.kind == "realworld":
-        from benchmark.real_world import FailureBenchmark
-        from benchmark.real_world.loader import discover_agilex_trajectories
-
-        proprio_slice = slice(int(args.proprio_start), int(args.proprio_stop))
-        action_slice = slice(int(args.action_start), int(args.action_stop))
-        bench = FailureBenchmark(
-            fail_labeled_root=args.fail_root,
-            success_root=args.success_root,
-            tasks=[str(args.task)],
-            max_fail_per_task=args.max_fail_per_task,
-            max_success_per_task=args.max_success_per_task,
-            cache_root=args.cache_root,
-            proprio_field=args.proprio_field,
-            proprio_slice=proprio_slice,
-            action_slice=action_slice,
-        )
-        trajs = bench.trajectories()
-        if not trajs:
-            raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
-
-        eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-        all_fail = discover_agilex_trajectories(
-            fail_labeled_root=args.fail_root,
-            success_root=args.success_root,
-            tasks=[str(args.task)],
-            max_fail_per_task=None,
-            max_success_per_task=0,
-            proprio_field=args.proprio_field,
-            proprio_slice=proprio_slice,
-            action_slice=action_slice,
-        )
-        all_fail = [t for t in all_fail if bool(t.is_failure)]
-        bank_pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
-        bank_pool_by_task: Dict[str, List] = {}
-        for t in bank_pool:
-            bank_pool_by_task.setdefault(str(t.task_name), []).append(t)
-        eval_tasks = sorted({str(t.task_name) for t in trajs})
-        fail_bank = _select_bank_realworld(bank_pool_by_task, eval_tasks, int(args.fail_bank_per_task))
-        print(
-            f"[bce][viz] realworld eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-            f"bank_pool={len(bank_pool)} bank_used={len(fail_bank)}",
-            flush=True,
-        )
-        return bench, trajs, fail_bank
-
-    raise ValueError(f"unknown --kind {args.kind!r}")
-
-
-# ---------------------------------------------------------------------- #
-# Load BCE head from disk without re-fitting                             #
-# ---------------------------------------------------------------------- #
-
-
-def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> None:
-    """Restore a fitted BCE head into ``disc`` without running fit_on_benchmark.
-
-    Mirrors :meth:`BCEBenchmarkDiscriminator._save_checkpoint` reverse.
-    Populates ``_shared_detector``, ``_detectors_per_task`` (aliased per task in
-    the saved threshold table), ``_global_stats``, and ``_calibration_stats``
-    so :meth:`score_trajectory` and :meth:`calibration_summary` both work.
-    """
+def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = payload["bce_detector"]
-    detector = BCEDiscriminator(
+    state = payload["pu_bce_detector"]
+    detector = PUBCEDiscriminator(
         in_dim=int(payload["in_dim"]),
         hidden=int(payload["hidden"]),
         num_layers=int(payload["num_layers"]),
@@ -765,12 +603,11 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
     detector.load_state_dict(state)
     if not detector.thresholds:
         raise RuntimeError(
-            f"BCE checkpoint at {ckpt_path} has no per-task thresholds; cannot score."
+            f"PU-BCE checkpoint at {ckpt_path} has no per-task thresholds; cannot score."
         )
 
     disc._shared_detector = detector
     disc._detectors_per_task = {task: detector for task in detector.thresholds}
-
     disc._global_stats = {
         "feat_dim": int(payload["in_dim"]),
         "epochs": int(payload.get("epoch", 0)),
@@ -778,9 +615,10 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
         "head_layers": int(payload["num_layers"]),
         "feature_source": str(payload.get("feature_source", disc.feature_source)),
         "transformer_layer": int(payload.get("transformer_layer", disc.transformer_layer)),
-        "max_expert_other_ratio": payload.get("max_expert_other_ratio"),
-        "num_fail_bank_trajectories": len(payload.get("fail_bank_video_ids", []) or []),
-        "num_fail_bank_skipped_no_gt": None,
+        "pi_p": payload.get("pi_p"),
+        "loss_surrogate": payload.get("loss_surrogate"),
+        "nn_correction": payload.get("nn_correction"),
+        "num_unlabeled_fail_trajectories": len(payload.get("unlabeled_fail_video_ids", []) or []),
         "loaded_from_ckpt": str(ckpt_path),
     }
     disc._calibration_stats = {}
@@ -795,7 +633,7 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
             "num_calib_success_frames": None if cs is None else int(cs.num_calib_frames),
         }
     print(
-        f"[bce][viz] loaded BCE head from {ckpt_path}; tasks="
+        f"[pu_bce][viz] loaded nnPU head from {ckpt_path}; tasks="
         f"{sorted(detector.thresholds)} "
         f"tau="
         + ", ".join(f"{k}={v:.4f}" for k, v in sorted(detector.thresholds.items())),
@@ -810,7 +648,6 @@ def _bootstrap_from_ckpt(disc: BCEBenchmarkDiscriminator, ckpt_path: str) -> Non
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--kind", required=True, choices=["robosuite", "realworld"])
     parser.add_argument(
         "--split",
         type=str,
@@ -819,18 +656,16 @@ def _parse_args() -> argparse.Namespace:
         help="Eval split to visualize: fail_rollout (--fail-split) or "
              "success_rollout (--success-split).",
     )
-    parser.add_argument("--model-ckpt", required=True, help="LPB v2 dynamics checkpoint .pth")
+    parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
     parser.add_argument("--success-split", type=str, default="success_rollout-val")
     parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
-    parser.add_argument("--fail-root", type=str, default=None)
-    parser.add_argument("--success-root", type=str, default=None)
     parser.add_argument("--task", required=True)
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--pdf-name", type=str, default="bce_v2_scores.pdf")
+    parser.add_argument("--pdf-name", type=str, default="pu_bce_scores.pdf")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--border-thickness", type=int, default=10)
@@ -838,25 +673,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-success-per-task", type=int, default=None)
     parser.add_argument("--no-flip-vertical", action="store_true",
                         help="Disable the default top/bottom flip applied to rendered frames.")
-
-    # robosuite-only
-    parser.add_argument("--fail-train-root", type=str, default=None,
-                        help="Deprecated for robosuite; use --fail-train-split.")
-    parser.add_argument("--success-cache-root", type=str, default=None,
-                        help="Deprecated for robosuite; ignored.")
-    parser.add_argument("--metadata-cache-root", type=str, default=None,
-                        help="Deprecated for robosuite; ignored.")
-    parser.add_argument("--cache-camera-names", nargs="*", default=None,
-                        help="Deprecated for robosuite; ignored.")
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
-
-    # realworld-only
-    parser.add_argument("--cache-root", type=str, default=None)
-    parser.add_argument("--proprio-field", type=str, default="qpos")
-    parser.add_argument("--proprio-start", type=int, default=7)
-    parser.add_argument("--proprio-stop", type=int, default=14)
-    parser.add_argument("--action-start", type=int, default=7)
-    parser.add_argument("--action-stop", type=int, default=14)
 
     # shared encoder / scoring knobs
     parser.add_argument("--device", type=str, default="cuda")
@@ -873,20 +690,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--quiet-fit", action="store_true")
 
-    # BCE-specific
+    # nnPU-specific
+    parser.add_argument("--pi-p", type=float, default=0.5)
+    parser.add_argument("--loss-surrogate", type=str, default="sigmoid",
+                        choices=["sigmoid", "logistic"])
+    parser.add_argument("--no-nn-correction", action="store_true")
+    parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--head-hidden", type=int, default=256)
     parser.add_argument("--head-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--max-expert-other-ratio", type=float, default=1.0)
-    parser.add_argument("--fail-bank-per-task", type=int, default=25)
+    parser.add_argument("--unlabeled-per-task", type=int, default=25)
     parser.add_argument("--save-ckpt-dir", type=str, default=None,
-                        help="Where bce_head.pth is written when fitting. "
+                        help="Where pu_bce_head.pth is written when fitting. "
                              "Defaults to <out-dir>/checkpoints.")
     parser.add_argument("--load-ckpt", type=str, default=None,
-                        help="Path to an existing bce_head.pth; skip fit and restore "
+                        help="Path to an existing pu_bce_head.pth; skip fit and restore "
                              "the head + per-task thresholds from disk.")
 
     parser.add_argument("--no-debug-score-stats", action="store_true")
@@ -895,10 +716,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if args.kind == "realworld" and (not args.fail_root or not args.success_root):
-        raise SystemExit("--fail-root and --success-root are required when --kind realworld")
 
-    bench, trajs, fail_bank_trajs = _build_benchmark_and_bank(args)
+    bench, trajs, unlabeled_trajs = _build_benchmark_and_pool(args)
     sampled = _sample_trajectories_for_viz(
         trajs,
         task=str(args.task),
@@ -908,14 +727,13 @@ def main() -> None:
     )
 
     save_ckpt_dir = args.save_ckpt_dir or os.path.join(str(args.out_dir), "checkpoints")
-    max_eo_ratio = (
-        None if float(args.max_expert_other_ratio) <= 0.0 else float(args.max_expert_other_ratio)
-    )
-    discriminator = BCEBenchmarkDiscriminator(
+    discriminator = PUBCEBenchmarkDiscriminator(
         model_ckpt=str(args.model_ckpt),
-        fail_bank_trajectories=fail_bank_trajs if not args.load_ckpt else [],
-        fail_calib_trajectories=[],
-        max_expert_other_ratio=max_eo_ratio,
+        unlabeled_fail_trajectories=unlabeled_trajs if not args.load_ckpt else [],
+        pi_p=float(args.pi_p),
+        loss_surrogate=str(args.loss_surrogate),
+        nn_correction=not bool(args.no_nn_correction),
+        beta=float(args.beta),
         head_hidden=int(args.head_hidden),
         head_layers=int(args.head_layers),
         epochs=int(args.epochs),
@@ -942,10 +760,10 @@ def main() -> None:
         if args.load_ckpt:
             if not os.path.isfile(args.load_ckpt):
                 raise FileNotFoundError(f"--load-ckpt not found: {args.load_ckpt}")
-            print(f"[bce][viz] loading BCE head from {args.load_ckpt}; skipping fit.", flush=True)
+            print(f"[pu_bce][viz] loading nnPU head from {args.load_ckpt}; skipping fit.", flush=True)
             _bootstrap_from_ckpt(discriminator, str(args.load_ckpt))
         else:
-            print("[bce][viz] fitting BCE head on benchmark...", flush=True)
+            print("[pu_bce][viz] fitting nnPU head on benchmark...", flush=True)
             discriminator.fit_on_benchmark(trajs)
 
         if str(args.task) not in discriminator._detectors_per_task:
@@ -955,52 +773,11 @@ def main() -> None:
                 f"Available tasks: {available}"
             )
 
-        # Threshold: always two-class Youden on (success-calib, fail-suffix).
-        if not fail_bank_trajs:
-            raise RuntimeError(
-                "Youden threshold requires a non-empty fail bank pool; "
-                "check --fail-train-root / --fail-root."
-            )
-        fail_suffix_scores = _compute_fail_suffix_failure_scores_per_task(
-            discriminator, fail_bank_trajs,
-        )
-        calib_scores = _compute_success_calib_failure_scores_per_task(
-            discriminator, trajs,
-            seed=int(args.seed),
-            calib_fraction=float(args.calib_fraction),
-        )
-        s_fail = fail_suffix_scores.get(str(args.task))
-        s_succ = calib_scores.get(str(args.task))
-        if s_fail is None or s_fail.size == 0:
-            raise RuntimeError(
-                f"No usable GT-failure-suffix frames for task {args.task!r}; "
-                f"cannot compute Youden threshold."
-            )
-        if s_succ is None or s_succ.size == 0:
-            raise RuntimeError(
-                f"No success-calib frames for task {args.task!r}; cannot compute "
-                f"Youden threshold. Under --load-ckpt this requires the same "
-                f"eval set / seed / calib_fraction as the fit run."
-            )
-        tau = two_class_youden_threshold(s_succ, s_fail)
-        threshold_overrides = {str(args.task): tau}
-        threshold_source = f"youden(n_succ={s_succ.size}, n_fail={s_fail.size})"
-        print(
-            f"[bce][viz][thr] youden  n_succ_calib={s_succ.size}  "
-            f"n_fail_suffix={s_fail.size}  "
-            f"succ[min/mean/max]=[{s_succ.min():.3f}/{s_succ.mean():.3f}/{s_succ.max():.3f}]  "
-            f"fail[min/mean/max]=[{s_fail.min():.3f}/{s_fail.mean():.3f}/{s_fail.max():.3f}]  "
-            f"tau={tau:.4f}",
-            flush=True,
-        )
-
-        visualizer = BCEVisualizer(
+        visualizer = PUBCEVisualizer(
             discriminator,
             camera_name=str(args.camera_name),
             fps=int(args.fps),
             border_thickness=int(args.border_thickness),
-            threshold_overrides=threshold_overrides,
-            threshold_source=threshold_source,
             debug_score_stats=not bool(args.no_debug_score_stats),
             flip_vertical=not bool(args.no_flip_vertical),
         )
@@ -1011,7 +788,7 @@ def main() -> None:
             split=str(args.split),
         )
         print(
-            f"[bce][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",
+            f"[pu_bce][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",
             flush=True,
         )
     finally:

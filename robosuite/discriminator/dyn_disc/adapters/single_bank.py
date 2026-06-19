@@ -1,14 +1,16 @@
-"""Benchmark adapter for the cleaned LPB v2 KNN OOD discriminator.
+"""Shared benchmark-adapter base (``DynBenchmarkDiscriminator``).
 
-Drop-in alternative to `robosuite.discriminator.lpb.lpb_benchmark` but built on
-the original LPB dynamics model + KNN feature definition (see `knn.py`).
+This is the encoder + trajectory-feature-cache backbone shared by every head in
+this package. It owns:
 
-Per-task workflow (matches `LPBBenchmarkDiscriminator` in lpb/):
-  1. fit_on_benchmark(trajectories): split per-task success demos into
-     bank + disjoint calibration, encode all frames via the original LPB encoder,
-     build the KNN bank, calibrate the percentile threshold.
-  2. score_trajectory(traj): encode the trajectory frame-by-frame, compute
-     per-frame min L2 distance to the bank, threshold to produce binary preds.
+  * a :class:`DynEncoder` (frozen DINOv3 dynamics model) built from ``model_ckpt``;
+  * camera->view resolution, proprio/action slicing, image preprocessing;
+  * a per-trajectory feature cache keyed by (file_path, demo/cache path,
+    feature_source, transformer_layer).
+
+It does **not** define a discriminator head of its own anymore. Concrete heads
+subclass it and implement ``fit_on_benchmark`` / ``score_trajectory`` /
+``calibration_summary`` (see ``adapters/pu_bce.py``).
 """
 
 from __future__ import annotations
@@ -20,9 +22,9 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
+from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput  # noqa: F401
 
-from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import LPBV2Encoder, LPBV2KNN
+from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import DynEncoder
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
@@ -39,10 +41,14 @@ def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.
     return np.concatenate([arr, pad], axis=0)
 
 
-class LPBV2BenchmarkDiscriminator:
-    """LPB v2 KNN OOD detector exposed through BenchmarkTrajectory API."""
+class DynBenchmarkDiscriminator:
+    """Encoder + feature-cache backbone exposed through the BenchmarkTrajectory API.
 
-    name = "dyn_disc_knn"
+    Concrete heads subclass this and override ``fit_on_benchmark`` /
+    ``score_trajectory`` / ``calibration_summary``.
+    """
+
+    name = "dyn_disc"
 
     def __init__(
         self,
@@ -82,7 +88,7 @@ class LPBV2BenchmarkDiscriminator:
         self.seed = int(seed)
         self.verbose_fit = bool(verbose_fit)
 
-        self.encoder = LPBV2Encoder(
+        self.encoder = DynEncoder(
             model_ckpt=self.model_ckpt,
             device=self.device,
             feature_source=self.feature_source,
@@ -98,10 +104,10 @@ class LPBV2BenchmarkDiscriminator:
         if self.camera_to_view is None:
             self.camera_to_view = {v: v for v in self.encoder.view_names}
 
-        # Per-task state.
-        self._detectors_per_task: Dict[str, LPBV2KNN] = {}
+        # Per-task state (populated by concrete subclasses).
+        self._detectors_per_task: Dict[str, Any] = {}
         self._calibration_stats: Dict[str, dict] = {}
-        # Cache encoded trajectories: (file_path, demo_path) -> (T, D) tensor.
+        # Cache encoded trajectories: key -> (T, D) tensor.
         self._feature_cache: Dict[tuple, torch.Tensor] = {}
         # Optional list populated with per-call encode_batch() latencies (seconds).
         self.batch_infer_times: Optional[List[float]] = None
@@ -283,146 +289,19 @@ class LPBV2BenchmarkDiscriminator:
         return self._encode_tensors(key, prepared)
 
     # ------------------------------------------------------------------ #
-    # Public API                                                         #
+    # Public API (overridden by concrete heads)                         #
     # ------------------------------------------------------------------ #
 
     def fit_on_benchmark(self, trajectories: List[BenchmarkTrajectory]) -> None:
-        task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
-        for traj in trajectories:
-            if bool(traj.is_failure):
-                continue
-            task_to_success.setdefault(str(traj.task_name), []).append(traj)
-
-        if not task_to_success:
-            raise RuntimeError(
-                "LPB-original KNN calibration requires success trajectories per task."
-            )
-
-        for task, succ_list in task_to_success.items():
-            if len(succ_list) < 2:
-                raise RuntimeError(
-                    f"Task {task!r} has only {len(succ_list)} success trajectory; "
-                    "need at least 2 for disjoint bank + calibration split."
-                )
-            rng = np.random.default_rng(int(self.seed))
-            perm = rng.permutation(len(succ_list))
-            n_calib = int(round(self.calib_fraction * len(succ_list)))
-            n_calib = max(1, min(len(succ_list) - 1, n_calib))
-            calib_idx = set(perm[:n_calib].tolist())
-            bank_trajs = [t for i, t in enumerate(succ_list) if i not in calib_idx]
-            calib_trajs = [t for i, t in enumerate(succ_list) if i in calib_idx]
-
-            bank_feats: List[torch.Tensor] = []
-            calib_feats: List[torch.Tensor] = []
-            bank_total = 0
-            calib_total = 0
-            for t in bank_trajs:
-                f = self._encode(t)
-                bank_feats.append(f)
-                bank_total += int(f.shape[0])
-            for t in calib_trajs:
-                f = self._encode(t)
-                calib_feats.append(f)
-                calib_total += int(f.shape[0])
-
-            feat_dim = int(bank_feats[0].shape[1])
-            if self.feature_source == "encoder":
-                visual_dim = int(self.encoder.visual_emb_dim_total)
-                proprio_dim = int(self.encoder.proprio_emb_dim)
-                action_dim = int(self.encoder.action_emb_dim)
-                visual_weight = float(self.visual_weight)
-                proprio_weight = float(self.proprio_weight)
-                action_weight = float(self.action_weight)
-            else:
-                visual_dim = int(feat_dim)
-                proprio_dim = 0
-                action_dim = 0
-                visual_weight = 1.0
-                proprio_weight = 1.0
-                action_weight = 1.0
-
-            if self.verbose_fit:
-                print(
-                    f"[dyn_disc][fit] task={task} "
-                    f"bank_trajs={len(bank_trajs)} ({bank_total} steps)  "
-                    f"calib_trajs={len(calib_trajs)} ({calib_total} steps)  "
-                    f"feature_source={self.feature_source} layer={self.transformer_layer}  "
-                    f"feat_dim={feat_dim} (visual={visual_dim} + proprio={proprio_dim} + action={action_dim})"
-                )
-
-            det = LPBV2KNN(
-                visual_dim=visual_dim,
-                proprio_dim=proprio_dim,
-                action_dim=action_dim,
-                visual_weight=visual_weight,
-                proprio_weight=proprio_weight,
-                action_weight=action_weight,
-                delta=self.delta,
-                chunk_size=self.knn_chunk_size,
-                device=self.device,
-            )
-            threshold = det.fit(expert_features=bank_feats, calibration_features=calib_feats)
-            self._detectors_per_task[task] = det
-            self._calibration_stats[task] = {
-                "num_success_trajectories": int(len(succ_list)),
-                "num_bank_trajectories": int(len(bank_trajs)),
-                "num_calib_trajectories": int(len(calib_trajs)),
-                "num_bank_steps": int(bank_total),
-                "num_calib_steps": int(calib_total),
-                "threshold_init": float(threshold),
-                "delta_init": float(self.delta),
-                "feat_dim": feat_dim,
-                "visual_dim": visual_dim,
-                "proprio_dim": proprio_dim,
-                "action_dim": action_dim,
-                "action_weight": float(self.action_weight),
-                "feature_source": self.feature_source,
-                "transformer_layer": int(self.transformer_layer),
-                "effective_visual_weight": float(visual_weight),
-                "effective_proprio_weight": float(proprio_weight),
-                "effective_action_weight": float(action_weight),
-            }
+        raise NotImplementedError(
+            "DynBenchmarkDiscriminator is an encoder/cache backbone; subclass it "
+            "and implement fit_on_benchmark (see adapters/pu_bce.py)."
+        )
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
-        task = str(trajectory.task_name)
-        det = self._detectors_per_task.get(task, None)
-        if det is None:
-            raise KeyError(
-                f"Task {task!r} is not calibrated. Available: "
-                f"{sorted(self._detectors_per_task)}"
-            )
-
-        T = int(trajectory.num_frames)
-        feat = self._encode(trajectory)
-        result = det.score(feat)
-
-        step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
-        thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
-        preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
-
-        positive = np.where(preds == 1)[0]
-        first_failure_frame = int(positive[0]) if positive.size > 0 else None
-
-        aux: Dict[str, Any] = {
-            "task": task,
-            "threshold": float(det.threshold) if det.threshold is not None else float("nan"),
-            "delta": float(det.delta),
-            "thresholds": thresholds,
-            "step_scores_raw": step_scores,
-            "feature_len": int(feat.shape[0]),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
-            "visual_weight": float(self.visual_weight),
-            "proprio_weight": float(self.proprio_weight),
-            "effective_visual_weight": float(det.visual_weight),
-            "effective_proprio_weight": float(det.proprio_weight),
-            "view_names": list(self.encoder.view_names),
-        }
-        return DiscriminatorOutput(
-            step_scores=step_scores,
-            predictions=preds,
-            first_failure_frame=first_failure_frame,
-            aux=aux,
+        raise NotImplementedError(
+            "DynBenchmarkDiscriminator is an encoder/cache backbone; subclass it "
+            "and implement score_trajectory (see adapters/pu_bce.py)."
         )
 
     def calibration_summary(self) -> dict:
@@ -431,13 +310,9 @@ class LPBV2BenchmarkDiscriminator:
             "model_ckpt": self.model_ckpt,
             "view_names": list(self.encoder.view_names),
             "camera_to_view": dict(self.camera_to_view),
-            "visual_weight": float(self.visual_weight),
-            "proprio_weight": float(self.proprio_weight),
-            "transformer_metric": "uniform_l2" if self.feature_source == "transformer" else "block_weighted_l2",
             "feature_source": self.feature_source,
             "transformer_layer": int(self.transformer_layer),
             "delta": float(self.delta),
-            "knn_chunk_size": int(self.knn_chunk_size),
             "calib_fraction": float(self.calib_fraction),
             "encode_batch_size": int(self.encode_batch_size),
         }
@@ -447,6 +322,3 @@ class LPBV2BenchmarkDiscriminator:
             self.encoder.model.to("cpu")
         except Exception:
             pass
-
-
-LPBOriginalBenchmarkDiscriminator = LPBV2BenchmarkDiscriminator

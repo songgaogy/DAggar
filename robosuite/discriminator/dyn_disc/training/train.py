@@ -1,9 +1,9 @@
-"""Single-GPU Hydra training entry for the cleaned LPB v2 dynamics model.
+"""Single-GPU Hydra training entry for the dyn_disc dynamics model.
 
 This is a stripped-down rewrite of `dyn_model/train.py` that:
   * reads HDF5 / preprocessed data via robosuite.discriminator.dyn_disc.data
   * skips Accelerate (single GPU torch loop), keeping the dependency surface small
-  * keeps the original LPB model architecture (ResNetEncoder + hydra-instantiated
+  * keeps the dynamics model architecture (DINOv3 encoder + hydra-instantiated
     proprio/action encoders + ViT predictor + VisualDynamicsModel), so checkpoints
     are loadable by `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
   * saves <run_dir>/{checkpoints/model_<epoch>.pth, hydra.yaml, normalizer.pth}
@@ -121,8 +121,10 @@ def _instantiate_dataset(cfg: DictConfig, train: bool):
 def _instantiate_encoder(cfg: DictConfig):
     encoder_cfg = getattr(cfg, "encoder", None)
     if encoder_cfg is None:
-        from robosuite.discriminator.dyn_disc.models.resnet_encoder import ResNetEncoder
-        return ResNetEncoder(policy_ckpt_path=None, view_names=list(cfg.view_names))
+        raise ValueError(
+            "dyn_disc is DINOv3-only: cfg.encoder must be set "
+            "(e.g. config/encoder/dinov3.yaml). No ResNet fallback is provided."
+        )
     return instantiate_local(encoder_cfg, view_names=list(cfg.view_names))
 
 

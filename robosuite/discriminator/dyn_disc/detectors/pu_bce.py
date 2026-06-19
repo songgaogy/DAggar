@@ -1,27 +1,49 @@
-"""BCE-style density-ratio failure discriminator on frozen WAM latent (GT split).
+"""Non-negative PU (nnPU) failure discriminator on the frozen dynamics latent.
 
-``D_e`` pools success-rollout frames plus, from each failure bank trajectory, the
-prefix before ``first_gt_failure_frame()``; ``D_o`` pools suffix frames after
-that cut. One shared MLP head ``g_theta(z)`` is trained with ``BCEWithLogitsLoss``.
+This is the **no-GT-failure-timing** sibling of the GT-split BCE head. Instead of
+slicing each failure trajectory at ``first_gt_failure_frame()`` into a clean
+(success-like prefix, failure suffix), this head treats every failure-rollout
+frame as **unlabeled** and learns a positive-vs-unlabeled classifier with the
+non-negative PU risk estimator of Kiryo et al. (2017).
 
-Score convention (matches ``LPBV2KNN`` so the benchmark JSON layout is unchanged):
+Labels
+------
+  * Positives (labeled, ``P``)  : all frames from SUCCESS trajectories.
+  * Unlabeled (``U``)           : all frames from failure-rollout trajectories,
+    taken as a WHOLE (no prefix/suffix split, no GT timing).
 
-    g(z)            = head(z)                # expert-likeness logit, higher = more expert
-    failure_score   = -g(z)                  # step_scores; higher = more failure
-    tau_task        = percentile(failure_score over success-calib frames, 100 - delta)
-    pred_t = 1      iff failure_score_t >= tau_task
+The unlabeled set is a mixture ``pi_p * P + (1 - pi_p) * N`` where ``pi_p`` is
+the (unknown) fraction of "success-like" frames inside failure rollouts and is
+supplied as the hyperparameter ``pi_p`` (class prior).
 
-A single ``BCEDiscriminator`` holds one shared head **and** a ``Dict[str, float]``
-of per-task thresholds. ``score(features, task=...)`` does the per-task lookup.
+Head + score convention (mirrors the GT BCE head so the benchmark JSON layout is
+unchanged):
+
+    g(z)           = head(z)          # "success/positive-likeness" logit
+    failure_score  = -g(z)            # step_scores; larger = more failure
+    tau_task       = percentile(failure_score over success-calib frames, 100 - delta)
+    pred_t = 1     iff failure_score_t >= tau_task
+
+nnPU risk (sigmoid surrogate, see ``_pu_risk`` for the exact form)
+------------------------------------------------------------------
+    R_pu = pi_p * E_p[ ell(+1, g) ]
+           + max( 0,  E_u[ ell(-1, g) ] - pi_p * E_p[ ell(-1, g) ] )
+
+with the **non-negative correction** clamping the second (negative-risk) term at
+0. We use the clamped variant; the canonical Kiryo nnPU additionally performs a
+gradient-ascent step on ``-gamma * (negative-risk term)`` when it goes negative
+(see ``_pu_risk`` note). ``ell`` is the sigmoid surrogate
+``ell(y, g) = sigmoid(-y * g)`` (a.k.a. the "ramp"/sigmoid loss used in the
+original nnPU paper). Logistic loss is available via ``loss_surrogate='logistic'``.
 
 **Hard constraint:** ``fit(...)`` does not run any evaluation or compute AUROC.
-It trains for a fixed number of epochs against the BCE objective and then
-calibrates per-task thresholds on the disjoint success-calib split.
+It trains for a fixed number of epochs against the nnPU objective and then
+calibrates per-task thresholds on the disjoint success-calib split using the
+success_percentile rule only (no failure labels are ever used).
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -31,41 +53,6 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from .single_bank_knn import DetectionResult
-
-
-# --------------------------------------------------------------------------- #
-# Two-class Youden threshold (shared by adapter calibration + viz)            #
-# --------------------------------------------------------------------------- #
-
-
-def two_class_youden_threshold(s_succ: np.ndarray, s_fail: np.ndarray) -> float:
-    """``argmax_tau (TPR(tau) - FPR(tau))`` on two empirical failure-score samples.
-
-    A candidate is "failure" iff ``failure_score >= tau``. The candidate grid is
-    the union of the two empirical samples, which is sufficient for the discrete
-    J curve (J is piecewise-constant between consecutive sample values).
-
-    Args:
-        s_succ: 1-D failure scores from success/expert calibration frames.
-        s_fail: 1-D failure scores from GT failure-suffix frames.
-
-    Returns:
-        tau (float).
-    """
-    s_succ = np.asarray(s_succ, dtype=np.float64).reshape(-1)
-    s_fail = np.asarray(s_fail, dtype=np.float64).reshape(-1)
-    if s_succ.size == 0 or s_fail.size == 0:
-        raise ValueError(
-            f"two_class_youden requires non-empty success and failure score arrays "
-            f"(got n_succ={s_succ.size}, n_fail={s_fail.size})."
-        )
-    cands = np.unique(np.concatenate([s_succ, s_fail]))
-    s_succ_sorted = np.sort(s_succ)
-    s_fail_sorted = np.sort(s_fail)
-    fpr = 1.0 - np.searchsorted(s_succ_sorted, cands, side="left") / float(s_succ.size)
-    tpr = 1.0 - np.searchsorted(s_fail_sorted, cands, side="left") / float(s_fail.size)
-    j = tpr - fpr
-    return float(cands[int(np.argmax(j))])
 
 
 # --------------------------------------------------------------------------- #
@@ -80,6 +67,8 @@ class BCEHead(nn.Module):
         Linear(in_dim, hidden) -> LayerNorm -> GELU
         Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden, 1)
+
+    Reused verbatim from the GT-split BCE head so checkpoints / geometry match.
     """
 
     def __init__(self, in_dim: int, hidden: int = 256, num_layers: int = 2) -> None:
@@ -107,12 +96,90 @@ class BCEHead(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# nnPU risk                                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def _surrogate_loss(g: torch.Tensor, positive: bool, surrogate: str) -> torch.Tensor:
+    """Per-sample surrogate loss ``ell(y, g)`` for ``y = +1`` (positive=True) or
+    ``y = -1`` (positive=False).
+
+    surrogate='sigmoid'  : ell(y, g) = sigmoid(-y * g)          (Kiryo nnPU default)
+    surrogate='logistic' : ell(y, g) = softplus(-y * g) = log(1 + exp(-y*g))
+    """
+    y = 1.0 if positive else -1.0
+    z = -y * g
+    if surrogate == "sigmoid":
+        return torch.sigmoid(z)
+    if surrogate == "logistic":
+        return torch.nn.functional.softplus(z)
+    raise ValueError(f"unknown loss surrogate {surrogate!r}; expected 'sigmoid' or 'logistic'")
+
+
+def pu_risk(
+    g_p: torch.Tensor,
+    g_u: torch.Tensor,
+    *,
+    pi_p: float,
+    surrogate: str = "sigmoid",
+    nn_correction: bool = True,
+    beta: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """Compute the (non-negative) PU risk and its components.
+
+    Args:
+        g_p: (Np,) head logits on labeled-positive frames.
+        g_u: (Nu,) head logits on unlabeled frames.
+        pi_p: class prior P(y=+1), the fraction of true positives in the
+            unlabeled mixture.
+        surrogate: 'sigmoid' (default) or 'logistic'.
+        nn_correction: when True, clamp the negative-risk term at ``-beta``
+            (nnPU); when False, use the plain uPU estimator (may go negative).
+        beta: lower clamp for the negative-risk term (Kiryo uses beta=0).
+
+    Returns:
+        dict with keys:
+          'risk'          : scalar loss to minimize.
+          'pos_risk'      : pi_p * E_p[ell(+1, g)].
+          'neg_risk'      : E_u[ell(-1, g)] - pi_p * E_p[ell(-1, g)] (pre-clamp).
+          'neg_risk_used' : the value actually added to 'risk' (post-clamp).
+
+    Note (variant): the canonical Kiryo nnPU additionally replaces the gradient
+    by ``-gamma * d(neg_risk)/d(theta)`` (gradient ascent) when ``neg_risk`` dips
+    below ``-beta``. We implement the simpler clamped objective (no ascent step),
+    which is the common practical default and keeps the loss a plain scalar.
+    """
+    pi = float(pi_p)
+    # Positive-class risk (treat positives as +1).
+    pos_risk = pi * _surrogate_loss(g_p, positive=True, surrogate=surrogate).mean()
+    # Negative-class risk estimated via the PU identity:
+    #   E_u[ell(-1)] = pi * E_p[ell(-1)] + (1-pi) * E_n[ell(-1)]
+    #   => (1-pi) E_n[ell(-1)] = E_u[ell(-1)] - pi * E_p[ell(-1)]
+    risk_u_neg = _surrogate_loss(g_u, positive=False, surrogate=surrogate).mean()
+    risk_p_neg = _surrogate_loss(g_p, positive=False, surrogate=surrogate).mean()
+    neg_risk = risk_u_neg - pi * risk_p_neg
+
+    if nn_correction:
+        neg_risk_used = torch.clamp(neg_risk, min=float(-beta))
+    else:
+        neg_risk_used = neg_risk
+
+    risk = pos_risk + neg_risk_used
+    return {
+        "risk": risk,
+        "pos_risk": pos_risk.detach(),
+        "neg_risk": neg_risk.detach(),
+        "neg_risk_used": neg_risk_used.detach(),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Calibration stats                                                           #
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
-class BCECalibStats:
+class PUCalibStats:
     threshold: float
     num_calib_frames: int
     calib_score_min: float
@@ -126,13 +193,13 @@ class BCECalibStats:
 # --------------------------------------------------------------------------- #
 
 
-class BCEDiscriminator:
-    """Shared-head BCE discriminator with per-task threshold table.
+class PUBCEDiscriminator:
+    """Shared-head nnPU discriminator with per-task threshold table.
 
     Workflow:
-        det = BCEDiscriminator(in_dim, ...)
-        det.fit(expert_features, other_features, expert_calib_per_task,
-                epochs=..., lr=..., delta=..., seed=...)
+        det = PUBCEDiscriminator(in_dim, ...)
+        det.fit(positive_features, unlabeled_features, success_calib_per_task,
+                pi_p=..., epochs=..., lr=..., delta=..., seed=...)
         det.score(features, task) -> DetectionResult
     """
 
@@ -151,10 +218,10 @@ class BCEDiscriminator:
 
         self.head: BCEHead = BCEHead(in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers).to(self.device)
         self.thresholds: Dict[str, float] = {}
-        self.calib_stats: Dict[str, BCECalibStats] = {}
-        # populated by fit; used by score()
+        self.calib_stats: Dict[str, PUCalibStats] = {}
         self._delta: Optional[float] = None
-        # bookkeeping
+        self._pi_p: Optional[float] = None
+        self._surrogate: str = "sigmoid"
         self._train_history: List[Dict[str, float]] = []
 
     # ------------------------------------------------------------------ #
@@ -181,32 +248,40 @@ class BCEDiscriminator:
 
     def fit(
         self,
-        expert_features: Sequence[torch.Tensor],
-        other_features: Sequence[torch.Tensor],
-        expert_calib_per_task: Dict[str, Sequence[torch.Tensor]],
+        positive_features: Sequence[torch.Tensor],
+        unlabeled_features: Sequence[torch.Tensor],
+        success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
+        pi_p: float = 0.5,
         epochs: int = 20,
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
         delta: float = 10.0,
         seed: int = 0,
+        loss_surrogate: str = "sigmoid",
+        nn_correction: bool = True,
+        beta: float = 0.0,
         verbose: bool = True,
-        max_expert_other_ratio: Optional[float] = 1.0,
     ) -> Dict[str, float]:
-        """Train the shared head with BCE; then calibrate per-task thresholds.
+        """Train the shared head with the nnPU risk; calibrate per-task thresholds.
 
         Args:
-            expert_features: list of (T_i, D) tensors. Pooled into ``D_e``.
-            other_features:  list of (T_j, D) tensors. Pooled into ``D_o``.
-            expert_calib_per_task: ``{task_name: [(T_k, D), ...]}`` of disjoint
+            positive_features: list of (T_i, D) tensors. Pooled into ``P``
+                (frames from success trajectories).
+            unlabeled_features: list of (T_j, D) tensors. Pooled into ``U``
+                (frames from WHOLE failure trajectories; no GT split).
+            success_calib_per_task: ``{task_name: [(T_k, D), ...]}`` of disjoint
                 success-calib trajectories per task. Threshold is calibrated
-                per-task on these features.
+                per-task on these via the success_percentile rule.
+            pi_p: class prior P(y=+1) for the unlabeled mixture. Defaults to 0.5
+                with a logged warning -- it should be set from domain knowledge.
             epochs: fixed epoch budget. No early stopping, no validation eval.
             delta: percentile-based false-alarm budget in [0, 100]. ``tau =
                 percentile(failure_score on success-calib, 100 - delta)``.
-            max_expert_other_ratio: cap ``|D_e| <= max_expert_other_ratio * |D_o|``
-                via random subsampling. ``None`` disables the cap. Default 1.0 (1:1).
+            loss_surrogate: 'sigmoid' (nnPU default) or 'logistic'.
+            nn_correction: enable the non-negative correction (clamp neg-risk).
+            beta: lower clamp for the negative-risk term (Kiryo default 0).
         Returns:
             Per-task threshold dict.
         """
@@ -216,61 +291,58 @@ class BCEDiscriminator:
             raise ValueError(f"epochs must be >= 1, got {epochs}")
         if batch_size < 2:
             raise ValueError(f"batch_size must be >= 2, got {batch_size}")
-        if max_expert_other_ratio is not None and float(max_expert_other_ratio) <= 0.0:
-            raise ValueError(
-                f"max_expert_other_ratio must be > 0 or None, got {max_expert_other_ratio}"
-            )
+        if not (0.0 < float(pi_p) < 1.0):
+            raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
+        if loss_surrogate not in ("sigmoid", "logistic"):
+            raise ValueError(f"loss_surrogate must be 'sigmoid' or 'logistic', got {loss_surrogate!r}")
 
         self._delta = float(delta)
+        self._pi_p = float(pi_p)
+        self._surrogate = str(loss_surrogate)
 
-        # ------- assemble pooled (D_e, D_o) frames ----------
-        e_seqs = [t.detach() for t in expert_features if t.numel() > 0]
-        o_seqs = [t.detach() for t in other_features if t.numel() > 0]
-        if not e_seqs:
-            raise ValueError("expert_features is empty after filtering")
-        if not o_seqs:
-            raise ValueError("other_features is empty after filtering")
+        if abs(float(pi_p) - 0.5) < 1e-9 and verbose:
+            print(
+                "[pu_bce][fit] WARNING: pi_p left at the 0.5 default. The class "
+                "prior (fraction of success-like frames inside failure rollouts) "
+                "should be set from domain knowledge via --pi-p.",
+                flush=True,
+            )
 
-        Z_e = torch.cat([t.to(torch.float32).reshape(-1, t.shape[-1]) for t in e_seqs], dim=0)
-        Z_o = torch.cat([t.to(torch.float32).reshape(-1, t.shape[-1]) for t in o_seqs], dim=0)
-        if Z_e.shape[1] != self.in_dim or Z_o.shape[1] != self.in_dim:
+        # ------- assemble pooled (P, U) frames ----------
+        p_seqs = [t.detach() for t in positive_features if t.numel() > 0]
+        u_seqs = [t.detach() for t in unlabeled_features if t.numel() > 0]
+        if not p_seqs:
+            raise ValueError("positive_features is empty after filtering")
+        if not u_seqs:
+            raise ValueError("unlabeled_features is empty after filtering")
+
+        Z_p = torch.cat([t.to(torch.float32).reshape(-1, t.shape[-1]) for t in p_seqs], dim=0)
+        Z_u = torch.cat([t.to(torch.float32).reshape(-1, t.shape[-1]) for t in u_seqs], dim=0)
+        if Z_p.shape[1] != self.in_dim or Z_u.shape[1] != self.in_dim:
             raise ValueError(
                 f"feature dim mismatch: in_dim={self.in_dim}, "
-                f"D_e={Z_e.shape[1]}, D_o={Z_o.shape[1]}"
+                f"P={Z_p.shape[1]}, U={Z_u.shape[1]}"
             )
-        Ne_raw = int(Z_e.shape[0])
-        No_raw = int(Z_o.shape[0])
+        Np = int(Z_p.shape[0])
+        Nu = int(Z_u.shape[0])
 
-        # ------- cap |D_e| relative to |D_o| (avoid the success side dwarfing failures) ----------
-        if max_expert_other_ratio is not None:
-            cap = int(float(max_expert_other_ratio) * float(No_raw))
-            if cap > 0 and Ne_raw > cap:
-                g_sub = torch.Generator(device="cpu").manual_seed(int(seed))
-                idx = torch.randperm(Ne_raw, generator=g_sub)[:cap]
-                Z_e = Z_e[idx]
-                if verbose:
-                    print(
-                        f"[bce][balance] subsampled D_e: {Ne_raw} -> {cap} frames "
-                        f"(ratio={float(max_expert_other_ratio):.2f} * No={No_raw})",
-                        flush=True,
-                    )
-        Ne = int(Z_e.shape[0])
-        No = int(Z_o.shape[0])
-        Z = torch.cat([Z_e, Z_o], dim=0)
-        # Labels: 1 = expert, 0 = other. BCEWithLogitsLoss wants float targets.
-        Y = torch.cat([
-            torch.ones(Ne, dtype=torch.float32),
-            torch.zeros(No, dtype=torch.float32),
+        # group=0 -> positive, group=1 -> unlabeled
+        Z = torch.cat([Z_p, Z_u], dim=0)
+        grp = torch.cat([
+            torch.zeros(Np, dtype=torch.int64),
+            torch.ones(Nu, dtype=torch.int64),
         ], dim=0)
 
-        # ------- balanced sampling: each class has equal total weight ----------
-        w_e = 1.0 / float(Ne)
-        w_o = 1.0 / float(No)
+        # ------- balanced sampling: P and U each carry equal total weight ----------
+        # Without this, mini-batches can contain only-positive or only-unlabeled
+        # samples, which makes the nnPU empirical risk components ill-defined.
+        w_p = 1.0 / float(Np)
+        w_u = 1.0 / float(Nu)
         weights = torch.cat([
-            torch.full((Ne,), w_e, dtype=torch.float64),
-            torch.full((No,), w_o, dtype=torch.float64),
+            torch.full((Np,), w_p, dtype=torch.float64),
+            torch.full((Nu,), w_u, dtype=torch.float64),
         ], dim=0)
-        num_samples = int(2 * (Ne + No))
+        num_samples = int(2 * (Np + Nu))
         generator = torch.Generator(device="cpu").manual_seed(int(seed))
         sampler = WeightedRandomSampler(
             weights=weights,
@@ -278,7 +350,7 @@ class BCEDiscriminator:
             replacement=True,
             generator=generator,
         )
-        dataset = TensorDataset(Z, Y)
+        dataset = TensorDataset(Z, grp)
         loader = DataLoader(
             dataset,
             batch_size=int(batch_size),
@@ -289,9 +361,6 @@ class BCEDiscriminator:
         )
 
         # ------- deterministic head init + optim & schedule ----------
-        # Re-init the head from a fresh seed so that two calls to fit(seed=k)
-        # produce identical thresholds regardless of the prior global RNG state
-        # at __init__ time.
         torch.manual_seed(int(seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
@@ -308,46 +377,73 @@ class BCEDiscriminator:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=total_steps, eta_min=0.0
         )
-        bce_loss_fn = nn.BCEWithLogitsLoss()
 
         # ------- train loop (NO eval, NO AUROC) ----------
         self.head.train()
         self._train_history = []
         for epoch in range(int(epochs)):
             epoch_loss = 0.0
+            epoch_neg = 0.0
+            n_correct = 0  # batches where the nn-correction fired (neg_risk < -beta)
             n_batches = 0
-            for z_batch, y_batch in loader:
+            for z_batch, grp_batch in loader:
                 z_batch = z_batch.to(self.device, non_blocking=True)
-                y_batch = y_batch.to(self.device, non_blocking=True)
+                grp_batch = grp_batch.to(self.device, non_blocking=True)
+                p_mask = grp_batch == 0
+                u_mask = grp_batch == 1
+                # Skip degenerate batches lacking one of the two groups.
+                if int(p_mask.sum()) == 0 or int(u_mask.sum()) == 0:
+                    continue
                 g = self.head(z_batch)
-                loss = bce_loss_fn(g, y_batch)
+                g_p = g[p_mask]
+                g_u = g[u_mask]
+                parts = pu_risk(
+                    g_p, g_u,
+                    pi_p=float(pi_p),
+                    surrogate=self._surrogate,
+                    nn_correction=bool(nn_correction),
+                    beta=float(beta),
+                )
+                loss = parts["risk"]
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 optim.step()
                 scheduler.step()
                 epoch_loss += float(loss.detach().item())
+                epoch_neg += float(parts["neg_risk"].item())
+                if float(parts["neg_risk"].item()) < float(-beta):
+                    n_correct += 1
                 n_batches += 1
             avg = epoch_loss / max(1, n_batches)
+            avg_neg = epoch_neg / max(1, n_batches)
             cur_lr = float(optim.param_groups[0]["lr"])
-            self._train_history.append({"epoch": float(epoch), "loss": avg, "lr": cur_lr})
+            self._train_history.append({
+                "epoch": float(epoch),
+                "loss": avg,
+                "neg_risk": avg_neg,
+                "nn_correction_batches": float(n_correct),
+                "lr": cur_lr,
+            })
             if verbose:
                 print(
-                    f"[bce][fit] epoch={epoch + 1}/{int(epochs)} "
-                    f"loss={avg:.5f} lr={cur_lr:.2e} "
-                    f"batches={n_batches} Ne={Ne} No={No}",
+                    f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
+                    f"risk={avg:.5f} neg_risk={avg_neg:+.5f} "
+                    f"nn_corr_batches={n_correct}/{n_batches} "
+                    f"lr={cur_lr:.2e} Np={Np} Nu={Nu} pi_p={float(pi_p):.3f}",
                     flush=True,
                 )
 
         # ------- per-task threshold calibration on disjoint success-calib ----------
+        # success_percentile only (no failure labels available in this branch).
         self.head.eval()
         self.thresholds = {}
         self.calib_stats = {}
         q = 100.0 * (1.0 - float(delta) / 100.0)
-        for task, calib_seqs in expert_calib_per_task.items():
+        for task, calib_seqs in success_calib_per_task.items():
             seqs = [t for t in calib_seqs if t.numel() > 0]
             if not seqs:
                 raise ValueError(
-                    f"Task {task!r}: expert_calib_per_task[{task!r}] is empty; "
+                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
                     "cannot calibrate threshold."
                 )
             calib_feats = torch.cat([s.to(torch.float32).reshape(-1, s.shape[-1]) for s in seqs], dim=0)
@@ -355,7 +451,7 @@ class BCEDiscriminator:
             failure_score = -g_calib  # higher = more failure
             tau = float(np.percentile(failure_score.astype(np.float64), q=q))
             self.thresholds[task] = tau
-            self.calib_stats[task] = BCECalibStats(
+            self.calib_stats[task] = PUCalibStats(
                 threshold=tau,
                 num_calib_frames=int(failure_score.size),
                 calib_score_min=float(failure_score.min()),
@@ -365,7 +461,7 @@ class BCEDiscriminator:
             )
             if verbose:
                 print(
-                    f"[bce][calib] task={task} tau={tau:.5f} "
+                    f"[pu_bce][calib] task={task} tau={tau:.5f} "
                     f"n_calib={failure_score.size} "
                     f"mean={failure_score.mean():.5f} std={failure_score.std():.5f}",
                     flush=True,
@@ -413,6 +509,8 @@ class BCEDiscriminator:
             "num_layers": int(self.num_layers),
             "thresholds": {str(k): float(v) for k, v in self.thresholds.items()},
             "delta": None if self._delta is None else float(self._delta),
+            "pi_p": None if self._pi_p is None else float(self._pi_p),
+            "loss_surrogate": str(self._surrogate),
             "calib_stats": {
                 str(k): {
                     "threshold": float(v.threshold),
@@ -432,7 +530,6 @@ class BCEDiscriminator:
         hidden = int(state["hidden"])  # type: ignore[arg-type]
         num_layers = int(state["num_layers"])  # type: ignore[arg-type]
         if (in_dim, hidden, num_layers) != (self.in_dim, self.hidden, self.num_layers):
-            # Re-init head with the saved geometry.
             self.in_dim = in_dim
             self.hidden = hidden
             self.num_layers = num_layers
@@ -440,9 +537,11 @@ class BCEDiscriminator:
         self.head.load_state_dict(state["head"])  # type: ignore[arg-type]
         self.thresholds = {str(k): float(v) for k, v in dict(state.get("thresholds", {})).items()}  # type: ignore[arg-type]
         self._delta = None if state.get("delta") is None else float(state["delta"])  # type: ignore[arg-type]
+        self._pi_p = None if state.get("pi_p") is None else float(state["pi_p"])  # type: ignore[arg-type]
+        self._surrogate = str(state.get("loss_surrogate", "sigmoid"))
         cs = state.get("calib_stats", {}) or {}
         self.calib_stats = {
-            str(k): BCECalibStats(
+            str(k): PUCalibStats(
                 threshold=float(v["threshold"]),
                 num_calib_frames=int(v["num_calib_frames"]),
                 calib_score_min=float(v["calib_score_min"]),
