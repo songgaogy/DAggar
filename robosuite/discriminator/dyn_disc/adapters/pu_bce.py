@@ -3,8 +3,12 @@
 Sits on top of :class:`DynBenchmarkDiscriminator` so all the DINOv3 dynamics
 encoding + trajectory feature cache is reused unchanged. Replaces any per-task
 scorer with a single shared :class:`PUBCEDiscriminator` trained with the
-non-negative PU risk on (positives = success frames, unlabeled = WHOLE failure
-trajectories), plus per-task success_percentile thresholds.
+non-negative PU risk on (positives = pre-done success frames, unlabeled = WHOLE
+failure trajectories), plus per-task success_percentile thresholds.
+
+Success trajectories (train + eval) use only frames before task completion,
+determined by the per-frame ``is_success`` label (``False`` = still executing;
+first ``True`` marks done). Failure rollouts in the unlabeled pool are used whole.
 
 **No GT failure timing is used in this branch.** Each failure-rollout trajectory
 is pooled into the unlabeled set as a whole -- ``first_gt_failure_frame()`` is
@@ -12,8 +16,10 @@ never consulted.
 
 Hard invariants:
   * No ``video_id`` in ``unlabeled_fail_trajectories`` may appear in the eval
-    set passed to ``fit_on_benchmark``. Enforced by :meth:`_assert_disjoint`
-    (hard assert).
+    failure set passed to ``fit_on_benchmark``. Enforced by
+    :meth:`_assert_disjoint_unlabeled_eval_fail` (hard assert).
+  * Train success ``video_id``s must not appear in the eval success set when a
+    separate train pool is supplied (:meth:`_assert_disjoint_train_eval_success`).
   * ``fit_on_benchmark`` does **not** call ``bench.evaluate(...)`` or compute
     any AUROC / metric over eval trajectories. Evaluation is the caller's job
     (see ``robosuite_pu_bce.py``).
@@ -34,6 +40,25 @@ from robosuite.discriminator.dyn_disc.adapters.single_bank import (
     _pad_to_length,
 )
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
+
+
+def _pad_to_length_with_fill(
+    values: np.ndarray,
+    *,
+    target_len: int,
+    fill_value: float | int,
+    dtype=np.float32,
+) -> np.ndarray:
+    """Pad a prefix-length array to ``target_len`` with a constant fill value."""
+    arr = np.asarray(values, dtype=dtype).reshape(-1)
+    n = int(arr.shape[0])
+    T = int(target_len)
+    if n >= T:
+        return arr[:T].copy()
+    if n == 0:
+        return np.full((T,), fill_value, dtype=dtype)
+    pad = np.full((T - n,), fill_value, dtype=dtype)
+    return np.concatenate([arr, pad], axis=0)
 
 
 class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
@@ -118,23 +143,80 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _assert_disjoint(
+    def _assert_disjoint_unlabeled_eval_fail(
         eval_trajs: Sequence[BenchmarkTrajectory],
         unlabeled_fail_trajs: Sequence[BenchmarkTrajectory],
     ) -> None:
-        """video_id disjointness invariant (HARD assert).
-
-        The unlabeled failure pool must never share a ``video_id`` with the eval
-        failure set, otherwise the head would be trained on its own test data.
-        """
-        eval_keys = {str(t.video_id) for t in eval_trajs}
+        """Unlabeled failure pool must not overlap eval failure ``video_id``s."""
+        eval_fail_keys = {
+            str(t.video_id) for t in eval_trajs if bool(t.is_failure)
+        }
         unlabeled_keys = {str(t.video_id) for t in unlabeled_fail_trajs}
-        overlap = sorted(eval_keys & unlabeled_keys)
+        overlap = sorted(eval_fail_keys & unlabeled_keys)
         if overlap:
             raise RuntimeError(
                 "PUBCEBenchmarkDiscriminator disjointness invariant violated:\n  - "
-                f"eval intersect unlabeled_fail = {overlap}"
+                f"eval_fail intersect unlabeled_fail = {overlap}"
             )
+
+    @staticmethod
+    def _assert_disjoint_train_eval_success(
+        train_success_trajs: Sequence[BenchmarkTrajectory],
+        eval_trajs: Sequence[BenchmarkTrajectory],
+    ) -> None:
+        """Train success pool must not overlap eval success ``video_id``s."""
+        train_keys = {str(t.video_id) for t in train_success_trajs}
+        eval_succ_keys = {
+            str(t.video_id) for t in eval_trajs if not bool(t.is_failure)
+        }
+        overlap = sorted(train_keys & eval_succ_keys)
+        if overlap:
+            raise RuntimeError(
+                "PUBCEBenchmarkDiscriminator disjointness invariant violated:\n  - "
+                f"train_success intersect eval_success = {overlap}"
+            )
+
+    @staticmethod
+    def _success_prefix_frame_end(trajectory: BenchmarkTrajectory) -> int:
+        """Exclusive end index for PU positive/calib success frames."""
+        prefix_fn = getattr(trajectory, "prefix_frames_before_done", None)
+        if prefix_fn is not None:
+            return int(prefix_fn())
+        return int(trajectory.num_frames)
+
+    def _encode_success_train_trajectories(
+        self,
+        trajectories: Sequence[BenchmarkTrajectory],
+        *,
+        desc: str = "encode",
+    ) -> List[torch.Tensor]:
+        """Encode success trajectories using only pre-done frames."""
+        if not trajectories:
+            return []
+
+        iterable: Sequence[BenchmarkTrajectory] = trajectories
+        if self.verbose_fit:
+            try:
+                from tqdm import tqdm
+
+                iterable = tqdm(
+                    trajectories,
+                    desc=desc,
+                    unit="traj",
+                    dynamic_ncols=True,
+                )
+            except ImportError:
+                pass
+
+        out: List[torch.Tensor] = []
+        for traj in iterable:
+            t_end = self._success_prefix_frame_end(traj)
+            if t_end <= 0:
+                raise ValueError(
+                    f"Success trajectory has no pre-done frames: {traj.describe()}"
+                )
+            out.append(self._encode(traj, frame_end=t_end))
+        return out
 
     def _save_checkpoint(self) -> Optional[Path]:
         if self.save_ckpt_dir is None or self._shared_detector is None:
@@ -166,29 +248,60 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
     # Public API                                                         #
     # ------------------------------------------------------------------ #
 
-    def fit_on_benchmark(self, trajectories: List[BenchmarkTrajectory]) -> None:
+    def fit_on_benchmark(
+        self,
+        eval_trajectories: List[BenchmarkTrajectory],
+        *,
+        train_success_trajectories: Optional[List[BenchmarkTrajectory]] = None,
+    ) -> None:
         """Train one shared nnPU head; calibrate per-task success_percentile thresholds.
 
         Does **not** call ``bench.evaluate(...)`` and does **not** compute any
-        eval metric over ``trajectories``. ``trajectories`` is used only to
-        gather the success-rollout pool (positives + per-task calibration). The
-        unlabeled pool comes from ``self.unlabeled_fail_trajectories``.
+        eval metric over ``eval_trajectories``. Positives + calibration success
+        come from ``train_success_trajectories`` when provided; otherwise they
+        are taken from success demos inside ``eval_trajectories`` (legacy).
+        The unlabeled pool comes from ``self.unlabeled_fail_trajectories``.
         """
-        self._assert_disjoint(
-            eval_trajs=trajectories,
+        self._assert_disjoint_unlabeled_eval_fail(
+            eval_trajs=eval_trajectories,
             unlabeled_fail_trajs=self.unlabeled_fail_trajectories,
         )
 
-        # ------ split benchmark success demos into train / calib per-task ------
-        task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
-        for traj in trajectories:
-            if bool(traj.is_failure):
-                continue
-            task_to_success.setdefault(str(traj.task_name), []).append(traj)
+        if train_success_trajectories is not None:
+            self._assert_disjoint_train_eval_success(
+                train_success_trajs=train_success_trajectories,
+                eval_trajs=eval_trajectories,
+            )
+            task_to_success: Dict[str, List[BenchmarkTrajectory]] = {}
+            for traj in train_success_trajectories:
+                if bool(traj.is_failure):
+                    continue
+                task_to_success.setdefault(str(traj.task_name), []).append(traj)
+        else:
+            task_to_success = {}
+            for traj in eval_trajectories:
+                if bool(traj.is_failure):
+                    continue
+                task_to_success.setdefault(str(traj.task_name), []).append(traj)
+
+        eval_tasks = sorted({
+            str(t.task_name)
+            for t in eval_trajectories
+            if bool(t.is_failure)
+        })
+        if not eval_tasks:
+            eval_tasks = sorted(task_to_success.keys())
+
+        missing_tasks = sorted(set(eval_tasks) - set(task_to_success))
+        if missing_tasks:
+            raise RuntimeError(
+                "PU-BCE requires train success trajectories for every eval task. "
+                f"Missing: {missing_tasks}. Pass --success-train-split or check data."
+            )
 
         if not task_to_success:
             raise RuntimeError(
-                "PU-BCE benchmark requires success trajectories per task in the eval set."
+                "PU-BCE requires success trajectories per task for train + calibration."
             )
 
         rng = np.random.default_rng(int(self.seed))
@@ -208,12 +321,25 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             calib_success_per_task[task] = [t for i, t in enumerate(succ_list) if i in calib_idx]
 
         # ------ encode positives via the parent's _encode cache ------
+        if self.verbose_fit:
+            n_train = sum(len(v) for v in train_success_per_task.values())
+            n_calib = sum(len(v) for v in calib_success_per_task.values())
+            n_unlabeled = len(self.unlabeled_fail_trajectories)
+            print(
+                f"[pu_bce][encode] fitting pool: "
+                f"success_train={n_train} success_calib={n_calib} "
+                f"unlabeled_fail={n_unlabeled}",
+                flush=True,
+            )
+
         pooled_positive: List[torch.Tensor] = []
         pooled_positive_stats: Dict[str, int] = {}
         for task, trajs in train_success_per_task.items():
             task_total = 0
-            for t in trajs:
-                f = self._encode(t)
+            for f in self._encode_success_train_trajectories(
+                trajs,
+                desc=f"[pu_bce][encode] success train pre-done ({task})",
+            ):
                 pooled_positive.append(f)
                 task_total += int(f.shape[0])
             pooled_positive_stats[task] = task_total
@@ -221,25 +347,29 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         success_calib_per_task: Dict[str, List[torch.Tensor]] = {}
         success_calib_stats: Dict[str, int] = {}
         for task, trajs in calib_success_per_task.items():
-            feats_list: List[torch.Tensor] = []
-            tot = 0
-            for t in trajs:
-                f = self._encode(t)
-                feats_list.append(f)
-                tot += int(f.shape[0])
+            feats_list = self._encode_success_train_trajectories(
+                trajs,
+                desc=f"[pu_bce][encode] success calib pre-done ({task})",
+            )
+            tot = sum(int(f.shape[0]) for f in feats_list)
             success_calib_per_task[task] = feats_list
             success_calib_stats[task] = tot
 
         # ------ pool unlabeled failure frames: WHOLE trajectory (no GT split) ------
         pooled_unlabeled: List[torch.Tensor] = []
         unlabeled_stats_per_task: Dict[str, int] = {}
+        unlabeled_by_task: Dict[str, List[BenchmarkTrajectory]] = {}
         for t in self.unlabeled_fail_trajectories:
-            f = self._encode(t)
-            task_name = str(t.task_name)
-            pooled_unlabeled.append(f)
-            unlabeled_stats_per_task[task_name] = (
-                unlabeled_stats_per_task.get(task_name, 0) + int(f.shape[0])
-            )
+            unlabeled_by_task.setdefault(str(t.task_name), []).append(t)
+        for task, trajs in sorted(unlabeled_by_task.items()):
+            for f in self._encode_trajectories(
+                trajs,
+                desc=f"[pu_bce][encode] unlabeled fail ({task})",
+            ):
+                pooled_unlabeled.append(f)
+                unlabeled_stats_per_task[task] = (
+                    unlabeled_stats_per_task.get(task, 0) + int(f.shape[0])
+                )
 
         if not pooled_unlabeled:
             raise RuntimeError(
@@ -354,17 +484,43 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             )
 
         T = int(trajectory.num_frames)
-        feat = self._encode(trajectory)
-        result = det.score(feat, task=task)
+        tau = float(det.thresholds.get(task, float("nan")))
 
-        step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
-        thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
-        preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        if bool(trajectory.is_failure):
+            feat = self._encode(trajectory)
+            result = det.score(feat, task=task)
+            step_scores = _pad_to_length(result.step_scores, target_len=T, dtype=np.float32)
+            thresholds = _pad_to_length(result.thresholds, target_len=T, dtype=np.float32)
+            preds = _pad_to_length(result.preds, target_len=T, dtype=np.int64).astype(np.int64)
+        else:
+            t_end = self._success_prefix_frame_end(trajectory)
+            if t_end <= 0:
+                raise ValueError(
+                    f"Success trajectory has no pre-done frames: {trajectory.describe()}"
+                )
+            feat = self._encode(trajectory, frame_end=t_end)
+            result = det.score(feat, task=task)
+            # Post-done padding keeps benchmark length alignment without scoring
+            # idle frames. The fill MUST be a *low* failure score so the post-done
+            # region never wins the max/topk trajectory aggregation: failure_score
+            # = -g lives in a negative regime for success frames, so 0.0 is a high
+            # spike that inverts trajectory-level AUROC. Use this trajectory's own
+            # minimum real score (<= every scored frame, scale-free, no -inf).
+            real_scores = np.asarray(result.step_scores, dtype=np.float32).reshape(-1)
+            post_done_fill = float(real_scores.min()) if real_scores.size > 0 else 0.0
+            step_scores = _pad_to_length_with_fill(
+                result.step_scores, target_len=T, fill_value=post_done_fill, dtype=np.float32
+            )
+            thresholds = _pad_to_length_with_fill(
+                result.thresholds, target_len=T, fill_value=tau, dtype=np.float32
+            )
+            preds = _pad_to_length_with_fill(
+                result.preds, target_len=T, fill_value=0, dtype=np.int64
+            ).astype(np.int64)
 
         positive = np.where(preds == 1)[0]
         first_failure_frame = int(positive[0]) if positive.size > 0 else None
 
-        tau = float(det.thresholds.get(task, float("nan")))
         aux: Dict[str, Any] = {
             "task": task,
             "threshold": tau,
@@ -376,6 +532,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "transformer_layer": int(self.transformer_layer),
             "view_names": list(self.encoder.view_names),
         }
+        if not bool(trajectory.is_failure):
+            aux["success_prefix_frames"] = int(feat.shape[0])
         return DiscriminatorOutput(
             step_scores=step_scores,
             predictions=preds,

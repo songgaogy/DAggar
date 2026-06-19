@@ -10,8 +10,9 @@ GT failure timing / two-class Youden is available in this branch (it would need
 failure labels). The HUD shows ``failure_score = -g(z)`` and that tau.
 
 Use ``--split`` to choose which eval trajectories are rendered:
-  * ``fail_rollout``    - sample from ``--fail-split`` (default)
+  * ``fail_rollout``    - sample from ``--fail-split``
   * ``success_rollout`` - sample from ``--success-split`` (``is_failure=False``)
+  * ``both``            - sample from failure and success eval pools (default)
 
 Outputs:
     <out_dir>/videos/<video_id>.mp4
@@ -289,6 +290,13 @@ class PUBCEVisualizer:
     # PDF                                                                #
     # ------------------------------------------------------------------ #
 
+    def _split_summary_label(self, split: str, vizs: List[PerTrajectoryViz]) -> str:
+        if split != "both":
+            return f"{split} (n={len(vizs)})"
+        n_fail = sum(1 for v in vizs if v.gt_mask is not None)
+        n_succ = len(vizs) - n_fail
+        return f"fail_rollout={n_fail}, success_rollout={n_succ} (total={len(vizs)})"
+
     def render_pdf(
         self,
         vizs: List[PerTrajectoryViz],
@@ -351,7 +359,7 @@ class PUBCEVisualizer:
                 f"  calib_score_mean = {_g(per_task, 'calib_score_mean')}  "
                 f"calib_score_std  = {_g(per_task, 'calib_score_std')}",
                 "",
-                f"Sampled {split} trajectories: {len(vizs)}",
+                f"Sampled trajectories: {self._split_summary_label(split, vizs)}",
                 "",
                 "Trigger rule: flag when failure_score = -head_logit(z) >= tau.",
             ]
@@ -445,7 +453,13 @@ class PUBCEVisualizer:
         video_paths: List[str] = []
         for traj in trajectories:
             viz = self._score_trajectory(traj)
-            video_path = os.path.join(videos_dir, f"{_safe_id(traj.video_id)}.mp4")
+            if split == "both":
+                kind = "fail_rollout" if bool(traj.is_failure) else "success_rollout"
+                traj_videos_dir = os.path.join(videos_dir, kind)
+            else:
+                traj_videos_dir = videos_dir
+            os.makedirs(traj_videos_dir, exist_ok=True)
+            video_path = os.path.join(traj_videos_dir, f"{_safe_id(traj.video_id)}.mp4")
             self.render_video(traj, viz, video_path)
             print(
                 f"[pu_bce][viz] {traj.task_name}/{traj.video_id}  T={viz.num_frames}  "
@@ -493,6 +507,23 @@ def _sample_trajectories_for_viz(
     num_trajs: int,
     seed: int,
 ) -> List[BenchmarkTrajectory]:
+    if split == "both":
+        fail = _sample_trajectories_for_viz(
+            trajs,
+            task=task,
+            split="fail_rollout",
+            num_trajs=num_trajs,
+            seed=seed,
+        )
+        success = _sample_trajectories_for_viz(
+            trajs,
+            task=task,
+            split="success_rollout",
+            num_trajs=num_trajs,
+            seed=int(seed) + 1,
+        )
+        return fail + success
+
     if split == "success_rollout":
         pool = [t for t in trajs if not bool(t.is_failure) and str(t.task_name) == str(task)]
         kind = "success"
@@ -500,7 +531,9 @@ def _sample_trajectories_for_viz(
         pool = [t for t in trajs if bool(t.is_failure) and str(t.task_name) == str(task)]
         kind = "failure"
     else:
-        raise ValueError(f"unknown split {split!r}; expected success_rollout or fail_rollout")
+        raise ValueError(
+            f"unknown split {split!r}; expected fail_rollout, success_rollout, or both"
+        )
 
     if not pool:
         raise RuntimeError(
@@ -549,7 +582,7 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
     """Build the eval FailureBenchmark plus the disjoint unlabeled failure pool."""
     from robosuite.discriminator.utils.robosuite_benchmark import (
         FailureBenchmark,
-        discover_failure_bank,
+        discover_unlabeled_failures,
     )
 
     bench = FailureBenchmark(
@@ -565,7 +598,7 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
         raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
 
     eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-    all_fail = discover_failure_bank(
+    all_fail = discover_unlabeled_failures(
         data_root=args.data_root,
         tasks=[str(args.task)],
         split=args.fail_train_split,
@@ -651,17 +684,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         type=str,
-        default="fail_rollout",
-        choices=["success_rollout", "fail_rollout"],
-        help="Eval split to visualize: fail_rollout (--fail-split) or "
-             "success_rollout (--success-split).",
+        default="both",
+        choices=["success_rollout", "fail_rollout", "both"],
+        help="Eval pool to visualize: fail_rollout, success_rollout, or both.",
     )
     parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
     parser.add_argument("--success-split", type=str, default="success_rollout-val")
-    parser.add_argument("--fail-train-split", type=str, default="fail_rollout-labeled")
+    parser.add_argument("--fail-train-split", type=str, default="fail_rollout")
     parser.add_argument("--task", required=True)
     parser.add_argument("--num-trajs", type=int, default=4)
     parser.add_argument("--out-dir", required=True)
@@ -692,7 +724,7 @@ def _parse_args() -> argparse.Namespace:
 
     # nnPU-specific
     parser.add_argument("--pi-p", type=float, default=0.5)
-    parser.add_argument("--loss-surrogate", type=str, default="sigmoid",
+    parser.add_argument("--loss-surrogate", type=str, default="logistic",
                         choices=["sigmoid", "logistic"])
     parser.add_argument("--no-nn-correction", action="store_true")
     parser.add_argument("--beta", type=float, default=0.0)

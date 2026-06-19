@@ -42,8 +42,14 @@ Kiryo et al. (2017):
 R_pu = pi_p * E_p[ ell(+1, g) ] + max( 0,  E_u[ ell(-1, g) ] - pi_p * E_p[ ell(-1, g) ] )
 ```
 
-- `ell` is the **sigmoid surrogate** by default, `ell(y, g) = sigmoid(-y * g)`
-  (`--loss-surrogate logistic` switches to `softplus(-y*g)`).
+- `ell` is the **logistic surrogate** by default, `ell(y, g) = softplus(-y * g)`
+  (`--loss-surrogate sigmoid` switches to the Kiryo `sigmoid(-y*g)`). Logistic is
+  the default because the sigmoid surrogate saturates to **zero gradient** once
+  logits run negative and then collapses to the trivial `risk == pi_p` solution
+  under a low `pi_p` and/or a weakly-trained encoder; softplus keeps a
+  non-vanishing gradient and trains robustly across `pi_p` (empirically verified
+  on `PickPlaceCereal`: logistic reaches fail-AUROC ~0.91 at `pi_p=0.3` where
+  sigmoid collapses to `risk=0.300`).
 - The **non-negative correction** clamps the second (negative-risk) term at
   `-beta` (default `beta=0`). We implement the simple clamped variant; the
   canonical Kiryo nnPU additionally does a gradient-ascent step when that term
