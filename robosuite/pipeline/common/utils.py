@@ -7,8 +7,6 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from .types import ReplayBatch
-
 
 def cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
     if cfg is None:
@@ -118,40 +116,9 @@ def standardize_image_tensor(image: torch.Tensor) -> torch.Tensor:
     return image
 
 
-def soft_update(target: torch.nn.Module, source: torch.nn.Module, tau: float) -> None:
-    for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.mul_(1.0 - tau).add_(source_param.data, alpha=tau)
-
-
 def set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
     for param in module.parameters():
         param.requires_grad_(requires_grad)
-
-
-def concat_replay_batches(first: ReplayBatch, second: ReplayBatch) -> ReplayBatch:
-    return ReplayBatch(
-        obs=_concat_tree(first.obs, second.obs),
-        actions=torch.cat([first.actions, second.actions], dim=0),
-        rewards=torch.cat([first.rewards, second.rewards], dim=0),
-        next_obs=_concat_tree(first.next_obs, second.next_obs),
-        dones=torch.cat([first.dones, second.dones], dim=0),
-        grasp_penalty=torch.cat([first.grasp_penalty, second.grasp_penalty], dim=0),
-        is_intervention=torch.cat([first.is_intervention, second.is_intervention], dim=0),
-        metadata={
-            "infos": list(first.metadata.get("infos", [])) + list(second.metadata.get("infos", [])),
-            "reward_source": list(first.metadata.get("reward_source", []))
-            + list(second.metadata.get("reward_source", [])),
-            "demo_source": list(first.metadata.get("demo_source", []))
-            + list(second.metadata.get("demo_source", [])),
-            "indices": list(first.metadata.get("indices", [])) + list(second.metadata.get("indices", [])),
-        },
-    )
-
-
-def _concat_tree(first: Any, second: Any) -> Any:
-    if isinstance(first, Mapping):
-        return {key: _concat_tree(first[key], second[key]) for key in first.keys()}
-    return torch.cat([first, second], dim=0)
 
 
 def infer_action_bounds(action_space: Any, action_dim: int) -> tuple[np.ndarray, np.ndarray]:

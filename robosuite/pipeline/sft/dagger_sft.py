@@ -14,7 +14,7 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.pipeline.algorithms.flow_dagger import FlowDaggerTrainer
+from robosuite.pipeline.flow_dagger import FlowDaggerTrainer
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.sft.flow_sft import (
     _build_ema_model,

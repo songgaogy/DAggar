@@ -14,8 +14,8 @@ from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from robosuite.pipeline.algorithms.flow_dagger.common import FlowAugmentationConfig, FlowDaggerConfig
-from robosuite.pipeline.algorithms.flow_dagger.models import FlowDaggerPolicy
+from robosuite.pipeline.flow_dagger.common import FlowAugmentationConfig, FlowDaggerConfig
+from robosuite.pipeline.flow_dagger.models import FlowDaggerPolicy
 from robosuite.pipeline.envs import build_robosuite_env, sparse_success_reward
 from robosuite.pipeline.train_flow_dagger import (
     bind_flow_proprio_extractor,
