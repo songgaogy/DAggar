@@ -4,9 +4,9 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
 # ----------------------------------------------------------------------
-ENVIRONMENT="PickPlaceCereal"
-NUM_TRAJECTORIES=10   # pretraining data
-UPDATE_PER_STEP=0.5     # 1 env step -> x policy updates
+ENVIRONMENT="NutAssemblySquare"
+NUM_TRAJECTORIES=30   # pretraining data
+UPDATE_PER_STEP=1     # 1 env step -> x policy updates
 SAVE_FREQ="${SAVE_FREQ:-5000}"        # save checkpoint every x env steps
 DEMO_SPLIT="pretrain_data-20260615_174814"
 SEED_VALUE=42

@@ -16,7 +16,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from robosuite.utils.mjcf_utils import IMAGE_CONVENTION_MAPPING
 
-from robosuite.pipeline.algorithms.flow_dagger import FlowDaggerTrainer
+from robosuite.pipeline.flow_dagger import FlowDaggerTrainer
 from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.envs import (

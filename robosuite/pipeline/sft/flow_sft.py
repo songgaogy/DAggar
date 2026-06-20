@@ -13,7 +13,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
-from robosuite.pipeline.algorithms.flow_dagger import FlowDaggerTrainer
+from robosuite.pipeline.flow_dagger import FlowDaggerTrainer
 from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.envs import build_robosuite_env
 from robosuite.pipeline.utils import load_demo_paths, resolve_camera_names, resolve_task_demo_paths

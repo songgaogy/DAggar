@@ -11,7 +11,6 @@ from .io import (
     serialize_transition,
 )
 from .determinism import EnvRandomReducer, assert_disjoint_seed_ranges, ranges_overlap
-from .replay_buffer import HILSERLReplayBuffer
 from .train_utils import (
     AsyncCheckpointWriter,
     AsyncTransitionChunkWriter,
@@ -53,7 +52,6 @@ __all__ = [
     "EnvRandomReducer",
     "assert_disjoint_seed_ranges",
     "ranges_overlap",
-    "HILSERLReplayBuffer",
     "list_hdf5_demo_names",
     "load_demo_paths",
     "load_transition_shard",

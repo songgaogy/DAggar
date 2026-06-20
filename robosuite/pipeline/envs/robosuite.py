@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import threading
 import time
 from copy import deepcopy
@@ -8,9 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-import h5py
 import numpy as np
-from PIL import Image
 
 import robosuite as suite
 from robosuite.controllers import load_composite_controller_config
@@ -451,61 +448,6 @@ def _snapshot_device_grasp_states(device) -> list[list[bool]]:
     return [[bool(value) for value in robot_states] for robot_states in grasp_states]
 
 
-def estimate_gripper_openness(env) -> float | None:
-    openness_values: list[float] = []
-    for robot in getattr(env, "robots", []):
-        for arm in robot.arms:
-            if not robot.has_gripper.get(arm, False):
-                continue
-            qpos_indexes = robot._ref_gripper_joint_pos_indexes.get(arm)
-            joint_ids = robot._ref_joints_indexes_dict.get(robot.get_gripper_name(arm))
-            if not qpos_indexes or not joint_ids:
-                continue
-
-            joint_qpos = np.asarray([env.sim.data.qpos[index] for index in qpos_indexes], dtype=np.float32)
-            joint_ranges = np.asarray([env.sim.model.jnt_range[joint_id] for joint_id in joint_ids], dtype=np.float32)
-            if joint_qpos.shape[0] != joint_ranges.shape[0]:
-                continue
-
-            span = joint_ranges[:, 1] - joint_ranges[:, 0]
-            valid = span > 1e-6
-            if not np.any(valid):
-                continue
-
-            normalized = np.zeros_like(joint_qpos, dtype=np.float32)
-            normalized[valid] = np.clip((joint_qpos[valid] - joint_ranges[valid, 0]) / span[valid], 0.0, 1.0)
-            openness_values.append(float(normalized[valid].mean()))
-
-    if len(openness_values) == 0:
-        return None
-    return float(np.mean(openness_values))
-
-
-def compute_grasp_penalty(
-    env,
-    action: np.ndarray,
-    *,
-    penalty: float = -0.02,
-    command_threshold: float = 0.5,
-    open_threshold: float = 0.9,
-    closed_threshold: float = 0.1,
-) -> float | None:
-    action_array = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action_array.size == 0:
-        return None
-
-    openness = estimate_gripper_openness(env)
-    if openness is None:
-        return None
-
-    gripper_action = float(action_array[-1])
-    if gripper_action >= float(command_threshold) and openness <= float(closed_threshold):
-        return float(penalty)
-    if gripper_action <= -float(command_threshold) and openness >= float(open_threshold):
-        return float(penalty)
-    return 0.0
-
-
 def build_device(env, device_cfg):
     device_type = str(getattr(device_cfg, "device", None) or device_cfg["device"])
     if device_type == "keyboard":
@@ -553,130 +495,6 @@ def sparse_success_reward(env, info: Optional[dict[str, Any]] = None) -> tuple[f
     return (0.0 if success else -1.0), success
 
 
-def load_hdf5_demos_into_transitions(
-    path: str | Path,
-    *,
-    camera_names: Sequence[str],
-    img_height: int,
-    img_width: int,
-    proprio_keys: Sequence[str],
-    renderer: str = "mjviewer",
-    control_freq: int = 20,
-    demo_names: Optional[Sequence[str]] = None,
-) -> list[Transition]:
-    path = Path(path)
-    with h5py.File(path, "r") as file_handle:
-        env_info_raw = file_handle.attrs["env_info"]
-        if isinstance(env_info_raw, bytes):
-            env_info_raw = env_info_raw.decode("utf-8")
-        env_info = json.loads(str(env_info_raw))
-        demos_group = _get_hdf5_demo_group(file_handle)
-        available_demo_names = {str(name) for name in demos_group.keys()}
-        if demo_names is None:
-            selected_demo_names = sorted(available_demo_names)
-        else:
-            selected_demo_names = [str(name) for name in demo_names if str(name) in available_demo_names]
-
-    runtime_cfg = build_runtime_config_from_env_info(
-        env_info=env_info,
-        camera_names=camera_names,
-        img_height=img_height,
-        img_width=img_width,
-        proprio_keys=proprio_keys,
-        has_renderer=False,
-        renderer=renderer,
-        reward_shaping=False,
-        control_freq=control_freq,
-    )
-    env = build_robosuite_env(runtime_cfg)
-    adapter = RobosuiteObservationAdapter(
-        env,
-        camera_names=camera_names,
-        img_height=img_height,
-        img_width=img_width,
-        proprio_keys=proprio_keys,
-    )
-
-    transitions: list[Transition] = []
-    try:
-        env.reset()
-        with h5py.File(path, "r") as file_handle:
-            demos_group = _get_hdf5_demo_group(file_handle)
-            for demo_name in selected_demo_names:
-                demo_group = demos_group[demo_name]
-                states = np.asarray(demo_group["states"])
-                actions = np.asarray(demo_group["actions"])
-                model_xml = demo_group.attrs.get("model_file", None)
-                if isinstance(model_xml, bytes):
-                    model_xml = model_xml.decode("utf-8")
-                if "intervention_labels" in demo_group:
-                    intervention_labels = np.asarray(demo_group["intervention_labels"])
-                else:
-                    intervention_labels = np.zeros(len(actions), dtype=np.bool_)
-                successful = bool(demo_group.attrs.get("successful", False))
-
-                if len(states) == 0 or len(actions) == 0:
-                    continue
-
-                if model_xml:
-                    _reset_env_from_demo_xml(env, str(model_xml))
-                else:
-                    env.reset()
-
-                demo_images = {}
-                if "observations" in demo_group:
-                    for camera_name in camera_names:
-                        if camera_name in demo_group["observations"]:
-                            images_dataset = demo_group["observations"][camera_name]["images"]
-                            demo_images[camera_name] = np.asarray(images_dataset)
-
-                for step_idx in range(len(actions)):
-                    env.done = False
-                    env.timestep = int(step_idx)
-                    env.cur_time = float(step_idx) * float(env.control_timestep)
-                    env.sim.set_state_from_flattened(states[step_idx])
-                    env.sim.forward()
-                    raw_obs = env._get_observations(force_update=True)
-                    grasp_penalty = compute_grasp_penalty(env, actions[step_idx])
-                    current_images = _resolve_demo_images(
-                        demo_images=demo_images,
-                        adapter=adapter,
-                        step_idx=step_idx,
-                    )
-                    obs = adapter.transform(raw_obs, images=current_images)
-                    step_output = env.step(actions[step_idx])
-                    if len(step_output) == 5:
-                        next_raw_obs, _, env_done, truncated, info = step_output
-                        env_done = bool(env_done or truncated)
-                    else:
-                        next_raw_obs, _, env_done, info = step_output
-                    next_obs = adapter.transform(next_raw_obs)
-                    reward, success = sparse_success_reward(env, info)
-                    info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
-                    if grasp_penalty is not None:
-                        info_payload.setdefault("grasp_penalty", float(grasp_penalty))
-                    done = bool(env_done or success or (successful and step_idx == len(actions) - 1))
-                    transitions.append(
-                        Transition(
-                            obs=obs,
-                            action=np.asarray(actions[step_idx], dtype=np.float32),
-                            reward=reward,
-                            next_obs=next_obs,
-                            done=done,
-                            grasp_penalty=grasp_penalty,
-                            is_intervention=bool(intervention_labels[step_idx]),
-                            info=info_payload,
-                            reward_source="env_success",
-                            demo_source="offline_demo",
-                        )
-                    )
-                    if done:
-                        break
-    finally:
-        env.close()
-    return transitions
-
-
 def make_checkpoint_directory(root_dir: str | Path, run_name: str) -> Path:
     checkpoint_dir = Path(root_dir) / run_name
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -715,55 +533,6 @@ def render_viewer_env(env) -> None:
 
 
 
-def _resolve_demo_images(
-    demo_images: dict[str, np.ndarray],
-    adapter: RobosuiteObservationAdapter,
-    step_idx: int,
-) -> dict[str, np.ndarray]:
-    current_images = {}
-    fallback_images = None
-    for camera_name in adapter.camera_names:
-        images = demo_images.get(camera_name, None)
-        if images is not None and images.ndim == 4 and step_idx < images.shape[0]:
-            current_images[camera_name] = _resize_demo_image(
-                np.asarray(images[step_idx], dtype=np.uint8),
-                height=adapter.img_height,
-                width=adapter.img_width,
-            )
-        else:
-            if fallback_images is None:
-                fallback_images = adapter.render_images()
-            current_images[camera_name] = fallback_images[camera_name]
-    return current_images
-
-
 def _is_numeric_observation(value: Any) -> bool:
     array = np.asarray(value)
     return array.dtype.kind in {"b", "i", "u", "f"} and array.ndim >= 1
-
-
-def _reset_env_from_demo_xml(env, model_xml: str) -> None:
-    xml = env.edit_model_xml(model_xml)
-    env.reset_from_xml_string(xml)
-    env.sim.reset()
-    env.sim.forward()
-    env.done = False
-    env.timestep = 0
-    env.cur_time = 0.0
-
-
-def _resize_demo_image(image: np.ndarray, *, height: int, width: int) -> np.ndarray:
-    if image.ndim != 3:
-        return image
-    if image.shape[0] == height and image.shape[1] == width:
-        return image
-    resized = Image.fromarray(image).resize((width, height), resample=Image.BILINEAR)
-    return np.asarray(resized, dtype=np.uint8)
-
-
-def _get_hdf5_demo_group(file_handle: h5py.File | h5py.Group) -> h5py.Group:
-    if "demos" in file_handle:
-        return file_handle["demos"]
-    if "data" in file_handle:
-        return file_handle["data"]
-    raise KeyError("HDF5 demo file must contain either a 'demos' group or a 'data' group.")
