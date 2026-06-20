@@ -2,11 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------------------------------------------------------------------
-ENV_NAME="PickPlaceCereal"
-CHECKPOINT="outputs/flow-DAgger_deterministic/flow_dagger_PickPlaceCereal_2026-06-20_14-43-17_10pretrain_seed42/checkpoints/step_00015000_updates_00007498_ep_00053.pt"
+ENV_NAME="NutAssemblySquare"
+CHECKPOINT="outputs/flow-DAgger_deterministic_pu-disc/flow_dagger_NutAssemblySquare_2026-06-22_02-08-20_30pretrain_seed42/checkpoints/step_00015000_updates_00012292_ep_00055.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 VIDEO_OUTPUT="true"
@@ -31,18 +31,6 @@ fi
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 cd "${ROOT_DIR}"
-
-if [[ -z "${CHECKPOINT}" ]]; then
-  echo "[ERROR] Missing CHECKPOINT." >&2
-  echo "Usage:" >&2
-  echo "  CHECKPOINT=/abs/path/to/ckpt.pt [ENV_NAME=PickPlaceBread] [TASK_NAME=PickPlaceBread] [EPISODES=5] bash robosuite/pipeline/scripts/eval_flow_dagger.sh" >&2
-  exit 1
-fi
-
-if [[ ! -f "${CHECKPOINT}" ]]; then
-  echo "[ERROR] Checkpoint file does not exist: ${CHECKPOINT}" >&2
-  exit 1
-fi
 
 CHECKPOINT_DIR="$(dirname "${CHECKPOINT}")"
 RUN_DIR="$(dirname "${CHECKPOINT_DIR}")"

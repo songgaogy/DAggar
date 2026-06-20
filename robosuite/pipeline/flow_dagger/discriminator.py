@@ -385,7 +385,7 @@ def render_hud(
     """Single-line, in-place (``\\r``) status bar written to the real terminal."""
     if status.paused:
         tag = f"{_ANSI['paused']}[ FAIL · PAUSED ]{_ANSI['reset']}"
-        hint = f" {_ANSI['dim']}ENTER 恢复 / 介入纠正{_ANSI['reset']}"
+        hint = f" {_ANSI['dim']}ENTER dagger/bin{_ANSI['reset']}"
     elif status.pred == 1:
         tag = f"{_ANSI['fail']}[ FAIL ]{_ANSI['reset']}"
         hint = ""

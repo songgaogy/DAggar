@@ -12,12 +12,14 @@ transformer_layer: null                 # int
 
 inference:
   device: "cuda:0"
-  fps: 2                                 # discriminator scoring / publish cadence
+  # -1 (default): chunk-triggered — score once each time the policy infers a new action chunk.
+  #  >0: legacy fixed-rate — score at this many frames/sec, decoupled from the policy chunk cadence.
+  fps: -1                                 # discriminator scoring / publish cadence
   # whether to intervene: pause the env on a sustained "fail" and wait for the human
-  intervene_env: false
+  intervene_env: true
 
 pause:
-  consecutive_fail_frames: 3            # require N consecutive scored "fail" frames before pausing
+  consecutive_fail_frames: 2            # require N consecutive scored "fail" frames before pausing
   require_safe_to_rearm: true          # after resume, only re-pause once it returns to "safe" then "fail" again
 
 hud:

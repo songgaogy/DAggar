@@ -97,13 +97,26 @@ indicator**. It has **zero effect on policy updates or learning** — it only di
 - **`DiscriminatorRuntime`** — loads the encoder + head once from a single
   `pu_bce_head.pth` checkpoint (the frozen dynamics `encoder_ckpt` and head dims are read
   from the checkpoint payload, overridable in config). A **background daemon thread** runs
-  the heavy DINOv3 encode + scoring on the latest published frame at `inference.fps`, so the
-  control loop is never blocked.
+  the heavy DINOv3 encode + scoring on the latest published frame, so the control loop is
+  never blocked.
+- **Scoring cadence (`inference.fps`)** — two modes:
+  - **`fps: -1` (default) — chunk-triggered.** The discriminator scores **exactly once per
+    new policy action chunk**, i.e. every time the policy infers a fresh chunk (every
+    `execute_horizon` control steps). Scoring is locked to the policy's planning rhythm
+    rather than wall-clock time.
+  - **`fps > 0` — legacy time-gated.** The discriminator scores at a fixed `fps` cadence,
+    decoupled from the policy's chunk boundaries (the previous behaviour).
 - **Snapshot model** — the **main thread** owns the MuJoCo sim and `publish(...)`es each
   scored frame (the two training views `agentview` + `robot0_eye_in_hand` rendered at
   256×256, Panda `qpos[7]+qvel[7]` proprio selected via the dynamics `proprio_map`, and the
   policy's **planned future action chunk**). The worker thread only reads that snapshot —
   it never touches the sim.
+- **Always the policy action, even under intervention** — the action fed to the
+  discriminator is **always the policy's inferred action chunk**, never the human override.
+  While a human is intervening, the policy keeps inferring in the background (at its normal
+  chunk cadence, on live observations) purely to supply this chunk — the inferred action is
+  **not executed** (the human command still drives the env). Background policy inference
+  during intervention runs only when the discriminator is enabled.
 - **Pause / resume** (only when `inference.intervene_env=true`) — once the policy is judged
   `fail` for `pause.consecutive_fail_frames` consecutive scored frames, the env pauses and
   waits. Press **ENTER** to resume policy rollout, or **intervene with the SpaceMouse**
@@ -263,7 +276,7 @@ All configs use [Hydra](https://hydra.cc/). The canonical training config is `co
 | `data` | Demo paths, splits, trajectory counts |
 | `runtime` | Interactive mode, async updates, checkpoint resume, FPS limits |
 | `logging` | WandB project, output directory, save intervals |
-| `discriminator` | PU-BCE fail/safe indicator: checkpoint, device, `inference.fps`, `inference.intervene_env`, `pause.*` debounce, `hud.enabled` (composed from `config/discriminator.yaml`) |
+| `discriminator` | PU-BCE fail/safe indicator: checkpoint, device, `inference.fps` (`-1` = score per new policy action chunk; `>0` = fixed-rate), `inference.intervene_env`, `pause.*` debounce, `hud.enabled` (composed from `config/discriminator.yaml`) |
 
 Override any field from the CLI:
 

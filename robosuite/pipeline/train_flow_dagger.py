@@ -528,6 +528,7 @@ def main(cfg: DictConfig) -> None:
     last_fps_log_time = time.monotonic()
     training_started_monotonic = last_fps_log_time
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
+    latest_policy_action = cached_policy_action
     cached_override_action: np.ndarray | None = None
     cached_is_intervention = False
     last_reported_publish_count = int(trainer.progress_snapshot()["publish_count"])
@@ -903,6 +904,7 @@ def main(cfg: DictConfig) -> None:
     discriminator = None
     disc_enter_listener: EnterKeyListener | None = None
     disc_publish_gate: IntervalGate | None = None
+    disc_chunk_triggered = False
     disc_hud_out = None
     try:
         discriminator = build_discriminator_runtime(getattr(cfg, "discriminator", None))
@@ -911,7 +913,12 @@ def main(cfg: DictConfig) -> None:
         discriminator = None
     if discriminator is not None:
         discriminator.start()
-        disc_publish_gate = IntervalGate(max(0.1, float(discriminator.cfg.fps)))
+        # fps <= 0 (default -1): score once per new policy action chunk (chunk-triggered,
+        # i.e. exactly when the policy infers a fresh chunk). fps > 0: legacy fixed-rate
+        # time gating, decoupled from the policy's chunk cadence.
+        disc_chunk_triggered = float(discriminator.cfg.fps) <= 0.0
+        if not disc_chunk_triggered:
+            disc_publish_gate = IntervalGate(float(discriminator.cfg.fps))
         if discriminator.cfg.intervene_env:
             disc_enter_listener = EnterKeyListener()
             disc_enter_listener.start()
@@ -920,11 +927,19 @@ def main(cfg: DictConfig) -> None:
             # Redirect the verbose rollout prints to console.log; keep the terminal for the HUD.
             console_capture.set_file_only(True)
 
-    def maybe_publish_discriminator(now: float, executed_action: np.ndarray) -> None:
-        if discriminator is None or disc_publish_gate is None:
+    def maybe_publish_discriminator(
+        now: float, policy_action: np.ndarray, new_chunk_inferred: bool
+    ) -> None:
+        if discriminator is None:
             return
-        if not disc_publish_gate.ready(now):
-            return
+        if disc_chunk_triggered:
+            # fps == -1: publish exactly when the policy infers a fresh action chunk.
+            if not new_chunk_inferred:
+                return
+        else:
+            # fps > 0: legacy fixed-rate time gating.
+            if disc_publish_gate is None or not disc_publish_gate.ready(now):
+                return
         try:
             images = render_policy_camera_images(
                 env,
@@ -934,10 +949,14 @@ def main(cfg: DictConfig) -> None:
                 img_width=discriminator.original_img_size,
             )
             proprio = discriminator.extract_proprio(env.sim.get_state().flatten())
+            # Always score the policy's planned action chunk — even during human
+            # intervention the policy keeps inferring, so this is the policy action
+            # (never the human override). ``policy_action`` only backs the action
+            # buffer fallback for the warmup phase before the first chunk exists.
             discriminator.publish(
                 images_per_view=images,
                 proprio=proprio,
-                executed_action=executed_action,
+                executed_action=policy_action,
                 planned_chunk=agent.planned_action_chunk(),
             )
         except Exception as exc:
@@ -989,15 +1008,29 @@ def main(cfg: DictConfig) -> None:
             if discriminator is not None and discriminator.pause_requested():
                 wait_during_discriminator_pause()
 
-            if (not cached_is_intervention) and (unthrottled_runtime or policy_gate.ready(loop_start)):
+            # Run policy inference on every gate tick. While a human is intervening the
+            # policy keeps inferring at its normal chunk cadence so the failure
+            # discriminator always scores the *policy's* planned action chunk — the
+            # inferred action just isn't executed (the human override wins below).
+            # Intervention-time inference exists only to feed the discriminator, so it
+            # is skipped when the discriminator is inactive (no behaviour change there).
+            new_policy_chunk_inferred = False
+            run_policy_inference = (not cached_is_intervention) or (discriminator is not None)
+            if run_policy_inference and (unthrottled_runtime or policy_gate.ready(loop_start)):
                 if step < int(cfg.algorithm.trainer.random_steps):
-                    cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
+                    if not cached_is_intervention:
+                        cached_policy_action = np.random.uniform(action_low, action_high).astype(np.float32)
                 else:
-                    if on_demand_image_obs and agent.needs_action_chunk():
+                    new_policy_chunk_inferred = agent.needs_action_chunk()
+                    if on_demand_image_obs and new_policy_chunk_inferred:
                         obs = make_live_obs(include_images=True, refresh_images=True)
-                    cached_policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
+                    policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
                     if on_demand_image_obs:
                         obs = make_live_obs(include_images=False)
+                    latest_policy_action = policy_action
+                    # Execute the policy action only when the human is not overriding.
+                    if not cached_is_intervention:
+                        cached_policy_action = policy_action
 
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
             is_intervention = False
@@ -1193,7 +1226,7 @@ def main(cfg: DictConfig) -> None:
             episode_length += 1
             success_count += int(success)
 
-            maybe_publish_discriminator(loop_start, env_action)
+            maybe_publish_discriminator(loop_start, latest_policy_action, new_policy_chunk_inferred)
 
             if online_updates_enabled:
                 if async_updates:

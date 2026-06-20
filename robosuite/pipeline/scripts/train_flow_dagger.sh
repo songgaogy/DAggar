@@ -4,15 +4,16 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
 # ----------------------------------------------------------------------
-ENVIRONMENT="PickPlaceCereal"
-NUM_TRAJECTORIES=10   # pretraining data
-UPDATE_PER_STEP=0.5     # 1 env step -> x policy updates
+ENVIRONMENT="NutAssemblySquare"
+NUM_TRAJECTORIES=30   # pretraining data
+UPDATE_PER_STEP=1     # 1 env step -> x policy updates
 SAVE_FREQ="${SAVE_FREQ:-5000}"        # save checkpoint every x env steps
 DEMO_SPLIT="pretrain_data-20260615_174814"
 SEED_VALUE=42
 RUN_NAME_SUFFIX="_${NUM_TRAJECTORIES}pretrain_seed${SEED_VALUE}"
 
 INIT_CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow_multi_ep0100.pt"
+DISCRIMINATOR_CHECKPOINT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_203140_NutAssemblySquare/checkpoints/pu_bce_head.pth"
 LEARNER_DEVICE="cuda:1"
 INFERENCE_DEVICE="cuda:0"
 ACTION_HORIZON=8
@@ -20,6 +21,7 @@ EXECUTE_HORIZON=8
 # ----------------------------------------------------------------------
 
 DEMO_TASK_NAME="${ENVIRONMENT}"
+DISCRIMINATOR_TASK_NAME="${ENVIRONMENT}"
 INTERACTIVE="true"
 export MUJOCO_GL="${MUJOCO_GL:-glfw}"
 VIEWER_ENABLED="${VIEWER_ENABLED:-true}"
@@ -61,24 +63,6 @@ if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
-
-if [[ -n "${LOAD}" && "${LOAD}" != "null" ]]; then
-  if [[ -d "${LOAD}" ]]; then
-    if [[ -f "${LOAD}/checkpoints/latest.pt" ]]; then
-      CHECKPOINT="${LOAD}/checkpoints/latest.pt"
-    elif [[ -f "${LOAD}/latest.pt" ]]; then
-      CHECKPOINT="${LOAD}/latest.pt"
-    else
-      echo "[ERROR] LOAD points to a directory, but no latest checkpoint was found under ${LOAD}" >&2
-      exit 1
-    fi
-  else
-    CHECKPOINT="${LOAD}"
-  fi
-  RESUME=true
-fi
-
-
 python -m robosuite.pipeline.train_flow_dagger \
   seed="${SEED_VALUE}" \
   env.environment="${ENVIRONMENT}" \
@@ -120,4 +104,6 @@ python -m robosuite.pipeline.train_flow_dagger \
   logging.run_name_suffix="${RUN_NAME_SUFFIX}" \
   logging.log_interval="${LOG_INTERVAL}" \
   logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \
+  discriminator.task_name="${DISCRIMINATOR_TASK_NAME}" \
+  discriminator.checkpoint="${DISCRIMINATOR_CHECKPOINT}" \
   "${EXTRA_ARGS[@]}"

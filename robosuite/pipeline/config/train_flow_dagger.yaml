@@ -176,7 +176,7 @@ runtime:
   episode_pause_sec: 1.0
 
 logging:
-  output_root: "./outputs/flow-DAgger_deterministic"
+  output_root: "./outputs/flow-DAgger_deterministic_pu-disc"
   run_name: null
   run_name_suffix: null
   project: "Flow-DAgger_AIR"
