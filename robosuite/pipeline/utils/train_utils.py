@@ -20,7 +20,6 @@ from robosuite.wrappers import VisualizationWrapper
 from robosuite.pipeline.envs import (
     RobosuiteObservationAdapter,
     RobosuiteRuntimeConfig,
-    make_checkpoint_directory,
 )
 from robosuite.pipeline.utils import resolve_task_demo_paths
 
@@ -209,59 +208,6 @@ def checkpoint_step_path(checkpoint_dir: Path, *, step: int, learner_updates: in
     )
 
 
-def resume_checkpoint_candidates(cfg: DictConfig, output_root: Path) -> list[Path]:
-    candidates: list[Path] = []
-
-    explicit_checkpoint = resolve_checkpoint_reference(cfg.runtime.checkpoint)
-    if explicit_checkpoint is not None:
-        candidates.append(explicit_checkpoint)
-    elif bool(cfg.runtime.resume):
-        resumable_run = find_latest_resumable_run(output_root, str(cfg.env.environment))
-        if resumable_run is not None:
-            latest = checkpoint_path(resumable_run, "latest")
-            if latest.exists():
-                candidates.append(latest)
-            candidates.extend(sorted((resumable_run / "checkpoints").glob("step_*.pt"), reverse=True))
-
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved in seen or not candidate.exists():
-            continue
-        seen.add(resolved)
-        deduped.append(candidate)
-    return deduped
-
-
-def find_latest_resumable_run(output_root: Path, env_name: str) -> Path | None:
-    env_prefix = f"hil_serl_{env_name}_"
-    candidates = []
-    for latest_checkpoint in output_root.glob("*/checkpoints/latest.pt"):
-        run_dir = latest_checkpoint.parent.parent
-        if run_dir.name.startswith(env_prefix):
-            candidates.append((latest_checkpoint.stat().st_mtime, run_dir))
-    if not candidates:
-        for latest_checkpoint in output_root.glob("*/checkpoints/latest.pt"):
-            candidates.append((latest_checkpoint.stat().st_mtime, latest_checkpoint.parent.parent))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
-
-
-def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
-    output_root = Path(to_absolute_path(str(cfg.logging.output_root)))
-    explicit_run_name = cfg.logging.run_name
-
-    if explicit_run_name is not None:
-        run_name = str(explicit_run_name)
-        return run_name, make_checkpoint_directory(output_root, run_name)
-
-    run_name = f"hil_serl_{cfg.env.environment}_{now_readable()}"
-    return run_name, make_checkpoint_directory(output_root, run_name)
-
-
 class FixedRateLimiter:
     def __init__(self, fps: float) -> None:
         if fps <= 0.0:
@@ -358,35 +304,6 @@ def resolve_requested_device(requested: Any, *, fallback: str) -> str:
     return normalized
 
 
-def resolve_algorithm_devices(algorithm_cfg: dict[str, Any]) -> tuple[str, str]:
-    sac_cfg = algorithm_cfg.setdefault("sac", {})
-    learner_requested = sac_cfg.get("device", "cpu")
-    inference_requested = sac_cfg.get("inference_device", None)
-    normalized_learner_request = "cpu" if learner_requested is None else str(learner_requested).strip().lower()
-
-    default_learner = "cuda:0" if torch.cuda.is_available() else "cpu"
-    learner_device = resolve_requested_device(learner_requested, fallback=default_learner)
-
-    if inference_requested is None or str(inference_requested).lower() == "auto":
-        if normalized_learner_request in {"cuda", "cuda:0"} and torch.cuda.device_count() >= 2:
-            learner_device = "cuda:1"
-            inference_device = "cuda:0"
-        elif learner_device.startswith("cuda"):
-            inference_device = "cpu"
-        else:
-            inference_device = learner_device
-    else:
-        explicit_inference_request = str(inference_requested).strip().lower()
-        inference_fallback = "cpu" if learner_device.startswith("cuda") else learner_device
-        inference_device = resolve_requested_device(inference_requested, fallback=inference_fallback)
-        if explicit_inference_request.startswith("cuda") and inference_device == learner_device and learner_device.startswith("cuda"):
-            inference_device = "cpu"
-
-    sac_cfg["device"] = learner_device
-    sac_cfg["inference_device"] = inference_device
-    return learner_device, inference_device
-
-
 def maybe_wrap_visualization(env, *, enabled: bool, label: str):
     if not enabled:
         return env
@@ -466,19 +383,43 @@ class TeeStream:
 
 
 class ConsoleLogCapture:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, file_only: bool = False) -> None:
         self.path = path
+        # When True, stdout/stderr are redirected to the log file only (no terminal
+        # echo). The original terminal stdout is preserved on ``terminal_stdout`` so
+        # callers (e.g. the discriminator HUD) can still draw to the real console.
+        self.file_only = bool(file_only)
         self._file = None
         self._stdout = None
         self._stderr = None
+        self.terminal_stdout = None
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("a", encoding="utf-8", buffering=1)
         self._stdout = sys.stdout
         self._stderr = sys.stderr
-        sys.stdout = TeeStream(self._stdout, self._file)
-        sys.stderr = TeeStream(self._stderr, self._file)
+        self.terminal_stdout = self._stdout
+        if self.file_only:
+            sys.stdout = self._file
+            sys.stderr = self._file
+        else:
+            sys.stdout = TeeStream(self._stdout, self._file)
+            sys.stderr = TeeStream(self._stderr, self._file)
+
+    def set_file_only(self, file_only: bool) -> None:
+        """Toggle file-only redirection at runtime (e.g. once rollout starts)."""
+        file_only = bool(file_only)
+        if file_only == self.file_only or self._file is None:
+            self.file_only = file_only
+            return
+        self.file_only = file_only
+        if file_only:
+            sys.stdout = self._file
+            sys.stderr = self._file
+        else:
+            sys.stdout = TeeStream(self._stdout, self._file)
+            sys.stderr = TeeStream(self._stderr, self._file)
 
     def stop(self) -> None:
         if self._stdout is not None:

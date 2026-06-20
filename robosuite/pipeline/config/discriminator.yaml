@@ -1,0 +1,24 @@
+# @package discriminator
+# PU-BCE failure discriminator — indicator only, no effect on policy learning.
+# Loaded into the Flow-DAgger run as `cfg.discriminator` (see train_flow_dagger.yaml defaults).
+enabled: true
+task_name: "PickPlaceCereal"            # must match the dynamics model's proprio_map tasks
+checkpoint: "checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
+encoder_ckpt: "checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
+
+# Optional overrides (null => read from the head checkpoint payload):
+feature_source: null                    # "transformer" | "encoder"
+transformer_layer: null                 # int
+
+inference:
+  device: "cuda:0"
+  fps: 2                                 # discriminator scoring / publish cadence
+  # whether to intervene: pause the env on a sustained "fail" and wait for the human
+  intervene_env: false
+
+pause:
+  consecutive_fail_frames: 3            # require N consecutive scored "fail" frames before pausing
+  require_safe_to_rearm: true          # after resume, only re-pause once it returns to "safe" then "fail" again
+
+hud:
+  enabled: true                         # single-line in-place console status bar

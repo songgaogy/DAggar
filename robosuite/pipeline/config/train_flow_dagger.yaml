@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - discriminator
 
 seed: 42
 

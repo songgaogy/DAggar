@@ -184,6 +184,18 @@ class FlowDaggerAgent:
     def needs_action_chunk(self) -> bool:
         return self.core.needs_action_chunk()
 
+    def planned_action_chunk(self) -> "np.ndarray | None":
+        """Return the policy's most recent predicted action chunk (horizon x action_dim).
+
+        Used by the failure discriminator as the action window matching the dynamics
+        model's source = action[t:t+horizon]. Returns ``None`` before the first
+        inference (e.g. during random_steps). Read-only; does not affect the policy.
+        """
+        chunk = getattr(self.core, "current_chunk", None)
+        if chunk is None:
+            return None
+        return np.asarray(chunk, dtype=np.float32)
+
     def notify_intervention(self) -> None:
         self.core.notify_intervention()
 
