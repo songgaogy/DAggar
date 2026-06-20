@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="/home/dodo/Documents/DAggar/robosuite"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
-EVAL_SCRIPT="${ROOT}/robosuite/policy/flow_multi-update/eval_flow.py"
+EVAL_MODULE="robosuite.policy.flow_multi_update.eval_flow"
 
 # Checkpoint root for flow-10 training runs.
 CKPT_DIR="${ROOT}/checkpoints/multitask_6/policy/flow-update"
@@ -67,7 +67,7 @@ launch_eval_job() {
 
   echo "[launch] epoch=${epoch} task=${task_name} gpu=${gpu} ckpt=${ckpt_path}"
   CUDA_VISIBLE_DEVICES="${gpu}" \
-    "${PYTHON_BIN}" "${EVAL_SCRIPT}" \
+    "${PYTHON_BIN}" -m "${EVAL_MODULE}" \
     eval.ckpt="${ckpt_path}" \
     eval.task_name="${task_name}" \
     eval.output_dir="${output_dir}" \

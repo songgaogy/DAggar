@@ -3,14 +3,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from modules.encoders import build_image_encoder, build_proprio_tokenizer
-from modules.fusion import (
+from robosuite.policy.flow_multi_update.modules.encoders import build_image_encoder, build_proprio_tokenizer
+from robosuite.policy.flow_multi_update.modules.fusion import (
     build_condition_aggregator,
     build_fusion_module,
 )
-from modules.heads import build_flow_head
-from modules.language import build_language_encoder
-from modules.modulation import build_language_guided_modulation
+from robosuite.policy.flow_multi_update.modules.heads import build_flow_head
+from robosuite.policy.flow_multi_update.modules.language import build_language_encoder
+from robosuite.policy.flow_multi_update.modules.modulation import build_language_guided_modulation
 
 
 def _cfg_get(cfg: Any, key: str, default=None):

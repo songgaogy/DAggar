@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.env_util import RobosuiteProprioExtractor, parse_env_info
+from robosuite.policy.flow_multi_update.utils.env_util import RobosuiteProprioExtractor, parse_env_info
 
 
 DEFAULT_TASK_PROMPTS = {

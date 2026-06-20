@@ -1,11 +1,6 @@
 import datetime
 import os
-import sys
 import time
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
 
 import hydra
 import numpy as np
@@ -16,9 +11,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 
-from utils.datasets import RobosuiteMultiViewFlowDataset
-from utils.save_pretrain_data import save_pretrain_demos
-from model import build_flow_policy
+from robosuite.policy.flow_multi_update.model import build_flow_policy
+from robosuite.policy.flow_multi_update.utils.datasets import RobosuiteMultiViewFlowDataset
+from robosuite.policy.flow_multi_update.utils.save_pretrain_data import save_pretrain_demos
 
 
 def _cfg_get(cfg, key: str, default=None):

@@ -1,10 +1,5 @@
 import json
 import os
-import sys
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
 
 import hydra
 import imageio
@@ -14,8 +9,8 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 from tqdm import tqdm
 
-from model import build_flow_policy
-from utils.env_util import RobosuiteProprioExtractor, camera_obs_key
+from robosuite.policy.flow_multi_update.model import build_flow_policy
+from robosuite.policy.flow_multi_update.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
 
 
 def resolve_language_instruction(task_prompt_map: dict, task_name: str) -> str:

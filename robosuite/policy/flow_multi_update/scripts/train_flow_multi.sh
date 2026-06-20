@@ -9,9 +9,11 @@ SAVE_TRAIN_DATA=true
 export CUDA_VISIBLE_DEVICES=0
 export WANDB_MODE="disabled"
 export WANDB_ENTITY="songgao-personal"
+PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 # may increase batch_size
-python "$ROOT/robosuite/policy/flow_multi-update/train_flow.py" \
+cd "$ROOT"
+"$PYTHON_BIN" -m robosuite.policy.flow_multi_update.train_flow \
   data.save_pretrain_data=$SAVE_TRAIN_DATA \
   data.preload_all_demos_to_ram=true \
   data.use_demo_cache=true \

@@ -1,11 +1,6 @@
 import datetime
 import json
 import os
-import sys
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
 
 import h5py
 import hydra
@@ -15,14 +10,14 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
-from eval_flow import (
+from robosuite.policy.flow_multi_update.eval_flow import (
     preprocess_observation_images,
     resolve_checkpoint_task_name,
     resolve_language_instruction,
     sample_action_sequence,
 )
-from model import build_flow_policy
-from utils.env_util import RobosuiteProprioExtractor
+from robosuite.policy.flow_multi_update.model import build_flow_policy
+from robosuite.policy.flow_multi_update.utils.env_util import RobosuiteProprioExtractor
 
 
 DEFAULT_TASK_OUTPUT_ROOTS = {

@@ -10,7 +10,7 @@ set -euo pipefail
 
 ROOT="${ROOT:-/home/dodo/Documents/DAggar/robosuite}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
-GENERATE_SCRIPT="${ROOT}/robosuite/policy/flow_multi-update/generate_rollout_data.py"
+GENERATE_MODULE="robosuite.policy.flow_multi_update.generate_rollout_data"
 
 MAX_PROC_GPU="${MAX_PROC_GPU:-4}"
 GPU_LIST="${GPU_LIST:-0 1}"
@@ -84,7 +84,7 @@ launch_rollout_job() {
   mkdir -p "${output_dir}"
   echo "[launch] task=${task_name} keep_mode=${keep_mode} num_trajs=${num_trajs} gpu=${gpu}"
   CUDA_VISIBLE_DEVICES="${gpu}" \
-    "${PYTHON_BIN}" "${GENERATE_SCRIPT}" \
+    "${PYTHON_BIN}" -m "${GENERATE_MODULE}" \
     generate.ckpt="${CKPT}" \
     generate.task_name="${task_name}" \
     generate.output_dir="${output_dir}" \
