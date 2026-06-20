@@ -6,14 +6,14 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------------------------------------------------------------------
 ENV_NAME="PickPlaceCereal"
-CHECKPOINT="outputs/flow-DAgger_deterministic/flow_dagger_PickPlaceCereal_2026-06-19_23-53-28_10pretrain_seed42/checkpoints/step_00015000_updates_00007496_ep_00053.pt"
+CHECKPOINT="outputs/flow-DAgger_deterministic/flow_dagger_PickPlaceCereal_2026-06-20_14-43-17_10pretrain_seed42/checkpoints/step_00015000_updates_00007498_ep_00053.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 VIDEO_OUTPUT="true"
 VIDEO_IMAGE_SIZE=512
 N_ODE_STEPS=10
 EXECUTE_HORIZON=8
-SEED=1
+SEED=10086
 # -------------------------------------------------------------------------------------------------
 
 TASK_NAME="${TASK_NAME:-$ENV_NAME}"
