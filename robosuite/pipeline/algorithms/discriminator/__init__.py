@@ -1,24 +1,34 @@
-"""Online-trainable BCE discriminator + shared frozen LPB v2 encoder.
+"""Frozen nnPU discriminator integration shared by DIPOLE and IQL."""
 
-Skeleton — see robosuite/pipeline/docs/DIPOLE_RL.md and
-robosuite/pipeline/docs/prompts/02_online_discriminator.md.
-"""
-
-from .base import (
-    DiscriminatorBase,
-    DiscriminatorBatch,
-    DiscriminatorOutput,
+from .base import DiscriminatorOutput
+from .encoder import SharedDynamicsEncoder, SharedFrozenEncoder
+from .nnpu import FrozenNNPUDiscriminator
+from .offline import (
+    NNPUOfflineScorer,
+    annotate_transitions_with_nnpu_scores,
+    nnpu_intrinsic_from_failure_score,
 )
-from .encoder import SharedFrozenEncoder
-from .online_bce import DiscriminatorConfig, OnlineBCEDiscriminator
-from .replay import DiscriminatorReplayBuffer
+from .runtime import (
+    EnterKeyListener,
+    NNPUDiscriminatorRuntime,
+    NNPURuntimeConfig,
+    NNPUStatus,
+    build_nnpu_runtime,
+    render_nnpu_hud,
+)
 
 __all__ = [
-    "DiscriminatorBase",
     "DiscriminatorOutput",
-    "DiscriminatorBatch",
-    "DiscriminatorConfig",
-    "OnlineBCEDiscriminator",
-    "DiscriminatorReplayBuffer",
+    "EnterKeyListener",
+    "FrozenNNPUDiscriminator",
+    "NNPUDiscriminatorRuntime",
+    "NNPUOfflineScorer",
+    "NNPURuntimeConfig",
+    "NNPUStatus",
+    "SharedDynamicsEncoder",
     "SharedFrozenEncoder",
+    "annotate_transitions_with_nnpu_scores",
+    "build_nnpu_runtime",
+    "nnpu_intrinsic_from_failure_score",
+    "render_nnpu_hud",
 ]

@@ -6,18 +6,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
-    lpb_disc_intrinsic_from_failure_score,
-)
-
 from .common import IQLActorBatch, IQLConfig, IQLStepBatch
 from .data_util import aggregate_chunk_reward, chunk_done_mask
 
 if TYPE_CHECKING:
-    from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-    from robosuite.pipeline.algorithms.discriminator.online_bce import (
-        OnlineBCEDiscriminator,
-    )
+    from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+    from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
 
 
 def _episode_index_of(transition: Any) -> int:
@@ -25,23 +19,23 @@ def _episode_index_of(transition: Any) -> int:
     return int(info.get("episode_index", -1))
 
 
-def _lpb_disc_intrinsic_for_transition(transition: Any) -> float | None:
-    """Read precomputed LPB disc reward from ``transition.info`` (warmup / offline)."""
+def _nnpu_disc_intrinsic_for_transition(transition: Any) -> float | None:
+    """Read an optional precomputed nnPU intrinsic reward."""
     info = getattr(transition, "info", None) or {}
-    cached = info.get("lpb_disc_intrinsic")
+    cached = info.get("nnpu_disc_intrinsic")
     if cached is not None:
         return float(cached)
-    failure_score = info.get("lpb_failure_score")
-    tau = info.get("lpb_tau")
+    failure_score = info.get("nnpu_failure_score")
+    tau = info.get("nnpu_threshold")
     if failure_score is None or tau is None:
         return None
-    return float(lpb_disc_intrinsic_from_failure_score(float(failure_score), float(tau)))
+    return float(-torch.sigmoid(torch.tensor(float(failure_score) - float(tau))).item())
 
 
-def _lpb_disc_steps_for_sequence(sequence: list[Any], horizon: int) -> np.ndarray | None:
+def _nnpu_disc_steps_for_sequence(sequence: list[Any], horizon: int) -> np.ndarray | None:
     steps: list[float] = []
     for item in sequence:
-        intrinsic = _lpb_disc_intrinsic_for_transition(item)
+        intrinsic = _nnpu_disc_intrinsic_for_transition(item)
         if intrinsic is None:
             return None
         steps.append(intrinsic)
@@ -53,11 +47,8 @@ def _lpb_disc_steps_for_sequence(sequence: list[Any], horizon: int) -> np.ndarra
 def _stack_views_uint8(obs: Any, camera_names: list[str]) -> np.ndarray:
     """Stack per-camera uint8 frames from ``obs`` into (V, 3, H, W).
 
-    No resize / crop: the SharedFrozenEncoder owns the full LPB v2
-    preprocessing pipeline (F.interpolate to ``original_img_size`` →
-    LinearNormalizer → CenterCrop to ``cropped_img_size``). Doing any
-    of that in the replay sampler would double-process the input.
-    See DEBUG_and_ERRORs.md §4.
+    No resize or crop is applied here; the shared dynamics encoder owns its
+    complete image preprocessing pipeline.
     """
     images = []
     for camera_name in camera_names:
@@ -132,17 +123,15 @@ class IQLReplayBuffer:
         self,
         batch_size: int,
         *,
-        encoder: "SharedFrozenEncoder",
-        discriminator: "OnlineBCEDiscriminator | None" = None,
+        encoder: "SharedDynamicsEncoder",
+        discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
     ) -> IQLStepBatch:
         """Sample `batch_size` chunk windows, encode every frame under no_grad,
         and synthesize total rewards (env + optional disc intrinsic).
 
-        When transitions carry ``info['lpb_disc_intrinsic']`` (offline warmup
-        LPB benchmark scores), those values are used for ``r_disc``. Otherwise
-        falls back to ``OnlineBCEDiscriminator.intrinsic_reward`` on
-        ``encode_chunk_frames`` latents.
+        Optional precomputed nnPU rewards are read from transition metadata;
+        otherwise the frozen nnPU head scores the per-frame chunk features.
         """
         sequences, start_indices = self._gather_chunks(batch_size)
         return self._build_step_batch(
@@ -158,8 +147,8 @@ class IQLReplayBuffer:
         sequences: list[list[Any]],
         start_indices: list[int],
         *,
-        encoder: "SharedFrozenEncoder",
-        discriminator: "OnlineBCEDiscriminator | None" = None,
+        encoder: "SharedDynamicsEncoder",
+        discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
     ) -> IQLStepBatch:
         """Encode the given chunk ``sequences`` (with their ``start_indices``)
@@ -185,10 +174,10 @@ class IQLReplayBuffer:
         is_intervention: list[float] = []
         episode_ids: list[int] = []
         episode_steps: list[int] = []
-        lpb_disc_per_sequence: list[np.ndarray | None] = []
+        nnpu_disc_per_sequence: list[np.ndarray | None] = []
 
         for sequence, start in zip(sequences, start_indices):
-            lpb_disc_per_sequence.append(_lpb_disc_steps_for_sequence(sequence, H))
+            nnpu_disc_per_sequence.append(_nnpu_disc_steps_for_sequence(sequence, H))
             first = sequence[0]
             next_obs, forced_done = self._next_obs_for(start)
             chunk_images.append(
@@ -249,44 +238,40 @@ class IQLReplayBuffer:
         sp_proprio_tensor = torch.from_numpy(
             np.ascontiguousarray(sp_proprio_np)
         ).float()
-        # next_obs: use the chunk's last action (the step that led to s').
-        sp_action_tensor = action_tensor[:, -1, :]
-
         with torch.no_grad():
-            chunk_ctx = encoder.encode_chunk_frames(
+            state_features, chunk_features = encoder.encode_features(
                 chunk_images=chunk_images_tensor,
                 chunk_proprio=chunk_proprio_tensor,
                 chunk_actions=action_tensor,
-            )                                                                   # (B, H, D_ctx)
-            chunk_ctx_flat = chunk_ctx.reshape(B * H, -1)
-            next_context = encoder.encode(
+            )
+            next_v_state_feature = encoder.encode_state(
                 image_obs_raw=sp_image_tensor,
                 proprio_raw=sp_proprio_tensor,
-                action_real=sp_action_tensor,
-            )                                                                   # (B, D_ctx)
+            )
 
-        D_ctx = int(chunk_ctx.shape[-1])
-        # Q/V Bellman uses the chunk-start latent; disc scores all H frames.
-        context = chunk_ctx[:, 0, :]
+        q_chunk_feature = chunk_features[:, 0, :]
+        v_state_feature = state_features[:, 0, :]
 
-        # Per-frame disc reward: LPB pre-annotations (offline) or online head.
+        # Per-frame disc reward: optional cache or frozen nnPU head.
         effective_disc_coef = float(self.cfg.disc_reward_coef)
         effective_output_coef = float(self.cfg.output_reward_coef)
-        use_lpb_disc = (
+        use_precomputed_disc = (
             effective_disc_coef != 0.0
-            and len(lpb_disc_per_sequence) == B
-            and all(step is not None for step in lpb_disc_per_sequence)
+            and len(nnpu_disc_per_sequence) == B
+            and all(step is not None for step in nnpu_disc_per_sequence)
         )
         if effective_disc_coef == 0.0:
             r_disc_per_step = torch.zeros_like(reward_tensor)
-        elif use_lpb_disc:
+        elif use_precomputed_disc:
             r_disc_per_step = torch.from_numpy(
-                np.stack([step for step in lpb_disc_per_sequence if step is not None])
+                np.stack([step for step in nnpu_disc_per_sequence if step is not None])
             ).to(device=reward_tensor.device, dtype=reward_tensor.dtype)
         elif discriminator is not None:
             with torch.no_grad():
-                r_disc_flat = discriminator.intrinsic_reward(context=chunk_ctx_flat)
-            r_disc_per_step = r_disc_flat.view(B, H).to(
+                r_disc_per_step = discriminator.intrinsic_reward(
+                    chunk_feature=chunk_features
+                )
+            r_disc_per_step = r_disc_per_step.view(B, H).to(
                 reward_tensor.device, dtype=reward_tensor.dtype
             )
         else:
@@ -297,13 +282,14 @@ class IQLReplayBuffer:
         dones = chunk_done_mask(done_tensor)
 
         disc_meta: dict[str, float] = {}
-        if effective_disc_coef != 0.0 and (use_lpb_disc or discriminator is not None):
+        if effective_disc_coef != 0.0 and (use_precomputed_disc or discriminator is not None):
             disc_meta["disc_reward_first_frame_mean"] = float(r_disc_per_step[:, 0].mean().item())
             disc_meta["disc_reward_chunk_mean"] = float(r_disc_per_step.mean().item())
 
         batch = IQLStepBatch(
-            context=context,
-            next_context=next_context,
+            q_chunk_feature=q_chunk_feature,
+            v_state_feature=v_state_feature,
+            next_v_state_feature=next_v_state_feature,
             action_chunk=action_tensor,
             rewards=rewards,
             dones=dones,
@@ -322,23 +308,26 @@ class IQLReplayBuffer:
         self,
         batch_size: int,
         *,
-        encoder: "SharedFrozenEncoder",
+        encoder: "SharedDynamicsEncoder",
         device: str = "cuda:1",
     ) -> IQLActorBatch:
         """Sample chunks for actor-side advantage scoring (no rewards needed)."""
         sequences, start_indices = self._gather_chunks(batch_size)
         camera_names = list(self._base.camera_names)
 
-        s_images: list[np.ndarray] = []
-        s_proprio: list[np.ndarray] = []
+        chunk_images: list[np.ndarray] = []
+        chunk_proprio: list[np.ndarray] = []
         actions: list[np.ndarray] = []
         episode_ids: list[int] = []
         episode_steps: list[int] = []
         for sequence in sequences:
             first = sequence[0]
-            s_obs = first.obs
-            s_images.append(_stack_views_uint8(s_obs, camera_names))
-            s_proprio.append(np.asarray(s_obs["state"], dtype=np.float32))
+            chunk_images.append(
+                np.stack([_stack_views_uint8(item.obs, camera_names) for item in sequence])
+            )
+            chunk_proprio.append(
+                np.stack([np.asarray(item.obs["state"], dtype=np.float32) for item in sequence])
+            )
             actions.append(
                 np.stack([np.asarray(item.action, dtype=np.float32) for item in sequence], axis=0)
             )
@@ -346,20 +335,26 @@ class IQLReplayBuffer:
             episode_ids.append(int(info.get("episode_index", -1)))
             episode_steps.append(int(info.get("episode_step", -1)))
 
-        s_image_tensor = _to_image_tensor(np.stack(s_images, axis=0), device)
-        s_proprio_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(s_proprio, axis=0))).float()
+        image_np = np.stack(chunk_images, axis=0)
+        B, H, V, C, Hi, Wi = image_np.shape
+        image_tensor = _to_image_tensor(
+            np.ascontiguousarray(image_np.reshape(B * H, V, C, Hi, Wi)), device
+        ).view(B, H, V, C, Hi, Wi)
+        proprio_tensor = torch.from_numpy(
+            np.ascontiguousarray(np.stack(chunk_proprio, axis=0))
+        ).float()
         action_tensor_raw = torch.from_numpy(np.ascontiguousarray(np.stack(actions, axis=0))).float()
 
         with torch.no_grad():
-            context = encoder.encode(
-                image_obs_raw=s_image_tensor,
-                proprio_raw=s_proprio_tensor,
-                action_real=action_tensor_raw[:, 0, :],
+            state_features, chunk_features = encoder.encode_features(
+                chunk_images=image_tensor,
+                chunk_proprio=proprio_tensor,
+                chunk_actions=action_tensor_raw,
             )
 
         batch = IQLActorBatch(
-            context=context,
-            action_chunk_raw=action_tensor_raw,
+            q_chunk_feature=chunk_features[:, 0, :],
+            v_state_feature=state_features[:, 0, :],
             metadata={
                 "start_indices": start_indices,
                 "episode_ids": episode_ids,
@@ -388,8 +383,8 @@ class IQLReplayBuffer:
     def preencode_step_cache(
         self,
         *,
-        encoder: "SharedFrozenEncoder",
-        discriminator: "OnlineBCEDiscriminator | None" = None,
+        encoder: "SharedDynamicsEncoder",
+        discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
         encode_batch_size: int = 64,
         cache_device: str = "cpu",
@@ -398,7 +393,7 @@ class IQLReplayBuffer:
         """Encode *every* valid chunk once and return an in-memory cache.
 
         This is a pure training-speed optimization for the offline warmup
-        setting (frozen encoder, static dataset, static LPB disc rewards). The
+        setting (frozen encoder, static dataset, static nnPU rewards). The
         frozen encoder runs under ``no_grad`` and is deterministic, so the
         cached tensors are bit-for-bit what :meth:`sample_step_batch` would
         produce for the same start index. The cache is built in
@@ -417,8 +412,9 @@ class IQLReplayBuffer:
         encode_bs = max(1, int(encode_batch_size))
 
         field_names = (
-            "context",
-            "next_context",
+            "q_chunk_feature",
+            "v_state_feature",
+            "next_v_state_feature",
             "action_chunk",
             "rewards",
             "dones",
@@ -449,8 +445,9 @@ class IQLReplayBuffer:
                 parts[name].append(getattr(batch, name).detach().to(cache_device))
 
         return IQLPreencodedReplayCache(
-            context=torch.cat(parts["context"], dim=0),
-            next_context=torch.cat(parts["next_context"], dim=0),
+            q_chunk_feature=torch.cat(parts["q_chunk_feature"], dim=0),
+            v_state_feature=torch.cat(parts["v_state_feature"], dim=0),
+            next_v_state_feature=torch.cat(parts["next_v_state_feature"], dim=0),
             action_chunk=torch.cat(parts["action_chunk"], dim=0),
             rewards=torch.cat(parts["rewards"], dim=0),
             dones=torch.cat(parts["dones"], dim=0),
@@ -478,8 +475,9 @@ class IQLPreencodedReplayCache:
     def __init__(
         self,
         *,
-        context: torch.Tensor,
-        next_context: torch.Tensor,
+        q_chunk_feature: torch.Tensor,
+        v_state_feature: torch.Tensor,
+        next_v_state_feature: torch.Tensor,
         action_chunk: torch.Tensor,
         rewards: torch.Tensor,
         dones: torch.Tensor,
@@ -487,8 +485,9 @@ class IQLPreencodedReplayCache:
         is_intervention: torch.Tensor,
         source_size: int,
     ) -> None:
-        self.context = context.contiguous()
-        self.next_context = next_context.contiguous()
+        self.q_chunk_feature = q_chunk_feature.contiguous()
+        self.v_state_feature = v_state_feature.contiguous()
+        self.next_v_state_feature = next_v_state_feature.contiguous()
         self.action_chunk = action_chunk.contiguous()
         self.rewards = rewards.contiguous()
         self.dones = dones.contiguous()
@@ -496,9 +495,10 @@ class IQLPreencodedReplayCache:
         self.is_intervention = is_intervention.contiguous()
         self.source_size = int(source_size)
 
-        n = self.context.shape[0]
+        n = self.q_chunk_feature.shape[0]
         for name, tensor in (
-            ("next_context", self.next_context),
+            ("v_state_feature", self.v_state_feature),
+            ("next_v_state_feature", self.next_v_state_feature),
             ("action_chunk", self.action_chunk),
             ("rewards", self.rewards),
             ("dones", self.dones),
@@ -508,28 +508,29 @@ class IQLPreencodedReplayCache:
             if tensor.shape[0] != n:
                 raise ValueError(
                     f"IQLPreencodedReplayCache {name} batch dim {tensor.shape[0]} "
-                    f"!= context batch dim {n}."
+                    f"!= q_chunk_feature batch dim {n}."
                 )
 
     def sample_step_batch(
         self,
         batch_size: int,
         *,
-        encoder: "SharedFrozenEncoder | None" = None,
-        discriminator: "OnlineBCEDiscriminator | None" = None,
+        encoder: "SharedDynamicsEncoder | None" = None,
+        discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
     ) -> IQLStepBatch:
         # `encoder` / `discriminator` are accepted for call-site compatibility
         # and intentionally unused (everything is already encoded).
         del encoder, discriminator
-        n = self.context.shape[0]
+        n = self.q_chunk_feature.shape[0]
         if n == 0:
             raise ValueError("IQLPreencodedReplayCache is empty.")
         sampled = np.random.randint(0, n, size=int(batch_size))
-        idx = torch.from_numpy(sampled).to(device=self.context.device, dtype=torch.long)
+        idx = torch.from_numpy(sampled).to(device=self.q_chunk_feature.device, dtype=torch.long)
         batch = IQLStepBatch(
-            context=self.context.index_select(0, idx),
-            next_context=self.next_context.index_select(0, idx),
+            q_chunk_feature=self.q_chunk_feature.index_select(0, idx),
+            v_state_feature=self.v_state_feature.index_select(0, idx),
+            next_v_state_feature=self.next_v_state_feature.index_select(0, idx),
             action_chunk=self.action_chunk.index_select(0, idx),
             rewards=self.rewards.index_select(0, idx),
             dones=self.dones.index_select(0, idx),
@@ -540,7 +541,7 @@ class IQLPreencodedReplayCache:
         return batch.to(device)
 
     def ready(self, batch_size: int) -> bool:
-        return self.context.shape[0] >= int(batch_size)
+        return self.q_chunk_feature.shape[0] >= int(batch_size)
 
     def __len__(self) -> int:
-        return int(self.context.shape[0])
+        return int(self.q_chunk_feature.shape[0])

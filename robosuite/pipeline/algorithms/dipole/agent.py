@@ -15,13 +15,12 @@ from robosuite.pipeline.common.utils import (
     infer_action_dim,
     infer_observation_example,
 )
-from robosuite.policy.flow_multi.utils.datasets import DEFAULT_TASK_PROMPTS
+from robosuite.policy.flow_multi_update.utils.datasets import DEFAULT_TASK_PROMPTS
 
 from .common import (
     DipoleBatch,
     DipoleConfig,
     FlowAugmentationConfig,
-    LPBDetectorConfig,
     TrainerConfig,
     concat_dipole_batches,
 )
@@ -29,7 +28,7 @@ from .models import DipoleFlowPolicy
 from .replay_buffer import DipoleReplayBuffer
 
 
-_VALID_G_MODES = ("bce_frozen", "advantage")
+_VALID_G_MODES = ("nnpu_frozen", "advantage")
 
 
 def _validate_g_mode(raw: Any) -> str:
@@ -145,18 +144,6 @@ class DipoleAgent:
         task_name = str(cfg_get(cfg, "task_name", "task"))
         task_prompt_map = cfg_get(flow_cfg, "task_prompt_map", None)
 
-        lpb_cfg = cfg_get(dipole_cfg, "lpb_detector", None)
-        camera_to_view_raw = cfg_get(lpb_cfg, "camera_to_view", {}) or {}
-        try:
-            camera_to_view = {str(k): str(v) for k, v in dict(camera_to_view_raw).items()}
-        except Exception:
-            camera_to_view = {}
-        lpb_detector_config = LPBDetectorConfig(
-            ckpt_path=cfg_get(lpb_cfg, "ckpt_path", None),
-            device=str(cfg_get(lpb_cfg, "device", cfg_get(flow_cfg, "device", "cuda:0"))),
-            camera_to_view=camera_to_view,
-        )
-
         flow_config = DipoleConfig(
             action_dim=action_dim,
             proprio_dim=proprio_dim,
@@ -185,8 +172,7 @@ class DipoleAgent:
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
             polarity_embedding_init=str(cfg_get(dipole_cfg, "polarity_embedding_init", "zero_pos")),
             polarity_embedding_init_scale=float(cfg_get(dipole_cfg, "polarity_embedding_init_scale", 2e-3)),
-            lpb_detector=lpb_detector_config,
-            g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "bce_frozen")),
+            g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "nnpu_frozen")),
         )
         online_buffer_config = ReplayBufferConfig(
             capacity=int(cfg_get(online_buffer_cfg, "capacity", cfg_get(cfg, "online_buffer_capacity", 200_000))),
@@ -215,10 +201,6 @@ class DipoleAgent:
             trainer_config=trainer_config,
         )
 
-    @property
-    def lpb_detector_config(self) -> LPBDetectorConfig:
-        return self.flow_config.lpb_detector
-
     def attach_g_provider(self, provider: Any) -> None:
         self.core.set_g_provider(provider)
 
@@ -233,6 +215,12 @@ class DipoleAgent:
 
     def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
         return self.core.plan_action_chunk(obs=obs, deterministic=deterministic)
+
+    def needs_action_chunk(self) -> bool:
+        return self.core.needs_action_chunk()
+
+    def planned_action_chunk(self) -> np.ndarray | None:
+        return self.core.planned_action_chunk()
 
     def reset_policy_state(self) -> None:
         self.core.reset_action_chunk()

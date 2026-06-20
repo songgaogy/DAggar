@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from robosuite.pipeline.common.utils import clone_array_tree
-from robosuite.policy.flow_multi.model import build_flow_policy
+from robosuite.policy.flow_multi_update.model import build_flow_policy
 
 from ..common import FlowDaggerBatch, FlowDaggerConfig
 

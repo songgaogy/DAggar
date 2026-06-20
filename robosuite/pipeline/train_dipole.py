@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,14 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.pipeline.algorithms.dipole import DipoleTrainer, LPBV2GProvider
+from robosuite.pipeline.algorithms.dipole import DipoleTrainer, NNPUGProvider
+from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
+from robosuite.pipeline.algorithms.discriminator.runtime import (
+    EnterKeyListener,
+    build_nnpu_runtime,
+    render_nnpu_hud,
+)
 from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.envs import (
@@ -26,7 +34,7 @@ from robosuite.pipeline.envs import (
     snapshot_env_state,
     sparse_success_reward,
 )
-from robosuite.policy.flow_multi.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
+from robosuite.policy.flow_multi_update.utils.env_util import RobosuiteProprioExtractor, camera_obs_key
 from robosuite.pipeline.utils import (
     AsyncCheckpointWriter,
     AsyncTransitionChunkWriter,
@@ -219,34 +227,6 @@ def format_publish_line(metrics: dict[str, float]) -> str:
     return (
         f"[publish] policy #{int(metrics.get('learner_publish_count', 0.0))} synced "
         f"at learner_update={int(metrics.get('learner_last_published_update', 0.0))}"
-    )
-
-
-# Live discriminator-display defaults (overridable via runtime.discriminator_display_hz).
-DISCRIMINATOR_DISPLAY_HZ: float = 2.0
-
-_ANSI_GREEN = "\033[32m"
-_ANSI_RED = "\033[31m"
-_ANSI_BOLD = "\033[1m"
-_ANSI_RESET = "\033[0m"
-
-
-def format_discriminator_line(
-    *,
-    step: int,
-    episode_index: int,
-    raw: float,
-    tau: float,
-    is_failure: bool,
-) -> str:
-    g_value = -raw  # convention: G > 0 means more expert/safe (g_sign=negate_raw)
-    if is_failure:
-        status = f"{_ANSI_BOLD}{_ANSI_RED}FAIL   {_ANSI_RESET}"
-    else:
-        status = f"{_ANSI_BOLD}{_ANSI_GREEN}SUCCESS{_ANSI_RESET}"
-    return (
-        f"[disc] step={step:>6d} ep={episode_index:>3d}  {status}  "
-        f"G={g_value:+.3f}  raw={raw:+.3f}  tau={tau:+.3f}"
     )
 
 
@@ -711,35 +691,50 @@ def main(cfg: DictConfig) -> None:
     checkpoint_writer.start()
     trainer = DipoleTrainer(agent)
 
-    # Attach the BCE-only LPB v2 G provider. The ckpt MUST be set — without G,
+    # Attach the frozen nnPU G provider. The ckpt MUST be set — without G,
     # DIPOLE degenerates into a pair of identical-loss branches and the CFG
     # combine at inference becomes pure noise.
-    lpb_cfg = cfg.algorithm.dipole.lpb_detector
-    ckpt_raw = lpb_cfg.ckpt_path if lpb_cfg is not None else None
+    disc_cfg = cfg.algorithm.discriminator
+    ckpt_raw = disc_cfg.checkpoint
     if ckpt_raw is None or str(ckpt_raw).strip() == "" or str(ckpt_raw).strip().lower() == "null":
         raise RuntimeError(
-            "DIPOLE requires algorithm.dipole.lpb_detector.ckpt_path to point at a "
-            "pretrained BCE checkpoint produced by run_bce_robosuite_benchmark.sh "
-            "(e.g. checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth)."
+            "DIPOLE requires algorithm.discriminator.checkpoint to point at a "
+            "task-calibrated pu_bce_head.pth."
         )
     ckpt_path = Path(to_absolute_path(str(ckpt_raw)))
     if not ckpt_path.exists():
-        raise FileNotFoundError(f"LPB BCE checkpoint not found: {ckpt_path}")
+        raise FileNotFoundError(f"nnPU checkpoint not found: {ckpt_path}")
+    disc_cfg.checkpoint = str(ckpt_path)
     camera_to_view = {}
     try:
-        camera_to_view = {str(k): str(v) for k, v in dict(lpb_cfg.camera_to_view or {}).items()}
+        camera_to_view = {str(k): str(v) for k, v in dict(disc_cfg.camera_to_view or {}).items()}
     except Exception:
         camera_to_view = {}
-    g_provider = LPBV2GProvider(
-        ckpt_path=str(ckpt_path),
-        task_name=str(task_name),
+    encoder_ckpt = None
+    if disc_cfg.encoder_ckpt is not None and str(disc_cfg.encoder_ckpt).strip().lower() not in ("", "null"):
+        encoder_ckpt = to_absolute_path(str(disc_cfg.encoder_ckpt))
+        disc_cfg.encoder_ckpt = encoder_ckpt
+    nnpu_encoder = SharedDynamicsEncoder(
+        nnpu_ckpt_path=str(ckpt_path),
+        encoder_ckpt=encoder_ckpt,
         device=str(cfg.algorithm.flow.device),
         camera_to_view=camera_to_view,
+    )
+    nnpu_encoder.bind_policy_cameras(list(agent.camera_names))
+    nnpu_discriminator = FrozenNNPUDiscriminator(
+        nnpu_ckpt_path=str(ckpt_path),
+        task_name=str(task_name),
+        device=str(cfg.algorithm.flow.device),
+        encoder=nnpu_encoder,
+    )
+    g_provider = NNPUGProvider(
+        encoder=nnpu_encoder,
+        discriminator=nnpu_discriminator,
     )
     g_provider.bind_policy_cameras(list(agent.camera_names))
     agent.attach_g_provider(g_provider)
     print(
-        f"[dipole] attached BCE provider ckpt={ckpt_path} task={task_name} "
+        f"[dipole] attached frozen nnPU provider ckpt={ckpt_path} task={task_name} "
         f"view_names={g_provider.view_names} policy_cameras={agent.camera_names}"
     )
 
@@ -1011,6 +1006,8 @@ def main(cfg: DictConfig) -> None:
     metric_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=checkpoint_dir)
     device = None
     intervention_runtime = None
+    nnpu_runtime = None
+    enter_listener = EnterKeyListener()
 
     episode_return = 0.0
     episode_length = 0
@@ -1021,17 +1018,6 @@ def main(cfg: DictConfig) -> None:
     policy_gate = IntervalGate(policy_fps)
     spacemouse_gate = IntervalGate(spacemouse_fps)
     overall_fps_tracker = EMAFpsTracker()
-    discriminator_display_hz = float(
-        getattr(cfg.runtime, "discriminator_display_hz", DISCRIMINATOR_DISPLAY_HZ)
-    )
-    disc_log_gate = IntervalGate(discriminator_display_hz) if discriminator_display_hz > 0.0 else None
-    if disc_log_gate is None:
-        print("[INFO] Discriminator display disabled (runtime.discriminator_display_hz <= 0).")
-    else:
-        print(
-            f"[INFO] Discriminator display rate: {discriminator_display_hz:.2f} Hz "
-            f"(BCE threshold tau={g_provider.threshold:+.3f})"
-        )
     last_fps_log_time = time.monotonic()
     training_started_monotonic = last_fps_log_time
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
@@ -1237,6 +1223,24 @@ def main(cfg: DictConfig) -> None:
             goal_update_mode=str(cfg.intervention.goal_update_mode),
         )
 
+    try:
+        nnpu_runtime = build_nnpu_runtime(
+            cfg.algorithm.discriminator,
+            policy_camera_names=list(agent.camera_names),
+            shared_encoder=nnpu_encoder,
+            discriminator=nnpu_discriminator,
+        )
+        if nnpu_runtime is not None:
+            nnpu_runtime.start()
+            enter_listener.start()
+            print(
+                f"[nnPU HUD] scorer started device={nnpu_runtime.cfg.device} "
+                f"fps={nnpu_runtime.cfg.fps:g} threshold={nnpu_runtime.discriminator.threshold:+.3f}"
+            )
+    except Exception as exc:
+        nnpu_runtime = None
+        print(f"[WARN] nnPU HUD/scorer disabled: {type(exc).__name__}: {exc}")
+
     # Refresh the rollout episode after model / demo bootstrap so the first episode starts from the
     # same phase as the original flow_multi eval path, which resets immediately before inference.
     obs, _ = reset_flow_policy_observation(
@@ -1254,6 +1258,8 @@ def main(cfg: DictConfig) -> None:
     spacemouse_gate.force_ready()
     if intervention_runtime is not None:
         intervention_runtime.start_episode()
+    if nnpu_runtime is not None:
+        nnpu_runtime.on_episode_reset()
 
     if async_updates and online_updates_enabled:
         trainer.start_async_worker()
@@ -1264,7 +1270,26 @@ def main(cfg: DictConfig) -> None:
             loop_start = time.monotonic() if control_limiter is None else control_limiter.wait()
             overall_fps_tracker.mark()
 
+            while nnpu_runtime is not None and nnpu_runtime.pause_requested():
+                render_nnpu_hud(
+                    sys.__stdout__, nnpu_runtime.status(), step=step, episode_step=episode_step_index
+                )
+                resume_requested = enter_listener.consume()
+                if intervention_runtime is not None and not resume_requested:
+                    _, sampled_intervention, sampled_reset = intervention_runtime.maybe_override_action(
+                        cached_policy_action
+                    )
+                    resume_requested = bool(sampled_intervention or sampled_reset)
+                if resume_requested:
+                    nnpu_runtime.resume()
+                    print("\n[nnPU HUD] rollout resumed")
+                    break
+                refresh_main_viewer()
+                time.sleep(0.02)
+
+            new_policy_chunk = False
             if unthrottled_runtime or policy_gate.ready(loop_start):
+                new_policy_chunk = agent.needs_action_chunk()
                 cached_policy_action = agent.select_action(
                     obs, deterministic=bool(cfg.runtime.eval_deterministic)
                 )
@@ -1273,6 +1298,7 @@ def main(cfg: DictConfig) -> None:
             is_intervention = False
             reset_requested = False
             if intervention_runtime is not None and (unthrottled_runtime or spacemouse_gate.ready(loop_start)):
+                was_intervening = cached_is_intervention
                 override_action, sampled_is_intervention, reset_requested = intervention_runtime.maybe_override_action(
                     cached_policy_action
                 )
@@ -1283,11 +1309,15 @@ def main(cfg: DictConfig) -> None:
                 elif sampled_is_intervention:
                     cached_override_action = np.asarray(override_action, dtype=np.float32)
                     cached_is_intervention = True
-                    agent.notify_intervention()
-                    policy_gate.force_ready()
+                    if not was_intervening:
+                        agent.notify_intervention()
+                        policy_gate.force_ready()
                 else:
                     cached_override_action = None
                     cached_is_intervention = False
+                    if was_intervening:
+                        agent.reset_policy_state()
+                        policy_gate.force_ready()
 
             if reset_requested:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
@@ -1314,12 +1344,30 @@ def main(cfg: DictConfig) -> None:
                 spacemouse_gate.force_ready()
                 if intervention_runtime is not None:
                     intervention_runtime.start_episode()
+                if nnpu_runtime is not None:
+                    nnpu_runtime.on_episode_reset()
                 maybe_report_runtime(step)
                 continue
 
             if cached_is_intervention and cached_override_action is not None:
                 env_action = np.asarray(cached_override_action, dtype=np.float32)
                 is_intervention = True
+
+            if nnpu_runtime is not None:
+                nnpu_runtime.publish(
+                    images_per_view={name: obs[name] for name in agent.camera_names},
+                    proprio=obs["state"],
+                    executed_action=env_action,
+                    planned_chunk=agent.planned_action_chunk(),
+                    is_new_chunk=new_policy_chunk,
+                )
+                if nnpu_runtime.cfg.hud_enabled:
+                    render_nnpu_hud(
+                        sys.__stdout__,
+                        nnpu_runtime.status(),
+                        step=step,
+                        episode_step=episode_step_index,
+                    )
 
             grasp_penalty = compute_grasp_penalty(env, env_action)
             step_output = env.step(env_action)
@@ -1404,58 +1452,6 @@ def main(cfg: DictConfig) -> None:
             episode_return += reward
             episode_length += 1
             success_count += int(success)
-
-            if disc_log_gate is not None and disc_log_gate.ready(time.monotonic()):
-                try:
-                    chunk_for_disc = agent.plan_action_chunk(
-                        next_obs, deterministic=bool(cfg.runtime.eval_deterministic)
-                    )
-                    disc_info = g_provider.compute_g_for_observation(next_obs, chunk_for_disc)
-                except Exception as exc:
-                    runtime_logger.log(
-                        {
-                            "event": "discriminator_display_error",
-                            "step": int(step),
-                            "episode_index": int(episode_index),
-                            "error": repr(exc),
-                            **event_time_fields(),
-                        }
-                    )
-                else:
-                    is_failure = bool(disc_info["is_failure"])
-                    raw_score = float(disc_info["raw"])
-                    tau_value = float(disc_info["tau"])
-                    print(
-                        format_discriminator_line(
-                            step=step,
-                            episode_index=episode_index,
-                            raw=raw_score,
-                            tau=tau_value,
-                            is_failure=is_failure,
-                        )
-                    )
-                    runtime_logger.log(
-                        {
-                            "event": "discriminator_display",
-                            "step": int(step),
-                            "episode_index": int(episode_index),
-                            "raw": raw_score,
-                            "G": -raw_score,
-                            "tau": tau_value,
-                            "is_failure": int(is_failure),
-                            **event_time_fields(),
-                        }
-                    )
-                    maybe_log(
-                        metric_logger,
-                        {
-                            "discriminator/raw": raw_score,
-                            "discriminator/G": -raw_score,
-                            "discriminator/tau": tau_value,
-                            "discriminator/is_failure": int(is_failure),
-                        },
-                        step=step,
-                    )
 
             if online_updates_enabled:
                 if async_updates:
@@ -1564,6 +1560,8 @@ def main(cfg: DictConfig) -> None:
                 spacemouse_gate.force_ready()
                 if intervention_runtime is not None:
                     intervention_runtime.start_episode()
+                if nnpu_runtime is not None:
+                    nnpu_runtime.on_episode_reset()
             else:
                 obs = next_obs
 
@@ -1571,6 +1569,8 @@ def main(cfg: DictConfig) -> None:
                 request_checkpoint_save(step)
             maybe_report_runtime(step)
     finally:
+        if nnpu_runtime is not None:
+            nnpu_runtime.stop()
         if async_updates:
             trainer.flush_async_updates()
             flushed_metrics = trainer.drain_async_metrics()

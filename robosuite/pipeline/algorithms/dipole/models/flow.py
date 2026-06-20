@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from robosuite.pipeline.algorithms.flow_dagger.models.flow import _center_crop_resize
 from robosuite.pipeline.common.utils import clone_array_tree
-from robosuite.policy.flow_multi.model import MultiModalFlowPolicy, build_flow_policy
+from robosuite.policy.flow_multi_update.model import MultiModalFlowPolicy, build_flow_policy
 
 from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
 
@@ -240,13 +240,24 @@ class DipoleFlowPolicy:
     def notify_intervention(self) -> None:
         self.reset_action_chunk()
 
-    def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
-        execute_horizon = max(1, min(int(self.config.execute_horizon), int(self.config.action_horizon)))
-        if (
+    def needs_action_chunk(self) -> bool:
+        execute_horizon = max(
+            1,
+            min(int(self.config.execute_horizon), int(self.config.action_horizon)),
+        )
+        return bool(
             self.current_chunk is None
             or self.step_in_chunk >= execute_horizon
             or self.step_in_chunk >= len(self.current_chunk)
-        ):
+        )
+
+    def planned_action_chunk(self) -> np.ndarray | None:
+        if self.current_chunk is None:
+            return None
+        return np.asarray(self.current_chunk, dtype=np.float32).copy()
+
+    def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
+        if self.needs_action_chunk():
             images = []
             for camera_name in self.camera_names:
                 image = np.asarray(obs[camera_name], dtype=np.uint8)
@@ -373,10 +384,10 @@ class DipoleFlowPolicy:
         w_neg = 1.0 - w_pos
         n = int(raw.numel())
         metrics = {
-            "raw_lpb_score_mean": float(raw.mean().item()),
-            "raw_lpb_score_std": float(raw.std().item() if n > 1 else 0.0),
-            "raw_lpb_score_min": float(raw.min().item()),
-            "raw_lpb_score_max": float(raw.max().item()),
+            "raw_nnpu_score_mean": float(raw.mean().item()),
+            "raw_nnpu_score_std": float(raw.std().item() if n > 1 else 0.0),
+            "raw_nnpu_score_min": float(raw.min().item()),
+            "raw_nnpu_score_max": float(raw.max().item()),
             "G_mean": float(g_norm.mean().item()),
             "G_std": float(g_norm.std().item() if n > 1 else 0.0),
             "logit_mean": float(logit.mean().item()),
@@ -404,10 +415,10 @@ class DipoleFlowPolicy:
             metrics: dict[str, float] = {
                 "frac_demo_buffer": float(demo_mask.float().mean().item()),
                 "w_pos_mean_demo": 1.0,
-                "raw_lpb_score_mean": 0.0,
-                "raw_lpb_score_std": 0.0,
-                "raw_lpb_score_min": 0.0,
-                "raw_lpb_score_max": 0.0,
+                "raw_nnpu_score_mean": 0.0,
+                "raw_nnpu_score_std": 0.0,
+                "raw_nnpu_score_min": 0.0,
+                "raw_nnpu_score_max": 0.0,
                 "G_mean": 0.0,
                 "G_std": 0.0,
                 "logit_mean": 0.0,

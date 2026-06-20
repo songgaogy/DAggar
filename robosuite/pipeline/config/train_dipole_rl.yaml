@@ -1,17 +1,13 @@
-# DIPOLE-RL training config (DIPOLE flow + IQL Q-chunking + online BCE disc).
+# DIPOLE-RL training config (DIPOLE flow + IQL Q-chunking + frozen nnPU disc).
 #
 # Inherits the existing DIPOLE schema and adds three new sections:
 #   - algorithm.q_learning      (IQLConfig + warmup schedule)
-#   - algorithm.discriminator   (DiscriminatorConfig + online_train switch)
+#   - algorithm.discriminator   (inherited frozen nnPU configuration)
 #   - algorithm.advantage_g_provider  (alpha, beta, normalization modes)
 #
 # To activate the advantage-G path:
 #   algorithm.dipole.g_mode: "advantage"
-# To revert to legacy frozen-BCE G (regression):
-#   algorithm.dipole.g_mode: "bce_frozen"
-#
-# Skeleton — keep keys but commented values until the integrated trainer is
-# implemented.
+# To use discriminator-only G, set algorithm.dipole.g_mode=nnpu_frozen.
 
 defaults:
   - train_dipole
@@ -21,19 +17,7 @@ algorithm:
   type: "dipole_rl"
 
   dipole:
-    lpb_detector:
-      # The legacy LPBV2GProvider is kept around in train_dipole_rl.py for
-      # the disc-display path (live UI overlay) and as the fallback when
-      # g_mode=bce_frozen. It uses the SAME encoder + BCE head as the
-      # online discriminator's warm_start, so we point its ckpt_path at
-      # the same checkpoint the user supplied for the disc warm-start to
-      # avoid silent divergence.
-      ckpt_path: ${algorithm.discriminator.warm_start_ckpt}
-
-    # g_mode is a NEW field added to DipoleConfig; default "bce_frozen" so
-    # existing DIPOLE runs are unaffected until the integrated trainer
-    # actively flips it.
-    g_mode: "advantage"   # "advantage" | "bce_frozen"
+    g_mode: "advantage"   # advantage | nnpu_frozen
 
   q_learning:
     enabled: true
@@ -60,21 +44,7 @@ algorithm:
     warmup_ckpt: null
 
   discriminator:
-    enabled: true
-    online_train: true
-    warm_start_ckpt: "checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth"
-    config:
-      lr: 3.0e-4
-      weight_decay: 1.0e-6
-      hidden: 256
-      num_layers: 2
-      batch_size: 64
-      balance_ratio: 1.0
-      update_freq: 1
-      threshold_ema: 0.99
-      warm_start_ckpt: ${algorithm.discriminator.warm_start_ckpt}
-      label_smoothing: 0.0
-      device: "cuda:1"
+    learner_device: ${algorithm.q_learning.config.device}
 
   advantage_g_provider:
     alpha: 1.0
@@ -102,4 +72,4 @@ warmup:
 
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
-  bootstrap_g_with_frozen_bce: true   # During warmup, force g_mode=bce_frozen.
+  bootstrap_g_with_frozen_nnpu: true  # During warmup, use discriminator-only G.

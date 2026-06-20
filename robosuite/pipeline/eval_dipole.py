@@ -27,7 +27,6 @@ from tqdm import tqdm
 from robosuite.pipeline.algorithms.dipole.common import (
     DipoleConfig,
     FlowAugmentationConfig,
-    LPBDetectorConfig,
 )
 from robosuite.pipeline.algorithms.dipole.models import DipoleFlowPolicy
 from robosuite.pipeline.envs import build_robosuite_env, sparse_success_reward
@@ -162,7 +161,6 @@ def _build_dipole_policy(
 ) -> DipoleFlowPolicy:
     flow_cfg = dict(payload["flow_config"])
     aug_cfg = dict(flow_cfg.get("augmentation", {}) or {})
-    lpb_cfg = dict(flow_cfg.get("lpb_detector", {}) or {})
     config = DipoleConfig(
         action_dim=int(flow_cfg["action_dim"]),
         proprio_dim=int(flow_cfg["proprio_dim"]),
@@ -191,11 +189,6 @@ def _build_dipole_policy(
         g_clip=float(flow_cfg.get("g_clip", 10.0)),
         polarity_embedding_init=str(flow_cfg.get("polarity_embedding_init", "zero_pos")),
         polarity_embedding_init_scale=float(flow_cfg.get("polarity_embedding_init_scale", 1e-3)),
-        lpb_detector=LPBDetectorConfig(
-            ckpt_path=lpb_cfg.get("ckpt_path"),
-            device=str(lpb_cfg.get("device", device)),
-            camera_to_view=dict(lpb_cfg.get("camera_to_view") or {}),
-        ),
     )
     policy = DipoleFlowPolicy(
         model_cfg=dict(payload["model_cfg"]),

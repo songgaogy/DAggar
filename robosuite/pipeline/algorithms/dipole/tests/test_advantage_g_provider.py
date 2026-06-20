@@ -1,9 +1,4 @@
-"""CPU-only smoke tests for AdvantageGProvider.
-
-The provider is exercised against tiny fakes for SharedFrozenEncoder /
-IQLLearner / OnlineBCEDiscriminator so the test runs without CUDA or the
-heavy LPB v2 / Q-network machinery. The mixing math is what we care about.
-"""
+"""CPU-only direction and normalization tests for AdvantageGProvider."""
 
 from __future__ import annotations
 
@@ -16,10 +11,11 @@ import torch
 from robosuite.pipeline.algorithms.dipole.advantage_g_provider import (
     AdvantageGProvider,
 )
+from robosuite.pipeline.algorithms.dipole.agent import DipoleAgent
 
 
 class _FakeEncoder:
-    """Stand-in for SharedFrozenEncoder. Returns a zero context."""
+    """Return deterministic state and action-conditioned chunk features."""
 
     def __init__(self, context_dim: int) -> None:
         self.context_dim = int(context_dim)
@@ -31,17 +27,18 @@ class _FakeEncoder:
         self.bind_calls.append(list(cams))
 
     @torch.no_grad()
-    def encode(
+    def encode_state_and_chunk(
         self,
         *,
         image_obs_raw: torch.Tensor,
         proprio_raw: torch.Tensor,
-        action_real: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        action_chunk: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B = int(image_obs_raw.shape[0])
-        if action_real is not None:
-            self.last_action_real = action_real.detach().clone()
-        return torch.zeros(B, self.context_dim)
+        self.last_action_real = action_chunk.detach().clone()
+        state = torch.zeros(B, self.context_dim)
+        chunk = torch.zeros(B, self.context_dim)
+        return state, chunk
 
 
 class _FakeIQL:
@@ -52,7 +49,7 @@ class _FakeIQL:
 
     @torch.no_grad()
     def compute_advantage_for_batch(self, actor_batch) -> torch.Tensor:
-        B = int(actor_batch.context.shape[0])
+        B = int(actor_batch.q_chunk_feature.shape[0])
         if isinstance(self.advantage_values, torch.Tensor):
             assert self.advantage_values.shape == (B,), (
                 f"fake advantage shape {tuple(self.advantage_values.shape)} != (B={B},)"
@@ -62,27 +59,22 @@ class _FakeIQL:
 
 
 class _FakeDisc:
-    """Returns a deterministic logit tensor."""
+    """Return a deterministic nnPU failure-score tensor."""
 
     def __init__(self, logit_values: torch.Tensor | float) -> None:
         self.logit_values = logit_values
 
     @torch.no_grad()
-    def score(self, *, context: torch.Tensor):
-        B = int(context.shape[0])
+    def failure_score(self, *, chunk_feature: torch.Tensor) -> torch.Tensor:
+        B = int(chunk_feature.shape[0])
         if isinstance(self.logit_values, torch.Tensor):
             assert self.logit_values.shape == (B,), (
                 f"fake logit shape {tuple(self.logit_values.shape)} != (B={B},)"
             )
-            logit = self.logit_values.clone()
+            score = self.logit_values.clone()
         else:
-            logit = torch.full((B,), float(self.logit_values))
-        return SimpleNamespace(
-            logit=logit,
-            prob_failure=torch.sigmoid(logit),
-            decision=logit > 0,
-            metadata={},
-        )
+            score = torch.full((B,), float(self.logit_values))
+        return score
 
 
 def _make_batch(B: int = 4, H: int = 3, D_a: int = 2, D_s: int = 5):
@@ -98,7 +90,7 @@ def _zscore(t: torch.Tensor) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
-# 1. beta=0 -> G == zscore(advantage)                                          #
+# 1. beta=0 -> raw == -zscore(advantage)                                       #
 # --------------------------------------------------------------------------- #
 
 
@@ -117,11 +109,11 @@ def test_g_reduces_to_pure_advantage_when_beta_zero() -> None:
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
     assert g.shape == (B,)
-    assert torch.allclose(g, _zscore(adv), atol=1e-5)
+    assert torch.allclose(g, -_zscore(adv), atol=1e-5)
 
 
 # --------------------------------------------------------------------------- #
-# 2. alpha=0 -> G == -zscore(disc_logit)                                       #
+# 2. alpha=0 -> raw == zscore(failure)                                         #
 # --------------------------------------------------------------------------- #
 
 
@@ -140,11 +132,11 @@ def test_g_reduces_to_negated_disc_when_alpha_zero() -> None:
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
     assert g.shape == (B,)
-    assert torch.allclose(g, -_zscore(logits), atol=1e-5)
+    assert torch.allclose(g, _zscore(logits), atol=1e-5)
 
 
 # --------------------------------------------------------------------------- #
-# 3. mode="none" -> G == alpha*adv + beta*(-logit)                             #
+# 3. mode="none" -> raw == -alpha*adv + beta*failure                          #
 # --------------------------------------------------------------------------- #
 
 
@@ -162,7 +154,7 @@ def test_linear_mixing_with_none_mode() -> None:
         disc_normalization="none",
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
-    expected = 2.0 * adv + 3.0 * (-logits)
+    expected = -2.0 * adv + 3.0 * logits
     assert torch.allclose(g, expected, atol=1e-6)
 
 
@@ -265,3 +257,15 @@ def test_unknown_normalization_mode_rejected() -> None:
             beta=0.0,
             advantage_normalization="ema",
         )
+
+
+def test_agent_attach_g_provider_is_a_method() -> None:
+    class Core:
+        def set_g_provider(self, provider) -> None:
+            self.provider = provider
+
+    agent = object.__new__(DipoleAgent)
+    agent.core = Core()
+    provider = object()
+    agent.attach_g_provider(provider)
+    assert agent.core.provider is provider

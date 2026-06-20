@@ -14,13 +14,8 @@ from .agent import DipoleAgent
 
 
 if TYPE_CHECKING:
-    from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-    from robosuite.pipeline.algorithms.discriminator.online_bce import (
-        OnlineBCEDiscriminator,
-    )
-    from robosuite.pipeline.algorithms.discriminator.replay import (
-        DiscriminatorReplayBuffer,
-    )
+    from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+    from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
     from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
     from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
 
@@ -35,14 +30,11 @@ class DipoleTrainer:
         config=None,
         *,
         iql_learner: "IQLLearner | None" = None,
-        discriminator: "OnlineBCEDiscriminator | None" = None,
+        discriminator: "FrozenNNPUDiscriminator | None" = None,
         iql_replay: "IQLReplayBuffer | None" = None,
-        disc_replay: "DiscriminatorReplayBuffer | None" = None,
-        shared_encoder: "SharedFrozenEncoder | None" = None,
+        shared_encoder: "SharedDynamicsEncoder | None" = None,
         learner_device: str = "cuda:1",
         iql_batch_size: int = 64,
-        disc_batch_size: int = 64,
-        disc_update_freq: int = 1,
         iql_update_freq: int = 1,
     ) -> None:
         self.agent = agent
@@ -65,12 +57,9 @@ class DipoleTrainer:
         self.iql_learner = iql_learner
         self.discriminator = discriminator
         self.iql_replay = iql_replay
-        self.disc_replay = disc_replay
         self.shared_encoder = shared_encoder
         self.learner_device = str(learner_device)
         self.iql_batch_size = int(iql_batch_size)
-        self.disc_batch_size = int(disc_batch_size)
-        self.disc_update_freq = int(disc_update_freq)
         self.iql_update_freq = int(iql_update_freq)
 
     def bootstrap_demo_buffer(
@@ -144,11 +133,7 @@ class DipoleTrainer:
             demo_source=demo_source or ("intervention" if is_intervention else None),
         )
         self.agent.store_transition(transition)
-        # DIPOLE-RL fanout: disc_replay reclassifies lazily but we still hand the
-        # transition to it (currently a no-op) so future swaps remain symmetric.
-        # iql_replay shares the agent.online_buffer by reference; no add needed.
-        if self.disc_replay is not None:
-            self.disc_replay.add_from_transition(transition)
+        # IQL replay shares the agent online buffer by reference; no add needed.
         self.total_env_steps += 1
         return transition
 
@@ -191,8 +176,8 @@ class DipoleTrainer:
                 with torch.no_grad():
                     adv = self.iql_learner.compute_advantage_for_batch(
                         IQLActorBatch(
-                            context=step_batch.context,
-                            action_chunk_raw=step_batch.action_chunk,
+                            q_chunk_feature=step_batch.q_chunk_feature,
+                            v_state_feature=step_batch.v_state_feature,
                         )
                     )
                 metrics["advantage_mean"] = float(adv.mean().item())
@@ -208,25 +193,12 @@ class DipoleTrainer:
                             meta["disc_reward_first_frame_mean"]
                         )
 
-        # 2. Discriminator BCE head (before flow so disc logit in G is current).
-        if (
-            self.discriminator is not None
-            and self.disc_replay is not None
-            and self.disc_replay.ready(self.disc_batch_size)
-        ):
-            for _ in range(self.disc_update_freq):
-                disc_batch = self.disc_replay.sample(self.disc_batch_size, device=self.learner_device)
-                disc_metrics = self.discriminator.update(disc_batch)
-                for k, v in disc_metrics.items():
-                    metrics[f"disc/{k}"] = float(v)
-
-        # 3. Flow / policy update last (online:demo 1:1 batch; uses g_provider from steps 1–2).
+        # 2. Flow / policy update last (online:demo 1:1 batch).
         batch = self.agent.sample_training_batch(batch_size=batch_size)
         flow_metrics = dict(self.agent.update(batch=batch))
         metrics.update(flow_metrics)
 
         metrics["iql_update_freq"] = float(self.iql_update_freq)
-        metrics["disc_update_freq"] = float(self.disc_update_freq)
         self.total_updates += 1
         return metrics
 

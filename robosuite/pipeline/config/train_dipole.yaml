@@ -117,11 +117,26 @@ algorithm:
     polarity_embedding_init: "zero_pos"   # zero_pos | zero_neg | small_gaussian | antipodal
     polarity_embedding_init_scale: 2.0e-3
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
+    g_mode: "nnpu_frozen"             # nnpu_frozen | advantage
 
-    lpb_detector:
-      ckpt_path: "checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth"   # pretrained BCE; MUST be set
-      device: ${algorithm.flow.device}
-      camera_to_view: {}              # {policy_camera_name: encoder_view_name}; default identity
+  # Frozen nnPU failure model. The checkpoint is task-calibrated and embeds
+  # the dynamics encoder checkpoint unless encoder_ckpt is overridden.
+  discriminator:
+    enabled: true
+    task_name: ${env.environment}
+    checkpoint: null                  # required: path to pu_bce_head.pth
+    encoder_ckpt: null
+    learner_device: ${algorithm.flow.device}
+    camera_to_view: {}
+    inference:
+      device: "cuda:0"
+      fps: -1                         # <=0: once per new policy chunk; >0: fixed Hz
+      intervene_env: true
+    pause:
+      consecutive_fail_frames: 2
+      require_safe_to_rearm: true
+    hud:
+      enabled: true
 
   online_buffer:
     capacity: 200000
@@ -169,7 +184,6 @@ runtime:
   spacemouse_fps: ${runtime.control_fps}
   policy_fps: ${runtime.control_fps}
   fps_log_interval: 1.0
-  discriminator_display_hz: 2.0  # live [disc] line refresh rate in console; 0 disables
   async_updates: true
   online_updates_enabled: true
   eval_episode_max_steps: 300

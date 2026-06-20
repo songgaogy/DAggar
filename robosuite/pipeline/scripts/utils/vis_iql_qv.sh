@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Visualize IQL Q/V on HDF5 rollout windows (see algorithms/q_learning/utils/vis_qv.py).
-# Env vars mirror init_iql_qv.sh so LPB / IQL paths stay consistent.
+# Env vars mirror init_iql_qv.sh so nnPU / IQL paths stay consistent.
 #
+# Experiment constants:
+#   ENVIRONMENT, SEED, SPLIT, TARGET_PATH, and BRANCH_NAME are intentionally
+#   set below. Edit them for a different experiment.
 # Optional env vars:
-#   ENVIRONMENT       — task env name (default PickPlaceCereal, same as init_iql_qv.sh).
 #   DEMO_TASK_NAME    — HDF5 subdir under data/ (default: ENVIRONMENT).
-#   LPB_CKPT          — BCE head for r_disc + discriminator HUD (default: bce_ckeckpoints/<ENV>/bce_head.pth).
-#   LPB_META_JSON     — Youden threshold metadata (default: sibling meta.json).
+#   NNPU_CKPT         — nnPU head for r_disc + discriminator HUD.
 #   OUTPUT_DIR        — IQL warmup output dir (default: outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
 #   IQL_CKPT          — trained IQL state (default: ${OUTPUT_DIR}/iql_state.pt).
 #   SPLIT             — HDF5 subdir split (success_rollout | fail_rollout; BON only for success_rollout).
 #   SEED              — demo selection seed (default 42).
 #   DEVICE            — torch device (default cuda:1).
-#   NO_DISC_VIZ       — set to 1 to skip discriminator/ HUD (LPB BCE benchmark path).
+#   NO_DISC_VIZ       — set to 1 to skip discriminator visualization.
 #   Q_DIAG_NOISE_SIGMAS     — comma-separated full-chunk Gaussian sigmas (default 0.05,0.10,0.20).
 #   Q_DIAG_NUM_RANDOM       — uniform random chunks per window (default 16).
 #   Q_DIAG_SINGLE_DIM_SIGMA — Gaussian sigma for one-action-dim perturbation (default 0.20).
@@ -35,9 +36,7 @@ BRANCH_NAME="DIPOLE_rl"
 
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
-LPB_CKPT_DIR="${LPB_CKPT_DIR:-${ROOT_DIR}/checkpoints/lpb_v2/bce_ckeckpoints/${ENVIRONMENT}}"
-LPB_CKPT="${LPB_CKPT:-${LPB_CKPT_DIR}/bce_head.pth}"
-LPB_META_JSON="${LPB_META_JSON:-${LPB_CKPT_DIR}/meta.json}"
+NNPU_CKPT="${NNPU_CKPT:-}"
 TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
 IQL_CKPT="${TARGET_DIR}/iql_state.pt"
 OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
@@ -63,23 +62,15 @@ if [[ ! -f "${IQL_CKPT}" ]]; then
   echo "          ENVIRONMENT=${ENVIRONMENT} bash robosuite/pipeline/scripts/utils/init_iql_qv.sh" >&2
   exit 1
 fi
-if [[ ! -f "${LPB_CKPT}" ]]; then
-  echo "[ERROR] LPB BCE checkpoint not found: ${LPB_CKPT}" >&2
-  echo "        Set LPB_CKPT or ENVIRONMENT (same layout as init_iql_qv.sh)." >&2
+if [[ -z "${NNPU_CKPT}" || ! -f "${NNPU_CKPT}" ]]; then
+  echo "[ERROR] NNPU_CKPT must point to a task-calibrated pu_bce_head.pth: ${NNPU_CKPT:-<unset>}" >&2
   exit 1
 fi
-if [[ ! -f "${LPB_META_JSON}" ]]; then
-  echo "[ERROR] LPB meta.json not found: ${LPB_META_JSON}" >&2
-  echo "        Expected bce_youden_threshold next to bce_head.pth." >&2
-  exit 1
-fi
-LPB_TAU="$("${PY}" -c "import json, sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['bce_youden_threshold'])" "${LPB_META_JSON}")"
 
 
 echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seed=${SEED}"
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
-echo "[vis_iql_qv] lpb_ckpt=${LPB_CKPT}"
-echo "[vis_iql_qv] lpb_meta=${LPB_META_JSON} bce_youden_threshold=${LPB_TAU}"
+echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 echo "[vis_iql_qv] device=${DEVICE}"
 echo "[vis_iql_qv] q_diag_noise_sigmas=${Q_DIAG_NOISE_SIGMAS} q_diag_random_n=${Q_DIAG_NUM_RANDOM} single_dim_sigma=${Q_DIAG_SINGLE_DIM_SIGMA} single_dim_n=${Q_DIAG_SINGLE_DIM_N} q_diag_seed=${Q_DIAG_SEED}"
 
@@ -101,7 +92,7 @@ exec "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
   --iql-ckpt "${IQL_CKPT}" \
   --output-root "${OUTPUT_DIR}" \
   --task-data-name "${DEMO_TASK_NAME}" \
-  --disc-ckpt "${LPB_CKPT}" \
+  --disc-ckpt "${NNPU_CKPT}" \
   --split "${SPLIT}" \
   --seed "${SEED}" \
   --device "${DEVICE}" \

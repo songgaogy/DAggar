@@ -1,7 +1,7 @@
 """Offline Q/V warmup entry point for IQL.
 
 Loads HDF5 expert (and optional success/failure) demos for a single task,
-encodes them with the SharedFrozenEncoder, then runs `warmup_value_only`
+encodes them with the SharedDynamicsEncoder, then runs `warmup_value_only`
 followed by full IQL `update` steps. Dumps `iql_state.pt` for the online
 phase to pick up via `algorithm.q_learning.warmup_ckpt`.
 
@@ -39,11 +39,8 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-from robosuite.pipeline.algorithms.discriminator.lpb_v2_scorer import (
-    LPBV2OfflineScorer,
-    annotate_transitions_lpb_by_demo,
-)
+from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
 from robosuite.pipeline.algorithms.flow_dagger.common import (
     FlowAugmentationConfig,
     ReplayBufferConfig,
@@ -261,7 +258,6 @@ def _load_split_into_buffer(
     renderer: str,
     episode_index_base: int,
     max_num_trajectories: int | None,
-    lpb_scorer: LPBV2OfflineScorer | None,
     control_freq: int,
     num_load_workers: int,
     load_worker_start_method: str,
@@ -363,16 +359,6 @@ def _load_split_into_buffer(
         if not path_transitions:
             continue
         _tag_transitions_with_hdf5_path(path_transitions, raw_path)
-        if lpb_scorer is not None:
-            n_demos = annotate_transitions_lpb_by_demo(
-                path_transitions,
-                lpb_scorer,
-                fps=int(control_freq),
-            )
-            print(
-                f"[warmup][lpb] scored {n_demos} demos in {Path(raw_path).name} "
-                f"tau={lpb_scorer.tau:.6f}"
-            )
         next_base = _annotate_episode_metadata(
             path_transitions,
             buffer_role="offline",
@@ -451,7 +437,7 @@ def main(cfg: DictConfig) -> None:
     }
 
     # Build env so we can extract proprio from HDF5 states using the same
-    # extractor train_dipole.py uses (the LPB encoder was trained against
+    # extractor train_dipole.py uses (the dynamics encoder was trained against
     # that exact proprio format).
     flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
     # Offline warmup reads images from HDF5 and proprio from flattened states;
@@ -466,8 +452,7 @@ def main(cfg: DictConfig) -> None:
         renderer=str(cfg.env.renderer),
     )
     print(f"[warmup] building env env={task_name} cameras={policy_camera_names}")
-    lpb_scorer: LPBV2OfflineScorer | None = None
-    disc_cfg_dict: dict[str, Any] = {}
+    discriminator: FrozenNNPUDiscriminator | None = None
 
     env = build_robosuite_env(main_runtime_cfg)
     try:
@@ -477,7 +462,13 @@ def main(cfg: DictConfig) -> None:
         print(f"[warmup] policy_action_dim={policy_action_dim}")
 
         # Build encoder and bind to policy cameras.
-        bce_ckpt = to_absolute_path(str(cfg.algorithm.discriminator.warm_start_ckpt))
+        nnpu_ckpt = to_absolute_path(str(cfg.algorithm.discriminator.checkpoint))
+        encoder_ckpt_raw = OmegaConf.select(
+            cfg, "algorithm.discriminator.encoder_ckpt", default=None
+        )
+        encoder_ckpt = (
+            to_absolute_path(str(encoder_ckpt_raw)) if encoder_ckpt_raw else None
+        )
         requested_device = str(q_cfg_block.config.device)
         default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         device = resolve_requested_device(requested_device, fallback=default_device)
@@ -488,15 +479,22 @@ def main(cfg: DictConfig) -> None:
             )
         camera_to_view: dict[str, str] = {
             str(k): str(v)
-            for k, v in dict(OmegaConf.select(cfg, "algorithm.dipole.lpb_detector.camera_to_view", default={}) or {}).items()
+            for k, v in dict(OmegaConf.select(cfg, "algorithm.discriminator.camera_to_view", default={}) or {}).items()
         }
-        print(f"[warmup] building SharedFrozenEncoder from {bce_ckpt} on {device}")
-        encoder = SharedFrozenEncoder(
-            bce_ckpt_path=bce_ckpt,
+        print(f"[warmup] building SharedDynamicsEncoder from {nnpu_ckpt} on {device}")
+        encoder = SharedDynamicsEncoder(
+            nnpu_ckpt_path=nnpu_ckpt,
+            encoder_ckpt=encoder_ckpt,
             device=device,
             camera_to_view=camera_to_view,
         )
         encoder.bind_policy_cameras(policy_camera_names)
+        discriminator = FrozenNNPUDiscriminator(
+            nnpu_ckpt_path=nnpu_ckpt,
+            task_name=str(cfg.algorithm.discriminator.task_name),
+            device=device,
+            encoder=encoder,
+        )
 
         iql_cfg_dict = OmegaConf.to_container(q_cfg_block.config, resolve=True)
         iql_cfg_dict["device"] = device
@@ -554,27 +552,6 @@ def main(cfg: DictConfig) -> None:
             f"start_method={load_worker_start_method}"
         )
 
-        disc_cfg_dict = OmegaConf.to_container(
-            cfg.algorithm.discriminator.config, resolve=True
-        )
-        if "warm_start_ckpt" in disc_cfg_dict and disc_cfg_dict["warm_start_ckpt"]:
-            disc_cfg_dict["warm_start_ckpt"] = to_absolute_path(
-                str(disc_cfg_dict["warm_start_ckpt"])
-            )
-        if float(iql_cfg.disc_reward_coef) != 0.0:
-            meta_json = disc_cfg_dict.get("meta_json_path")
-            lpb_scorer = LPBV2OfflineScorer(
-                bce_ckpt_path=bce_ckpt,
-                task_name=str(task_data_name),
-                device=str(device),
-                batch_size=32,
-                meta_json_path=(
-                    str(Path(to_absolute_path(str(meta_json))).resolve())
-                    if meta_json
-                    else None
-                ),
-            )
-
         print("[warmup] start loading splits... it may takes a few minutes...")
         episode_index_base = 0
         total_loaded = 0
@@ -594,7 +571,6 @@ def main(cfg: DictConfig) -> None:
                 renderer=str(cfg.env.renderer),
                 episode_index_base=episode_index_base,
                 max_num_trajectories=split_caps[split],
-                lpb_scorer=lpb_scorer,
                 control_freq=int(cfg.env.control_freq),
                 num_load_workers=num_load_workers,
                 load_worker_start_method=load_worker_start_method,
@@ -614,7 +590,12 @@ def main(cfg: DictConfig) -> None:
         env.close()
 
     # Build IQL learner and replay sampler.
-    iql = IQLLearner(cfg=iql_cfg, context_dim=encoder.context_dim, action_dim=policy_action_dim)
+    iql = IQLLearner(
+        cfg=iql_cfg,
+        state_feature_dim=encoder.state_feature_dim,
+        chunk_feature_dim=encoder.chunk_feature_dim,
+        action_dim=policy_action_dim,
+    )
     replay = IQLReplayBuffer(base_buffer=buffer, cfg=iql_cfg)
     if not replay.ready(batch_size):
         raise RuntimeError(
@@ -622,13 +603,11 @@ def main(cfg: DictConfig) -> None:
             f"to fill batch_size={batch_size}."
         )
 
-    lpb_tau = float(lpb_scorer.tau) if lpb_scorer is not None else None
-    lpb_tau_source = str(lpb_scorer.tau_source) if lpb_scorer is not None else None
     print(
-        f"[warmup] disc_reward: LPB benchmark scores on transition.info "
+        f"[warmup] disc_reward: frozen nnPU scores on chunk features "
         f"(coef={float(iql_cfg.disc_reward_coef)} "
         f"output_reward_coef={float(iql_cfg.output_reward_coef)} "
-        f"tau={lpb_tau} source={lpb_tau_source})"
+        f"threshold={getattr(discriminator, 'threshold', None)} source=checkpoint)"
     )
 
     # Optional pre-encoded replay cache: encode every valid chunk once up front
@@ -651,7 +630,7 @@ def main(cfg: DictConfig) -> None:
         )
         train_replay = replay.preencode_step_cache(
             encoder=encoder,
-            discriminator=None,
+            discriminator=discriminator,
             device=device,
             encode_batch_size=preencode_batch_size,
             cache_device=cache_device,
@@ -659,29 +638,13 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[warmup] preencoded cache ready: {len(train_replay)} chunks")
 
-    # Per-action-dim z-score stats over all valid chunk actions, computed once
-    # from the base buffer (robust regardless of preencode_cache). Injected into
-    # every critic's buffers BEFORE training so Q sees normalized actions, and
-    # saved alongside iql_state.pt for explicit load at eval/vis.
-    H_stats = int(iql_cfg.action_horizon)
-    action_samples: list[np.ndarray] = []
-    with buffer._lock:  # noqa: SLF001
-        for s in list(buffer._get_valid_start_indices_locked()):  # noqa: SLF001
-            for item in buffer._storage[s : s + H_stats]:  # noqa: SLF001
-                action_samples.append(np.asarray(item.action, dtype=np.float32).reshape(-1))
-    action_stack = np.stack(action_samples, axis=0)  # (N * H, D_a)
-    action_mean = action_stack.mean(axis=0)
-    action_std = action_stack.std(axis=0) + 1e-6
-    iql.set_action_norm_stats(action_mean, action_std)
-    print(f"[warmup] action_norm: mean={action_mean} std={action_std}")
-
-    # Warmup loops (r_disc from pre-annotated LPB fields; no OnlineBCEDiscriminator).
+    # Action normalization is owned by the frozen dynamics encoder.
     print(f"[warmup] starting value-only loop for {value_steps} steps (batch={batch_size})")
     for step in range(value_steps):
         batch = train_replay.sample_step_batch(
             batch_size,
             encoder=encoder,
-            discriminator=None,
+            discriminator=discriminator,
             device=device,
         )
         metrics = iql.warmup_value_only(batch)
@@ -697,7 +660,7 @@ def main(cfg: DictConfig) -> None:
         batch = train_replay.sample_step_batch(
             batch_size,
             encoder=encoder,
-            discriminator=None,
+            discriminator=discriminator,
             device=device,
         )
         metrics = iql.update(batch)
@@ -713,29 +676,28 @@ def main(cfg: DictConfig) -> None:
         "iql_state": iql.state_dict(),
         "cfg": asdict(iql_cfg),
         "encoder_meta": {
-            "bce_ckpt": bce_ckpt,
-            "context_dim": int(encoder.context_dim),
+            "nnpu_checkpoint": nnpu_ckpt,
+            "state_feature_dim": int(encoder.state_feature_dim),
+            "chunk_feature_dim": int(encoder.chunk_feature_dim),
             "view_names": list(encoder.view_names),
             "policy_camera_names": list(policy_camera_names),
             "task": task_data_name,
             "task_env": task_name,
+            "nnpu_task": str(discriminator.task_name),
             "policy_action_dim": int(policy_action_dim),
-            "disc_warm_start_ckpt": str(bce_ckpt),
-            "meta_json_path": str(disc_cfg_dict.get("meta_json_path", "")),
-            "bce_youden_threshold": float(lpb_tau) if lpb_tau is not None else float("nan"),
-            "bce_threshold_source": str(lpb_tau_source or ""),
+            "threshold": (
+                float(discriminator.threshold) if discriminator is not None else float("nan")
+            ),
+            "threshold_source": "checkpoint",
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
             "output_reward_coef": float(iql_cfg.output_reward_coef),
-            "disc_reward_source": "LPBV2OfflineScorer(-sigmoid(failure_score - tau))",
+            "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
         },
-        "schema_version": 1,
+        "schema_version": 2,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")
 
-    stats_path = output_path.parent / "action_norm_stats.pt"
-    torch.save({"action_mean": action_mean, "action_std": action_std}, stats_path)
-    print(f"[warmup] wrote action_norm stats to {stats_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

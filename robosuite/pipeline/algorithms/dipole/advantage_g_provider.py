@@ -1,20 +1,18 @@
-"""G provider that mixes Q-V advantage with the online BCE logit.
+"""G provider that mixes Q-V advantage with frozen nnPU failure scores.
 
-Replaces `LPBV2GProvider` when DipoleConfig.g_mode == "advantage".
+Replaces `NNPUGProvider` when DipoleConfig.g_mode == "advantage".
 Implements the exact same `compute_g_for_batch(batch) -> (B,)` contract so
 `DipoleFlowPolicy.update()` is unchanged.
 
 Math:
-    A(s, a)        = min(Q1(s, a), Q2(s, a)) - V(s)
+    A(s, a)        = mean(Q_1(s, a), ..., Q_K(s, a)) - V(s)
     A_norm         = normalize(A,         mode=advantage_normalization)
-    disc_logit     = OnlineBCEDiscriminator.score(s, a).logit
-    disc_norm      = normalize(disc_logit, mode=disc_normalization)
-    G              = alpha * A_norm + beta * (-disc_norm)
-                              ^                  ^
-                              advantage          disc; sign-flip keeps
-                                                 higher = more failure-like
-                                                 to match DIPOLE's existing
-                                                 sigmoid convention.
+    failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
+    failure_norm   = normalize(failure, mode=disc_normalization)
+    raw            = -alpha * A_norm + beta * failure_norm
+
+The policy's existing ``g_sign=negate_raw`` then yields the preference
+``G = alpha * A_norm - beta * failure_norm``.
 
 The flow policy then maps G -> w_pos = sigmoid(beta_policy * G + k).
 
@@ -31,10 +29,8 @@ import torch
 from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
 
 if TYPE_CHECKING:
-    from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-    from robosuite.pipeline.algorithms.discriminator.online_bce import (
-        OnlineBCEDiscriminator,
-    )
+    from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+    from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
     from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 
 
@@ -46,8 +42,8 @@ class AdvantageGProvider:
 
     Args:
         iql_learner:           the IQL learner; provides advantage.
-        discriminator:         online BCE; provides disc_logit.
-        encoder:               shared frozen encoder; used to build context
+        discriminator:         frozen nnPU head; provides failure score.
+        encoder:               shared frozen encoder; used to build features
                                from `DipoleBatch.image_obs_raw` + `proprio_raw`.
         alpha, beta:           linear mixing coefficients.
         advantage_normalization, disc_normalization:
@@ -59,8 +55,8 @@ class AdvantageGProvider:
         self,
         *,
         iql_learner: "IQLLearner",
-        discriminator: "OnlineBCEDiscriminator",
-        encoder: "SharedFrozenEncoder",
+        discriminator: "FrozenNNPUDiscriminator",
+        encoder: "SharedDynamicsEncoder",
         alpha: float,
         beta: float,
         advantage_normalization: str = "batch_zscore",
@@ -89,7 +85,7 @@ class AdvantageGProvider:
         self._disc_running_count = 0
 
     # ------------------------------------------------------------------ #
-    # G provider contract (matches LPBV2GProvider)                        #
+    # G provider contract                                                  #
     # ------------------------------------------------------------------ #
 
     @torch.no_grad()
@@ -104,45 +100,38 @@ class AdvantageGProvider:
         action_chunk_raw = batch.action_sequences_raw.to(
             device=torch.device(self.encoder.device), dtype=torch.float32
         )
-        # Encoder is single-frame and consumes the proposed action via
-        # `action_real`. Use the chunk's first step — consistent with the
-        # IQL replay's chunk-start `context` and with the lpb v2 BCE head's
-        # training-time inputs.
-        first_action = action_chunk_raw[:, 0, :]
-        context = self.encoder.encode(
+        state_feature, chunk_feature = self.encoder.encode_state_and_chunk(
             image_obs_raw=batch.image_obs_raw,
             proprio_raw=batch.proprio_raw,
-            action_real=first_action,
+            action_chunk=action_chunk_raw,
         )
 
-        action_chunk_raw = action_chunk_raw.to(device=context.device)
-
         actor_batch = IQLActorBatch(
-            context=context,
-            action_chunk_raw=action_chunk_raw,
+            q_chunk_feature=chunk_feature,
+            v_state_feature=state_feature,
             metadata={},
         )
 
         advantage = self.iql_learner.compute_advantage_for_batch(actor_batch)
         advantage = advantage.reshape(-1)
 
-        disc_out = self.discriminator.score(context=context)
-        disc_logit = disc_out.logit.reshape(-1)
+        failure_score = self.discriminator.failure_score(
+            chunk_feature=chunk_feature
+        ).reshape(-1)
 
         a_norm = self._normalize(advantage, mode=self.advantage_normalization, stats="advantage")
-        d_norm = self._normalize(disc_logit, mode=self.disc_normalization, stats="disc")
+        d_norm = self._normalize(failure_score, mode=self.disc_normalization, stats="disc")
 
-        g = self.alpha * a_norm + self.beta * (-d_norm)
-        return g.to(batch.action_sequences_raw.device).reshape(-1)
+        raw = -self.alpha * a_norm + self.beta * d_norm
+        return raw.to(batch.action_sequences_raw.device).reshape(-1)
 
     @torch.no_grad()
     def compute_g_for_observation(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Single-observation variant. Not supported by AdvantageGProvider:
-        eval/UI scoring uses the frozen `LPBV2GProvider` path instead."""
+        eval/UI scoring uses the background nnPU runtime instead."""
         raise NotImplementedError(
             "AdvantageGProvider does not support single-observation scoring; "
-            "use compute_g_for_batch in training, and the frozen "
-            "LPBV2GProvider path for eval-time UI scoring."
+            "use compute_g_for_batch in training and the nnPU runtime for UI scoring."
         )
 
     def bind_policy_cameras(self, policy_cameras: list[str]) -> None:

@@ -28,14 +28,21 @@ class IQLLearner:
 
     Args:
         cfg:           IQLConfig.
-        context_dim:   D_ctx of the frozen encoder.
-        action_dim:    per-step POLICY action dim D_a (NOT encoder
-                       action_dim_per_step). Q input = D_ctx + H * D_a.
+        state_feature_dim: action-free encoder feature dimension used by V.
+        chunk_feature_dim: action-conditioned encoder feature dimension used by Q.
+        action_dim: policy action dimension retained as checkpoint metadata.
     """
 
-    def __init__(self, cfg: IQLConfig, context_dim: int, action_dim: int) -> None:
+    def __init__(
+        self,
+        cfg: IQLConfig,
+        state_feature_dim: int,
+        chunk_feature_dim: int,
+        action_dim: int,
+    ) -> None:
         self.cfg = cfg
-        self.context_dim = int(context_dim)
+        self.state_feature_dim = int(state_feature_dim)
+        self.chunk_feature_dim = int(chunk_feature_dim)
         self.action_dim = int(action_dim)
         device = cfg.device
 
@@ -44,20 +51,18 @@ class IQLLearner:
         self.q_ensemble: nn.ModuleList = nn.ModuleList(
             [
                 QChunkNetwork(
-                    context_dim=self.context_dim,
-                    action_dim=self.action_dim,
-                    action_horizon=int(cfg.action_horizon),
+                    chunk_feature_dim=self.chunk_feature_dim,
                     hidden_dims=tuple(cfg.hidden_dims),
                 )
                 for _ in range(self.q_ensemble_size)
             ]
         ).to(device)
         self.v: nn.Module = VNetwork(
-            context_dim=self.context_dim,
+            context_dim=self.state_feature_dim,
             hidden_dims=tuple(cfg.hidden_dims),
         ).to(device)
         self.target_v: nn.Module = VNetwork(
-            context_dim=self.context_dim,
+            context_dim=self.state_feature_dim,
             hidden_dims=tuple(cfg.hidden_dims),
         ).to(device)
         self.target_v.load_state_dict(self.v.state_dict())
@@ -88,20 +93,6 @@ class IQLLearner:
         """
         return self.q_ensemble[min(1, self.q_ensemble_size - 1)]
 
-    def set_action_norm_stats(self, mean: Any, std: Any) -> None:
-        """Populate the per-action-dim z-score buffers on every critic.
-
-        Stats are computed once from the offline dataset during warmup (see
-        warmup.py) and travel with the checkpoint as registered buffers, so
-        eval/vis pick them up via load_state_dict. std is floored to avoid
-        divide-by-zero on constant action dims.
-        """
-        m = torch.as_tensor(mean, dtype=torch.float32)
-        s = torch.as_tensor(std, dtype=torch.float32).clamp_min(1e-6)
-        for q in self.q_ensemble:
-            q.action_mean.copy_(m.to(q.action_mean.device))
-            q.action_std.copy_(s.to(q.action_std.device))
-
     # ------------------------------------------------------------------ #
     # Internals                                                            #
     # ------------------------------------------------------------------ #
@@ -110,14 +101,14 @@ class IQLLearner:
         """Bellman target r + γ^H · (1 - done) · target_v(s')."""
         bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
         with torch.no_grad():
-            v_next = self.target_v(step_batch.next_context)
+            v_next = self.target_v(step_batch.next_v_state_feature)
             target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
 
-    def _q_values(self, context: torch.Tensor, action_chunk: torch.Tensor) -> torch.Tensor:
+    def _q_values(self, chunk_feature: torch.Tensor) -> torch.Tensor:
         """Return all critic predictions as (K, B, 1)."""
         return torch.stack(
-            [q(context, action_chunk) for q in self.q_ensemble],
+            [q(chunk_feature) for q in self.q_ensemble],
             dim=0,
         )
 
@@ -139,7 +130,7 @@ class IQLLearner:
         """
         target_q = self._bootstrap_target(step_batch)
 
-        q_values = self._q_values(step_batch.context, step_batch.action_chunk)
+        q_values = self._q_values(step_batch.q_chunk_feature)
         q_loss = bellman_q_loss(q_values, target_q.expand_as(q_values))
         self.q_optim.zero_grad(set_to_none=True)
         q_loss.backward()
@@ -157,7 +148,7 @@ class IQLLearner:
             q_subset = q_values.detach().index_select(0, subset_idx)
             q_min = q_subset.min(dim=0).values
 
-        v_pred = self.v(step_batch.context)
+        v_pred = self.v(step_batch.v_state_feature)
         diff = q_min - v_pred
         v_loss = expectile_v_loss(diff, float(self.cfg.expectile_tau))
         self.v_optim.zero_grad(set_to_none=True)
@@ -188,7 +179,7 @@ class IQLLearner:
         well-defined. V regresses toward r + γ^H · (1 - done) · target_v(s')
         directly (no min-of-two-Q)."""
         target = self._bootstrap_target(step_batch)
-        v_pred = self.v(step_batch.context)
+        v_pred = self.v(step_batch.v_state_feature)
         v_loss = torch.nn.functional.mse_loss(v_pred, target)
         self.v_optim.zero_grad(set_to_none=True)
         v_loss.backward()
@@ -208,8 +199,8 @@ class IQLLearner:
     @torch.no_grad()
     def compute_advantage_for_batch(self, actor_batch: IQLActorBatch) -> torch.Tensor:
         """Return A(s, a_chunk) shape (B,). Pure inference, no grads."""
-        q_values = self._q_values(actor_batch.context, actor_batch.action_chunk_raw)
-        v = self.v(actor_batch.context)
+        q_values = self._q_values(actor_batch.q_chunk_feature)
+        v = self.v(actor_batch.v_state_feature)
         return compute_ensemble_advantage(q_values, v)
 
     # ------------------------------------------------------------------ #
@@ -226,16 +217,28 @@ class IQLLearner:
             "q_optim": self.q_optim.state_dict(),
             "v_optim": self.v_optim.state_dict(),
             "cfg": asdict(self.cfg),
-            "context_dim": self.context_dim,
+            "state_feature_dim": self.state_feature_dim,
+            "chunk_feature_dim": self.chunk_feature_dim,
             "action_dim": self.action_dim,
         }
 
     def load_state_dict(self, sd: dict[str, Any], strict: bool = True) -> None:
+        if "state_feature_dim" not in sd or "chunk_feature_dim" not in sd:
+            raise ValueError(
+                "IQLLearner.load_state_dict: checkpoint uses the legacy LPB "
+                "single-context critic schema. Re-run offline Q/V warmup with "
+                "the nnPU chunk encoder."
+            )
         if strict:
-            if int(sd.get("context_dim", -1)) != self.context_dim:
+            if int(sd["state_feature_dim"]) != self.state_feature_dim:
                 raise ValueError(
-                    f"IQLLearner.load_state_dict: context_dim mismatch "
-                    f"(ckpt={sd.get('context_dim')}, runtime={self.context_dim})"
+                    "IQLLearner.load_state_dict: state_feature_dim mismatch "
+                    f"(ckpt={sd['state_feature_dim']}, runtime={self.state_feature_dim})"
+                )
+            if int(sd["chunk_feature_dim"]) != self.chunk_feature_dim:
+                raise ValueError(
+                    "IQLLearner.load_state_dict: chunk_feature_dim mismatch "
+                    f"(ckpt={sd['chunk_feature_dim']}, runtime={self.chunk_feature_dim})"
                 )
             if int(sd.get("action_dim", -1)) != self.action_dim:
                 raise ValueError(

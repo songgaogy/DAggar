@@ -21,7 +21,7 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class DipoleReplayBuffer(FlowDaggerReplayBuffer):
     """FlowDagger buffer that additionally exposes per-sample is_intervention and
-    raw (un-ImageNet-normalized) images / proprio / actions for the LPB encoder."""
+    raw (un-ImageNet-normalized) images / proprio / actions for the dynamics encoder."""
 
     def sample(
         self,
@@ -117,7 +117,7 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (raw_unit, imagenet_normalized) image tensors.
 
-        - raw_unit: [0, 1] floats after the same augmentation pipeline (consumed by LPB encoder)
+        - raw_unit: [0, 1] floats after the same augmentation pipeline (consumed by DynEncoder)
         - imagenet_normalized: raw_unit with ImageNet mean/std subtracted (consumed by policy)
         """
         images = images.to(dtype=torch.float32).div_(255.0)

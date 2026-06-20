@@ -14,10 +14,6 @@ import threading
 import numpy as np
 import torch
 
-# Import the discriminator package first to initialize it before
-# q_learning.replay (they have a known circular dependency that only bites when
-# replay.py is imported first; see test_replay_lpb_disc.py).
-import robosuite.pipeline.algorithms.discriminator  # noqa: F401
 from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.replay import (
     IQLPreencodedReplayCache,
@@ -27,6 +23,7 @@ from robosuite.pipeline.common.types import Transition
 
 H = 2
 CONTEXT_DIM = 5
+STATE_DIM = 4
 CAMERA = "agentview"
 VALID_STARTS = [0, 1, 2, 3, 4]
 
@@ -38,18 +35,22 @@ class _FakeEncoder:
     were selected, not just the same shapes.
     """
 
-    context_dim = CONTEXT_DIM
+    state_feature_dim = STATE_DIM
+    chunk_feature_dim = CONTEXT_DIM
     view_names = [CAMERA]
 
-    def encode_chunk_frames(self, *, chunk_images, chunk_proprio, chunk_actions):
+    def encode_features(self, *, chunk_images, chunk_proprio, chunk_actions):
         base = chunk_actions.sum(dim=-1) + chunk_proprio.sum(dim=-1)  # (B, H)
-        ctx = base.unsqueeze(-1).repeat(1, 1, CONTEXT_DIM)
-        return ctx + torch.arange(CONTEXT_DIM, dtype=ctx.dtype).view(1, 1, -1)
+        chunk = base.unsqueeze(-1).repeat(1, 1, CONTEXT_DIM)
+        chunk = chunk + torch.arange(CONTEXT_DIM, dtype=chunk.dtype).view(1, 1, -1)
+        state = base.unsqueeze(-1).repeat(1, 1, STATE_DIM)
+        state = state + torch.arange(STATE_DIM, dtype=state.dtype).view(1, 1, -1)
+        return state, chunk
 
-    def encode(self, *, image_obs_raw, proprio_raw, action_real):
-        base = action_real.sum(dim=-1) + proprio_raw.sum(dim=-1)  # (B,)
-        ctx = base.unsqueeze(-1).repeat(1, CONTEXT_DIM)
-        return ctx + torch.arange(CONTEXT_DIM, dtype=ctx.dtype).view(1, -1) * 10.0
+    def encode_state(self, *, image_obs_raw, proprio_raw):
+        base = proprio_raw.sum(dim=-1)
+        state = base.unsqueeze(-1).repeat(1, STATE_DIM)
+        return state + torch.arange(STATE_DIM, dtype=state.dtype).view(1, -1) * 10.0
 
 
 class _FakeBase:
@@ -79,7 +80,7 @@ class _FakeBase:
             reward=float(i) * 0.1,
             next_obs=nxt,
             done=False,
-            info={"episode_index": 0, "episode_step": i, "lpb_disc_intrinsic": -0.1 * i},
+            info={"episode_index": 0, "episode_step": i, "nnpu_disc_intrinsic": -0.1 * i},
         )
 
     def _get_valid_start_indices_locked(self):
@@ -103,8 +104,9 @@ def _cfg() -> IQLConfig:
 
 def _assert_batches_equal(a, b) -> None:
     for name in (
-        "context",
-        "next_context",
+        "q_chunk_feature",
+        "v_state_feature",
+        "next_v_state_feature",
         "action_chunk",
         "rewards",
         "dones",
@@ -163,5 +165,41 @@ def test_cache_row_order_matches_valid_starts() -> None:
     for i, start in enumerate(VALID_STARTS):
         seq = [base._storage[start + k] for k in range(H)]
         one = replay._build_step_batch([seq], [start], encoder=enc, device="cpu")
-        assert torch.equal(cache.context[i : i + 1], one.context)
+        assert torch.equal(cache.q_chunk_feature[i : i + 1], one.q_chunk_feature)
+        assert torch.equal(cache.v_state_feature[i : i + 1], one.v_state_feature)
         assert torch.equal(cache.rewards[i : i + 1], one.rewards)
+
+
+def test_live_replay_scores_nnpu_when_metadata_is_absent() -> None:
+    class Discriminator:
+        def __init__(self) -> None:
+            self.features = None
+
+        def intrinsic_reward(self, *, chunk_feature):
+            self.features = chunk_feature.detach().clone()
+            values = torch.tensor([-0.25, -0.5], dtype=chunk_feature.dtype)
+            return values.view(1, H).expand(chunk_feature.shape[0], -1)
+
+    base = _FakeBase(n=8)
+    for transition in base._storage:
+        transition.info.pop("nnpu_disc_intrinsic", None)
+    replay = IQLReplayBuffer(base_buffer=base, cfg=_cfg())
+    discriminator = Discriminator()
+
+    np.random.seed(1)
+    batch = replay.sample_step_batch(
+        2,
+        encoder=_FakeEncoder(),
+        discriminator=discriminator,
+        device="cpu",
+    )
+
+    assert discriminator.features is not None
+    assert discriminator.features.shape == (2, H, CONTEXT_DIM)
+    starts = batch.metadata["start_indices"]
+    expected = []
+    for start in starts:
+        env = torch.tensor([0.1 * start, 0.1 * (start + 1)])
+        disc = torch.tensor([-0.25, -0.5])
+        expected.append(((env + disc) * torch.tensor([1.0, 0.99])).sum())
+    torch.testing.assert_close(batch.rewards[:, 0], torch.stack(expected))

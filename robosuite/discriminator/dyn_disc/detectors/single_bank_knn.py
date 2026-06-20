@@ -336,6 +336,163 @@ class DynEncoder:
         action_in = self.normalizer["act"].normalize(action_in)
         return action_in.reshape(batch_size, 1, self.action_input_dim)
 
+    def _prepare_action_chunks_tensor(self, actions: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Return flattened, train-aligned action windows without leaving torch."""
+        action = actions.to(self.device, dtype=torch.float32, non_blocking=True)
+        if action.ndim == 2 and action.shape[-1] == self.action_input_dim:
+            return action.contiguous()
+        if action.ndim == 2:
+            action = action.unsqueeze(1)
+        if action.ndim != 3 or action.shape[0] != batch_size:
+            raise ValueError(
+                "actions must be (B, H, D_a) or (B, action_input_dim); "
+                f"got {tuple(action.shape)}"
+            )
+        if action.shape[1] == 0:
+            raise ValueError("action chunk horizon cannot be zero")
+
+        if action.shape[-1] < self.action_dim_per_step:
+            pad = torch.zeros(
+                (*action.shape[:-1], self.action_dim_per_step - action.shape[-1]),
+                device=action.device,
+                dtype=action.dtype,
+            )
+            action = torch.cat([action, pad], dim=-1)
+        elif action.shape[-1] > self.action_dim_per_step:
+            action = action[..., : self.action_dim_per_step]
+
+        if action.shape[1] < self.frameskip:
+            tail = action[:, -1:, :].expand(-1, self.frameskip - action.shape[1], -1)
+            action = torch.cat([action, tail], dim=1)
+        else:
+            action = action[:, : self.frameskip, :]
+
+        flat = action.reshape(batch_size, -1)
+        if flat.shape[-1] < self.action_input_dim:
+            pad = torch.zeros(
+                (batch_size, self.action_input_dim - flat.shape[-1]),
+                device=flat.device,
+                dtype=flat.dtype,
+            )
+            flat = torch.cat([flat, pad], dim=-1)
+        elif flat.shape[-1] > self.action_input_dim:
+            flat = flat[:, : self.action_input_dim]
+        return flat.contiguous()
+
+    def _encode_observation_batch(
+        self,
+        images_per_view: Dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Normalize and encode the action-free observation once."""
+        if not images_per_view:
+            raise ValueError("images_per_view cannot be empty")
+        B = next(iter(images_per_view.values())).shape[0]
+        missing = [v for v in self.view_names if v not in images_per_view]
+        if missing:
+            raise KeyError(f"Missing dynamics encoder views: {missing}")
+
+        visual_in: Dict[str, torch.Tensor] = {}
+        for view in self.view_names:
+            x = images_per_view[view].to(self.device, dtype=torch.float32, non_blocking=True)
+            if x.ndim != 4 or x.shape[0] != B or x.shape[1] != 3:
+                raise ValueError(
+                    f"images_per_view[{view!r}] must be (B, 3, H, W); got {tuple(x.shape)}"
+                )
+            if not bool(getattr(self.model.encoder, "normalizes_images", False)):
+                x = self.normalizer[view].normalize(x)
+                x = self.img_transform(
+                    x.view(-1, 3, self.original_img_size, self.original_img_size)
+                )
+            visual_in[view] = x.view(B, 1, 3, x.shape[-2], x.shape[-1])
+
+        proprio_in = self.normalizer["state"].normalize(
+            proprio.to(self.device, dtype=torch.float32, non_blocking=True)
+        )
+        if proprio_in.ndim == 2:
+            proprio_in = proprio_in.unsqueeze(1)
+        if proprio_in.ndim != 3 or proprio_in.shape[0] != B:
+            raise ValueError(f"proprio must be (B, D); got {tuple(proprio.shape)}")
+        return self.model.encode_obs({"visual": visual_in, "proprio": proprio_in})
+
+    @staticmethod
+    def _flatten_state_encoding(enc: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Flatten visual and proprio embeddings into an action-free state latent."""
+        visual = enc["visual"]
+        proprio = enc["proprio"]
+        if visual.ndim >= 3 and visual.shape[1] == 1:
+            visual = visual.squeeze(1)
+        if proprio.ndim >= 3 and proprio.shape[1] == 1:
+            proprio = proprio.squeeze(1)
+        return torch.cat(
+            [visual.reshape(visual.shape[0], -1), proprio.reshape(proprio.shape[0], -1)],
+            dim=-1,
+        )
+
+    @torch.no_grad()
+    def encode_state_batch(
+        self,
+        images_per_view: Dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode visual + proprio state without injecting an action."""
+        enc = self._encode_observation_batch(images_per_view, proprio)
+        return self._flatten_state_encoding(enc)
+
+    @torch.no_grad()
+    def encode_chunk_batch(
+        self,
+        images_per_view: Dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode a state fused with the complete train-aligned action window."""
+        enc = self._encode_observation_batch(images_per_view, proprio)
+        return self._encode_chunk_from_encoding(enc, action_chunk)
+
+    def _encode_chunk_from_encoding(
+        self,
+        enc: Dict[str, torch.Tensor],
+        action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse a precomputed observation encoding with an action window."""
+        B = int(enc["visual"].shape[0])
+        flat_actions = self._prepare_action_chunks_tensor(action_chunk, B)
+        action_in = self._normalize_flat_actions(flat_actions, B)
+        action_emb = self.model.encode_act(action_in)
+
+        if self.feature_source == "transformer":
+            visual_emb = enc["visual"]
+            proprio_emb = enc["proprio"]
+            if visual_emb.ndim == 4:
+                num_patches = visual_emb.shape[2]
+                proprio_emb = proprio_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
+                action_emb = action_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
+            z = torch.cat([visual_emb, proprio_emb, action_emb], dim=-1)
+            if z.ndim == 4:
+                z = z.reshape(z.shape[0], z.shape[1] * z.shape[2], z.shape[3])
+            feat = self.model.predictor.extract_transformer_features(
+                z, layer_index=self.transformer_layer
+            )
+            return feat.reshape(feat.shape[0], -1)
+
+        state = self._flatten_state_encoding(enc)
+        action_emb = action_emb.reshape(action_emb.shape[0], -1)
+        return torch.cat([state, action_emb], dim=-1)
+
+    @torch.no_grad()
+    def encode_state_and_chunk_batch(
+        self,
+        images_per_view: Dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute state and chunk features with one visual/proprio forward."""
+        enc = self._encode_observation_batch(images_per_view, proprio)
+        state = self._flatten_state_encoding(enc)
+        chunk = self._encode_chunk_from_encoding(enc, action_chunk)
+        return state, chunk
+
     @torch.no_grad()
     def encode_batch(
         self,
@@ -353,56 +510,6 @@ class DynEncoder:
                 (typically produced by `prepare_actions`).
               - feature_source="transformer": required per-step actions shaped (B, action_dim_per_step).
         """
-        B = next(iter(images_per_view.values())).shape[0]
-
-        visual_in: Dict[str, torch.Tensor] = {}
-        for v in self.view_names:
-            x = images_per_view[v].to(self.device, non_blocking=True)
-            if not bool(getattr(self.model.encoder, "normalizes_images", False)):
-                x = self.normalizer[v].normalize(x)  # per-view image normalize
-                x = self.img_transform(x.view(-1, 3, self.original_img_size, self.original_img_size))
-            x = x.view(B, 1, 3, x.shape[-2], x.shape[-1])  # add T=1
-            visual_in[v] = x
-
-        proprio_in = self.normalizer["state"].normalize(proprio.to(self.device, non_blocking=True))
-        if proprio_in.dim() == 2:
-            proprio_in = proprio_in.unsqueeze(1)  # (B, 1, D)
-
-        obs = {"visual": visual_in, "proprio": proprio_in}
-        enc = self.model.encode_obs(obs)
-        if self.feature_source == "transformer":
-            if actions is None:
-                raise ValueError("actions are required when feature_source='transformer'")
-            action_in = self._normalize_flat_actions(actions, B)
-            act_emb = self.model.encode_act(action_in)
-            visual_emb = enc["visual"]
-            proprio_emb = enc["proprio"]
-            if visual_emb.dim() == 4:
-                num_patches = visual_emb.shape[2]
-                proprio_emb = proprio_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
-                act_emb = act_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
-            z = torch.cat([visual_emb, proprio_emb, act_emb], dim=-1)
-            if z.dim() == 4:
-                z = z.reshape(z.shape[0], z.shape[1] * z.shape[2], z.shape[3])
-            feat = self.model.predictor.extract_transformer_features(
-                z,
-                layer_index=self.transformer_layer,
-            )
-            return feat.reshape(feat.shape[0], -1)
-
         if actions is None:
-            raise ValueError("actions are required when feature_source='encoder'")
-
-        v = enc["visual"].squeeze(1) if enc["visual"].dim() == 3 else enc["visual"]
-        p = enc["proprio"].squeeze(1) if enc["proprio"].dim() == 3 else enc["proprio"]
-        if v.dim() > 2:
-            v = v.reshape(v.shape[0], -1)
-        if p.dim() > 2:
-            p = p.reshape(p.shape[0], -1)
-
-        action_in = self._normalize_flat_actions(actions, B)
-        a = self.model.encode_act(action_in).squeeze(1)
-        if a.dim() > 2:
-            a = a.reshape(a.shape[0], -1)
-        return torch.cat([v, p, a], dim=-1)
-
+            raise ValueError("actions are required for chunk encoding")
+        return self.encode_chunk_batch(images_per_view, proprio, actions)

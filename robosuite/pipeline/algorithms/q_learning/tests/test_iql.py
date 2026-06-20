@@ -50,11 +50,18 @@ def _make_cfg(action_horizon: int = 2) -> IQLConfig:
     )
 
 
-def _make_step_batch(B: int = 8, D_ctx: int = 16, D_a: int = 4, H: int = 2) -> IQLStepBatch:
+def _make_step_batch(
+    B: int = 8,
+    D_state: int = 12,
+    D_chunk: int = 16,
+    D_a: int = 4,
+    H: int = 2,
+) -> IQLStepBatch:
     torch.manual_seed(0)
     return IQLStepBatch(
-        context=torch.randn(B, D_ctx),
-        next_context=torch.randn(B, D_ctx),
+        q_chunk_feature=torch.randn(B, D_chunk),
+        v_state_feature=torch.randn(B, D_state),
+        next_v_state_feature=torch.randn(B, D_state),
         action_chunk=torch.randn(B, H, D_a),
         rewards=torch.randn(B, 1),
         dones=torch.zeros(B, 1),
@@ -143,8 +150,8 @@ def test_chunk_done_mask() -> None:
 
 def test_iql_update_step_runs_and_moves_params() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    batch = _make_step_batch(B=8, D_ctx=16, D_a=4, H=2)
+    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    batch = _make_step_batch(B=8, D_state=12, D_chunk=16, D_a=4, H=2)
 
     # Step v away from its zero-init final layer using one warmup pass so the
     # initial degenerate case (q_min == v_pred == 0 => expectile_v_loss == 0)
@@ -171,8 +178,8 @@ def test_iql_update_step_runs_and_moves_params() -> None:
 
 def test_iql_warmup_value_only_runs() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    batch = _make_step_batch(B=8, D_ctx=16, D_a=4, H=2)
+    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    batch = _make_step_batch(B=8, D_state=12, D_chunk=16, D_a=4, H=2)
     snapshot_q1 = [p.detach().clone() for p in iql.q1.parameters()]
     snapshot_v = [p.detach().clone() for p in iql.v.parameters()]
     metrics = iql.warmup_value_only(batch)
@@ -192,10 +199,10 @@ def test_iql_warmup_value_only_runs() -> None:
 
 def test_iql_state_dict_roundtrip() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql_b = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
     # Run one step on A so its weights diverge from B's fresh init.
-    batch = _make_step_batch(B=4, D_ctx=16, D_a=4, H=2)
+    batch = _make_step_batch(B=4, D_state=12, D_chunk=16, D_a=4, H=2)
     iql_a.update(batch)
     sd = iql_a.state_dict()
     iql_b.load_state_dict(sd, strict=True)
@@ -205,19 +212,23 @@ def test_iql_state_dict_roundtrip() -> None:
         assert torch.equal(pa, pb)
 
 
-def test_iql_load_state_dict_mismatched_context_dim_raises() -> None:
+def test_iql_load_state_dict_mismatched_feature_dim_raises() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    iql_c = IQLLearner(cfg=cfg, context_dim=8, action_dim=4)  # mismatched context_dim
+    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql_c = IQLLearner(cfg=cfg, state_feature_dim=8, chunk_feature_dim=16, action_dim=4)
     sd = iql_a.state_dict()
-    with pytest.raises(ValueError, match="context_dim mismatch"):
+    with pytest.raises(ValueError, match="state_feature_dim mismatch"):
         iql_c.load_state_dict(sd, strict=True)
+
+    iql_d = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=8, action_dim=4)
+    with pytest.raises(ValueError, match="chunk_feature_dim mismatch"):
+        iql_d.load_state_dict(sd, strict=True)
 
 
 def test_iql_old_two_q_checkpoint_schema_raises() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
+    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql_b = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
     sd = iql_a.state_dict()
     old_sd = dict(sd)
     old_sd.pop("q_ensemble")
@@ -229,39 +240,20 @@ def test_iql_old_two_q_checkpoint_schema_raises() -> None:
         iql_b.load_state_dict(old_sd, strict=True)
 
 
-def test_qchunk_input_dim_is_context_plus_action_embed() -> None:
-    from robosuite.pipeline.algorithms.q_learning.networks import (
-        _ACTION_EMBED_DIM,
-        QChunkNetwork,
-    )
+def test_qchunk_consumes_chunk_feature_directly() -> None:
+    from robosuite.pipeline.algorithms.q_learning.networks import QChunkNetwork
 
-    q = QChunkNetwork(context_dim=16, action_dim=4, action_horizon=2, hidden_dims=(32, 32))
-    assert q._input_dim == 16 + _ACTION_EMBED_DIM
-    # Forward produces (B, 1) and is non-trivial (action_proj is not zero-init,
-    # so the embedding is not identically zero at startup).
-    out = q(torch.randn(5, 16), torch.randn(5, 2, 4))
+    q = QChunkNetwork(chunk_feature_dim=16, hidden_dims=(32, 32))
+    assert q._input_dim == 16
+    out = q(torch.randn(5, 16))
     assert out.shape == (5, 1)
 
 
-def test_set_action_norm_stats_populates_all_critics_and_roundtrips() -> None:
+def test_legacy_lpb_checkpoint_requires_new_warmup() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    mean = torch.tensor([0.1, -0.2, 0.3, -0.4])
-    std = torch.tensor([1.0, 2.0, 0.5, 3.0])
-    iql_a.set_action_norm_stats(mean, std)
-    for q in iql_a.q_ensemble:
-        assert torch.allclose(q.action_mean, mean)
-        assert torch.allclose(q.action_std, std)
-
-    # std floor: a zero std becomes 1e-6, never zero.
-    iql_a.set_action_norm_stats(torch.zeros(4), torch.zeros(4))
-    for q in iql_a.q_ensemble:
-        assert torch.all(q.action_std >= 1e-6)
-
-    # Stats travel with the checkpoint as registered buffers.
-    iql_a.set_action_norm_stats(mean, std)
-    iql_b = IQLLearner(cfg=cfg, context_dim=16, action_dim=4)
-    iql_b.load_state_dict(iql_a.state_dict(), strict=True)
-    for q in iql_b.q_ensemble:
-        assert torch.allclose(q.action_mean, mean)
-        assert torch.allclose(q.action_std, std)
+    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    legacy = iql.state_dict()
+    legacy["context_dim"] = legacy.pop("state_feature_dim")
+    legacy.pop("chunk_feature_dim")
+    with pytest.raises(ValueError, match="legacy LPB.*Re-run offline Q/V warmup"):
+        iql.load_state_dict(legacy, strict=True)

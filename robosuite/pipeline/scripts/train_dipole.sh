@@ -20,15 +20,15 @@ EXECUTE_HORIZON="${EXECUTE_HORIZON:-4}"
 N_ODE_STEPS="${N_ODE_STEPS:-10}"
 EVAL_EPISODE_MAX_STEPS="${EVAL_EPISODE_MAX_STEPS:-300}"
 FPS_LOG_INTERVAL="${FPS_LOG_INTERVAL:-3.0}"
-DISCRIMINATOR_DISPLAY_HZ="${DISCRIMINATOR_DISPLAY_HZ:-2.0}"   # live [disc] console line; 0 disables
+DISC_INFERENCE_FPS="${DISC_INFERENCE_FPS:--1}"
+DISC_INTERVENE_ENV="${DISC_INTERVENE_ENV:-true}"
 UNTHROTTLED="${UNTHROTTLED:-false}"
 
 # ----------------------------------------------------------------------------------------------
-# REQUIRED: flow-policy base checkpoint. The LPB BCE ckpt defaults to the
-# shared multi-task artefact produced by run_bce_robosuite_benchmark.sh.
+# REQUIRED: flow-policy base checkpoint and task-calibrated nnPU head.
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt}"
-# NOTE: not suit for PandaStack
-LPB_CKPT="${LPB_CKPT:-${ROOT_DIR}/checkpoints/lpb_v2/bce_viz_robosuite/viz_bce_PickPlaceBread-20260518_014008/checkpoints/bce_head.pth}"
+NNPU_CKPT="${NNPU_CKPT:-}"
+NNPU_ENCODER_CKPT="${NNPU_ENCODER_CKPT:-null}"
 
 # DIPOLE hyperparameters.
 BETA="${BETA:-1.0}"
@@ -43,7 +43,7 @@ POLARITY_INIT_SCALE="${POLARITY_INIT_SCALE:-1.0e-3}"
 
 # Optional: camera_to_view JSON object, e.g. '{robot0_robotview: agentview}'.
 # Leave empty to use identity (policy camera_name == encoder view_name).
-LPB_CAMERA_TO_VIEW="${LPB_CAMERA_TO_VIEW:-{}}"
+NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-{}}"
 # ----------------------------------------------------------------------------------------------
 
 
@@ -140,6 +140,10 @@ if [[ "${CHECKPOINT}" != "null" && ! -f "${CHECKPOINT}" ]]; then
   echo "[ERROR] Checkpoint file does not exist: ${CHECKPOINT}" >&2
   exit 1
 fi
+if [[ -z "${NNPU_CKPT}" || ! -f "${NNPU_CKPT}" ]]; then
+  echo "[ERROR] NNPU_CKPT must point to a task-calibrated pu_bce_head.pth: ${NNPU_CKPT:-<unset>}" >&2
+  exit 1
+fi
 
 EFFECTIVE_OMEGA="${OMEGA_RUNTIME_OVERRIDE:-${OMEGA}}"
 
@@ -158,7 +162,6 @@ TRAIN_DIPOLE_CMD=(
   runtime.viewer_async="${VIEWER_ASYNC}" \
   runtime.viewer_backend="${VIEWER_BACKEND}" \
   runtime.fps_log_interval="${FPS_LOG_INTERVAL}" \
-  runtime.discriminator_display_hz="${DISCRIMINATOR_DISPLAY_HZ}" \
   runtime.buffer_save_interval="${BUFFER_SAVE_INTERVAL}" \
   runtime.unthrottled="${UNTHROTTLED}" \
   runtime.async_updates="${ASYNC_UPDATES}" \
@@ -185,8 +188,11 @@ TRAIN_DIPOLE_CMD=(
   algorithm.dipole.g_clip="${G_CLIP}" \
   algorithm.dipole.polarity_embedding_init="${POLARITY_INIT}" \
   algorithm.dipole.polarity_embedding_init_scale="${POLARITY_INIT_SCALE}" \
-  algorithm.dipole.lpb_detector.ckpt_path="${LPB_CKPT}" \
-  algorithm.dipole.lpb_detector.camera_to_view="${LPB_CAMERA_TO_VIEW}" \
+  algorithm.discriminator.checkpoint="${NNPU_CKPT}" \
+  algorithm.discriminator.encoder_ckpt="${NNPU_ENCODER_CKPT}" \
+  algorithm.discriminator.camera_to_view="${NNPU_CAMERA_TO_VIEW}" \
+  algorithm.discriminator.inference.fps="${DISC_INFERENCE_FPS}" \
+  algorithm.discriminator.inference.intervene_env="${DISC_INTERVENE_ENV}" \
   logging.use_tensorboard="${LOGGING_USE_TENSORBOARD}" \
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.log_interval="${LOG_INTERVAL}" \
@@ -200,10 +206,10 @@ TRAIN_DIPOLE_CMD=(
 
 # Train with intervention + online updates:
 #   INIT_CHECKPOINT=/abs/flow_dagger_latest.pt \
-#   LPB_CKPT=checkpoints/lpb_v2/robosuite_ckpt/bce_head.pth \
+#   NNPU_CKPT=checkpoints/dyn_disc/.../checkpoints/pu_bce_head.pth \
 #   bash robosuite/pipeline/scripts/train_dipole.sh
 #
 # Sweep omega at eval time without retraining:
 #   DIPOLE_MODE=eval OMEGA_RUNTIME_OVERRIDE=4 \
-#   INIT_CHECKPOINT=... LPB_CKPT=... \
+#   INIT_CHECKPOINT=... NNPU_CKPT=... \
 #   bash robosuite/pipeline/scripts/train_dipole.sh

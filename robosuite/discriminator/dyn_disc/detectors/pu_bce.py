@@ -228,6 +228,39 @@ class PUBCEDiscriminator:
     # Internal forward helpers                                           #
     # ------------------------------------------------------------------ #
 
+    def logits_tensor(self, features: torch.Tensor) -> torch.Tensor:
+        """Return success-likeness logits while preserving tensor/device flow."""
+        if features.shape[-1] != self.in_dim:
+            raise ValueError(
+                f"feature dim mismatch: expected {self.in_dim}, got {features.shape[-1]}"
+            )
+        leading_shape = features.shape[:-1]
+        flat = features.reshape(-1, self.in_dim).to(self.device, dtype=torch.float32)
+        logits = self.head(flat)
+        return logits.reshape(leading_shape)
+
+    def failure_score_tensor(self, features: torch.Tensor) -> torch.Tensor:
+        """Return ``-g(z)``; larger values are more failure-like."""
+        return -self.logits_tensor(features)
+
+    # Short aliases keep tensor inference ergonomic without changing the
+    # existing numpy ``score(...)`` benchmark API.
+    logits = logits_tensor
+    failure_scores = failure_score_tensor
+
+    def threshold_tensor(self, features: torch.Tensor, task: str) -> torch.Tensor:
+        """Return the calibrated task threshold on ``features``' output device."""
+        if task not in self.thresholds:
+            raise KeyError(
+                f"Task {task!r} has no calibrated threshold. "
+                f"Available: {sorted(self.thresholds)}"
+            )
+        return torch.as_tensor(
+            self.thresholds[task],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
     @torch.no_grad()
     def _logits_np(self, features: torch.Tensor, batch_size: int = 4096) -> np.ndarray:
         """Run the head in eval mode and return (N,) numpy g(z) values."""
@@ -238,7 +271,7 @@ class PUBCEDiscriminator:
         outs: List[np.ndarray] = []
         for start in range(0, f.shape[0], batch_size):
             chunk = f[start : start + batch_size]
-            g = self.head(chunk)
+            g = self.logits_tensor(chunk)
             outs.append(g.detach().cpu().numpy().astype(np.float32))
         return np.concatenate(outs, axis=0)
 

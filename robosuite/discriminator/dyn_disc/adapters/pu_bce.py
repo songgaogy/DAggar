@@ -160,6 +160,23 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             )
 
     @staticmethod
+    def _assert_disjoint(
+        eval_trajs: Sequence[BenchmarkTrajectory],
+        unlabeled_fail_trajs: Sequence[BenchmarkTrajectory],
+    ) -> None:
+        """Compatibility wrapper for the original disjointness check."""
+        eval_keys = {str(trajectory.video_id) for trajectory in eval_trajs}
+        unlabeled_keys = {
+            str(trajectory.video_id) for trajectory in unlabeled_fail_trajs
+        }
+        overlap = sorted(eval_keys & unlabeled_keys)
+        if overlap:
+            raise RuntimeError(
+                "PUBCEBenchmarkDiscriminator disjointness invariant violated:\n  - "
+                f"eval intersect unlabeled_fail = {overlap}"
+            )
+
+    @staticmethod
     def _assert_disjoint_train_eval_success(
         train_success_trajs: Sequence[BenchmarkTrajectory],
         eval_trajs: Sequence[BenchmarkTrajectory],

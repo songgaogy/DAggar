@@ -1,4 +1,4 @@
-"""DIPOLE-RL training entry: DIPOLE flow + IQL Q-chunking + online BCE disc.
+"""DIPOLE-RL training entry: DIPOLE flow + IQL Q-chunking + frozen nnPU.
 
 This module is a sibling of ``train_dipole.py`` (not a replacement). The rollout
 loop body is a near-verbatim copy from ``train_dipole.main()``; RL additions are
@@ -6,12 +6,13 @@ marked with ``# RL-ADD`` / ``# RL-EDIT`` comments. Helper functions
 (``load_hdf5_demos_into_flow_transitions`` etc.) are imported from
 ``train_dipole`` to keep both entry points in lock-step.
 
-See ``robosuite/pipeline/docs/prompts/05_integrated_trainer.md`` for the spec
-and ``docs/DIPOLE_RL.md`` for the architecture diagram.
+The complete architecture and runtime contract are documented in
+``robosuite/pipeline/README.md``.
 """
 from __future__ import annotations
 
 import datetime
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -22,14 +23,15 @@ import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.pipeline.algorithms.dipole import DipoleTrainer, LPBV2GProvider
+from robosuite.pipeline.algorithms.dipole import DipoleTrainer, NNPUGProvider
 from robosuite.pipeline.algorithms.dipole.advantage_g_provider import AdvantageGProvider
-from robosuite.pipeline.algorithms.discriminator.encoder import SharedFrozenEncoder
-from robosuite.pipeline.algorithms.discriminator.online_bce import (
-    DiscriminatorConfig,
-    OnlineBCEDiscriminator,
+from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
+from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
+from robosuite.pipeline.algorithms.discriminator.runtime import (
+    EnterKeyListener,
+    build_nnpu_runtime,
+    render_nnpu_hud,
 )
-from robosuite.pipeline.algorithms.discriminator.replay import DiscriminatorReplayBuffer
 from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
@@ -72,11 +74,9 @@ from robosuite.pipeline.utils import (
 
 # Reuse all the helpers from train_dipole (module-level functions only).
 from robosuite.pipeline.train_dipole import (
-    DISCRIMINATOR_DISPLAY_HZ,
     bind_flow_proprio_extractor,
     build_flow_runtime_cfg,
     convert_env_camera_observation,
-    format_discriminator_line,
     format_publish_line,
     load_hdf5_demos_into_flow_transitions,
     load_init_checkpoint_payload,
@@ -99,10 +99,9 @@ def _annotate_offline_demos(
 ) -> list[Transition]:
     """Stamp episode_index / episode_step / buffer_role onto ``info``.
 
-    ``DiscriminatorReplayBuffer.bootstrap_from_demos`` calls ``base.add(t)``
-    directly without per-episode bookkeeping, but the IQL replay's chunk-window
-    valid-start cache reads ``info['episode_index']`` and ``info['buffer_role']``.
-    We pre-annotate so the two replays see consistent metadata.
+    The IQL replay's chunk-window valid-start cache reads
+    ``info['episode_index']`` and ``info['buffer_role']``. We pre-annotate the
+    demonstrations so offline and online windows remain separate.
     """
     out: list[Transition] = []
     episode_index = int(starting_episode_index)
@@ -138,7 +137,8 @@ def _load_iql_warmup_state(
     learner: IQLLearner,
     warmup_ckpt: str,
     *,
-    expected_context_dim: int,
+    expected_state_feature_dim: int,
+    expected_chunk_feature_dim: int,
     expected_action_dim: int,
 ) -> None:
     """Load an IQL state-dict ckpt produced by ``algorithms/q_learning/warmup.py``."""
@@ -148,10 +148,15 @@ def _load_iql_warmup_state(
     payload = torch.load(path, map_location="cpu", weights_only=False)
     learner.load_state_dict(payload["iql_state"], strict=True)
     meta = payload.get("encoder_meta", {})
-    if int(meta.get("context_dim", -1)) != int(expected_context_dim):
+    if int(meta.get("state_feature_dim", -1)) != int(expected_state_feature_dim):
         raise ValueError(
-            f"IQL warmup ckpt context_dim={meta.get('context_dim')} != "
-            f"shared_encoder.context_dim={expected_context_dim}."
+            f"IQL warmup ckpt state_feature_dim={meta.get('state_feature_dim')} != "
+            f"shared_encoder.state_feature_dim={expected_state_feature_dim}."
+        )
+    if int(meta.get("chunk_feature_dim", -1)) != int(expected_chunk_feature_dim):
+        raise ValueError(
+            f"IQL warmup ckpt chunk_feature_dim={meta.get('chunk_feature_dim')} != "
+            f"shared_encoder.chunk_feature_dim={expected_chunk_feature_dim}."
         )
     if int(meta.get("policy_action_dim", -1)) != int(expected_action_dim):
         raise ValueError(
@@ -319,56 +324,54 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     checkpoint_writer = AsyncCheckpointWriter(agent, checkpoint_dir)
     checkpoint_writer.start()
 
-    # ------------------------------------------------------------------ #
-    # RL-ADD: shared encoder, IQL, discriminator, two replay wrappers.   #
-    # ------------------------------------------------------------------ #
-
-    # shared ViT encoder
-    bce_warm_ckpt_raw = cfg.algorithm.discriminator.warm_start_ckpt
-    if bce_warm_ckpt_raw is None or str(bce_warm_ckpt_raw).strip().lower() in ("", "null"):
+    # Shared frozen dynamics encoder + calibrated nnPU head.
+    disc_node = cfg.algorithm.discriminator
+    nnpu_ckpt_raw = disc_node.checkpoint
+    if nnpu_ckpt_raw is None or str(nnpu_ckpt_raw).strip().lower() in ("", "null"):
         raise RuntimeError(
-            "DIPOLE-RL requires algorithm.discriminator.warm_start_ckpt to point at a "
-            "pretrained LPB BCE checkpoint (used to seed the SharedFrozenEncoder)."
+            "DIPOLE-RL requires algorithm.discriminator.checkpoint to point at "
+            "a task-calibrated pu_bce_head.pth."
         )
-    bce_warm_ckpt = to_absolute_path(str(bce_warm_ckpt_raw))
-    if not Path(bce_warm_ckpt).exists():
-        raise FileNotFoundError(f"LPB BCE checkpoint not found: {bce_warm_ckpt}")
+    nnpu_ckpt = to_absolute_path(str(nnpu_ckpt_raw))
+    if not Path(nnpu_ckpt).exists():
+        raise FileNotFoundError(f"nnPU checkpoint not found: {nnpu_ckpt}")
+    disc_node.checkpoint = nnpu_ckpt
     rl_learner_device = str(cfg.algorithm.q_learning.config.device)
-    shared_encoder = SharedFrozenEncoder(bce_warm_ckpt, device=rl_learner_device)
+    camera_to_view = {
+        str(k): str(v) for k, v in dict(disc_node.camera_to_view or {}).items()
+    }
+    encoder_override = getattr(disc_node, "encoder_ckpt", None)
+    encoder_ckpt = (
+        None
+        if encoder_override is None or str(encoder_override).strip().lower() in ("", "null")
+        else to_absolute_path(str(encoder_override))
+    )
+    if encoder_ckpt is not None:
+        disc_node.encoder_ckpt = encoder_ckpt
+    shared_encoder = SharedDynamicsEncoder(
+        nnpu_ckpt_path=nnpu_ckpt,
+        encoder_ckpt=encoder_ckpt,
+        device=rl_learner_device,
+        camera_to_view=camera_to_view,
+    )
     shared_encoder.bind_policy_cameras(list(agent.camera_names))
     print(
-        f"[rl] shared_encoder ckpt={bce_warm_ckpt} device={rl_learner_device} "
-        f"context_dim={shared_encoder.context_dim} views={shared_encoder.view_names}"
+        f"[rl] dynamics_encoder ckpt={nnpu_ckpt} device={rl_learner_device} "
+        f"state_dim={shared_encoder.state_feature_dim} "
+        f"chunk_dim={shared_encoder.chunk_feature_dim} views={shared_encoder.view_names}"
     )
-
-    # LBP-style discriminator G provider
-    lpb_cfg = cfg.algorithm.dipole.lpb_detector
-    lpb_ckpt_raw = lpb_cfg.ckpt_path if lpb_cfg is not None else None
-    if lpb_ckpt_raw is None or str(lpb_ckpt_raw).strip().lower() in ("", "null"):
-        raise RuntimeError(
-            "DIPOLE-RL requires algorithm.dipole.lpb_detector.ckpt_path even in "
-            "g_mode=advantage (used by the discriminator-display path)."
-        )
-    lpb_ckpt_path = Path(to_absolute_path(str(lpb_ckpt_raw)))
-    if not lpb_ckpt_path.exists():
-        raise FileNotFoundError(f"LPB BCE checkpoint not found: {lpb_ckpt_path}")
-    try:
-        legacy_camera_to_view = {str(k): str(v) for k, v in dict(lpb_cfg.camera_to_view or {}).items()}
-    except Exception:
-        legacy_camera_to_view = {}
-    legacy_g_provider = LPBV2GProvider(
-        ckpt_path=str(lpb_ckpt_path),
+    discriminator = FrozenNNPUDiscriminator(
+        nnpu_ckpt_path=nnpu_ckpt,
         task_name=str(task_name),
-        device=str(cfg.algorithm.flow.device),
-        camera_to_view=legacy_camera_to_view,
-        shared_encoder=shared_encoder,
+        device=rl_learner_device,
+        encoder=shared_encoder,
     )
-    legacy_g_provider.bind_policy_cameras(list(agent.camera_names))
+    nnpu_g_provider = NNPUGProvider(
+        encoder=shared_encoder,
+        discriminator=discriminator,
+    )
 
-    # IQL learner + replay. Gated by `algorithm.q_learning.enabled` so the
-    # legacy DIPOLE regression path (g_mode=bce_frozen + q_learning.enabled=
-    # false) degenerates into the existing DipoleTrainer with no IQL work
-    # per tick.
+    # IQL learner + replay. The frozen nnPU path can run without IQL updates.
     policy_action_dim = int(agent.flow_config.action_dim)
     iql_cfg_dict = OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True)
     iql_cfg = IQLConfig(**iql_cfg_dict)
@@ -376,7 +379,10 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
 
     if q_learning_enabled:
         iql_learner = IQLLearner(
-            iql_cfg, context_dim=int(shared_encoder.context_dim), action_dim=policy_action_dim
+            iql_cfg,
+            state_feature_dim=int(shared_encoder.state_feature_dim),
+            chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
+            action_dim=policy_action_dim,
         )
         iql_replay = IQLReplayBuffer(agent.online_buffer, iql_cfg)
     else:
@@ -384,40 +390,10 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         iql_replay = None
         print("[rl] algorithm.q_learning.enabled=false — IQL learner / replay skipped")
 
-    # Discriminator + replay. Gated by `algorithm.discriminator.online_train`
-    # so the legacy regression run leaves the BCE head frozen on disk.
-    disc_cfg_dict = OmegaConf.to_container(cfg.algorithm.discriminator.config, resolve=True)
-    if disc_cfg_dict.get("warm_start_ckpt"):
-        disc_cfg_dict["warm_start_ckpt"] = str(bce_warm_ckpt)
-    disc_cfg = DiscriminatorConfig(**disc_cfg_dict)
-    disc_online_train = bool(getattr(cfg.algorithm.discriminator, "online_train", True))
-    if disc_online_train:
-        discriminator = OnlineBCEDiscriminator(
-            cfg=disc_cfg,
-            encoder=shared_encoder,
-            context_dim=int(shared_encoder.context_dim),
-            action_dim=policy_action_dim,
-        )
-        print(
-            f"[rl] online_disc threshold={discriminator.threshold:.6f} "
-            f"(source={discriminator.threshold_source}); "
-            f"EMA continues from this seed during update()."
-        )
-        disc_replay = DiscriminatorReplayBuffer(
-            disc_cfg,
-            agent.online_buffer,
-            encoder=shared_encoder,
-        )
-    else:
-        discriminator = None
-        disc_replay = None
-        print("[rl] algorithm.discriminator.online_train=false — online disc / replay skipped")
-
-    # Hard-assert device consistency on the learner side.
-    if not (iql_cfg.device == disc_cfg.device == shared_encoder.device == rl_learner_device):
+    if not (str(iql_cfg.device) == str(shared_encoder.device) == rl_learner_device):
         raise RuntimeError(
             "DIPOLE-RL device mismatch: "
-            f"iql_cfg.device={iql_cfg.device} disc_cfg.device={disc_cfg.device} "
+            f"iql_cfg.device={iql_cfg.device} "
             f"encoder.device={shared_encoder.device} expected={rl_learner_device}"
         )
 
@@ -427,25 +403,23 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         iql_learner=iql_learner,
         discriminator=discriminator,
         iql_replay=iql_replay,
-        disc_replay=disc_replay,
         shared_encoder=shared_encoder,
         learner_device=rl_learner_device,
         iql_batch_size=int(cfg.algorithm.trainer.batch_size),
-        disc_batch_size=int(disc_cfg.batch_size),
-        disc_update_freq=int(disc_cfg.update_freq),
         iql_update_freq=int(iql_cfg.update_freq),
     )
     if iql_learner is not None:
         agent.attach_iql_learner(iql_learner)
-    if discriminator is not None:
-        agent.attach_discriminator(discriminator)
+    agent.attach_discriminator(discriminator)
 
-    # Until warmup completes (or always, when bootstrap_g_with_frozen_bce=true)
-    # the flow loss G is sourced from the frozen LPB BCE detector.
-    bootstrap_with_frozen = bool(getattr(cfg.runtime, "bootstrap_g_with_frozen_bce", True))
-    agent.attach_g_provider(legacy_g_provider)
+    # Until warmup completes the flow loss can use discriminator-only G.
+    bootstrap_with_frozen = bool(
+        getattr(cfg.runtime, "bootstrap_g_with_frozen_nnpu", True)
+    )
+    agent.attach_g_provider(nnpu_g_provider)
     print(
-        f"[dipole] attached legacy BCE G provider (bootstrap_g_with_frozen_bce={bootstrap_with_frozen})"
+        "[dipole] attached frozen nnPU G provider "
+        f"(bootstrap_g_with_frozen_nnpu={bootstrap_with_frozen})"
     )
 
     # ------------------------------------------------------------------ #
@@ -658,30 +632,19 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         print("[INFO] Reusing normalizers from checkpoint.")
 
     # ------------------------------------------------------------------ #
-    # RL-ADD: seed disc/IQL non-failure pool from offline demos.         #
+    # RL-ADD: seed the IQL replay from offline demonstrations.           #
     # ------------------------------------------------------------------ #
 
     # load offline demos into online buffer
-    if (iql_replay is not None or disc_replay is not None) and len(agent.online_buffer) == 0:
+    if iql_replay is not None and len(agent.online_buffer) == 0:
         annotated_demos = _annotate_offline_demos(transitions, namespace="offline_demo")
-
-        if disc_replay is not None:
-            disc_replay.bootstrap_from_demos(annotated_demos)
-            print(
-                f"[rl] disc/iql online buffer seeded with {len(annotated_demos)} offline demo transitions "
-                f"(failure pool={disc_replay.num_failure}, non_failure pool={disc_replay.num_non_failure})"
-            )
-        else:
-            for t in annotated_demos:
-                agent.online_buffer.add(t)
-            print(
-                f"[rl] iql online buffer seeded with {len(annotated_demos)} offline demo transitions "
-                f"(disc disabled — no bucket classification)"
-            )
+        for transition in annotated_demos:
+            agent.online_buffer.add(transition)
+        print(f"[rl] iql online buffer seeded with {len(annotated_demos)} offline demo transitions")
     elif len(agent.online_buffer) > 0:
         print(
             f"[rl] reusing checkpoint online buffer with {len(agent.online_buffer)} transitions; "
-            "failure/non_failure pools will be classified lazily on next disc/iql sample"
+            "offline/online windows will be indexed lazily on the next IQL sample"
         )
 
     if bool(cfg.runtime.load_buffers):
@@ -707,6 +670,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     metric_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=checkpoint_dir)
     device = None
     intervention_runtime = None
+    nnpu_runtime = None
+    enter_listener = EnterKeyListener()
 
     episode_return = 0.0
     episode_length = 0
@@ -717,17 +682,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     policy_gate = IntervalGate(policy_fps)
     spacemouse_gate = IntervalGate(spacemouse_fps)
     overall_fps_tracker = EMAFpsTracker()
-    discriminator_display_hz = float(
-        getattr(cfg.runtime, "discriminator_display_hz", DISCRIMINATOR_DISPLAY_HZ)
-    )
-    disc_log_gate = IntervalGate(discriminator_display_hz) if discriminator_display_hz > 0.0 else None
-    if disc_log_gate is None:
-        print("[INFO] Discriminator display disabled (runtime.discriminator_display_hz <= 0).")
-    else:
-        print(
-            f"[INFO] Discriminator display rate: {discriminator_display_hz:.2f} Hz "
-            f"(BCE threshold tau={legacy_g_provider.threshold:+.3f})"
-        )
     last_fps_log_time = time.monotonic()
     training_started_monotonic = last_fps_log_time
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
@@ -897,7 +851,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         _load_iql_warmup_state(
             iql_learner,
             str(warmup_ckpt_raw),
-            expected_context_dim=int(shared_encoder.context_dim),
+            expected_state_feature_dim=int(shared_encoder.state_feature_dim),
+            expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
             expected_action_dim=policy_action_dim,
         )
     else:
@@ -914,12 +869,9 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     # RL-ADD: flip g_mode → advantage if requested.
     g_mode = str(cfg.algorithm.dipole.g_mode)
     if g_mode == "advantage":
-        if iql_learner is None or discriminator is None:
+        if iql_learner is None:
             raise RuntimeError(
-                "g_mode='advantage' requires both algorithm.q_learning.enabled "
-                "and algorithm.discriminator.online_train to be true; got "
-                f"q_learning.enabled={iql_learner is not None}, "
-                f"discriminator.online_train={discriminator is not None}."
+                "g_mode='advantage' requires algorithm.q_learning.enabled=true."
             )
         advantage_g = AdvantageGProvider(
             iql_learner=iql_learner,
@@ -937,8 +889,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             f"(alpha={cfg.algorithm.advantage_g_provider.alpha}, "
             f"beta={cfg.algorithm.advantage_g_provider.beta})"
         )
-    elif g_mode == "bce_frozen":
-        # legacy_g_provider already attached above. No-op.
+    elif g_mode == "nnpu_frozen":
+        # The frozen nnPU provider was attached before warmup.
         pass
     else:
         raise ValueError(f"Unknown algorithm.dipole.g_mode: {g_mode}")
@@ -951,6 +903,24 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             device=device,
             goal_update_mode=str(cfg.intervention.goal_update_mode),
         )
+
+    try:
+        nnpu_runtime = build_nnpu_runtime(
+            cfg.algorithm.discriminator,
+            policy_camera_names=list(agent.camera_names),
+            shared_encoder=dynamics_encoder,
+            discriminator=discriminator,
+        )
+        if nnpu_runtime is not None:
+            nnpu_runtime.start()
+            enter_listener.start()
+            print(
+                f"[nnPU HUD] scorer started device={nnpu_runtime.cfg.device} "
+                f"fps={nnpu_runtime.cfg.fps:g} threshold={nnpu_runtime.discriminator.threshold:+.3f}"
+            )
+    except Exception as exc:
+        nnpu_runtime = None
+        print(f"[WARN] nnPU HUD/scorer disabled: {type(exc).__name__}: {exc}")
     obs, _ = reset_flow_policy_observation(
         env,
         preserve_mjviewer=rollout_has_renderer,
@@ -966,6 +936,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     spacemouse_gate.force_ready()
     if intervention_runtime is not None:
         intervention_runtime.start_episode()
+    if nnpu_runtime is not None:
+        nnpu_runtime.on_episode_reset()
 
     if async_updates and online_updates_enabled:
         trainer.start_async_worker()
@@ -976,7 +948,26 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             loop_start = time.monotonic() if control_limiter is None else control_limiter.wait()
             overall_fps_tracker.mark()
 
+            while nnpu_runtime is not None and nnpu_runtime.pause_requested():
+                render_nnpu_hud(
+                    sys.__stdout__, nnpu_runtime.status(), step=step, episode_step=episode_step_index
+                )
+                resume_requested = enter_listener.consume()
+                if intervention_runtime is not None and not resume_requested:
+                    _, sampled_intervention, sampled_reset = intervention_runtime.maybe_override_action(
+                        cached_policy_action
+                    )
+                    resume_requested = bool(sampled_intervention or sampled_reset)
+                if resume_requested:
+                    nnpu_runtime.resume()
+                    print("\n[nnPU HUD] rollout resumed")
+                    break
+                refresh_main_viewer()
+                time.sleep(0.02)
+
+            new_policy_chunk = False
             if unthrottled_runtime or policy_gate.ready(loop_start):
+                new_policy_chunk = agent.needs_action_chunk()
                 cached_policy_action = agent.select_action(
                     obs, deterministic=bool(cfg.runtime.eval_deterministic)
                 )
@@ -986,6 +977,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             is_intervention = False
             reset_requested = False
             if intervention_runtime is not None and (unthrottled_runtime or spacemouse_gate.ready(loop_start)):
+                was_intervening = cached_is_intervention
                 override_action, sampled_is_intervention, reset_requested = intervention_runtime.maybe_override_action(
                     cached_policy_action
                 )
@@ -996,11 +988,15 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 elif sampled_is_intervention:
                     cached_override_action = np.asarray(override_action, dtype=np.float32)
                     cached_is_intervention = True
-                    agent.notify_intervention()
-                    policy_gate.force_ready()
+                    if not was_intervening:
+                        agent.notify_intervention()
+                        policy_gate.force_ready()
                 else:
                     cached_override_action = None
                     cached_is_intervention = False
+                    if was_intervening:
+                        agent.reset_policy_state()
+                        policy_gate.force_ready()
 
             # reset the environment
             if reset_requested:
@@ -1028,12 +1024,30 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 spacemouse_gate.force_ready()
                 if intervention_runtime is not None:
                     intervention_runtime.start_episode()
+                if nnpu_runtime is not None:
+                    nnpu_runtime.on_episode_reset()
                 maybe_report_runtime(step)
                 continue
 
             if cached_is_intervention and cached_override_action is not None:
                 env_action = np.asarray(cached_override_action, dtype=np.float32)
                 is_intervention = True
+
+            if nnpu_runtime is not None:
+                nnpu_runtime.publish(
+                    images_per_view={name: obs[name] for name in agent.camera_names},
+                    proprio=obs["state"],
+                    executed_action=env_action,
+                    planned_chunk=agent.planned_action_chunk(),
+                    is_new_chunk=new_policy_chunk,
+                )
+                if nnpu_runtime.cfg.hud_enabled:
+                    render_nnpu_hud(
+                        sys.__stdout__,
+                        nnpu_runtime.status(),
+                        step=step,
+                        episode_step=episode_step_index,
+                    )
 
             grasp_penalty = compute_grasp_penalty(env, env_action)
             step_output = env.step(env_action)
@@ -1125,61 +1139,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             episode_return += reward
             episode_length += 1
             success_count += int(success)
-
-            # print discriminator result
-            if disc_log_gate is not None and disc_log_gate.ready(time.monotonic()):
-                try:
-                    chunk_for_disc = agent.plan_action_chunk(
-                        next_obs, deterministic=bool(cfg.runtime.eval_deterministic)
-                    )
-                    # RL-EDIT: use legacy_g_provider for the disc-display path because
-                    # AdvantageGProvider.compute_g_for_observation raises NotImplementedError.
-                    disc_info = legacy_g_provider.compute_g_for_observation(next_obs, chunk_for_disc)
-                except Exception as exc:
-                    runtime_logger.log(
-                        {
-                            "event": "discriminator_display_error",
-                            "step": int(step),
-                            "episode_index": int(episode_index),
-                            "error": repr(exc),
-                            **event_time_fields(),
-                        }
-                    )
-                else:
-                    is_failure = bool(disc_info["is_failure"])
-                    raw_score = float(disc_info["raw"])
-                    tau_value = float(disc_info["tau"])
-                    print(
-                        format_discriminator_line(
-                            step=step,
-                            episode_index=episode_index,
-                            raw=raw_score,
-                            tau=tau_value,
-                            is_failure=is_failure,
-                        )
-                    )
-                    runtime_logger.log(
-                        {
-                            "event": "discriminator_display",
-                            "step": int(step),
-                            "episode_index": int(episode_index),
-                            "raw": raw_score,
-                            "G": -raw_score,
-                            "tau": tau_value,
-                            "is_failure": int(is_failure),
-                            **event_time_fields(),
-                        }
-                    )
-                    maybe_log(
-                        metric_logger,
-                        {
-                            "discriminator/raw": raw_score,
-                            "discriminator/G": -raw_score,
-                            "discriminator/tau": tau_value,
-                            "discriminator/is_failure": int(is_failure),
-                        },
-                        step=step,
-                    )
 
             # -----------------------------------------------------------------
             # update all
@@ -1292,6 +1251,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 spacemouse_gate.force_ready()
                 if intervention_runtime is not None:
                     intervention_runtime.start_episode()
+                if nnpu_runtime is not None:
+                    nnpu_runtime.on_episode_reset()
             else:
                 obs = next_obs
 
@@ -1299,6 +1260,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 request_checkpoint_save(step)
             maybe_report_runtime(step)
     finally:
+        if nnpu_runtime is not None:
+            nnpu_runtime.stop()
         if async_updates:
             trainer.flush_async_updates()
             flushed_metrics = trainer.drain_async_metrics()

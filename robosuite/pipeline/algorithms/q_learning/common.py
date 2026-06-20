@@ -1,6 +1,6 @@
 """Dataclasses shared across the IQL Q-chunking module.
 
-Interface contract (see docs/DIPOLE_RL.md §A):
+Interface contract (see the DIPOLE-RL section in ``pipeline/README.md``):
 - `IQLStepBatch` is the unit consumed by Bellman + expectile losses; rewards
   are already aggregated as n-step discounted returns over the action chunk
   and include the discriminator intrinsic term r_disc.
@@ -24,9 +24,9 @@ class IQLConfig:
     Notes:
         action_horizon must match DipoleConfig.action_horizon (Q-chunking
         assumes the critic sees the full execution chunk).
-        r_disc is sourced from ``OnlineBCEDiscriminator.intrinsic_reward``:
+        r_disc is sourced from ``FrozenNNPUDiscriminator.intrinsic_reward``:
         ``-sigmoid(failure_score - tau)`` with ``failure_score = -head(z)``
-        (LPB convention). Per-frame values lie in (-1, 0); the replay
+        (nnPU convention). Per-frame values lie in (-1, 0); the replay
         γ-aggregates them with r_env via ``aggregate_chunk_reward``.
     """
 
@@ -77,11 +77,11 @@ class IQLStepBatch:
     """Transition-centric batch for Q/V updates.
 
     Shapes:
-        context        (B, D_ctx)   — frozen latent at chunk start s_t
-                                      (Q/V Bellman state; disc also scores
-                                      all H frames inside the replay sampler)
-        next_context   (B, D_ctx)   — frozen encoder latent for s'
-        action_chunk   (B, H, D_a)  — normalized chunk a_{t:t+H}
+        q_chunk_feature (B, D_chunk) — action-conditioned chunk latent for Q
+        v_state_feature (B, D_state) — action-free state latent for V(s_t)
+        next_v_state_feature
+                        (B, D_state) — action-free state latent for V(s')
+        action_chunk    (B, H, D_a) — raw chunk retained for metadata/debug
         rewards        (B, 1)       — n-step aggregated r_env + λ_disc·r_disc
         dones          (B, 1)       — 1 if any step in chunk terminated
         is_online      (B, 1)       — 1 if sampled from online buffer
@@ -89,8 +89,9 @@ class IQLStepBatch:
         metadata       dict         — debug fields (episode ids, sources)
     """
 
-    context: torch.Tensor
-    next_context: torch.Tensor
+    q_chunk_feature: torch.Tensor
+    v_state_feature: torch.Tensor
+    next_v_state_feature: torch.Tensor
     action_chunk: torch.Tensor
     rewards: torch.Tensor
     dones: torch.Tensor
@@ -100,8 +101,9 @@ class IQLStepBatch:
 
     def to(self, device: str | torch.device) -> "IQLStepBatch":
         return IQLStepBatch(
-            context=self.context.to(device),
-            next_context=self.next_context.to(device),
+            q_chunk_feature=self.q_chunk_feature.to(device),
+            v_state_feature=self.v_state_feature.to(device),
+            next_v_state_feature=self.next_v_state_feature.to(device),
             action_chunk=self.action_chunk.to(device),
             rewards=self.rewards.to(device),
             dones=self.dones.to(device),
@@ -116,18 +118,18 @@ class IQLActorBatch:
     """Actor-side batch consumed by AdvantageGProvider.
 
     Shapes:
-        context           (B, D_ctx)   — frozen encoder latent for s
-        action_chunk_raw  (B, H, D_a)  — UN-normalized chunk used to score Q
+        q_chunk_feature   (B, D_chunk) — action-conditioned chunk latent for Q
+        v_state_feature   (B, D_state) — action-free state latent for V
         metadata          dict         — episode ids, mask flags
     """
 
-    context: torch.Tensor
-    action_chunk_raw: torch.Tensor
+    q_chunk_feature: torch.Tensor
+    v_state_feature: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to(self, device: str | torch.device) -> "IQLActorBatch":
         return IQLActorBatch(
-            context=self.context.to(device),
-            action_chunk_raw=self.action_chunk_raw.to(device),
+            q_chunk_feature=self.q_chunk_feature.to(device),
+            v_state_feature=self.v_state_feature.to(device),
             metadata=self.metadata,
         )

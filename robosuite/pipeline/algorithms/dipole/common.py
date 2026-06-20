@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -17,24 +17,6 @@ from robosuite.pipeline.common.types import (
 
 
 @dataclass
-class LPBDetectorConfig:
-    """Pre-fitted BCE detector wiring for DIPOLE.
-
-    ``ckpt_path`` points at the artefact produced by
-    ``robosuite/discriminator/lpb_v2/scripts/run_bce_robosuite_benchmark.sh``
-    (or its visualize_ companion). All other detector-side hyperparameters
-    (feature_source, transformer_layer, head shape, thresholds, encoder ckpt
-    path, view_names, frameskip, action_dim_per_step) are read from the
-    artefact itself. ``camera_to_view`` lets you remap policy camera names to
-    encoder view names when they differ.
-    """
-
-    ckpt_path: Optional[str] = None
-    device: str = "cuda:0"
-    camera_to_view: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass
 class DipoleConfig(FlowDaggerConfig):
     # CFG-style guidance + sigmoid weighting params
     beta: float = 2.0
@@ -45,11 +27,9 @@ class DipoleConfig(FlowDaggerConfig):
     g_clip: float = 10.0
     polarity_embedding_init: str = "zero_pos"   # "zero_pos" | "zero_neg" | "small_gaussian" | "antipodal"
     polarity_embedding_init_scale: float = 1e-3
-    lpb_detector: LPBDetectorConfig = field(default_factory=LPBDetectorConfig)
-    # DIPOLE-RL: which G provider the trainer should attach.
-    # "bce_frozen" -> LPBV2GProvider (legacy); "advantage" -> AdvantageGProvider.
-    # Read by train_dipole_rl.py; DipoleFlowPolicy itself does not consume it.
-    g_mode: str = "bce_frozen"
+    # DIPOLE-RL: which frozen nnPU-backed G provider the trainer attaches.
+    # Read by train_dipole*.py; DipoleFlowPolicy itself does not consume it.
+    g_mode: str = "nnpu_frozen"
 
 
 @dataclass
@@ -65,11 +45,11 @@ class TrainerConfig:
 @dataclass
 class DipoleBatch:
     image_obs: torch.Tensor                # ImageNet-normalized for policy
-    image_obs_raw: torch.Tensor            # [0,1] floats, for LPB encoder
+    image_obs_raw: torch.Tensor            # [0,1] floats, for dynamics encoder
     proprio: torch.Tensor                  # policy-normalized
-    proprio_raw: torch.Tensor              # un-normalized for LPB encoder
+    proprio_raw: torch.Tensor              # un-normalized for dynamics encoder
     action_sequences: torch.Tensor         # policy-normalized
-    action_sequences_raw: torch.Tensor     # un-normalized for LPB encoder
+    action_sequences_raw: torch.Tensor     # un-normalized for dynamics encoder
     is_intervention: torch.Tensor          # (B,) bool/float
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -162,7 +142,6 @@ __all__ = [
     "DipoleConfig",
     "EncoderConfig",
     "FlowAugmentationConfig",
-    "LPBDetectorConfig",
     "ReplayBufferConfig",
     "TrainerConfig",
     "Transition",

@@ -6,10 +6,10 @@
 #   INIT_CHECKPOINT  — path to flow-dagger / flow-multi base checkpoint
 #                      (passed to runtime.init_checkpoint)
 # Optional env vars:
-#   LPB_CKPT         — overrides algorithm.discriminator.warm_start_ckpt
+#   NNPU_CKPT        — task-calibrated pu_bce_head.pth
 #   IQL_WARMUP_CKPT  — overrides algorithm.q_learning.warmup_ckpt
 #   ALPHA, BETA      — overrides algorithm.advantage_g_provider.{alpha,beta}
-#   G_MODE           — "advantage" | "bce_frozen"
+#   G_MODE           — "advantage" | "nnpu_frozen"
 #   LOGGING_USE_TENSORBOARD / LOGGING_USE_WANDB          — logging backends
 #   INTERACTIVE / VIEWER_ENABLED / INTERVENTION_ENABLED  — same semantics
 #                      as scripts/train_dipole.sh.
@@ -37,13 +37,18 @@ if [[ -z "${INIT_CHECKPOINT:-}" ]]; then
   echo "ERROR: INIT_CHECKPOINT is required (path to flow-dagger / flow-multi base checkpoint)." >&2
   exit 1
 fi
+if [[ -z "${NNPU_CKPT:-}" || ! -f "${NNPU_CKPT}" ]]; then
+  echo "ERROR: NNPU_CKPT must point to a task-calibrated pu_bce_head.pth." >&2
+  exit 1
+fi
 
 HYDRA_ARGS=(
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
+  "algorithm.discriminator.checkpoint=${NNPU_CKPT}"
   "logging.use_tensorboard=${LOGGING_USE_TENSORBOARD}"
   "logging.use_wandb=${LOGGING_USE_WANDB}"
 )
-[[ -n "${LPB_CKPT:-}" ]]              && HYDRA_ARGS+=("algorithm.discriminator.warm_start_ckpt=${LPB_CKPT}")
+[[ -n "${NNPU_ENCODER_CKPT:-}" ]]     && HYDRA_ARGS+=("algorithm.discriminator.encoder_ckpt=${NNPU_ENCODER_CKPT}")
 [[ -n "${IQL_WARMUP_CKPT:-}" ]]       && HYDRA_ARGS+=("algorithm.q_learning.warmup_ckpt=${IQL_WARMUP_CKPT}")
 [[ -n "${ALPHA:-}" ]]                 && HYDRA_ARGS+=("algorithm.advantage_g_provider.alpha=${ALPHA}")
 [[ -n "${BETA:-}" ]]                  && HYDRA_ARGS+=("algorithm.advantage_g_provider.beta=${BETA}")

@@ -4,12 +4,11 @@ from .common import (
     DipoleConfig,
     EncoderConfig,
     FlowAugmentationConfig,
-    LPBDetectorConfig,
     ReplayBufferConfig,
     TrainerConfig,
     Transition,
 )
-from .g_provider import LPBV2GProvider
+from .g_provider import NNPUGProvider
 from .trainer import DipoleTrainer
 
 __all__ = [
@@ -19,8 +18,7 @@ __all__ = [
     "DipoleTrainer",
     "EncoderConfig",
     "FlowAugmentationConfig",
-    "LPBDetectorConfig",
-    "LPBV2GProvider",
+    "NNPUGProvider",
     "ReplayBufferConfig",
     "TrainerConfig",
     "Transition",
