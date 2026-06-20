@@ -3,11 +3,11 @@
 set -euo pipefail
 
 ROOT="/home/dodo/Documents/DAggar/robosuite"
-NUM_TRAJ=20
-SAVE_DIR="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow-${NUM_TRAJ}"
+NUM_TRAJ=10
+SAVE_DIR="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-${NUM_TRAJ}"
 
 export CUDA_VISIBLE_DEVICES=0
-export WANDB_MODE="offline"
+export WANDB_MODE="disabled"
 export WANDB_ENTITY="songgao-personal"
 
 # may increase batch_size
@@ -27,5 +27,6 @@ python "$ROOT/robosuite/policy/flow_multi/train_flow.py" \
   train.min_lr=1e-6 \
   train.weight_decay=1e-6 \
   train.grad_clip_norm=1.0 \
+  train.log_freq=1 \
   train.device="cuda" \
-  checkpoint.save_freq=100
+  checkpoint.save_freq=25
