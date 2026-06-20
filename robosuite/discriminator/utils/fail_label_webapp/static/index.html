@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fail Frame Labeling Tool</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">Fail Frame Label</span>
+      <label>Task
+        <select id="task-select"></select>
+      </label>
+      <label>File
+        <select id="file-select"></select>
+      </label>
+    </div>
+    <div class="topbar-right">
+      <span id="progress" class="progress">- / -</span>
+      <button id="export-btn" class="btn primary">Export labeled HDF5</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- left: demo list -->
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <span>Demos</span>
+        <input id="demo-filter" type="text" placeholder="Filter (demo / mode)" />
+      </div>
+      <ul id="demo-list" class="demo-list"></ul>
+    </aside>
+
+    <!-- center: player -->
+    <section class="player">
+      <div class="player-head">
+        <span id="demo-title" class="demo-title">No demo selected</span>
+        <label class="cam-label">Camera
+          <select id="cam-select"></select>
+        </label>
+      </div>
+
+      <div id="viewport" class="viewport">
+        <img id="frame-img" alt="frame" draggable="false" />
+        <div id="loading" class="loading hidden">Prefetching frames <span id="load-pct">0</span>%</div>
+      </div>
+
+      <div class="slider-wrap">
+        <div id="seg-highlight" class="seg-highlight hidden"></div>
+        <input id="frame-slider" type="range" min="0" max="0" value="0" />
+      </div>
+
+      <div class="controls">
+        <button id="prev-btn" class="btn" title="Previous frame (←)">◀ Frame</button>
+        <button id="play-btn" class="btn" title="Play/Pause (Space)">▶ Play</button>
+        <button id="next-btn" class="btn" title="Next frame (→)">Frame ▶</button>
+        <span class="frame-readout">Frame <b id="cur-frame">0</b> / <span id="max-frame">0</span></span>
+        <label class="speed-label">Speed
+          <select id="speed-select">
+            <option value="0.25">0.25x</option>
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="4">4x</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <!-- right: labeling -->
+    <aside class="annot">
+      <h3>Label</h3>
+      <div class="annot-row">
+        <button id="set-start-btn" class="btn primary" title="Set failure start frame (f)">Set failure start (current frame)</button>
+      </div>
+      <div class="annot-row">
+        <label>start <input id="start-input" type="number" min="0" value="0" /></label>
+        <label>end <input id="end-input" type="number" min="0" value="0" /></label>
+        <button id="end-last-btn" class="btn small" title="Set end to last frame">Last</button>
+      </div>
+      <div class="annot-row">
+        <label>mode
+          <select id="mode-select">
+            <option value="drop">drop</option>
+            <option value="grasp_failure">grasp_failure</option>
+            <option value="wrong_place">wrong_place</option>
+            <option value="__custom__">Custom...</option>
+          </select>
+        </label>
+        <input id="mode-custom" type="text" class="hidden" placeholder="Custom mode" />
+      </div>
+      <div class="annot-row btns">
+        <button id="save-btn" class="btn primary" title="Save (s)">Save label</button>
+        <button id="clear-btn" class="btn danger" title="Clear label for this demo">Clear</button>
+      </div>
+      <div class="annot-row nav">
+        <button id="prev-demo-btn" class="btn" title="Previous demo (p)">◀ Prev</button>
+        <button id="next-demo-btn" class="btn" title="Next demo (n)">Next ▶</button>
+      </div>
+      <div id="cur-label" class="cur-label">No label for this demo</div>
+
+      <div class="help">
+        <h4>Shortcuts</h4>
+        <ul>
+          <li><b>Space</b> Play/Pause</li>
+          <li><b>← →</b> Step frame</li>
+          <li><b>f</b> Set failure start</li>
+          <li><b>s</b> Save</li>
+          <li><b>n / p</b> Next / Previous demo</li>
+        </ul>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
