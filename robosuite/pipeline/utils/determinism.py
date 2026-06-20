@@ -44,7 +44,12 @@ class EnvRandomReducer:
     def seed_env(env: Any, seed: int) -> None:
         rng = np.random.default_rng(int(seed))
         for candidate in _iter_env_chain(env):
-            if hasattr(candidate, "seed"):
+            # Only record the integer seed on plain `seed` attributes. robosuite's MujocoEnv stores
+            # `seed` as a construction-time int that reset() no longer reads, so this is informational
+            # only -- the actual layout control comes from the `rng` injection below. Crucially, do
+            # NOT overwrite a callable `seed()` method (gym-style wrappers expose one): assigning an
+            # int there would clobber the method and break later `env.seed()` calls.
+            if hasattr(candidate, "seed") and not callable(getattr(candidate, "seed", None)):
                 try:
                     candidate.seed = int(seed)
                 except Exception:
@@ -122,3 +127,45 @@ def _seed_rng_graph(obj: Any, rng: np.random.Generator, *, seen: set[int], depth
 
     for child in children:
         _seed_rng_graph(child, rng, seen=seen, depth=depth + 1)
+
+
+def seed_range(base_seed: int, count: int) -> range:
+    """Inclusive-of-start, exclusive-of-end seed range produced by ``base_seed + episode_index``."""
+    return range(int(base_seed), int(base_seed) + int(count))
+
+
+def ranges_overlap(a_base: int, a_count: int, b_base: int, b_count: int) -> bool:
+    """True iff the two ``[base, base+count)`` integer seed ranges intersect."""
+    if a_count <= 0 or b_count <= 0:
+        return False
+    a_lo, a_hi = int(a_base), int(a_base) + int(a_count)  # [a_lo, a_hi)
+    b_lo, b_hi = int(b_base), int(b_base) + int(b_count)  # [b_lo, b_hi)
+    return a_lo < b_hi and b_lo < a_hi
+
+
+def assert_disjoint_seed_ranges(
+    train_base: int,
+    train_count: int,
+    eval_base: int,
+    eval_count: int,
+    *,
+    context: str = "",
+) -> None:
+    """Hard-assert that eval episode seeds never reuse a training episode seed.
+
+    With deterministic layouts ``layout_seed = base_seed + episode_index`` the eval set must live in
+    a seed band disjoint from training, otherwise the policy is benchmarked on the exact initial
+    configurations it was trained on. Raises ``ValueError`` on any overlap.
+    """
+    if not ranges_overlap(train_base, train_count, eval_base, eval_count):
+        return
+    overlap = sorted(set(seed_range(train_base, train_count)) & set(seed_range(eval_base, eval_count)))
+    preview = overlap[:10] + (["..."] if len(overlap) > 10 else [])
+    suffix = f" [{context}]" if context else ""
+    raise ValueError(
+        "Eval layout seeds overlap training layout seeds"
+        f"{suffix}: train=[{train_base}, {train_base + train_count}) "
+        f"eval=[{eval_base}, {eval_base + eval_count}) "
+        f"overlap_count={len(overlap)} overlap={preview}. "
+        "Pick an eval --seed in a band disjoint from training (e.g. a large offset)."
+    )

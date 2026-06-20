@@ -24,11 +24,19 @@ from robosuite.pipeline.train_flow_dagger import (
     load_init_checkpoint_payload,
     resolve_flow_task_metadata,
 )
-from robosuite.pipeline.utils import EnvRandomReducer, resolve_requested_device
+from robosuite.pipeline.utils import (
+    EnvRandomReducer,
+    assert_disjoint_seed_ranges,
+    resolve_requested_device,
+)
 DEFAULT_OUTPUT_ROOT = "./outputs/flow-DAgger/eval"
 DEFAULT_VIDEO_CAMERA = "agentview"
 DEFAULT_VIDEO_FPS = 20
 DEFAULT_VIDEO_SIZE = 512
+# Eval layout seeds live in a band deliberately disjoint from training (which uses the low base_seed
+# from cfg.seed, e.g. 42). This prevents benchmarking the policy on layouts it trained on. The
+# overlap is still hard-asserted at runtime against the training run_info when available.
+DEFAULT_EVAL_SEED = 900000
 
 
 def _parse_args() -> argparse.Namespace:
@@ -45,7 +53,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--video-height", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame height.")
     parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_SIZE, help="Saved video frame width.")
     parser.add_argument("--interactive", action="store_true", help="Open the robosuite viewer during eval.")
-    parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic episode layouts.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_EVAL_SEED,
+        help=(
+            "Base seed for deterministic episode layouts. Defaults to a high band disjoint from "
+            "training seeds; overlap with the training seed range is hard-asserted at runtime."
+        ),
+    )
     action_group = parser.add_mutually_exclusive_group()
     action_group.add_argument(
         "--deterministic",
@@ -91,6 +107,41 @@ def _resolve_run_dir(checkpoint_path: Path) -> Path | None:
     if checkpoint_path.parent.name == "checkpoints":
         return checkpoint_path.parent.parent
     return None
+
+
+def _assert_eval_seeds_disjoint(
+    run_info: dict[str, Any] | None,
+    *,
+    eval_base: int,
+    eval_count: int,
+) -> None:
+    """Hard-assert eval layout seeds do not reuse training layout seeds.
+
+    Reads the training run's ``env_reset_seed`` and episode count from run_info.json. If they are
+    unavailable (e.g. eval run from a bare checkpoint), warn and skip rather than fail hard.
+    """
+    if run_info is None:
+        print("[determinism][warn] no run_info.json found; skipping train/eval seed-disjoint check.")
+        return
+    train_base = run_info.get("env_reset_seed")
+    if train_base is None:
+        print(
+            "[determinism][warn] run_info has no env_reset_seed (training was not deterministic); "
+            "skipping seed-disjoint check."
+        )
+        return
+    # episode_index is the next/total episode count; layout seeds used = [base, base + count).
+    train_count = int(run_info.get("episode_index", 0) or 0)
+    if train_count <= 0:
+        print("[determinism][warn] run_info episode_index is 0/missing; skipping seed-disjoint check.")
+        return
+    assert_disjoint_seed_ranges(
+        int(train_base), train_count, int(eval_base), int(eval_count), context="train vs eval layouts"
+    )
+    print(
+        f"[determinism] seed-disjoint OK: train=[{train_base}, {int(train_base) + train_count}) "
+        f"eval=[{eval_base}, {int(eval_base) + int(eval_count)})"
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -285,6 +336,7 @@ def main() -> None:
     )
     env = build_robosuite_env(runtime_cfg)
     env_random_reducer = EnvRandomReducer(int(args.seed))
+    _assert_eval_seeds_disjoint(run_info, eval_base=int(args.seed), eval_count=int(args.episodes))
     proprio_extractor = bind_flow_proprio_extractor(env, env_metadata)
     eval_device = _resolve_eval_device(checkpoint_payload)
     policy = _build_policy(

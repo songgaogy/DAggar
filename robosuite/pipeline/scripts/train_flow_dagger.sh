@@ -17,9 +17,6 @@ LEARNER_DEVICE="cuda:1"
 INFERENCE_DEVICE="cuda:0"
 ACTION_HORIZON=8
 EXECUTE_HORIZON=8
-# MuJoCo offscreen camera rendering (EGL/GLFW) runs on GPU 0, so keep the learner — the async
-# update bottleneck — isolated on GPU 1. Inference is lightweight (one ODE-sampled forward every
-# execute_horizon steps) and can share GPU 0 with rendering without throttling the learner.
 # ----------------------------------------------------------------------
 
 DEMO_TASK_NAME="${ENVIRONMENT}"
