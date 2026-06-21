@@ -149,21 +149,22 @@ def _overlay_hud(
     font: ImageFont.ImageFont,
 ) -> np.ndarray:
     """Draw a translucent HUD bar with frame index, score/tau/r_disc, and verdict."""
+    scale = max(1, int(image.shape[0]) // 128)
     pil = Image.fromarray(np.ascontiguousarray(image)).convert("RGBA")
     overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    bar_height = 46
+    bar_height = 46 * scale
     draw.rectangle([0, 0, pil.size[0], bar_height], fill=(0, 0, 0, 160))
-    draw.text((4, 2), f"frame {int(frame_idx)}/{int(total)}", fill=(255, 255, 255, 255), font=font)
+    draw.text((4 * scale, 2 * scale), f"frame {int(frame_idx)}/{int(total)}", fill=(255, 255, 255, 255), font=font)
     draw.text(
-        (4, 15),
+        (4 * scale, 15 * scale),
         f"score={float(score):+.3f}  tau={float(threshold):+.3f}  r_disc={float(intrinsic_reward):+.3f}",
         fill=(255, 255, 255, 255),
         font=font,
     )
     verdict = "FAIL" if pred_failure else "OK"
     verdict_color = (255, 80, 80, 255) if pred_failure else (80, 255, 80, 255)
-    draw.text((4, 30), f"PRED: {verdict}", fill=verdict_color, font=font)
+    draw.text((4 * scale, 30 * scale), f"PRED: {verdict}", fill=verdict_color, font=font)
     composited = Image.alpha_composite(pil, overlay).convert("RGB")
     return np.asarray(composited, dtype=np.uint8)
 
@@ -182,7 +183,11 @@ def _write_video(
 ) -> None:
     """Render an MP4 with a per-frame HUD and a red border on predicted failures."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    font = ImageFont.load_default()
+    scale = max(1, int(frames.shape[1]) // 128)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 8 * scale)
+    except OSError:
+        font = ImageFont.load_default()
     total = int(frames.shape[0])
     with imageio.get_writer(
         path,
@@ -199,7 +204,7 @@ def _write_video(
                 frame = np.flipud(frame)
             pred = bool(predictions[idx])
             if pred:
-                frame = _draw_red_border(frame, border_thickness)
+                frame = _draw_red_border(frame, border_thickness * scale)
             frame = _overlay_hud(
                 frame,
                 score=float(scores[idx]),
@@ -224,7 +229,7 @@ def _plot_disc_scores(
 ) -> tuple[Path, Path]:
     """2-subplot discriminator timeseries: failure score (+tau) and intrinsic reward."""
     steps = np.arange(int(scores.shape[0]), dtype=np.float32)
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(48, 28), sharex=True)
     fig.suptitle(title)
 
     axes[0].plot(steps, scores, label="nnPU failure score", color="tab:blue")

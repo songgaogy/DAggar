@@ -137,6 +137,61 @@ def resolve_device(requested: str | None, checkpoint_device: str) -> str:
     return device
 
 
+def is_success_related_split(split: str) -> bool:
+    """True for rollout splits that may contain post-success padding (e.g. success_rollout)."""
+    return "success" in str(split).lower()
+
+
+def load_demo_is_success(selected: SelectedDemo) -> np.ndarray | None:
+    """Per-frame flag: True if task success already occurred before this step."""
+    with h5py.File(selected.hdf5_path, "r") as handle:
+        root = handle["demos"] if "demos" in handle else handle["data"]
+        group = root[selected.demo_key]
+        if "is_success" not in group:
+            return None
+        return np.asarray(group["is_success"][:], dtype=bool)
+
+
+def pre_success_exclusive_end(is_success: np.ndarray | None, num_frames: int) -> int:
+    """Exclusive end index: keep frames with ``is_success == False`` only."""
+    if is_success is None:
+        return int(num_frames)
+    mask = np.asarray(is_success, dtype=bool).reshape(-1)
+    n = int(min(int(num_frames), int(mask.shape[0])))
+    if n <= 0:
+        return 0
+    mask = mask[:n]
+    if not mask.any():
+        return n
+    return int(np.argmax(mask))
+
+
+def truncate_transitions_for_success_viz(
+    transitions: list[Transition],
+    *,
+    split: str,
+    selected: SelectedDemo,
+    action_horizon: int,
+) -> tuple[list[Transition], int | None]:
+    """Drop post-success frames for success-related splits (viz only)."""
+    if not is_success_related_split(split):
+        return transitions, None
+    is_success = load_demo_is_success(selected)
+    viz_end = pre_success_exclusive_end(is_success, len(transitions))
+    if viz_end >= len(transitions):
+        return transitions, None
+    if viz_end < int(action_horizon):
+        raise RuntimeError(
+            f"Pre-success segment has {viz_end} frames, but action_horizon={action_horizon} "
+            f"requires at least {action_horizon} frames for Q/V windows."
+        )
+    print(
+        f"[vis_qv] success split: truncate viz to pre-success frames "
+        f"[0, {viz_end}) / {len(transitions)} (last is_success=False at step {viz_end - 1})"
+    )
+    return transitions[:viz_end], int(viz_end)
+
+
 def select_demo(split_dir: Path, *, seed: int, demo_key: str | None) -> SelectedDemo:
     candidates: list[SelectedDemo] = []
     for path in sorted(split_dir.glob("*.hdf5")) + sorted(split_dir.glob("*.h5")):
@@ -575,9 +630,15 @@ def main() -> None:
     transitions = load_demo(
         selected,
         camera_names=camera_names,
-        image_size=int(meta.get("image_size", 128)),
+        image_size=int(meta.get("image_size", 256)),
         renderer=args.renderer,
         control_freq=args.control_freq,
+    )
+    transitions, viz_end_exclusive = truncate_transitions_for_success_viz(
+        transitions,
+        split=str(args.split),
+        selected=selected,
+        action_horizon=int(cfg.action_horizon),
     )
     rows, per_step_disc = compute_metrics(
         transitions,
@@ -655,6 +716,8 @@ def main() -> None:
         "chunk_feature_dim": int(encoder.chunk_feature_dim),
         "selected_hdf5": str(selected.hdf5_path),
         "selected_demo_key": selected.demo_key,
+        "viz_end_exclusive": viz_end_exclusive,
+        "num_transitions_viz": len(transitions),
         "num_windows": len(rows),
         "per_step_disc_frames": int(per_step_disc.num_frames),
         "first_pred_failure_frame": None if first_pred.size == 0 else int(first_pred[0]),

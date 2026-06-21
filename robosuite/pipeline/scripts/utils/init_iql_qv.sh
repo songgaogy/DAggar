@@ -33,10 +33,10 @@ PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
-ENVIRONMENT="NutAssemblySquare"
+ENVIRONMENT="PickPlaceCereal"
 NAME="offline_iql_qv"
 BRANCH_NAME="dipole_rl"
-NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_203140_NutAssemblySquare/checkpoints/pu_bce_head.pth"
+NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
 
@@ -74,6 +74,12 @@ HYDRA_OVERRIDES=(
 # Save assembled offline transitions for future reuse (offline DIPOLE etc.).
 HYDRA_OVERRIDES+=("warmup.num_trajectories.save_data=true")
 HYDRA_OVERRIDES+=("warmup.num_trajectories.save_dir=offline_data")
+
+# Collapse each success demo's post-success drift into one frozen absorbing
+# (s, a) anchor (see warmup.freeze_post_success). Default on; set
+# FREEZE_POST_SUCCESS=false to keep the raw post-success drift frames.
+FREEZE_POST_SUCCESS="${FREEZE_POST_SUCCESS:-true}"
+HYDRA_OVERRIDES+=("warmup.freeze_post_success=${FREEZE_POST_SUCCESS}")
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"

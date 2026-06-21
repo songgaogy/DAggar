@@ -169,6 +169,61 @@ def _tag_transitions_with_hdf5_path(
         trans.info = info
 
 
+def _freeze_post_success_tail(transitions: list[Any]) -> int:
+    """Collapse each demo's post-success drift into one frozen absorbing anchor.
+
+    Within every demo (delimited by ``Transition.done``), find the first frame
+    whose ``info["success"]`` is True (``t_s``) and overwrite every *later* frame
+    with a frozen copy of that ``t_s`` frame: ``obs`` (images + proprio),
+    ``next_obs`` and ``action`` all become the ``t_s`` values, and
+    ``info["success"]`` is pinned True. Reward / ``done`` are left untouched
+    (success frames already carry ``r_env=0`` and only the demo's last frame
+    keeps ``done=True``).
+
+    Rationale: the recorded success rollouts keep running the live policy after
+    success, so the post-success tail is real *drift* (moving state, non-zero
+    actions). Fitting Q/V on those many distinct meaningless states is the
+    "task burden" we want to drop, while the terminal-value anchor (V≈0 at
+    success) is what stabilizes offline IQL TD. Freezing the tail to a single
+    ``(s_{t_s}, a_{t_s})`` keeps every frozen frame a valid chunk start (so the
+    anchor *sampling density* is preserved) but makes all those chunks encode to
+    one identical latent — a clean, dense, unbiased absorbing anchor.
+
+    No-op for demos with no success frame (e.g. ``fail_rollout`` truncations).
+    The anchor ``obs`` / ``action`` are shared *by reference* across the tail
+    (read-only downstream) to avoid copying hundreds of image frames per demo.
+    Returns the number of frozen frames.
+    """
+    if not transitions:
+        return 0
+    frozen = 0
+    n = len(transitions)
+    demo_start = 0
+    for idx in range(n):
+        if not (bool(transitions[idx].done) or idx == n - 1):
+            continue
+        demo = transitions[demo_start : idx + 1]
+        first_success = next(
+            (j for j, t in enumerate(demo) if bool((t.info or {}).get("success", False))),
+            None,
+        )
+        if first_success is not None:
+            anchor = demo[first_success]
+            anchor_obs = anchor.obs
+            anchor_action = anchor.action
+            for tail in demo[first_success + 1 :]:
+                tail.obs = anchor_obs
+                tail.next_obs = anchor_obs
+                tail.action = anchor_action
+                info = dict(tail.info or {})
+                info["success"] = True
+                info["frozen_post_success"] = True
+                tail.info = info
+                frozen += 1
+        demo_start = idx + 1
+    return frozen
+
+
 def _select_split_demo_jobs(
     demo_paths: list[Path],
     *,
@@ -563,6 +618,11 @@ def main(cfg: DictConfig) -> None:
             f"start_method={load_worker_start_method}"
         )
 
+        freeze_post_success = bool(
+            OmegaConf.select(cfg, "warmup.freeze_post_success", default=True)
+        )
+        print(f"[warmup] freeze_post_success={freeze_post_success}")
+
         print("[warmup] start loading splits... it may takes a few minutes...")
         episode_index_base = 0
         total_loaded = 0
@@ -628,6 +688,22 @@ def main(cfg: DictConfig) -> None:
         print(
             f"[warmup] saved offline transitions -> {offline_path} "
             f"({len(buffer)} transitions, valid_starts={buffer.num_valid_sequences()})"
+        )
+
+    # Collapse each success demo's post-success drift into one frozen absorbing
+    # (s, a) anchor for the IQL critics. Applied AFTER the offline-data save so
+    # the persisted `offline_data` keeps the raw drift frames (offline DIPOLE's
+    # policy BC must not over-imitate a single repeated success-moment action);
+    # only the in-memory buffer the IQL warmup consumes is frozen. done/episode
+    # structure is unchanged, so valid-start windows (and thus anchor sampling
+    # density) are preserved while every post-success chunk now encodes to one
+    # identical latent. No-op for fail/no-success demos.
+    if freeze_post_success:
+        with buffer._lock:  # noqa: SLF001 — intentional in-place storage edit
+            n_frozen = _freeze_post_success_tail(buffer._storage)  # noqa: SLF001
+        print(
+            f"[warmup] freeze_post_success: collapsed {n_frozen} post-success "
+            f"frames into absorbing anchors (offline_data save kept raw)"
         )
 
     # Build IQL learner and replay sampler.

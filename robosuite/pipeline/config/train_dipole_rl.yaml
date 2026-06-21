@@ -65,6 +65,14 @@ warmup:
   # on the IQL GPU) accumulates tens of GB of VRAM during preencode and OOMs.
   # CPU cache costs only a per-step batch H2D copy in the warmup loops.
   preencode_cache_device: "cpu"        # "cpu" | "learner"/"device" (cache on the IQL GPU; OOM risk)
+  # Collapse each success demo's post-success drift into one frozen absorbing
+  # anchor: every frame strictly after the first success frame is overwritten
+  # with a copy of that first-success frame (obs images + proprio + action), so
+  # all post-success chunks encode to one identical (s, a) latent. Keeps the
+  # terminal-anchor sampling density (still valid chunk starts) but drops the
+  # burden/bias of fitting Q/V on many distinct meaningless drift states.
+  # No-op for demos without a success frame (e.g. fail_rollout truncations).
+  freeze_post_success: true
   demo_splits:
     - expert
     - success_rollout

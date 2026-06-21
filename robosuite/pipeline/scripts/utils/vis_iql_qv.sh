@@ -34,8 +34,8 @@ export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEED=2
-SPLIT="success_rollout-val"    # success_rollout or fail_rollout
+SEED=1
+SPLIT="fail_rollout-val"    # success_rollout or fail_rollout
 TARGET_PATH="offline_iql_qv"
 BRANCH_NAME="dipole_rl"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
