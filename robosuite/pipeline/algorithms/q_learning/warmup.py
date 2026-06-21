@@ -24,6 +24,7 @@ Per-split HDF5 caps: ``warmup.num_trajectories.{expert,success_rollout,fail_roll
 from __future__ import annotations
 
 import builtins
+import json
 import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -64,6 +65,7 @@ from robosuite.pipeline.utils.train_utils import (
     resolve_camera_names,
     resolve_demo_task_name,
     resolve_requested_device,
+    set_seed,
 )
 
 
@@ -397,6 +399,15 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
 
+    # Seed-controlled reproducibility: identical SEED + same machine/GPU yields
+    # the same demo-load order (deterministic buffer assembly) and the same
+    # np/torch sampling stream during the warmup loops. cudnn.benchmark / tf32
+    # stay enabled for speed, so this is run-to-run reproducible, not bit-exact
+    # across hardware.
+    seed = int(OmegaConf.select(cfg, "seed", default=42))
+    set_seed(seed)
+    print(f"[warmup] seed={seed}")
+
     warmup_cfg = OmegaConf.select(cfg, "warmup", default=None)
     if warmup_cfg is None or warmup_cfg.get("output_path", None) is None:
         raise ValueError(
@@ -588,6 +599,36 @@ def main(cfg: DictConfig) -> None:
 
     finally:
         env.close()
+
+    # Optionally persist the assembled offline transitions (raw images + proprio +
+    # actions + rewards + dones + metadata) so they can be reloaded verbatim into a
+    # replay buffer later (e.g. offline DIPOLE under pipeline/offline). Reuses
+    # FlowDaggerReplayBuffer.save() (torch.save of the full storage state_dict).
+    save_data = bool(OmegaConf.select(cfg, "warmup.num_trajectories.save_data", default=False))
+    if save_data:
+        save_dir = str(OmegaConf.select(cfg, "warmup.num_trajectories.save_dir", default="offline_data"))
+        offline_dir = Path(data_root) / task_data_name / save_dir
+        offline_path = offline_dir / "iql_offline_transitions.pt"
+        buffer.save(offline_path)
+        meta = {
+            "task": task_data_name,
+            "task_env": task_name,
+            "seed": int(seed),
+            "demo_splits": list(demo_splits),
+            "split_caps": {str(k): split_caps[k] for k in demo_splits},
+            "n_transitions": int(len(buffer)),
+            "num_valid_sequences": int(buffer.num_valid_sequences()),
+            "action_horizon": int(iql_cfg.action_horizon),
+            "camera_names": list(policy_camera_names),
+            "reward_mode": reward_mode,
+            "source": "q_learning.warmup",
+        }
+        meta_path = offline_path.with_suffix(".meta.json")
+        meta_path.write_text(json.dumps(meta, indent=2))
+        print(
+            f"[warmup] saved offline transitions -> {offline_path} "
+            f"({len(buffer)} transitions, valid_starts={buffer.num_valid_sequences()})"
+        )
 
     # Build IQL learner and replay sampler.
     iql = IQLLearner(

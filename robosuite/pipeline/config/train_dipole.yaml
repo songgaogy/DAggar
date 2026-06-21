@@ -1,5 +1,6 @@
 defaults:
   - _self_
+  - discriminator
 
 seed: 42
 
@@ -119,24 +120,8 @@ algorithm:
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
     g_mode: "nnpu_frozen"             # nnpu_frozen | advantage
 
-  # Frozen nnPU failure model. The checkpoint is task-calibrated and embeds
-  # the dynamics encoder checkpoint unless encoder_ckpt is overridden.
-  discriminator:
-    enabled: true
-    task_name: ${env.environment}
-    checkpoint: null                  # required: path to pu_bce_head.pth
-    encoder_ckpt: null
-    learner_device: ${algorithm.flow.device}
-    camera_to_view: {}
-    inference:
-      device: "cuda:0"
-      fps: -1                         # <=0: once per new policy chunk; >0: fixed Hz
-      intervene_env: true
-    pause:
-      consecutive_fail_frames: 2
-      require_safe_to_rearm: true
-    hud:
-      enabled: true
+  # Frozen nnPU failure model is configured in config/discriminator.yaml
+  # (Hydra `defaults`), which merges under `algorithm.discriminator`.
 
   online_buffer:
     capacity: 200000

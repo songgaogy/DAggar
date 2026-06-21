@@ -1,0 +1,25 @@
+# @package algorithm.discriminator
+# Frozen nnPU failure discriminator — online scoring cadence, HUD, and pause
+# behavior. Shared by train_dipole.yaml and train_dipole_rl.yaml via Hydra
+# `defaults`, so both runs configure the discriminator from this single file.
+#
+# NOTE: feature_source / transformer_layer are intentionally NOT exposed here.
+# They are immutable properties of the trained nnPU head and are always read
+# from the checkpoint payload (see algorithms/discriminator/encoder.py).
+enabled: true
+task_name: ${env.environment}
+checkpoint: null                  # required: path to pu_bce_head.pth (NNPU_CKPT)
+encoder_ckpt: null                # optional dynamics-encoder path override
+learner_device: ${algorithm.flow.device}
+camera_to_view: {}                # map policy camera name -> encoder view name
+inference:
+  device: "cuda:0"
+  # -1 (default): chunk-triggered — score once per new policy action chunk.
+  #  >0: legacy fixed-rate — score at this many frames/sec, decoupled from chunks.
+  fps: -1
+  intervene_env: true             # pause the env on a sustained "fail" prediction
+pause:
+  consecutive_fail_frames: 2      # consecutive scored "fail" frames before pausing
+  require_safe_to_rearm: true     # after resume, re-pause only after a "safe" frame
+hud:
+  enabled: true                   # single-line in-place console status bar

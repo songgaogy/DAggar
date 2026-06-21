@@ -1,0 +1,6 @@
+task_name: "PickPlaceCereal"
+
+data:
+  data_root: "/home/dodo/Documents/DAggar/robosuite/data"
+  pretrain_dir: "/pretrain_data-20260615_174814"  # <data_root>/<task_name>/<pretrain_dir>, all
+  offline_data_dir: "offline_data"  # <data_root>/<task_name>/<offline_data_dir>

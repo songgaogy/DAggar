@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -8,6 +11,26 @@ from tqdm import tqdm
 
 from .common import IQLActorBatch, IQLConfig, IQLStepBatch
 from .data_util import aggregate_chunk_reward, chunk_done_mask
+
+# Opt-in timing instrumentation for the offline warmup preencode sweep. Enable
+# with WARMUP_PROFILE=1 to print a per-stage breakdown (gather / assemble /
+# encode / disc / finalize / to_cache). Off by default => zero overhead.
+_WARMUP_PROFILE = os.environ.get("WARMUP_PROFILE", "0").strip().lower() not in {
+    "0",
+    "",
+    "false",
+    "no",
+}
+_PROFILE_TIMES: dict[str, float] = defaultdict(float)
+
+
+def _sync_if_cuda(device: Any) -> None:
+    if (
+        isinstance(device, str)
+        and device.startswith("cuda")
+        and torch.cuda.is_available()
+    ):
+        torch.cuda.synchronize(device)
 
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
@@ -160,6 +183,9 @@ class IQLReplayBuffer:
         the resulting batch is independent of *how* the start indices were
         chosen — that is what makes the preencode cache results-neutral.
         """
+        _prof = _WARMUP_PROFILE
+        _t0 = time.perf_counter() if _prof else 0.0
+
         camera_names = list(self._base.camera_names)
         H = int(self.cfg.action_horizon)
 
@@ -201,9 +227,24 @@ class IQLReplayBuffer:
                 [float(item.reward) if item.reward is not None else 0.0 for item in sequence],
                 dtype=np.float32,
             )
-            step_dones = np.asarray([bool(item.done) for item in sequence], dtype=np.float32)
-            if forced_done:
-                step_dones[-1] = 1.0
+            # Bootstrap terminal mask: γ^H·V(s') is dropped (done=1) ONLY at a
+            # genuine absorbing terminal. For offline demos that means a task
+            # *success* frame — a trajectory that merely ran off its recording
+            # boundary (e.g. every fail_rollout) is a *truncation*, so we keep
+            # bootstrapping and its tail chunks regress to r + γ^H·V(s') like the
+            # interior instead of collapsing to the immediate chunk reward.
+            # `_next_obs_for` already supplies a valid s', so `forced_done` must
+            # not zero the bootstrap on the success-annotated (offline) path.
+            if "success" in (first.info or {}):
+                step_dones = np.asarray(
+                    [bool((item.info or {}).get("success", False)) for item in sequence],
+                    dtype=np.float32,
+                )
+            else:
+                # Online / unknown provenance: preserve the prior done semantics.
+                step_dones = np.asarray([bool(item.done) for item in sequence], dtype=np.float32)
+                if forced_done:
+                    step_dones[-1] = 1.0
             rewards_per_step.append(step_rewards)
             dones_per_step.append(step_dones)
             info = first.info or {}
@@ -238,21 +279,18 @@ class IQLReplayBuffer:
         sp_proprio_tensor = torch.from_numpy(
             np.ascontiguousarray(sp_proprio_np)
         ).float()
-        with torch.no_grad():
-            state_features, chunk_features = encoder.encode_features(
-                chunk_images=chunk_images_tensor,
-                chunk_proprio=chunk_proprio_tensor,
-                chunk_actions=action_tensor,
-            )
-            next_v_state_feature = encoder.encode_state(
-                image_obs_raw=sp_image_tensor,
-                proprio_raw=sp_proprio_tensor,
-            )
+        if _prof:
+            _PROFILE_TIMES["assemble"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
-        q_chunk_feature = chunk_features[:, 0, :]
-        v_state_feature = state_features[:, 0, :]
-
-        # Per-frame disc reward: optional cache or frozen nnPU head.
+        # Only the *first* chunk frame's Q/V features (plus the s' state feature)
+        # feed the IQL batch (`q_chunk_feature`/`v_state_feature` index [:, 0, :]).
+        # The frozen encoder's per-frame disc reward is the sole consumer of the
+        # remaining H-1 chunk frames, so when no live disc scoring is needed we
+        # encode just frame 0 of the chunk instead of all H. Each frame is encoded
+        # independently along the batch dim, so the frame-0 output is bit-identical
+        # either way — this is a pure speedup (~H x fewer DINOv3 forwards on the
+        # chunk path; the dominant warmup cost).
         effective_disc_coef = float(self.cfg.disc_reward_coef)
         effective_output_coef = float(self.cfg.output_reward_coef)
         use_precomputed_disc = (
@@ -260,6 +298,40 @@ class IQLReplayBuffer:
             and len(nnpu_disc_per_sequence) == B
             and all(step is not None for step in nnpu_disc_per_sequence)
         )
+        need_full_chunk_features = (
+            effective_disc_coef != 0.0
+            and not use_precomputed_disc
+            and discriminator is not None
+        )
+
+        chunk_features: torch.Tensor | None = None
+        with torch.no_grad():
+            if need_full_chunk_features:
+                state_features, chunk_features = encoder.encode_features(
+                    chunk_images=chunk_images_tensor,
+                    chunk_proprio=chunk_proprio_tensor,
+                    chunk_actions=action_tensor,
+                )
+                q_chunk_feature = chunk_features[:, 0, :]
+                v_state_feature = state_features[:, 0, :]
+            else:
+                # frame-0-only fast path: encode obs_0 once, fused with the full
+                # H-step action window (identical to encode_features step 0).
+                v_state_feature, q_chunk_feature = encoder.encode_state_and_chunk(
+                    image_obs_raw=chunk_images_tensor[:, 0],
+                    proprio_raw=chunk_proprio_tensor[:, 0],
+                    action_chunk=action_tensor,
+                )
+            next_v_state_feature = encoder.encode_state(
+                image_obs_raw=sp_image_tensor,
+                proprio_raw=sp_proprio_tensor,
+            )
+        if _prof:
+            _sync_if_cuda(device)
+            _PROFILE_TIMES["encode"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+
+        # Per-frame disc reward: optional cache or frozen nnPU head.
         if effective_disc_coef == 0.0:
             r_disc_per_step = torch.zeros_like(reward_tensor)
         elif use_precomputed_disc:
@@ -276,6 +348,11 @@ class IQLReplayBuffer:
             )
         else:
             r_disc_per_step = torch.zeros_like(reward_tensor)
+
+        if _prof:
+            _sync_if_cuda(device)
+            _PROFILE_TIMES["disc"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
 
         r_total_chunk = effective_output_coef * reward_tensor + effective_disc_coef * r_disc_per_step
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
@@ -302,7 +379,11 @@ class IQLReplayBuffer:
                 **disc_meta,
             },
         )
-        return batch.to(device)
+        out = batch.to(device)
+        if _prof:
+            _sync_if_cuda(device)
+            _PROFILE_TIMES["finalize"] += time.perf_counter() - _t0
+        return out
 
     def sample_actor_batch(
         self,
@@ -430,10 +511,15 @@ class IQLReplayBuffer:
                 total=(len(valid_starts) + encode_bs - 1) // encode_bs,
                 desc=progress_desc,
             )
+        if _WARMUP_PROFILE:
+            _PROFILE_TIMES.clear()
         for offset in iterator:
+            _t = time.perf_counter() if _WARMUP_PROFILE else 0.0
             batch_starts = valid_starts[offset : offset + encode_bs]
             with self._base._lock:  # noqa: SLF001
                 sequences = [self._base._storage[s : s + H] for s in batch_starts]  # noqa: SLF001
+            if _WARMUP_PROFILE:
+                _PROFILE_TIMES["gather"] += time.perf_counter() - _t
             batch = self._build_step_batch(
                 sequences,
                 batch_starts,
@@ -441,8 +527,18 @@ class IQLReplayBuffer:
                 discriminator=discriminator,
                 device=device,
             )
+            _t = time.perf_counter() if _WARMUP_PROFILE else 0.0
             for name in field_names:
                 parts[name].append(getattr(batch, name).detach().to(cache_device))
+            if _WARMUP_PROFILE:
+                _PROFILE_TIMES["to_cache"] += time.perf_counter() - _t
+
+        if _WARMUP_PROFILE:
+            total = sum(_PROFILE_TIMES.values()) or 1e-9
+            print("[warmup][profile] preencode stage breakdown:")
+            for key, value in sorted(_PROFILE_TIMES.items(), key=lambda kv: -kv[1]):
+                print(f"  {key:10s} {value:8.2f}s ({100.0 * value / total:5.1f}%)")
+            print(f"  {'TOTAL':10s} {total:8.2f}s")
 
         return IQLPreencodedReplayCache(
             q_chunk_feature=torch.cat(parts["q_chunk_feature"], dim=0),

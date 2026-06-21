@@ -58,8 +58,13 @@ warmup:
   # warmup loops (frozen encoder => results-neutral; pure speedup). Set false to
   # re-encode every step (old behavior).
   preencode_cache: true
-  preencode_batch_size: 64
-  preencode_cache_device: "learner"   # "cpu" | "learner"/"device" (cache on the IQL GPU)
+  preencode_batch_size: 32
+  # Where to hold the full pre-encoded chunk cache. "cpu" is the safe default:
+  # the cache holds one encoded-feature row per valid chunk (q_chunk_feature
+  # alone is ~14k floats), so on a 100k+ chunk dataset "learner"/"device" (cache
+  # on the IQL GPU) accumulates tens of GB of VRAM during preencode and OOMs.
+  # CPU cache costs only a per-step batch H2D copy in the warmup loops.
+  preencode_cache_device: "cpu"        # "cpu" | "learner"/"device" (cache on the IQL GPU; OOM risk)
   demo_splits:
     - expert
     - success_rollout
@@ -69,6 +74,8 @@ warmup:
     expert: 0
     success_rollout: 50
     fail_rollout: 50
+    save_data: true           # save the iql training data for future use
+    save_dir: "offline_data"  # <data_root>/<task_name>/<save_dir>
 
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.
