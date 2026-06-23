@@ -436,6 +436,7 @@ class IQLReplayBuffer:
         batch = IQLActorBatch(
             q_chunk_feature=chunk_features[:, 0, :],
             v_state_feature=state_features[:, 0, :],
+            action_chunk=action_tensor_raw,
             metadata={
                 "start_indices": start_indices,
                 "episode_ids": episode_ids,

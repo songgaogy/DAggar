@@ -175,10 +175,10 @@ def _freeze_post_success_tail(transitions: list[Any]) -> int:
     Within every demo (delimited by ``Transition.done``), find the first frame
     whose ``info["success"]`` is True (``t_s``) and overwrite every *later* frame
     with a frozen copy of that ``t_s`` frame: ``obs`` (images + proprio),
-    ``next_obs`` and ``action`` all become the ``t_s`` values, and
-    ``info["success"]`` is pinned True. Reward / ``done`` are left untouched
-    (success frames already carry ``r_env=0`` and only the demo's last frame
-    keeps ``done=True``).
+    ``next_obs`` and ``action`` all become the ``t_s`` values,
+    ``info["success"]`` is pinned True, and ``reward`` is set to ``0.0`` so
+    every frozen tail chunk matches the absorbing terminal target. ``done`` is
+    left untouched (only the demo's last frame keeps ``done=True``).
 
     Rationale: the recorded success rollouts keep running the live policy after
     success, so the post-success tail is real *drift* (moving state, non-zero
@@ -215,6 +215,7 @@ def _freeze_post_success_tail(transitions: list[Any]) -> int:
                 tail.obs = anchor_obs
                 tail.next_obs = anchor_obs
                 tail.action = anchor_action
+                tail.reward = 0.0
                 info = dict(tail.info or {})
                 info["success"] = True
                 info["frozen_post_success"] = True
@@ -712,12 +713,19 @@ def main(cfg: DictConfig) -> None:
             f"frames into absorbing anchors (offline_data save kept raw)"
         )
 
-    # Build IQL learner and replay sampler.
+    # Build IQL learner and replay sampler. The Token/Group projectors need the
+    # encoder's patch-token layout (chunk feature = n_tokens x chunk_token_dim;
+    # state visual block = n_tokens x state_visual_token_dim; proprio_dim is the
+    # trailing block on the state feature).
+    n_tokens = int(encoder.inner_encoder.num_patches)
+    proprio_dim = int(encoder.inner_encoder.proprio_emb_dim)
     iql = IQLLearner(
         cfg=iql_cfg,
         state_feature_dim=encoder.state_feature_dim,
         chunk_feature_dim=encoder.chunk_feature_dim,
         action_dim=policy_action_dim,
+        n_tokens=n_tokens,
+        proprio_dim=proprio_dim,
     )
     replay = IQLReplayBuffer(base_buffer=buffer, cfg=iql_cfg)
     if not replay.ready(batch_size):
@@ -821,8 +829,16 @@ def main(cfg: DictConfig) -> None:
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
+            # Token/Group dim-reduction projector layout (schema v3).
+            "n_tokens": int(n_tokens),
+            "proprio_dim": int(proprio_dim),
+            "chunk_proj_dim": int(iql_cfg.chunk_proj_dim),
+            "state_proj_dim": int(iql_cfg.state_proj_dim),
+            "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
+            "action_proj_dim": int(iql_cfg.action_proj_dim),
+            "proj_activation": str(iql_cfg.proj_activation),
         },
-        "schema_version": 2,
+        "schema_version": 3,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")

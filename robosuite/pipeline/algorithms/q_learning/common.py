@@ -39,7 +39,19 @@ class IQLConfig:
     target_polyak: float = 0.005
 
     n_step_aggregate: bool = True
-    hidden_dims: tuple[int, ...] = (512, 512)
+    # Head width *after* the Token/Group projector (the projector — not the
+    # head — is the anti-overfit lever, so this is now much smaller than the
+    # legacy 512x512 that fed on the raw 14272-d feature).
+    hidden_dims: tuple[int, ...] = (256, 256)
+    # Token/Group dim-reduction projectors inserted BEFORE the Q/V heads
+    # (see networks.py). The frozen encoder feature is 16 tokens x per-token
+    # dim; chunk/state proj dims must be divisible by n_tokens (asserted in the
+    # learner once n_tokens is known from the encoder).
+    chunk_proj_dim: int = 256      # 14272 chunk feature -> compressed Q input
+    state_proj_dim: int = 256      # 12288 state visual tokens -> compressed V input
+    proprio_proj_dim: int = 32     # state proprio block -> appended to V input
+    action_proj_dim: int = 128     # raw action chunk -> re-injected into Q
+    proj_activation: str = "mish"  # mish | gelu | relu | silu
     # Q-ensemble: q_ensemble_size critics; the V-target uses min over a random
     # subset of v_subset_size critics (REDQ-style), while the actor advantage
     # uses mean over all critics (see iql.py / losses.py).
@@ -58,6 +70,13 @@ class IQLConfig:
 
     def __post_init__(self) -> None:
         self.hidden_dims = tuple(int(h) for h in self.hidden_dims)
+        self.chunk_proj_dim = int(self.chunk_proj_dim)
+        self.state_proj_dim = int(self.state_proj_dim)
+        self.proprio_proj_dim = int(self.proprio_proj_dim)
+        self.action_proj_dim = int(self.action_proj_dim)
+        for name in ("chunk_proj_dim", "state_proj_dim", "proprio_proj_dim", "action_proj_dim"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"IQLConfig.{name} must be >= 1, got {getattr(self, name)}.")
         self.q_ensemble_size = int(self.q_ensemble_size)
         self.v_subset_size = int(self.v_subset_size)
         if self.q_ensemble_size < 1:
@@ -120,16 +139,19 @@ class IQLActorBatch:
     Shapes:
         q_chunk_feature   (B, D_chunk) — action-conditioned chunk latent for Q
         v_state_feature   (B, D_state) — action-free state latent for V
+        action_chunk      (B, H, D_a)  — raw action chunk re-injected into Q
         metadata          dict         — episode ids, mask flags
     """
 
     q_chunk_feature: torch.Tensor
     v_state_feature: torch.Tensor
+    action_chunk: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to(self, device: str | torch.device) -> "IQLActorBatch":
         return IQLActorBatch(
             q_chunk_feature=self.q_chunk_feature.to(device),
             v_state_feature=self.v_state_feature.to(device),
+            action_chunk=self.action_chunk.to(device),
             metadata=self.metadata,
         )

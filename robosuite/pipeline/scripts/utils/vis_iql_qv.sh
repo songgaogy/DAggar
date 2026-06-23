@@ -30,14 +30,14 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEED=1
-SPLIT="fail_rollout-val"    # success_rollout or fail_rollout
-TARGET_PATH="offline_iql_qv-v1"
-BRANCH_NAME="dipole_rl"
+SEED=6
+SPLIT="success_rollout-val"    # success_rollout or fail_rollout
+TARGET_PATH="offline_iql_qv-v2"
+BRANCH_NAME="dipole_rl-debug"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
