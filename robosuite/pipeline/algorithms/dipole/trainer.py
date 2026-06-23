@@ -178,6 +178,7 @@ class DipoleTrainer:
                         IQLActorBatch(
                             q_chunk_feature=step_batch.q_chunk_feature,
                             v_state_feature=step_batch.v_state_feature,
+                            action_chunk=step_batch.action_chunk,
                         )
                     )
                 metrics["advantage_mean"] = float(adv.mean().item())

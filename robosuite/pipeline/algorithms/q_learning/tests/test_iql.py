@@ -32,6 +32,12 @@ from robosuite.pipeline.algorithms.q_learning.losses import (
 )
 
 
+# Synthetic token layout for the Token/Group projectors: small dims that stay
+# divisible by n_tokens=4 (chunk 16 -> 4x4, state visual 12-4=8 -> 4x2).
+_N_TOKENS = 4
+_PROPRIO_DIM = 4
+
+
 def _make_cfg(action_horizon: int = 2) -> IQLConfig:
     return IQLConfig(
         action_horizon=action_horizon,
@@ -42,11 +48,32 @@ def _make_cfg(action_horizon: int = 2) -> IQLConfig:
         target_polyak=0.1,
         n_step_aggregate=True,
         hidden_dims=(32, 32),
+        chunk_proj_dim=8,
+        state_proj_dim=8,
+        proprio_proj_dim=4,
+        action_proj_dim=8,
+        proj_activation="mish",
         grad_clip_norm=1.0,
         weight_decay=0.0,
         device="cpu",
         disc_reward_coef=0.0,
         output_reward_coef=1.0,
+    )
+
+
+def _make_learner(
+    cfg: IQLConfig,
+    state_feature_dim: int = 12,
+    chunk_feature_dim: int = 16,
+    action_dim: int = 4,
+) -> IQLLearner:
+    return IQLLearner(
+        cfg=cfg,
+        state_feature_dim=state_feature_dim,
+        chunk_feature_dim=chunk_feature_dim,
+        action_dim=action_dim,
+        n_tokens=_N_TOKENS,
+        proprio_dim=_PROPRIO_DIM,
     )
 
 
@@ -150,7 +177,7 @@ def test_chunk_done_mask() -> None:
 
 def test_iql_update_step_runs_and_moves_params() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql = _make_learner(cfg)
     batch = _make_step_batch(B=8, D_state=12, D_chunk=16, D_a=4, H=2)
 
     # Step v away from its zero-init final layer using one warmup pass so the
@@ -178,7 +205,7 @@ def test_iql_update_step_runs_and_moves_params() -> None:
 
 def test_iql_warmup_value_only_runs() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql = _make_learner(cfg)
     batch = _make_step_batch(B=8, D_state=12, D_chunk=16, D_a=4, H=2)
     snapshot_q1 = [p.detach().clone() for p in iql.q1.parameters()]
     snapshot_v = [p.detach().clone() for p in iql.v.parameters()]
@@ -199,8 +226,8 @@ def test_iql_warmup_value_only_runs() -> None:
 
 def test_iql_state_dict_roundtrip() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
-    iql_b = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql_a = _make_learner(cfg)
+    iql_b = _make_learner(cfg)
     # Run one step on A so its weights diverge from B's fresh init.
     batch = _make_step_batch(B=4, D_state=12, D_chunk=16, D_a=4, H=2)
     iql_a.update(batch)
@@ -214,21 +241,21 @@ def test_iql_state_dict_roundtrip() -> None:
 
 def test_iql_load_state_dict_mismatched_feature_dim_raises() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
-    iql_c = IQLLearner(cfg=cfg, state_feature_dim=8, chunk_feature_dim=16, action_dim=4)
+    iql_a = _make_learner(cfg)
+    iql_c = _make_learner(cfg, state_feature_dim=8)
     sd = iql_a.state_dict()
     with pytest.raises(ValueError, match="state_feature_dim mismatch"):
         iql_c.load_state_dict(sd, strict=True)
 
-    iql_d = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=8, action_dim=4)
+    iql_d = _make_learner(cfg, chunk_feature_dim=8)
     with pytest.raises(ValueError, match="chunk_feature_dim mismatch"):
         iql_d.load_state_dict(sd, strict=True)
 
 
 def test_iql_old_two_q_checkpoint_schema_raises() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql_a = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
-    iql_b = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql_a = _make_learner(cfg)
+    iql_b = _make_learner(cfg)
     sd = iql_a.state_dict()
     old_sd = dict(sd)
     old_sd.pop("q_ensemble")
@@ -251,7 +278,7 @@ def test_qchunk_consumes_chunk_feature_directly() -> None:
 
 def test_legacy_lpb_checkpoint_requires_new_warmup() -> None:
     cfg = _make_cfg(action_horizon=2)
-    iql = IQLLearner(cfg=cfg, state_feature_dim=12, chunk_feature_dim=16, action_dim=4)
+    iql = _make_learner(cfg)
     legacy = iql.state_dict()
     legacy["context_dim"] = legacy.pop("state_feature_dim")
     legacy.pop("chunk_feature_dim")

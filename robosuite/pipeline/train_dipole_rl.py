@@ -383,6 +383,8 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             state_feature_dim=int(shared_encoder.state_feature_dim),
             chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
             action_dim=policy_action_dim,
+            n_tokens=int(shared_encoder.inner_encoder.num_patches),
+            proprio_dim=int(shared_encoder.inner_encoder.proprio_emb_dim),
         )
         iql_replay = IQLReplayBuffer(agent.online_buffer, iql_cfg)
     else:

@@ -129,10 +129,12 @@ def load_iql_payload(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"IQL checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if int(payload.get("schema_version", -1)) != 2:
+    schema_version = int(payload.get("schema_version", -1))
+    if schema_version not in (2, 3):
         raise ValueError(
-            "Legacy LPB IQL checkpoints are incompatible with nnPU features. "
-            "Re-run offline Q/V warmup."
+            f"Unsupported IQL checkpoint schema_version={schema_version}. "
+            "Legacy LPB checkpoints are incompatible with nnPU features; "
+            "re-run offline Q/V warmup."
         )
     for key in ("iql_state", "cfg", "encoder_meta"):
         if key not in payload:
@@ -364,6 +366,8 @@ def build_models(
         state_feature_dim=encoder.state_feature_dim,
         chunk_feature_dim=encoder.chunk_feature_dim,
         action_dim=action_dim,
+        n_tokens=int(encoder.inner_encoder.num_patches),
+        proprio_dim=int(encoder.inner_encoder.proprio_emb_dim),
     )
     learner.load_state_dict(payload["iql_state"], strict=True)
     learner.q_ensemble.eval()
@@ -460,7 +464,9 @@ def compute_metrics(
         total_steps = float(cfg.output_reward_coef) * rewards + float(cfg.disc_reward_coef) * disc_steps
         aggregated = aggregate_chunk_reward(total_steps, float(cfg.discount)).to(learner.cfg.device)
         done = chunk_done_mask(dones).to(learner.cfg.device)
-        q_values = learner._q_values(chunk_features[:, 0])  # noqa: SLF001
+        q_values = learner._q_values(  # noqa: SLF001
+            chunk_features[:, 0], actions.to(learner.cfg.device)
+        )
         v = learner.v(state_features[:, 0])
         next_v = learner.target_v(next_state)
         bootstrap_v = bootstrap_discount * (1.0 - done) * next_v

@@ -109,6 +109,7 @@ class AdvantageGProvider:
         actor_batch = IQLActorBatch(
             q_chunk_feature=chunk_feature,
             v_state_feature=state_feature,
+            action_chunk=action_chunk_raw,
             metadata={},
         )
 
