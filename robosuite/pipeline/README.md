@@ -24,8 +24,8 @@ observations + proposed action chunk
              |
              +--> frozen DynEncoder
                     |-- state feature ----------------------> V(s)
-                    `-- action-conditioned chunk feature --> Q(s, a_chunk)
-                                                        `--> frozen nnPU head
+                    `-- action-conditioned chunk feature --> frozen nnPU head
+                                                        `--> Q token projector + action projector
 
 DIPOLE:    G = -failure_score
 DIPOLE-RL: G = alpha * normalized_advantage
@@ -73,23 +73,24 @@ Useful overrides include `LEARNER_DEVICE`, `INFERENCE_DEVICE`, `ACTION_HORIZON`,
 DIPOLE-RL should normally start from a task-specific Q/V warmup checkpoint:
 
 ```bash
-export NNPU_CKPT=/abs/path/to/pu_bce_head.pth
 bash robosuite/pipeline/scripts/utils/init_iql_qv.sh
 ```
 
 The utility reads the configured `expert`, `success_rollout`, and `fail_rollout` HDF5 splits, freezes the dynamics encoder, optionally pre-encodes its state/chunk features, and writes:
 
 ```text
-outputs/DIPOLE_rl/iql_qv_cache/<task>/iql_state.pt
+outputs/dipole_rl/offline_iql_qv-v1/<task>/iql_state.pt
 ```
 
 The warmup is seed-controlled (`SEED`, default 42): it seeds python/numpy/torch so the demo-load order and the sampling stream are reproducible run-to-run on the same machine/GPU (`cudnn.benchmark`/TF32 stay on for speed, so this is not bit-exact across hardware).
 
-With `SAVE_DATA=true` (default, via `warmup.num_trajectories.save_data`), the assembled raw offline transitions are also saved to `<data_root>/<task>/<SAVE_DIR>/iql_offline_transitions.pt` (plus a `.meta.json` sidecar). These reload verbatim via `FlowDaggerReplayBuffer.load` and feed the offline DIPOLE entrance under `pipeline/offline`.
+With `warmup.num_trajectories.save_data=true` (forced by `init_iql_qv.sh`), the assembled raw offline transitions are also saved to `<data_root>/<task>/<save_dir>/iql_offline_transitions.pt` (plus a `.meta.json` sidecar). These reload verbatim via `FlowDaggerReplayBuffer.load`. The export is implemented, but the offline DIPOLE training entry under `pipeline/offline` is still a placeholder.
 
-With `FREEZE_POST_SUCCESS=true` (default, via `warmup.freeze_post_success`), each success demo's post-success tail is collapsed into a single frozen absorbing anchor before the IQL critics consume it. Recorded `success_rollout` demos are fixed-length (e.g. 400 steps) but keep running the live policy after success, so the frames after the first success are real *drift* (moving state, non-zero actions). Fitting Q/V on those many distinct, meaningless states is a burden, while their dense sampling is what anchors the terminal value `V≈0` and stabilizes TD. The warmup therefore overwrites every frame strictly after the first success frame `t_s` with a copy of that frame — `obs` (images + proprio), `next_obs`, and `action` all become the `t_s` values — so all post-success chunks encode to one identical `(s, a)` latent: a clean, dense, unbiased anchor that preserves the stabilizing sampling density without the drift-fitting burden. The first success frame keeps its real `(s, a)`; `fail_rollout` (and any demo without a success frame) is untouched, since it is a truncation that must keep bootstrapping. The freeze is applied **after** the `SAVE_DATA` save, so the persisted `offline_data` keeps the raw drift frames (offline DIPOLE's policy BC must not over-imitate one repeated success-moment action); only the in-memory buffer the IQL warmup trains on is frozen. Set `FREEZE_POST_SUCCESS=false` to disable.
+With `FREEZE_POST_SUCCESS=true` (default, via `warmup.freeze_post_success`), each success demo's post-success tail is collapsed into a single frozen absorbing anchor before the IQL critics consume it. Recorded `success_rollout` demos are fixed-length (e.g. 400 steps) but keep running the live policy after success, so the frames after the first success are real *drift* (moving state, non-zero actions). Fitting Q/V on those many distinct, meaningless states is a burden, while their dense sampling is what anchors the terminal value `V≈0` and stabilizes TD. The warmup therefore overwrites every frame strictly after the first success frame `t_s` with a copy of that frame: `obs` (images + proprio), `next_obs`, and `action` all become the `t_s` values, and the frozen-tail reward is set to `0.0`. The first success frame keeps its real `(s, a)`; `fail_rollout` and demos without a success frame are untouched. The freeze is applied after the offline-data save, so the persisted `offline_data` keeps the raw drift frames; only the in-memory buffer the IQL warmup trains on is frozen. Set `FREEZE_POST_SUCCESS=false` to disable.
 
-This is an experiment-specific entrance: `ENVIRONMENT` and `INIT_CHECKPOINT` are intentionally hardcoded near the top of the script. Edit those constants directly for another task or base policy. The seed, trajectory counts, learner device, output path, warmup lengths, and offline-data save options retain their documented environment-variable overrides.
+Current IQL warmup uses schema version 3. It compresses the frozen encoder features with Token/Group projectors before the Q/V heads, re-injects the raw `action_chunk` into Q through an action projector, and defaults to a lighter head (`hidden_dims=[256,256]`, `chunk_proj_dim=128`, `state_proj_dim=128`). The Hydra defaults run `10000` V-only steps followed by `5000` full IQL steps, with `reward_mode="-1/0"`, `output_reward_coef=0.1`, and `disc_reward_coef=0.0`.
+
+This is an experiment-specific entrance: `ENVIRONMENT`, `INIT_CHECKPOINT`, and `NNPU_CKPT` are intentionally hardcoded near the top of the script. Edit those constants directly for another task, base policy, or nnPU artifact. `SEED`, `BATCH_SIZE`, `DEVICE`, `OUTPUT_DIR`, `OUTPUT_FILE`, `PREENCODE_CACHE_DEVICE`, and `FREEZE_POST_SUCCESS` retain environment-variable overrides.
 
 ### Train DIPOLE-RL
 
@@ -123,7 +124,7 @@ NNPU_CKPT=/abs/path/to/pu_bce_head.pth \
 bash robosuite/pipeline/scripts/utils/vis_iql_qv.sh
 ```
 
-This utility is diagnostic only. Its task, split, seed, and checkpoint layout are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and Q/V schema as training.
+This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and Q/V schema as training.
 
 ## Human-in-the-loop runtime
 
@@ -179,7 +180,7 @@ With the default `g_sign=negate_raw`, discriminator-only DIPOLE uses `G=-failure
 
 ### DIPOLE-RL critics
 
-Q consumes the action-conditioned chunk feature directly. V and target-V consume the action-free state feature. The frozen dynamics encoder owns action chunk normalization and fusion; Q does not add a second action projection. For an H-step replay window, the unchanged learner computes:
+Q first compresses the action-conditioned chunk feature with a shared Token/Group projector, separately embeds the raw action chunk with an `ActionProjector`, then feeds the concatenated projection to each Q head. V and target-V consume the action-free state feature through their own Token/Group projector. For an H-step replay window, the learner computes:
 
 ```text
 R_H   = sum(i=0..H-1) gamma^i * r_total_i
@@ -189,7 +190,7 @@ delta = min(Q_subset(s, a_chunk)) - V(s)
 L_V   = mean(abs(expectile_tau - 1[delta < 0]) * delta^2)
 ```
 
-Only target-V receives a Polyak update. Each learner tick performs the IQL update before the flow-policy update; there is no discriminator update.
+Only target-V receives a Polyak update. Each learner tick performs the IQL update before the flow-policy update; there is no discriminator update. Q uses an ensemble (`q_ensemble_size=10` by default), V uses the minimum over a random subset (`v_subset_size=2` by default), and the actor advantage uses the ensemble output through `compute_ensemble_advantage`.
 
 ## Configuration and repository layout
 
@@ -202,7 +203,10 @@ pipeline/
 |   `-- flow_dagger/      shared rollout/runtime utilities
 |-- config/
 |   |-- train_dipole.yaml
-|   `-- train_dipole_rl.yaml
+|   |-- train_dipole_rl.yaml
+|   |-- discriminator.yaml
+|   `-- offline.yaml
+|-- offline/              placeholder offline DIPOLE entry points
 |-- scripts/              maintained bash entry points
 |-- train_dipole.py
 |-- train_dipole_rl.py
@@ -226,6 +230,14 @@ algorithm:
   q_learning:
     enabled: true
     warmup_ckpt: null
+    config:
+      reward_mode: "-1/0"
+      hidden_dims: [256, 256]
+      chunk_proj_dim: 128
+      state_proj_dim: 128
+      action_proj_dim: 64
+      q_ensemble_size: 10
+      v_subset_size: 2
 ```
 
 `camera_to_view` maps a policy camera name to the view name expected by the dynamics encoder. Leave it empty when names match.
@@ -247,10 +259,10 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 
 ## Checkpoint compatibility
 
-- Existing flow policy checkpoints remain compatible because the actor architecture and state-dict keys are unchanged; only the import package is now `robosuite.policy.flow_multi_update`.
+- Existing flow policy checkpoints remain compatible because the actor architecture and state-dict keys are unchanged.
 - Old LPB v2 BCE or online-BCE discriminator artifacts are not valid `NNPU_CKPT` inputs.
-- Old Q/V warmup checkpoints that contain one LPB context feature, separate `q1/q2`, or omit `state_feature_dim` and `chunk_feature_dim` are rejected. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder.
-- A Q/V checkpoint is tied to the nnPU encoder, task, camera views, action dimension, horizon, and ensemble size recorded in its metadata.
+- Old Q/V warmup checkpoints that contain one LPB context feature, separate `q1/q2`, omit `state_feature_dim` / `chunk_feature_dim`, or predate schema version 3 are rejected. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder.
+- A Q/V checkpoint is tied to the nnPU encoder, task, camera views, action dimension, horizon, ensemble size, token count, proprio width, and projector dimensions recorded in its metadata.
 
 ## Troubleshooting
 
@@ -268,19 +280,19 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 
 # TODO List
 
-1. [done] refactor to suit for new PU-learning based discriminator
-2. [done] add [config](./config/discriminator.yaml) for online discriminator behavior setting, apply these settings in main training loop. Follow implementation and logic in git branch `dagger/v0-pu-bce`.
-  - `algorithm.discriminator` is now a standalone Hydra fragment (`# @package algorithm.discriminator`) pulled into both `train_dipole.yaml` and `train_dipole_rl.yaml` via `defaults`, so the online scoring cadence / pause / HUD knobs live in one file. `feature_source` / `transformer_layer` stay read-only from the nnPU checkpoint (not exposed as overrides).
-3. [done] modify [offline iql learning](./scripts/utils/init_iql_qv.sh) and related logic:
-  - save IQL training data each time, new parameters have been defined in [config](./config/train_dipole_rl.yaml) (`warmup.num_trajectories.save_data` / `save_dir`); the assembled raw offline transitions are written to `<data_root>/<task>/<save_dir>/iql_offline_transitions.pt` (reloadable via `FlowDaggerReplayBuffer.load`) for offline DIPOLE reuse.
-  - make all learning deterministic, controlled by `SEED`, reproducable (warmup seeds python/numpy/torch; demo-load order and sampling stream are reproducible run-to-run on the same machine/GPU).
-  - debug and check (although no output bugs are observed)
-  - fix success_rollout: `success_rollout` demos keep running the live policy after success, so the recorded post-success tail is real drift (moving state, non-zero actions), not a frozen pad. `warmup.freeze_post_success` (default true; `FREEZE_POST_SUCCESS` in `init_iql_qv.sh`) collapses each demo's frames after the first success frame `t_s` into a single frozen absorbing `(s_{t_s}, a_{t_s})` anchor (obs + next_obs + action copied), keeping the terminal-anchor sampling density while dropping the burden/bias of fitting Q/V on many distinct drift states. Applied after the offline-data save so `offline_data` stays raw for offline DIPOLE.
-4. [tbd] implement offline dipole learning under folder `./offline`
-  - load pretrain_data + offline_data into `replay_buffer`, keep `demo_buffer` empty
-  - use iql checkpoint and pretrained policy to perform dipole_rl algorithm 
-5. [tbd] change current condition-injection based positive-negative policy architecture. Target: LoRA liked negative injection
-  - for positive policy, uses original policy; during updates, tune all policy network
-  - for negative policy, add LoRA(or others) module. During updates, tune base policy NNs + LoRA module together. note: when BP for negative policy, lr for base policy NNs should set 0.5 of LoRA module
-  - during online rollout, uses only positive branch (no extra 2-policy inference during online)
-  - during evaluation, uses DIPOLE 2 policy inference with $1+w$ and $w$ weighted
+- [x] Refactor the pipeline to use the PU-learning based nnPU discriminator.
+- [x] Add shared online discriminator configuration in [config/discriminator.yaml](./config/discriminator.yaml). `algorithm.discriminator` is a standalone Hydra fragment merged into both `train_dipole.yaml` and `train_dipole_rl.yaml`; online scoring cadence, pause behavior, and HUD settings now live in one file. `feature_source` and `transformer_layer` remain read-only properties loaded from the nnPU checkpoint.
+- [x] Update offline IQL warmup in [scripts/utils/init_iql_qv.sh](./scripts/utils/init_iql_qv.sh):
+  1. Save assembled raw offline transitions to `<data_root>/<task>/<save_dir>/iql_offline_transitions.pt` plus metadata for later reuse.
+  2. Seed python, numpy, and torch from `SEED` so demo loading and sampling are reproducible on the same machine/GPU.
+  3. Freeze post-success drift in memory with `warmup.freeze_post_success`, while keeping saved offline data raw.
+  4. Move IQL Q/V to schema version 3 with Token/Group feature projectors, raw action re-injection for Q, smaller `[256,256]` heads, `q_ensemble_size=10`, and `v_subset_size=2`.
+  5. Remove legacy debug-only Q/V scripts and keep `vis_iql_qv.sh` as the maintained diagnostic entrance.
+- [ ] Implement offline DIPOLE training under `pipeline/offline`, with config being [this](./config/offline.yaml)
+  - Load `pretrain_data` and exported `offline_data` into `replay_buffer`, keeping `demo_buffer` empty.
+  - Use the pretrained flow policy and IQL checkpoint to run the DIPOLE-RL update offline.
+- [ ] Replace the current condition-injection positive/negative policy architecture with a LoRA-like negative branch.
+  - Positive branch should use the original policy path and update all policy network parameters.
+  - Negative branch should add an adapter module; during negative updates, train the adapter and base policy together, with the base-policy learning rate lower than the adapter learning rate.
+  - Online rollout should use only the positive branch.
+  - Evaluation should keep DIPOLE two-branch inference with `(1 + omega)` and `omega` weighting.

@@ -267,11 +267,11 @@ def test_iql_old_two_q_checkpoint_schema_raises() -> None:
         iql_b.load_state_dict(old_sd, strict=True)
 
 
-def test_qchunk_consumes_chunk_feature_directly() -> None:
-    from robosuite.pipeline.algorithms.q_learning.networks import QChunkNetwork
+def test_qhead_consumes_projected_features() -> None:
+    from robosuite.pipeline.algorithms.q_learning.networks import QHead
 
-    q = QChunkNetwork(chunk_feature_dim=16, hidden_dims=(32, 32))
-    assert q._input_dim == 16
+    q = QHead(input_dim=16, hidden_dims=(32, 32))
+    assert q.input_dim == 16
     out = q(torch.randn(5, 16))
     assert out.shape == (5, 1)
 
