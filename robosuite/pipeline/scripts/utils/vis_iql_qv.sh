@@ -6,11 +6,13 @@
 #   ENVIRONMENT, SEED, SPLIT, TARGET_PATH, and BRANCH_NAME are intentionally
 #   set below. Edit them for a different experiment.
 # Optional env vars:
-#   DEMO_TASK_NAME    — HDF5 subdir under data/ (default: ENVIRONMENT).
+#   DEMO_TASK_NAME    — task subdir under data/ (default: ENVIRONMENT).
 #   NNPU_CKPT         — nnPU head for r_disc + discriminator HUD.
 #   OUTPUT_DIR        — IQL warmup output dir (default: outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
 #   IQL_CKPT          — trained IQL state (default: ${OUTPUT_DIR}/iql_state.pt).
-#   SPLIT             — HDF5 subdir split (success_rollout | fail_rollout; BON only for success_rollout).
+#   OFFLINE_BUFFER    — saved training transitions; default data/<task>/offline_data/iql_offline_transitions.pt.
+#                        Set OFFLINE_BUFFER="" to use the HDF5 SPLIT path.
+#   SPLIT             — output label, or HDF5 subdir when OFFLINE_BUFFER="".
 #   SEED              — demo selection seed (default 42).
 #   DEVICE            — torch device (default cuda:1).
 #   NO_DISC_VIZ       — set to 1 to skip the discriminator/ subdir (CSV+plot+HUD video).
@@ -30,21 +32,22 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEED=6
-SPLIT="success_rollout-val"    # success_rollout or fail_rollout
+SEED=3
+SPLIT="offline_data"    # output label; set OFFLINE_BUFFER="" to use an HDF5 split.
 TARGET_PATH="offline_iql_qv-v2"
 BRANCH_NAME="dipole_rl-debug"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
+OFFLINE_BUFFER="${OFFLINE_BUFFER-${ROOT_DIR}/data/${DEMO_TASK_NAME}/offline_data/iql_offline_transitions.pt}"
 TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
-IQL_CKPT="${TARGET_DIR}/iql_state.pt"
-OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
+IQL_CKPT="${IQL_CKPT:-${TARGET_DIR}/iql_state.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis-train}"
 DEVICE="${DEVICE:-cuda}"
 # Q_DIAG_NOISE_SIGMAS="${Q_DIAG_NOISE_SIGMAS:-0.05,0.10,0.20}"
 # Q_DIAG_NUM_RANDOM="${Q_DIAG_NUM_RANDOM:-16}"
@@ -71,6 +74,7 @@ fi
 echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seed=${SEED}"
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
 echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
+echo "[vis_iql_qv] offline_buffer=${OFFLINE_BUFFER:-<disabled: using HDF5 split>}"
 echo "[vis_iql_qv] device=${DEVICE}"
 
 EXTRA_ARGS=()
@@ -85,6 +89,13 @@ if [[ "${NO_FLIP_VERTICAL:-0}" == "1" ]]; then
 fi
 if [[ -n "${DISC_VIZ_CAMERA:-}" ]]; then
   EXTRA_ARGS+=(--disc-viz-camera "${DISC_VIZ_CAMERA}")
+fi
+if [[ -n "${OFFLINE_BUFFER}" ]]; then
+  if [[ ! -f "${OFFLINE_BUFFER}" ]]; then
+    echo "[ERROR] OFFLINE_BUFFER does not exist: ${OFFLINE_BUFFER}" >&2
+    exit 1
+  fi
+  EXTRA_ARGS+=(--offline-buffer "${OFFLINE_BUFFER}")
 fi
 EXTRA_ARGS+=(
   --video-fps "${VIDEO_FPS}"

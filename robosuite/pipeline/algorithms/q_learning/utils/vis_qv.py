@@ -29,8 +29,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from hydra.utils import to_absolute_path
-
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
 from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
@@ -58,12 +56,28 @@ DEFAULT_IMAGE_SIZE = 128
 DISC_VIZ_IMAGE_SIZE = 256
 
 
+def resolve_cli_path(path: str | Path) -> Path:
+    """Resolve CLI paths without Hydra original-cwd state."""
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return Path.cwd() / candidate
+
+
 @dataclass(frozen=True)
 class SelectedDemo:
     hdf5_path: Path
     demo_key: str
     length: int
     successful: bool
+
+
+@dataclass(frozen=True)
+class SelectedOfflineEpisode:
+    buffer_path: Path
+    episode_index: int
+    length: int
+    demo_source: str | None
 
 
 @dataclass
@@ -92,6 +106,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--demo-root", default=DEFAULT_DEMO_ROOT)
     parser.add_argument("--task-data-name", default=None)
     parser.add_argument("--split", default="fail_rollout")
+    parser.add_argument(
+        "--offline-buffer",
+        default=None,
+        help="Optional saved FlowDaggerReplayBuffer transitions (.pt). If set, --split is used only for output naming.",
+    )
     parser.add_argument("--demo-key", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
@@ -294,6 +313,69 @@ def select_demo(split_dir: Path, *, seed: int, demo_key: str | None) -> Selected
     if not candidates:
         raise FileNotFoundError(f"No matching HDF5 demo found under {split_dir}")
     return random.Random(int(seed)).choice(candidates)
+
+
+def select_offline_episode(
+    buffer_path: Path,
+    *,
+    seed: int,
+    demo_key: str | None,
+    action_horizon: int,
+) -> tuple[SelectedOfflineEpisode, list[Transition]]:
+    """Select one episode from a saved FlowDaggerReplayBuffer state dict."""
+    if not buffer_path.exists():
+        raise FileNotFoundError(f"Offline buffer does not exist: {buffer_path}")
+    state_dict = torch.load(buffer_path, map_location="cpu", weights_only=False)
+    storage = state_dict.get("storage", [])
+    if not storage:
+        raise RuntimeError(f"Offline buffer contains zero transitions: {buffer_path}")
+
+    episodes: dict[int, list[Transition]] = {}
+    for transition in storage:
+        info = transition.info or {}
+        if "episode_index" not in info:
+            continue
+        episode_index = int(info["episode_index"])
+        episodes.setdefault(episode_index, []).append(transition)
+    if not episodes:
+        raise RuntimeError(
+            f"Offline buffer has no transition.info['episode_index']; cannot select a trajectory: {buffer_path}"
+        )
+
+    valid: dict[int, list[Transition]] = {}
+    for episode_index, transitions in episodes.items():
+        ordered = sorted(
+            transitions,
+            key=lambda item: int((item.info or {}).get("episode_step", 0)),
+        )
+        if len(ordered) >= int(action_horizon):
+            valid[int(episode_index)] = ordered
+    if not valid:
+        raise RuntimeError(
+            f"Offline buffer has no episode with at least action_horizon={int(action_horizon)} transitions."
+        )
+
+    if demo_key is not None:
+        try:
+            selected_index = int(str(demo_key))
+        except ValueError as exc:
+            raise ValueError("--demo-key must be an integer episode_index in --offline-buffer mode") from exc
+        if selected_index not in valid:
+            raise KeyError(
+                f"Requested episode_index={selected_index} is missing or too short in {buffer_path}"
+            )
+    else:
+        selected_index = random.Random(int(seed)).choice(sorted(valid))
+
+    selected_transitions = valid[selected_index]
+    first = selected_transitions[0]
+    selected = SelectedOfflineEpisode(
+        buffer_path=buffer_path,
+        episode_index=int(selected_index),
+        length=len(selected_transitions),
+        demo_source=None if first.demo_source is None else str(first.demo_source),
+    )
+    return selected, selected_transitions
 
 
 def load_demo(
@@ -702,15 +784,13 @@ def write_metrics_csv(csv_path: Path, rows: list[dict[str, float]]) -> None:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = Path(to_absolute_path(str(args.iql_ckpt))).resolve()
+    checkpoint = resolve_cli_path(args.iql_ckpt)
     payload = load_iql_payload(checkpoint)
     device = resolve_device(args.device, str(payload["cfg"].get("device", "cpu")))
     learner, encoder, discriminator, cfg, meta = build_models(
         payload, device=device, disc_override=args.disc_ckpt
     )
     task = str(args.task_data_name or meta.get("task") or meta.get("task_env"))
-    split_dir = Path(to_absolute_path(str(args.demo_root))) / task / str(args.split)
-    selected = select_demo(split_dir.resolve(), seed=args.seed, demo_key=args.demo_key)
     camera_names = [str(name) for name in meta["policy_camera_names"]]
     load_cfg = resolve_demo_load_config(
         meta,
@@ -724,30 +804,67 @@ def main() -> None:
         f"reward_mode={load_cfg.reward_mode} renderer={load_cfg.renderer} "
         f"control_freq={load_cfg.control_freq} camera_aliases={load_cfg.camera_aliases or '{}'}"
     )
-    transitions = load_demo(
-        selected,
-        camera_names=camera_names,
-        load_cfg=load_cfg,
-    )
-    transitions, viz_end_exclusive = truncate_transitions_for_success_viz(
-        transitions,
-        split=str(args.split),
-        selected=selected,
-        action_horizon=int(cfg.action_horizon),
-    )
-    disc_viz_load_cfg = disc_viz_load_config(load_cfg)
-    disc_viz_transitions = align_disc_viz_transitions(
-        load_demo(
+
+    selected: SelectedDemo | SelectedOfflineEpisode
+    selected_hdf5: str | None = None
+    selected_demo_key: str | None = None
+    selected_offline_buffer: str | None = None
+    selected_episode_index: int | None = None
+    selected_demo_source: str | None = None
+    viz_end_exclusive: int | None = None
+
+    if args.offline_buffer:
+        offline_buffer = resolve_cli_path(args.offline_buffer)
+        selected, transitions = select_offline_episode(
+            offline_buffer,
+            seed=args.seed,
+            demo_key=args.demo_key,
+            action_horizon=int(cfg.action_horizon),
+        )
+        disc_viz_transitions = transitions
+        selected_offline_buffer = str(selected.buffer_path)
+        selected_episode_index = int(selected.episode_index)
+        selected_demo_source = selected.demo_source
+        print(
+            f"[vis_qv] offline_buffer={selected.buffer_path} "
+            f"episode_index={selected.episode_index} length={selected.length} "
+            f"demo_source={selected.demo_source or '<unknown>'}"
+        )
+    else:
+        split_dir = resolve_cli_path(args.demo_root) / task / str(args.split)
+        selected = select_demo(split_dir.resolve(), seed=args.seed, demo_key=args.demo_key)
+        transitions = load_demo(
             selected,
             camera_names=camera_names,
-            load_cfg=disc_viz_load_cfg,
-        ),
-        viz_end_exclusive=viz_end_exclusive,
-    )
-    print(
-        f"[vis_qv] disc_viz_frames img={disc_viz_load_cfg.img_height}x"
-        f"{disc_viz_load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
-    )
+            load_cfg=load_cfg,
+        )
+        transitions, viz_end_exclusive = truncate_transitions_for_success_viz(
+            transitions,
+            split=str(args.split),
+            selected=selected,
+            action_horizon=int(cfg.action_horizon),
+        )
+        disc_viz_load_cfg = disc_viz_load_config(load_cfg)
+        disc_viz_transitions = align_disc_viz_transitions(
+            load_demo(
+                selected,
+                camera_names=camera_names,
+                load_cfg=disc_viz_load_cfg,
+            ),
+            viz_end_exclusive=viz_end_exclusive,
+        )
+        selected_hdf5 = str(selected.hdf5_path)
+        selected_demo_key = selected.demo_key
+        print(
+            f"[vis_qv] disc_viz_frames img={disc_viz_load_cfg.img_height}x"
+            f"{disc_viz_load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
+        )
+    if args.offline_buffer:
+        print(
+            f"[vis_qv] disc_viz_frames img={load_cfg.img_height}x"
+            f"{load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
+        )
+
     rows, per_step_disc = compute_metrics(
         transitions,
         learner=learner,
@@ -761,7 +878,7 @@ def main() -> None:
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = (
-        Path(to_absolute_path(str(args.output_root))).resolve()
+        resolve_cli_path(args.output_root)
         / f"{task}_iql-qv"
         / f"{args.split}_seed{args.seed}_{timestamp}"
     )
@@ -776,7 +893,11 @@ def main() -> None:
     plot_paths = plot_qv(
         output_dir / "qv_timeseries",
         rows,
-        title=f"{task} {args.split} {selected.hdf5_path.name}::{selected.demo_key}",
+        title=(
+            f"{task} {args.split} offline episode {selected_episode_index}"
+            if selected_episode_index is not None
+            else f"{task} {args.split} {selected_hdf5}::{selected_demo_key}"
+        ),
         action_horizon=int(cfg.action_horizon),
         per_step_disc=per_step_disc,
     )
@@ -824,8 +945,11 @@ def main() -> None:
         "threshold_source": "checkpoint",
         "state_feature_dim": int(encoder.state_feature_dim),
         "chunk_feature_dim": int(encoder.chunk_feature_dim),
-        "selected_hdf5": str(selected.hdf5_path),
-        "selected_demo_key": selected.demo_key,
+        "selected_hdf5": selected_hdf5,
+        "selected_demo_key": selected_demo_key,
+        "selected_offline_buffer": selected_offline_buffer,
+        "selected_episode_index": selected_episode_index,
+        "selected_demo_source": selected_demo_source,
         "viz_end_exclusive": viz_end_exclusive,
         "num_transitions_viz": len(transitions),
         "num_windows": len(rows),
