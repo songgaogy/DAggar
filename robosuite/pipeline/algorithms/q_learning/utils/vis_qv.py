@@ -52,6 +52,10 @@ from robosuite.policy.flow_multi_update.utils.env_util import (
 
 
 DEFAULT_DEMO_ROOT = "data"
+# Must match train_dipole.yaml env.img_height when checkpoint omits image_size.
+DEFAULT_IMAGE_SIZE = 128
+# HUD / MP4 discriminator rollout videos use native dynamics-encoder resolution.
+DISC_VIZ_IMAGE_SIZE = 256
 
 
 @dataclass(frozen=True)
@@ -94,8 +98,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--output-root", default="outputs/DIPOLE_rl/iql_qv_cache-vis")
-    parser.add_argument("--renderer", default="mjviewer")
-    parser.add_argument("--control-freq", type=int, default=20)
+    parser.add_argument("--renderer", default=None)
+    parser.add_argument("--control-freq", type=int, default=None)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help="Override HDF5 resize (H=W). Default: read from IQL checkpoint encoder_meta.",
+    )
     parser.add_argument("--no-disc-reward", action="store_true")
     parser.add_argument("--no-disc-viz", action="store_true")
     # Discriminator HUD / rollout video controls.
@@ -135,6 +145,76 @@ def resolve_device(requested: str | None, checkpoint_device: str) -> str:
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(f"Requested device={device}, but CUDA is unavailable")
     return device
+
+
+@dataclass(frozen=True)
+class DemoLoadConfig:
+    """HDF5 demo loading settings aligned with IQL warmup / training."""
+
+    img_height: int
+    img_width: int
+    camera_aliases: dict[str, str]
+    reward_mode: str
+    renderer: str
+    control_freq: int
+
+
+def resolve_demo_load_config(
+    meta: dict[str, Any],
+    cfg: IQLConfig,
+    *,
+    image_size_override: int | None = None,
+    renderer_override: str | None = None,
+    control_freq_override: int | None = None,
+) -> DemoLoadConfig:
+    """Resolve demo-loading kwargs to mirror q_learning.warmup data flow."""
+    if image_size_override is not None:
+        img_height = int(image_size_override)
+        img_width = int(image_size_override)
+    else:
+        img_height = int(meta.get("img_height", meta.get("image_size", DEFAULT_IMAGE_SIZE)))
+        img_width = int(meta.get("img_width", img_height))
+    aliases_raw = meta.get("camera_aliases", {})
+    camera_aliases = {str(k): str(v) for k, v in dict(aliases_raw or {}).items()}
+    reward_mode = str(cfg.reward_mode)
+    renderer = str(renderer_override or meta.get("renderer", "mjviewer"))
+    control_freq = int(control_freq_override or meta.get("control_freq", 20))
+    if "image_size" not in meta and "img_height" not in meta and image_size_override is None:
+        print(
+            f"[vis_qv] warning: checkpoint encoder_meta lacks image_size; "
+            f"using default img={img_height}x{img_width} (re-run warmup to persist)."
+        )
+    return DemoLoadConfig(
+        img_height=img_height,
+        img_width=img_width,
+        camera_aliases=camera_aliases,
+        reward_mode=reward_mode,
+        renderer=renderer,
+        control_freq=control_freq,
+    )
+
+
+def disc_viz_load_config(load_cfg: DemoLoadConfig) -> DemoLoadConfig:
+    """Demo load config for discriminator HUD/video frames (256px, not training 128)."""
+    return DemoLoadConfig(
+        img_height=DISC_VIZ_IMAGE_SIZE,
+        img_width=DISC_VIZ_IMAGE_SIZE,
+        camera_aliases=dict(load_cfg.camera_aliases),
+        reward_mode=str(load_cfg.reward_mode),
+        renderer=str(load_cfg.renderer),
+        control_freq=int(load_cfg.control_freq),
+    )
+
+
+def align_disc_viz_transitions(
+    disc_transitions: list[Transition],
+    *,
+    viz_end_exclusive: int | None,
+) -> list[Transition]:
+    """Match Q/V pre-success truncation on the high-res video trajectory."""
+    if viz_end_exclusive is None:
+        return disc_transitions
+    return disc_transitions[: int(viz_end_exclusive)]
 
 
 def is_success_related_split(split: str) -> bool:
@@ -218,9 +298,7 @@ def load_demo(
     selected: SelectedDemo,
     *,
     camera_names: list[str],
-    image_size: int,
-    renderer: str,
-    control_freq: int,
+    load_cfg: DemoLoadConfig,
 ) -> list[Transition]:
     with h5py.File(selected.hdf5_path, "r") as handle:
         env_info = parse_env_info(handle.attrs["env_info"])
@@ -234,14 +312,15 @@ def load_demo(
         transitions = load_hdf5_demos_into_flow_transitions(
             selected.hdf5_path,
             policy_camera_names=camera_names,
-            camera_aliases={},
-            img_height=int(image_size),
-            img_width=int(image_size),
+            camera_aliases=dict(load_cfg.camera_aliases),
+            img_height=int(load_cfg.img_height),
+            img_width=int(load_cfg.img_width),
             proprio_keys=(),
-            renderer=str(renderer),
-            control_freq=int(control_freq),
+            renderer=str(load_cfg.renderer),
+            control_freq=int(load_cfg.control_freq),
             demo_names=[selected.demo_key],
             state_extractor=extractor,
+            reward_mode=str(load_cfg.reward_mode),
         )
     finally:
         extractor.close()
@@ -402,7 +481,7 @@ def compute_metrics(
                     "v": v_val,
                     "next_v": float(next_v[index].item()),
                     "bootstrap_v": float(bootstrap_v[index].item()),
-                    "advantage": q_min - v_val,
+                    "advantage": float(q_mean[index].item()) - v_val,
                     "advantage_td1": td_target_val - v_val,
                     "td_target": td_target_val,
                     "td_residual": td_target_val - q_min,
@@ -525,7 +604,7 @@ def _save_qv_timeseries_png(
     axes[1].legend(loc="best", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(steps, advantage, label="advantage Qmin - V", color="tab:brown")
+    axes[2].plot(steps, advantage, label="advantage Qmean - V", color="tab:brown")
     axes[2].plot(
         steps,
         advantage_td1,
@@ -627,18 +706,41 @@ def main() -> None:
     split_dir = Path(to_absolute_path(str(args.demo_root))) / task / str(args.split)
     selected = select_demo(split_dir.resolve(), seed=args.seed, demo_key=args.demo_key)
     camera_names = [str(name) for name in meta["policy_camera_names"]]
+    load_cfg = resolve_demo_load_config(
+        meta,
+        cfg,
+        image_size_override=args.image_size,
+        renderer_override=args.renderer,
+        control_freq_override=args.control_freq,
+    )
+    print(
+        f"[vis_qv] demo_load img={load_cfg.img_height}x{load_cfg.img_width} "
+        f"reward_mode={load_cfg.reward_mode} renderer={load_cfg.renderer} "
+        f"control_freq={load_cfg.control_freq} camera_aliases={load_cfg.camera_aliases or '{}'}"
+    )
     transitions = load_demo(
         selected,
         camera_names=camera_names,
-        image_size=int(meta.get("image_size", 256)),
-        renderer=args.renderer,
-        control_freq=args.control_freq,
+        load_cfg=load_cfg,
     )
     transitions, viz_end_exclusive = truncate_transitions_for_success_viz(
         transitions,
         split=str(args.split),
         selected=selected,
         action_horizon=int(cfg.action_horizon),
+    )
+    disc_viz_load_cfg = disc_viz_load_config(load_cfg)
+    disc_viz_transitions = align_disc_viz_transitions(
+        load_demo(
+            selected,
+            camera_names=camera_names,
+            load_cfg=disc_viz_load_cfg,
+        ),
+        viz_end_exclusive=viz_end_exclusive,
+    )
+    print(
+        f"[vis_qv] disc_viz_frames img={disc_viz_load_cfg.img_height}x"
+        f"{disc_viz_load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
     )
     rows, per_step_disc = compute_metrics(
         transitions,
@@ -659,7 +761,9 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    video_fps = int(args.video_fps if args.video_fps is not None else args.control_freq)
+    video_fps = int(
+        args.video_fps if args.video_fps is not None else load_cfg.control_freq
+    )
     flip_vertical = not bool(args.no_flip_vertical)
 
     write_metrics_csv(output_dir / "steps.csv", rows)
@@ -683,7 +787,7 @@ def main() -> None:
     if not bool(args.no_disc_viz):
         disc_result = visualize_selected_trajectory_discriminator_nnpu(
             output_dir=output_dir / "discriminator",
-            transitions=transitions,
+            transitions=disc_viz_transitions,
             camera_names=camera_names,
             failure_score=per_step_disc.failure_score,
             intrinsic_reward=per_step_disc.intrinsic_reward,
@@ -719,6 +823,19 @@ def main() -> None:
         "viz_end_exclusive": viz_end_exclusive,
         "num_transitions_viz": len(transitions),
         "num_windows": len(rows),
+        "demo_load": {
+            "img_height": int(load_cfg.img_height),
+            "img_width": int(load_cfg.img_width),
+            "reward_mode": str(load_cfg.reward_mode),
+            "renderer": str(load_cfg.renderer),
+            "control_freq": int(load_cfg.control_freq),
+            "camera_aliases": dict(load_cfg.camera_aliases),
+        },
+        "disc_viz": {
+            "img_height": int(DISC_VIZ_IMAGE_SIZE),
+            "img_width": int(DISC_VIZ_IMAGE_SIZE),
+            "num_frames": len(disc_viz_transitions),
+        },
         "per_step_disc_frames": int(per_step_disc.num_frames),
         "first_pred_failure_frame": None if first_pred.size == 0 else int(first_pred[0]),
         "device": device,

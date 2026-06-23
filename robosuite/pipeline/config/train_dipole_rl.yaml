@@ -33,10 +33,10 @@ algorithm:
       hidden_dims: [512, 512]
       q_ensemble_size: 10
       v_subset_size: 2
-      grad_clip_norm: 1.0
+      grad_clip_norm: 2.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      output_reward_coef: 1.0
+      output_reward_coef: 0.1
       disc_reward_coef: 0.0
       update_freq: 1
     warmup_value_steps: 20000

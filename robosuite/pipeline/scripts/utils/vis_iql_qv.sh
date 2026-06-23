@@ -36,7 +36,7 @@ export CUDA_VISIBLE_DEVICES=1
 ENVIRONMENT="PickPlaceCereal"
 SEED=1
 SPLIT="fail_rollout-val"    # success_rollout or fail_rollout
-TARGET_PATH="offline_iql_qv"
+TARGET_PATH="offline_iql_qv-v1"
 BRANCH_NAME="dipole_rl"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
@@ -46,13 +46,13 @@ TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
 IQL_CKPT="${TARGET_DIR}/iql_state.pt"
 OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
 DEVICE="${DEVICE:-cuda}"
-Q_DIAG_NOISE_SIGMAS="${Q_DIAG_NOISE_SIGMAS:-0.05,0.10,0.20}"
-Q_DIAG_NUM_RANDOM="${Q_DIAG_NUM_RANDOM:-16}"
-Q_DIAG_SINGLE_DIM_SIGMA="${Q_DIAG_SINGLE_DIM_SIGMA:-0.20}"
-Q_DIAG_SINGLE_DIM_N="${Q_DIAG_SINGLE_DIM_N:-0}"
-Q_DIAG_SEED="${Q_DIAG_SEED:-${SEED}}"
-Q_DIAG_ACTION_LOW="${Q_DIAG_ACTION_LOW:--1.0}"
-Q_DIAG_ACTION_HIGH="${Q_DIAG_ACTION_HIGH:-1.0}"
+# Q_DIAG_NOISE_SIGMAS="${Q_DIAG_NOISE_SIGMAS:-0.05,0.10,0.20}"
+# Q_DIAG_NUM_RANDOM="${Q_DIAG_NUM_RANDOM:-16}"
+# Q_DIAG_SINGLE_DIM_SIGMA="${Q_DIAG_SINGLE_DIM_SIGMA:-0.20}"
+# Q_DIAG_SINGLE_DIM_N="${Q_DIAG_SINGLE_DIM_N:-0}"
+# Q_DIAG_SEED="${Q_DIAG_SEED:-${SEED}}"
+# Q_DIAG_ACTION_LOW="${Q_DIAG_ACTION_LOW:--1.0}"
+# Q_DIAG_ACTION_HIGH="${Q_DIAG_ACTION_HIGH:-1.0}"
 VIDEO_FPS="${VIDEO_FPS:-${CONTROL_FREQ:-20}}"
 DISC_VIZ_BORDER="${DISC_VIZ_BORDER:-10}"
 
@@ -72,7 +72,6 @@ echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT}
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
 echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 echo "[vis_iql_qv] device=${DEVICE}"
-echo "[vis_iql_qv] q_diag_noise_sigmas=${Q_DIAG_NOISE_SIGMAS} q_diag_random_n=${Q_DIAG_NUM_RANDOM} single_dim_sigma=${Q_DIAG_SINGLE_DIM_SIGMA} single_dim_n=${Q_DIAG_SINGLE_DIM_N} q_diag_seed=${Q_DIAG_SEED}"
 
 EXTRA_ARGS=()
 if [[ -n "${MAX_WINDOWS:-}" ]]; then
@@ -90,13 +89,13 @@ fi
 EXTRA_ARGS+=(
   --video-fps "${VIDEO_FPS}"
   --disc-viz-border-thickness "${DISC_VIZ_BORDER}"
-  --q-candidate-noise-sigmas "${Q_DIAG_NOISE_SIGMAS}"
-  --q-candidate-random-n "${Q_DIAG_NUM_RANDOM}"
-  --q-candidate-single-dim-sigma "${Q_DIAG_SINGLE_DIM_SIGMA}"
-  --q-candidate-single-dim-n "${Q_DIAG_SINGLE_DIM_N}"
-  --q-candidate-seed "${Q_DIAG_SEED}"
-  --q-candidate-action-low "${Q_DIAG_ACTION_LOW}"
-  --q-candidate-action-high "${Q_DIAG_ACTION_HIGH}"
+  # --q-candidate-noise-sigmas "${Q_DIAG_NOISE_SIGMAS}"
+  # --q-candidate-random-n "${Q_DIAG_NUM_RANDOM}"
+  # --q-candidate-single-dim-sigma "${Q_DIAG_SINGLE_DIM_SIGMA}"
+  # --q-candidate-single-dim-n "${Q_DIAG_SINGLE_DIM_N}"
+  # --q-candidate-seed "${Q_DIAG_SEED}"
+  # --q-candidate-action-low "${Q_DIAG_ACTION_LOW}"
+  # --q-candidate-action-high "${Q_DIAG_ACTION_HIGH}"
 )
 
 exec "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
