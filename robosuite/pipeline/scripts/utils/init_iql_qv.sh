@@ -34,7 +34,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v1"
+NAME="offline_iql_qv-v2"
 BRANCH_NAME="dipole_rl-debug"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42

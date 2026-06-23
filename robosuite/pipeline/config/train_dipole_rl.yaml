@@ -36,10 +36,10 @@ algorithm:
       # Token/Group dim-reduction projectors before the Q/V heads. The frozen
       # encoder feature is 16 patch-tokens; chunk_proj_dim / state_proj_dim must
       # be divisible by that token count (asserted in the learner).
-      chunk_proj_dim: 256      # 14272 chunk feature -> compressed Q input
-      state_proj_dim: 256      # 12288 state visual tokens -> compressed V input
+      chunk_proj_dim: 128      # 14272 chunk feature -> compressed Q input
+      state_proj_dim: 128      # 12288 state visual tokens -> compressed V input
       proprio_proj_dim: 32     # state proprio block -> appended to V input
-      action_proj_dim: 128     # raw action chunk -> re-injected into Q
+      action_proj_dim: 64     # raw action chunk -> re-injected into Q
       proj_activation: "mish"  # mish | gelu | relu | silu
       q_ensemble_size: 10
       v_subset_size: 2
@@ -49,8 +49,8 @@ algorithm:
       output_reward_coef: 0.1
       disc_reward_coef: 0.0
       update_freq: 1
-    warmup_value_steps: 20000
-    warmup_full_steps: 10000
+    warmup_value_steps: 10000
+    warmup_full_steps: 5000
     warmup_ckpt: null
 
   discriminator:
