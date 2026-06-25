@@ -18,6 +18,12 @@ algorithm:
 
   dipole:
     g_mode: "advantage"   # advantage | nnpu_frozen
+    # Master switch for offline G normalization (read by offline/train_offline_dipole.py).
+    #   true  -> keep batch_zscore on advantage, disc score, and combined g.
+    #   false -> force all three normalization modes to "none"; raw_mean / G_mean become
+    #            real (non-zero) values instead of structurally-zero z-score means.
+    # Independent of the string `dipole.g_normalization` mode inherited from train_dipole.
+    use_norm: false
 
   q_learning:
     enabled: true
@@ -86,12 +92,13 @@ warmup:
   demo_splits:
     - expert
     - success_rollout
-    - fail_rollout
+    - fail_rollout-labeled
   # Max HDF5 trajectories per split (null = all demos in that folder).
   num_trajectories:
     expert: 0
     success_rollout: 50
     fail_rollout: 50
+    fail_rollout-labeled: 50
     save_data: true           # save the iql training data for future use
     save_dir: "offline_data"  # <data_root>/<task_name>/<save_dir>
 

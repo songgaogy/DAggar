@@ -1,3 +1,4 @@
+from .determinism import EnvRandomReducer
 from .io import (
     deserialize_transition,
     ensure_directory,
@@ -46,6 +47,7 @@ from .train_utils import (
 )
 
 __all__ = [
+    "EnvRandomReducer",
     "deserialize_transition",
     "ensure_directory",
     "list_hdf5_demo_names",

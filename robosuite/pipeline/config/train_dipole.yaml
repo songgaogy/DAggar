@@ -130,7 +130,7 @@ algorithm:
     capacity: 200000
 
   trainer:
-    batch_size: 64
+    batch_size: 128
     warmup_steps: 0
     updates_per_step: 1
     steps_per_update: 50

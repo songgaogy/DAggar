@@ -280,18 +280,20 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 
 # TODO List
 
-- [x] Refactor the pipeline to use the PU-learning based nnPU discriminator.
-- [x] Add shared online discriminator configuration in [config/discriminator.yaml](./config/discriminator.yaml). `algorithm.discriminator` is a standalone Hydra fragment merged into both `train_dipole.yaml` and `train_dipole_rl.yaml`; online scoring cadence, pause behavior, and HUD settings now live in one file. `feature_source` and `transformer_layer` remain read-only properties loaded from the nnPU checkpoint.
-- [x] Update offline IQL warmup in [scripts/utils/init_iql_qv.sh](./scripts/utils/init_iql_qv.sh):
+- [x] step1: Refactor the pipeline to use the PU-learning based nnPU discriminator.
+- [x] step2: Add shared online discriminator configuration in [config/discriminator.yaml](./config/discriminator.yaml). `algorithm.discriminator` is a standalone Hydra fragment merged into both `train_dipole.yaml` and `train_dipole_rl.yaml`; online scoring cadence, pause behavior, and HUD settings now live in one file. `feature_source` and `transformer_layer` remain read-only properties loaded from the nnPU checkpoint.
+- [x] step 3: Update offline IQL warmup in [scripts/utils/init_iql_qv.sh](./scripts/utils/init_iql_qv.sh):
   1. Save assembled raw offline transitions to `<data_root>/<task>/<save_dir>/iql_offline_transitions.pt` plus metadata for later reuse.
   2. Seed python, numpy, and torch from `SEED` so demo loading and sampling are reproducible on the same machine/GPU.
   3. Freeze post-success drift in memory with `warmup.freeze_post_success`, while keeping saved offline data raw.
   4. Move IQL Q/V to schema version 3 with Token/Group feature projectors, raw action re-injection for Q, smaller `[256,256]` heads, `q_ensemble_size=10`, and `v_subset_size=2`.
   5. Remove legacy debug-only Q/V scripts and keep `vis_iql_qv.sh` as the maintained diagnostic entrance.
-- [ ] Implement offline DIPOLE training under `pipeline/offline`, with config being [this](./config/offline.yaml)
-  - Load `pretrain_data` and exported `offline_data` into `replay_buffer`, keeping `demo_buffer` empty.
-  - Use the pretrained flow policy and IQL checkpoint to run the DIPOLE-RL update offline.
-- [ ] Replace the current condition-injection positive/negative policy architecture with a LoRA-like negative branch.
+- [x] step 4: Implement offline DIPOLE training under `pipeline/offline`, with config being [this](./config/offline.yaml)
+  1. Load `pretrain_data` and exported `offline_data` into `replay_buffer`, keeping `demo_buffer` empty. **note**: for success trajectories, only uses "is_success=false" part; for fail trajectories, only uses "failure_frame_mask=0"(no failure) part
+  2. Use the pretrained flow policy and IQL checkpoint to run the DIPOLE-RL update offline. **note**: when compute dipole weight G, use TD term $Adv= V - \gamma*V' - r$ rather then current $Adv=Q-V$
+  3. for code structure, make codebase moduler, leave tool functions under `robosuite/pipeline/offline/utils`
+  4. implement evaluation logic: evaluate success rate for finetuned policy. For video saving logic and saving directory arrangement, you can refer to `pipeline/sft` folder in branch `dagger/v0-pu-bce`
+- [ ] step 5: Replace the current condition-injection positive/negative policy architecture with a LoRA-like negative branch.
   - Positive branch should use the original policy path and update all policy network parameters.
   - Negative branch should add an adapter module; during negative updates, train the adapter and base policy together, with the base-policy learning rate lower than the adapter learning rate.
   - Online rollout should use only the positive branch.

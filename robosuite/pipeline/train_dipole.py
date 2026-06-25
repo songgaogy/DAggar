@@ -469,6 +469,27 @@ def load_hdf5_demos_into_flow_transitions(
                 intervention_labels = np.asarray(demo_group["intervention_labels"], dtype=np.bool_)
             else:
                 intervention_labels = np.zeros(len(actions), dtype=np.bool_)
+            annotations = demo_group.get("annotations", None)
+            if annotations is not None and "failure_frame_mask" in annotations:
+                gt_fail_labels = np.asarray(annotations["failure_frame_mask"], dtype=np.bool_)
+                if int(gt_fail_labels.shape[0]) != int(len(actions)):
+                    raise ValueError(
+                        f"{path}:{demo_name} annotations/failure_frame_mask length "
+                        f"{gt_fail_labels.shape[0]} != actions length {len(actions)}"
+                    )
+                gt_fail_source = "annotations/failure_frame_mask"
+            else:
+                gt_fail_labels = np.zeros(len(actions), dtype=np.bool_)
+                gt_fail_source = "missing_default_false"
+            if annotations is not None and "failure_segment_index" in annotations:
+                failure_segment_index = np.asarray(annotations["failure_segment_index"], dtype=np.int32)
+                if int(failure_segment_index.shape[0]) != int(len(actions)):
+                    raise ValueError(
+                        f"{path}:{demo_name} annotations/failure_segment_index length "
+                        f"{failure_segment_index.shape[0]} != actions length {len(actions)}"
+                    )
+            else:
+                failure_segment_index = np.full(len(actions), -1, dtype=np.int32)
             obs_group = demo_group["observations"]
             required_hdf5_camera_names = {
                 camera_aliases.get(camera_name, camera_name) for camera_name in policy_camera_names
@@ -523,6 +544,9 @@ def load_hdf5_demos_into_flow_transitions(
                         is_intervention=bool(intervention_labels[step_idx]),
                         info={
                             "success": bool(step_success),
+                            "gt_fail": bool(gt_fail_labels[step_idx]),
+                            "gt_fail_source": gt_fail_source,
+                            "failure_segment_index": int(failure_segment_index[step_idx]),
                             "demo_success_attr": bool(demo_success_attr),
                             "demo_name": str(demo_name),
                             "reward_convention": "sparse_success_-1_0",

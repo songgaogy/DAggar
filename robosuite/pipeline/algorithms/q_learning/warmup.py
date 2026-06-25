@@ -117,12 +117,42 @@ def _resolve_split_max_trajectories(cfg: DictConfig, split: str) -> int | None:
     if limits is not None:
         if split in limits:
             return _normalize_trajectory_cap(limits[split])
+        base_split = str(split).removesuffix("-labeled")
+        if base_split != str(split) and base_split in limits:
+            return _normalize_trajectory_cap(limits[base_split])
         return None
 
     if split == "expert":
         legacy = OmegaConf.select(cfg, "data.num_trajectories", default=None)
         return _normalize_trajectory_cap(legacy)
     return None
+
+
+def _summarize_gt_fail_labels(transitions: list) -> dict[str, int | bool]:
+    gt_fail_frames = 0
+    annotated_frames = 0
+    episodes_with_gt_fail: set[int] = set()
+    episodes_seen: set[int] = set()
+    has_gt_fail_key = False
+    for idx, trans in enumerate(transitions):
+        info = trans.info or {}
+        if "gt_fail" not in info:
+            continue
+        has_gt_fail_key = True
+        episode_index = int(info.get("episode_index", idx))
+        episodes_seen.add(episode_index)
+        if str(info.get("gt_fail_source", "")) != "missing_default_false":
+            annotated_frames += 1
+        if bool(info.get("gt_fail", False)):
+            gt_fail_frames += 1
+            episodes_with_gt_fail.add(episode_index)
+    return {
+        "gt_fail_available": bool(has_gt_fail_key),
+        "gt_fail_annotated_frames": int(annotated_frames),
+        "gt_fail_positive_frames": int(gt_fail_frames),
+        "gt_fail_positive_episodes": int(len(episodes_with_gt_fail)),
+        "gt_fail_total_episodes": int(len(episodes_seen)),
+    }
 
 
 def _annotate_episode_metadata(
@@ -688,6 +718,7 @@ def main(cfg: DictConfig) -> None:
             "renderer": str(cfg.env.renderer),
             "control_freq": int(cfg.env.control_freq),
             "reward_mode": reward_mode,
+            **_summarize_gt_fail_labels(buffer._storage),  # noqa: SLF001
             "source": "q_learning.warmup",
         }
         meta_path = offline_path.with_suffix(".meta.json")

@@ -133,8 +133,13 @@ def _sample_guided_action_sequence(
             dtype=proprio.dtype,
         )
         v_pos = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=1)
-        v_neg = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=0)
-        v = (1.0 + float(omega)) * v_pos - float(omega) * v_neg
+        if float(omega) == 0.0:
+            # omega=0 => v = v_pos exactly; skip the negative branch forward pass
+            # (halves the per-ODE-step network cost, identical result).
+            v = v_pos
+        else:
+            v_neg = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=0)
+            v = (1.0 + float(omega)) * v_pos - float(omega) * v_neg
         x = x + dt * v
     return x.transpose(1, 2)
 
