@@ -106,7 +106,7 @@ def build_dipole_flow_policy(
     return polar
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _sample_guided_action_sequence(
     model: DipolePolarityFlowModel,
     *,
@@ -124,6 +124,18 @@ def _sample_guided_action_sequence(
     else:
         x = torch.randn(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
     context = model.encode_multimodal_context(images=images, proprio=proprio, language=language)
+    guided_context: dict[str, torch.Tensor] | None = None
+    if float(omega) != 0.0:
+        polarity = model.polarity_embedding.weight[[1, 0]]
+        task_scene_cond = context["task_scene_cond"]
+        guided_context = {
+            "task_scene_cond": torch.cat(
+                [task_scene_cond + polarity[0], task_scene_cond + polarity[1]],
+                dim=0,
+            ),
+            "context_tokens": context["context_tokens"].repeat(2, 1, 1),
+            "context_padding_mask": context["context_padding_mask"].repeat(2, 1),
+        }
     dt = 1.0 / float(n_steps)
     for step in range(int(n_steps)):
         t = torch.full(
@@ -132,13 +144,21 @@ def _sample_guided_action_sequence(
             device=proprio.device,
             dtype=proprio.dtype,
         )
-        v_pos = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=1)
         if float(omega) == 0.0:
             # omega=0 => v = v_pos exactly; skip the negative branch forward pass
             # (halves the per-ODE-step network cost, identical result).
-            v = v_pos
+            v = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=1)
         else:
-            v_neg = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=0)
+            assert guided_context is not None
+            velocities = model.flow_head(
+                x_t=x.repeat(2, 1, 1),
+                timesteps=t.repeat(2),
+                task_scene_cond=guided_context["task_scene_cond"],
+                context_tokens=guided_context["context_tokens"],
+                context_padding_mask=guided_context["context_padding_mask"],
+            )
+            v_pos = velocities[:batch_size]
+            v_neg = velocities[batch_size:]
             v = (1.0 + float(omega)) * v_pos - float(omega) * v_neg
         x = x + dt * v
     return x.transpose(1, 2)
@@ -297,7 +317,7 @@ class DipoleFlowPolicy:
         self.step_in_chunk += 1
         return action
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
         """Plan a fresh action chunk from ``obs`` without mutating ``current_chunk``.
 

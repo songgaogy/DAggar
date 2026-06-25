@@ -28,7 +28,7 @@ algorithm:
 
   flow:
     action_horizon: 8
-    execute_horizon: 1
+    execute_horizon: 8
     image_size: ${env.img_height}
     learning_rate: 1.0e-4
     weight_decay: 1.0e-6
@@ -109,6 +109,7 @@ algorithm:
           embedding_dim: 64
 
   dipole:
+    condition_scale: 1.0
     beta: 2.0
     k: 0.0
     guidance_omega: 2.0
@@ -171,7 +172,7 @@ runtime:
   fps_log_interval: 1.0
   async_updates: true
   online_updates_enabled: true
-  eval_episode_max_steps: 300
+  eval_episode_max_steps: 500
   resume: false
   checkpoint: null
   init_checkpoint: null                # MUST be set: path to a flow-dagger / flow-multi checkpoint
@@ -200,3 +201,6 @@ hydra:
   output_subdir: null
   job:
     chdir: false
+  job_logging:
+    root:
+      handlers: [console]

@@ -69,6 +69,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=50, help="Number of evaluation episodes.")
     parser.add_argument("--episode-max-steps", type=int, default=500, help="Per-episode step cap.")
     parser.add_argument("--omega", type=float, default=0.2, help="DIPOLE guidance omega at sampling time.")
+    parser.add_argument(
+        "--execute-horizon",
+        type=int,
+        default=8,
+        help="Actions executed from each planned chunk before replanning (default: 8; use 1 for step-wise replanning).",
+    )
     parser.add_argument("--output-root", default=None, help="Override eval output root (defaults to <run_dir>/eval).")
     parser.add_argument("--video-output", default="true", help="Whether to save mp4 videos.")
     parser.add_argument("--video-camera", default=DEFAULT_VIDEO_CAMERA, help="Camera to record.")
@@ -87,6 +93,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
     parser.add_argument("--device", default=None, help="Override eval device (e.g. cuda:0).")
     return parser.parse_args()
+
+
+def _resolve_execute_horizon(requested: int, action_horizon: int) -> int:
+    execute_horizon = int(requested)
+    action_horizon = int(action_horizon)
+    if not 1 <= execute_horizon <= action_horizon:
+        raise ValueError(
+            f"--execute-horizon must be in [1, {action_horizon}], got {execute_horizon}."
+        )
+    return execute_horizon
 
 
 def _build_eval_output_dir(
@@ -167,6 +183,15 @@ def main() -> None:
         task_name=args.task_name,
         device=eval_device,
         omega=float(args.omega),
+    )
+    checkpoint_execute_horizon = int(policy.config.execute_horizon)
+    policy.config.execute_horizon = _resolve_execute_horizon(
+        int(args.execute_horizon),
+        int(policy.config.action_horizon),
+    )
+    print(
+        f"[eval] execute_horizon={policy.config.execute_horizon} "
+        f"(checkpoint={checkpoint_execute_horizon}, action_horizon={policy.config.action_horizon})"
     )
 
     if args.output_root is not None:
@@ -317,6 +342,8 @@ def main() -> None:
             "env_name": str(args.env_name),
             "task_name": str(args.task_name),
             "omega": float(args.omega),
+            "checkpoint_execute_horizon": checkpoint_execute_horizon,
+            "execute_horizon": int(policy.config.execute_horizon),
             "deterministic": bool(args.deterministic),
             "seed": int(args.seed) if args.seed is not None else None,
             "seed_rule": "base_seed+episode_index" if args.seed is not None else None,
@@ -339,7 +366,8 @@ def main() -> None:
         print(f"checkpoint: {checkpoint_path}")
         print(f"output_dir: {output_dir}")
         print(
-            f"omega={args.omega:.3f} episodes={len(episode_results)} "
+            f"omega={args.omega:.3f} execute_horizon={policy.config.execute_horizon} "
+            f"episodes={len(episode_results)} "
             f"success_rate={success_rate:.3f} ({success_count}/{len(episode_results)}) "
             f"ci95=[{success_rate_ci_low:.3f}, {success_rate_ci_high:.3f}] "
             f"mean_return={mean_return:.3f} mean_steps={mean_steps:.1f}"
