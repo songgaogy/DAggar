@@ -1,5 +1,0 @@
-make following modification:
-currently, we randomly sample an action step from demo_buffer as "chunk start index"; since human intervention data are pieces and in fragmentation, so its very likely to sample "invalid" chunk. Make modification: if sample is fragmentation "tail", do NOT mark them as "invalid", but use the tail chunk (originally sampled single action step is chunk start, here we do not force this to be start if there is no enough action step left)
-
-communicate with me in Chinese
-ask me anything if you are unclear, do NOT decide important detail and logic by yourself, ask me questions and wait for my response or list the details that should let me to decide into choice questions
