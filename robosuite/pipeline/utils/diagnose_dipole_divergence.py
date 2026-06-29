@@ -1,15 +1,16 @@
 """Static branch-divergence diagnostic for a trained DIPOLE checkpoint.
 
-Reads `core.model.polarity_embedding.weight` from a DIPOLE `.pt` and reports
-how far the positive and negative branches have separated. No env / dataset
-required; meant to be called before any rollout-eval as a quick "did the two
-CFG branches actually specialize" check.
+Reads the LoRA adapters from a DIPOLE `.pt` and reports how strongly the
+negative branch's condition-pathway adapters have grown away from the base
+(positive) branch. No env / dataset required; meant to be called before any
+rollout-eval as a quick "did the negative LoRA branch actually specialize"
+check.
 
 Usage:
     python -m robosuite.pipeline.utils.diagnose_dipole_divergence \
         --checkpoint outputs/DIPOLE/<run>/checkpoints/latest.pt
 
-The diagnostic returns nonzero exit code when divergence is below the warning
+The diagnostic returns nonzero exit code when LoRA growth is below the warning
 threshold, so it can short-circuit a sweep when the model has clearly collapsed.
 """
 
@@ -25,10 +26,7 @@ from typing import Any
 import torch
 
 
-POLARITY_KEY = "polarity_embedding.weight"
-
-
-def _load_polarity_weight(checkpoint_path: Path) -> torch.Tensor:
+def _load_model_state(checkpoint_path: Path) -> dict[str, Any]:
     payload: Any = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise RuntimeError(f"Checkpoint at {checkpoint_path} is not a dict payload.")
@@ -40,52 +38,68 @@ def _load_polarity_weight(checkpoint_path: Path) -> torch.Tensor:
     model_state = core.get("model")
     if not isinstance(model_state, dict):
         raise KeyError(f"Checkpoint {checkpoint_path} is missing 'core.model' state dict.")
-    if POLARITY_KEY not in model_state:
+    return model_state
+
+
+def _lora_summary(model_state: dict[str, Any]) -> dict[str, float]:
+    """Aggregate LoRA-adapter magnitude stats from a model state dict.
+
+    For each wrapped condition Linear the state dict stores ``<path>.lora_A``
+    (r, in) and ``<path>.lora_B`` (out, r). Per-layer delta (unscaled) is the
+    Frobenius norm of ``lora_B @ lora_A`` -- the scaling factor lives on the live
+    module, not the state dict, so it is omitted here.
+    """
+    b_norms: list[float] = []
+    delta_norms: list[float] = []
+    for key, value in model_state.items():
+        if not key.endswith(".lora_B"):
+            continue
+        if not isinstance(value, torch.Tensor):
+            continue
+        lora_b = value.detach().float().cpu()
+        a_key = key[: -len(".lora_B")] + ".lora_A"
+        lora_a = model_state.get(a_key)
+        if not isinstance(lora_a, torch.Tensor):
+            raise KeyError(f"State dict has '{key}' but no matching '{a_key}'.")
+        lora_a = lora_a.detach().float().cpu()
+        b_norms.append(float(torch.linalg.matrix_norm(lora_b).item()))
+        delta = lora_b @ lora_a
+        delta_norms.append(float(torch.linalg.matrix_norm(delta).item()))
+    if not b_norms:
         raise KeyError(
-            f"State dict has no '{POLARITY_KEY}'. Either this is not a DIPOLE checkpoint "
-            "or the polarity embedding was renamed."
+            "State dict has no '.lora_B' adapter keys. Either this is not a "
+            "LoRA-based DIPOLE checkpoint or the adapters were renamed."
         )
-    weight = model_state[POLARITY_KEY]
-    if not isinstance(weight, torch.Tensor) or weight.ndim != 2 or weight.shape[0] != 2:
-        raise ValueError(
-            f"'{POLARITY_KEY}' must be a (2, cond_dim) tensor; got shape {tuple(weight.shape)}."
-        )
-    return weight.detach().float().cpu()
+    return {
+        "num_lora_layers": float(len(b_norms)),
+        "lora_B_norm_mean": float(sum(b_norms) / len(b_norms)),
+        "lora_delta_norm_mean": float(sum(delta_norms) / len(delta_norms)),
+        "lora_delta_norm_max": float(max(delta_norms)),
+    }
 
 
-def _verdict(cos: float, max_norm: float, *, cos_good: float, cos_warn: float, norm_warn: float) -> str:
-    if max_norm < norm_warn:
-        return "BAD: polarity embedding never grew — branches are still at init scale."
-    if cos > cos_warn:
-        return (
-            "BAD: pos/neg are near-collinear; CFG combine will mostly amplify noise. "
-            "Consider zero_both + omega warmup, or upgrade to adaLN-Zero modulation."
-        )
-    if cos > cos_good:
-        return "OK-ish: partial divergence. Worth scanning omega; watch action quality."
-    return "GOOD: branches are clearly separated; CFG has room to move policy aggressiveness."
+def _verdict(delta_max: float, delta_mean: float, *, delta_good: float, delta_warn: float) -> str:
+    if delta_max < delta_warn:
+        return "BAD: LoRA adapters never grew — negative branch is still ~identical to base."
+    if delta_mean < delta_good:
+        return "OK-ish: partial LoRA growth. Worth scanning omega; watch action quality."
+    return "GOOD: LoRA adapters are clearly active; CFG has room to move policy aggressiveness."
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path, help="Path to DIPOLE .pt checkpoint")
     parser.add_argument(
-        "--cos-good",
+        "--delta-good",
         type=float,
-        default=0.7,
-        help="Cosine threshold below which branches are considered well-diverged.",
+        default=0.1,
+        help="Mean per-layer LoRA delta norm above which branches are well-diverged.",
     )
     parser.add_argument(
-        "--cos-warn",
+        "--delta-warn",
         type=float,
-        default=0.95,
-        help="Cosine threshold above which branches are considered collapsed.",
-    )
-    parser.add_argument(
-        "--norm-warn",
-        type=float,
-        default=0.05,
-        help="Min branch-embedding norm; below this the embedding never escaped init.",
+        default=1e-4,
+        help="Max per-layer LoRA delta norm below which the adapters never escaped init.",
     )
     parser.add_argument(
         "--strict",
@@ -100,48 +114,41 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    weight = _load_polarity_weight(args.checkpoint)
-    neg = weight[0]
-    pos = weight[1]
-    pos_norm = float(torch.linalg.vector_norm(pos).item())
-    neg_norm = float(torch.linalg.vector_norm(neg).item())
-    diff_norm = float(torch.linalg.vector_norm(pos - neg).item())
-    cos = float((pos * neg).sum().item() / (pos_norm * neg_norm + 1e-12))
-    norm_ratio = max(pos_norm, neg_norm) / max(1e-12, min(pos_norm, neg_norm))
-    max_norm = max(pos_norm, neg_norm)
+    model_state = _load_model_state(args.checkpoint)
+    stats = _lora_summary(model_state)
+    num_layers = int(stats["num_lora_layers"])
+    b_norm_mean = stats["lora_B_norm_mean"]
+    delta_mean = stats["lora_delta_norm_mean"]
+    delta_max = stats["lora_delta_norm_max"]
 
     verdict = _verdict(
-        cos=cos,
-        max_norm=max_norm,
-        cos_good=args.cos_good,
-        cos_warn=args.cos_warn,
-        norm_warn=args.norm_warn,
+        delta_max=delta_max,
+        delta_mean=delta_mean,
+        delta_good=args.delta_good,
+        delta_warn=args.delta_warn,
     )
 
     summary = {
         "checkpoint": str(args.checkpoint),
-        "polarity_embedding_pos_norm": pos_norm,
-        "polarity_embedding_neg_norm": neg_norm,
-        "polarity_embedding_l2_distance": diff_norm,
-        "polarity_embedding_cos": cos,
-        "polarity_norm_ratio_max_over_min": norm_ratio,
+        "num_lora_layers": num_layers,
+        "lora_B_norm_mean": b_norm_mean,
+        "lora_delta_norm_mean": delta_mean,
+        "lora_delta_norm_max": delta_max,
         "thresholds": {
-            "cos_good": args.cos_good,
-            "cos_warn": args.cos_warn,
-            "norm_warn": args.norm_warn,
+            "delta_good": args.delta_good,
+            "delta_warn": args.delta_warn,
         },
         "verdict": verdict,
     }
 
     print(f"[dipole-divergence] checkpoint = {args.checkpoint}")
-    print(f"[dipole-divergence] pos_norm   = {pos_norm:.4f}")
-    print(f"[dipole-divergence] neg_norm   = {neg_norm:.4f}")
-    print(f"[dipole-divergence] ||pos-neg|| = {diff_norm:.4f}")
-    print(f"[dipole-divergence] cos(pos, neg) = {cos:+.4f}")
-    print(f"[dipole-divergence] norm ratio (max/min) = {norm_ratio:.2f}")
+    print(f"[dipole-divergence] num_lora_layers     = {num_layers}")
+    print(f"[dipole-divergence] mean ||lora_B||      = {b_norm_mean:.4f}")
+    print(f"[dipole-divergence] mean ||lora_B@lora_A|| = {delta_mean:.4f}")
+    print(f"[dipole-divergence] max  ||lora_B@lora_A|| = {delta_max:.4f}")
     print(
-        f"[dipole-divergence] thresholds: cos_good<{args.cos_good}, cos_warn>{args.cos_warn}, "
-        f"norm_warn<{args.norm_warn}"
+        f"[dipole-divergence] thresholds: delta_good>{args.delta_good}, "
+        f"delta_warn<{args.delta_warn}"
     )
     print(f"[dipole-divergence] {verdict}")
     if args.emit_json:
@@ -149,7 +156,7 @@ def main() -> int:
 
     if args.strict and verdict.startswith("BAD"):
         return 2
-    if not math.isfinite(cos):
+    if not math.isfinite(delta_mean):
         return 1
     return 0
 

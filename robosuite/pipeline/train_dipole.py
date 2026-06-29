@@ -40,6 +40,7 @@ from robosuite.pipeline.utils import (
     AsyncTransitionChunkWriter,
     ConsoleLogCapture,
     EMAFpsTracker,
+    EnvRandomReducer,
     FixedRateLimiter,
     IntervalGate,
     JsonlEventLogger,
@@ -772,6 +773,9 @@ def main(cfg: DictConfig) -> None:
 
     env = main_env
     obs = initial_obs
+    env_random_reducer = EnvRandomReducer(serialize_seed(getattr(cfg, "seed", None)))
+    if env_random_reducer.enabled:
+        print(f"[determinism] env_reset_seed={env_random_reducer.base_seed} rule=base_seed+episode_index")
     control_fps = resolve_runtime_fps(cfg, "control_fps", float(cfg.env.control_freq))
     render_fps = resolve_runtime_fps(cfg, "render_fps", control_fps)
     policy_fps = resolve_runtime_fps(cfg, "policy_fps", control_fps)
@@ -908,6 +912,9 @@ def main(cfg: DictConfig) -> None:
             "resume_enabled": bool(cfg.runtime.resume),
             "load_buffers": bool(cfg.runtime.load_buffers),
             "seed": serialize_seed(getattr(cfg, "seed", None)),
+            "env_reset_seed": env_random_reducer.base_seed,
+            "env_reset_seed_rule": "base_seed+episode_index" if env_random_reducer.enabled else None,
+            "episode_index": int(episode_index),
             "console_log": str(console_log_path),
             "runtime_log": str(runtime_log_path),
             "train_log": str(train_log_path),
@@ -1082,6 +1089,28 @@ def main(cfg: DictConfig) -> None:
             snapshot_env_state(env),
             warmup_frames=int(getattr(cfg.runtime, "viewer_reset_warmup_frames", 2)),
         )
+
+    def reset_rollout_observation() -> tuple[dict[str, Any], int | None]:
+        episode_seed = env_random_reducer.prepare_episode(env, episode_index, seed_global=False)
+        reset_obs, _ = reset_flow_policy_observation(
+            env,
+            preserve_mjviewer=rollout_has_renderer,
+            extractor=flow_proprio_extractor,
+            policy_camera_names=policy_camera_names,
+            camera_aliases=camera_aliases,
+            img_height=int(cfg.env.img_height),
+            img_width=int(cfg.env.img_width),
+        )
+        runtime_logger.log(
+            {
+                "event": "episode_reset",
+                "step": int(last_step),
+                "episode_index": int(episode_index),
+                "episode_seed": None if episode_seed is None else int(episode_seed),
+                **event_time_fields(),
+            }
+        )
+        return reset_obs, episode_seed
 
     def maybe_print_publish_events(metrics_list: list[dict[str, float]]) -> None:
         nonlocal last_reported_publish_count
@@ -1267,15 +1296,7 @@ def main(cfg: DictConfig) -> None:
 
     # Refresh the rollout episode after model / demo bootstrap so the first episode starts from the
     # same phase as the original flow_multi eval path, which resets immediately before inference.
-    obs, _ = reset_flow_policy_observation(
-        env,
-        preserve_mjviewer=rollout_has_renderer,
-        extractor=flow_proprio_extractor,
-        policy_camera_names=policy_camera_names,
-        camera_aliases=camera_aliases,
-        img_height=int(cfg.env.img_height),
-        img_width=int(cfg.env.img_width),
-    )
+    obs, _ = reset_rollout_observation()
     reset_viewer_preview()
     agent.reset_policy_state()
     policy_gate.force_ready()
@@ -1347,21 +1368,13 @@ def main(cfg: DictConfig) -> None:
                 if not bool(cfg.intervention.device_reset_as_episode_reset):
                     print("[INFO] Device reset requested. Exiting training loop.")
                     break
-                obs, _ = reset_flow_policy_observation(
-                    env,
-                    preserve_mjviewer=rollout_has_renderer,
-                    extractor=flow_proprio_extractor,
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
-                    img_height=int(cfg.env.img_height),
-                    img_width=int(cfg.env.img_width),
-                )
+                episode_index += 1
+                obs, _ = reset_rollout_observation()
                 reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
                 episode_length = 0
                 episode_step_index = 0
-                episode_index += 1
                 episode_transition_count = 0
                 episode_intervention_transitions = 0
                 policy_gate.force_ready()
@@ -1416,6 +1429,8 @@ def main(cfg: DictConfig) -> None:
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
                 done = True
             done = bool(done or success)
+            info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
+            info_payload.setdefault("episode_seed", env_random_reducer.seed_for_episode(episode_index))
             recorded_transition = trainer.record_transition(
                 obs=obs,
                 action=env_action,
@@ -1424,7 +1439,7 @@ def main(cfg: DictConfig) -> None:
                 reward=reward,
                 grasp_penalty=info.get("grasp_penalty") if isinstance(info, dict) else None,
                 is_intervention=is_intervention,
-                info=dict(info) if isinstance(info, dict) else {"raw_info": info},
+                info=info_payload,
                 reward_source="env_success",
                 demo_source="intervention" if is_intervention else None,
                 episode_index=episode_index,
@@ -1539,6 +1554,7 @@ def main(cfg: DictConfig) -> None:
                         "event": "episode_end",
                         "step": int(step),
                         "episode_index": int(episode_index),
+                        "episode_seed": env_random_reducer.seed_for_episode(episode_index),
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                         "episode_success": bool(success),
@@ -1561,21 +1577,13 @@ def main(cfg: DictConfig) -> None:
                 )
                 if episode_pause_sec > 0.0:
                     time.sleep(episode_pause_sec)
-                obs, _ = reset_flow_policy_observation(
-                    env,
-                    preserve_mjviewer=rollout_has_renderer,
-                    extractor=flow_proprio_extractor,
-                    policy_camera_names=policy_camera_names,
-                    camera_aliases=camera_aliases,
-                    img_height=int(cfg.env.img_height),
-                    img_width=int(cfg.env.img_width),
-                )
+                episode_index += 1
+                obs, _ = reset_rollout_observation()
                 reset_viewer_preview()
                 agent.reset_policy_state()
                 episode_return = 0.0
                 episode_length = 0
                 episode_step_index = 0
-                episode_index += 1
                 episode_transition_count = 0
                 episode_intervention_transitions = 0
                 cached_override_action = None
@@ -1647,6 +1655,8 @@ def main(cfg: DictConfig) -> None:
                 "resume_enabled": bool(cfg.runtime.resume),
                 "load_buffers": bool(cfg.runtime.load_buffers),
                 "seed": serialize_seed(getattr(cfg, "seed", None)),
+                "env_reset_seed": env_random_reducer.base_seed,
+                "env_reset_seed_rule": "base_seed+episode_index" if env_random_reducer.enabled else None,
                 "console_log": str(console_log_path),
                 "runtime_log": str(runtime_log_path),
                 "train_log": str(train_log_path),

@@ -13,6 +13,16 @@ from robosuite.pipeline.common.utils import clone_array_tree
 from robosuite.policy.flow_multi_update.model import MultiModalFlowPolicy, build_flow_policy
 
 from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
+from .lora import (
+    LoRARuntime,
+    apply_lora,
+    default_selector,
+    lora_disabled,
+    lora_full,
+    lora_health_metrics,
+    lora_masked,
+    remap_legacy_cond_keys,
+)
 
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -23,58 +33,84 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 
 
 class DipolePolarityFlowModel(MultiModalFlowPolicy):
-    """Shared backbone + learnable polarity embedding for DIPOLE CFG-style branches.
+    """Shared backbone + LoRA negative branch for DIPOLE CFG-style guidance.
 
-    Index 0 = negative branch (low w_pos), Index 1 = positive branch (high w_pos).
-    The polarity embedding is added to ``task_scene_cond`` before the flow head; the
-    rest of the backbone is shared and trainable.
+    The positive branch is the original pretrained path (LoRA OFF). The negative
+    branch is ``base + LoRA delta`` on the condition-pathway ``nn.Linear`` modules
+    of the flow head (and, optionally, the condition aggregator). Branch selection
+    is carried by a shared :class:`LoRARuntime` so the existing single 2x-batch
+    ``flow_head`` call can apply the delta to only the negative half via a row mask.
     """
 
-    def __init__(self, *args, polarity_embedding_init: str = "zero_pos", polarity_embedding_init_scale: float = 1e-3, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        lora_rank: int = 16,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_include_aggregator: bool = True,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
-        cond_dim = int(self.condition_aggregator.output_dim)
-        self.polarity_embedding = nn.Embedding(2, cond_dim)
-        self._initialize_polarity_embedding(polarity_embedding_init, float(polarity_embedding_init_scale))
+        self._install_lora(
+            rank=lora_rank,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+            include_aggregator=lora_include_aggregator,
+        )
 
-    def _initialize_polarity_embedding(self, scheme: str, scale: float) -> None:
-        scheme = str(scheme).lower()
-        with torch.no_grad():
-            self.polarity_embedding.weight.zero_()
-            if scheme == "zero_pos":
-                # pos branch (row 1) zero == base flow at init; neg (row 0) small gaussian
-                self.polarity_embedding.weight[0].normal_(mean=0.0, std=scale)
-            elif scheme == "zero_neg":
-                # neg branch (row 0) zero, pos branch (row 1) small gaussian
-                self.polarity_embedding.weight[1].normal_(mean=0.0, std=scale)
-            elif scheme == "antipodal":
-                e = torch.randn_like(self.polarity_embedding.weight[0]) * scale
-                self.polarity_embedding.weight[0].copy_(-e)
-                self.polarity_embedding.weight[1].copy_(e)
-            elif scheme == "small_gaussian":
-                self.polarity_embedding.weight.normal_(mean=0.0, std=scale)
-            else:
-                raise ValueError(
-                    f"Unsupported polarity_embedding_init={scheme!r}. "
-                    "Expected one of: zero_pos, zero_neg, small_gaussian, antipodal."
-                )
+    def _install_lora(
+        self,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        include_aggregator: bool,
+    ) -> None:
+        self.lora_runtime = LoRARuntime()
+        self.lora_num_modules = apply_lora(
+            self.flow_head,
+            self.condition_aggregator if include_aggregator else None,
+            rank=int(rank),
+            alpha=float(alpha),
+            dropout=float(dropout),
+            selector=default_selector(),
+            runtime=self.lora_runtime,
+        )
+
+    def negative_task_scene_cond(self, context: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Re-run the aggregator under LoRA to get the negative-branch condition.
+
+        ``encode_multimodal_context`` runs the aggregator with LoRA disabled, so
+        ``context['task_scene_cond']`` is the positive (base) condition. The
+        aggregator sits before the 2x split, so the per-row mask cannot reach it;
+        instead we recompute the negative condition with a cheap second aggregator
+        pass (once per inference, not per ODE step).
+        """
+        with lora_full(self.lora_runtime):
+            return self.condition_aggregator(
+                fused_tokens=context["fused_tokens"],
+                token_padding_mask=context["token_padding_mask"],
+                language_global=context["language_global"],
+            )
 
     def forward_from_context(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
         context: dict[str, torch.Tensor],
-        polarity_idx: int,
+        *,
+        negative: bool,
     ) -> torch.Tensor:
-        cond = context["task_scene_cond"]
-        polarity_vec = self.polarity_embedding.weight[int(polarity_idx)].unsqueeze(0)
-        cond_polarized = cond + polarity_vec
-        return self.flow_head(
-            x_t=x_t,
-            timesteps=t,
-            task_scene_cond=cond_polarized,
-            context_tokens=context["context_tokens"],
-            context_padding_mask=context["context_padding_mask"],
-        )
+        manager = lora_full(self.lora_runtime) if negative else lora_disabled(self.lora_runtime)
+        with manager:
+            return self.flow_head(
+                x_t=x_t,
+                timesteps=t,
+                task_scene_cond=context["task_scene_cond"],
+                context_tokens=context["context_tokens"],
+                context_padding_mask=context["context_padding_mask"],
+            )
 
 
 def build_dipole_flow_policy(
@@ -83,8 +119,10 @@ def build_dipole_flow_policy(
     proprio_dim: int,
     action_dim: int,
     camera_names: list[str],
-    polarity_embedding_init: str,
-    polarity_embedding_init_scale: float,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float,
+    lora_include_aggregator: bool,
 ) -> DipolePolarityFlowModel:
     base = build_flow_policy(cfg, proprio_dim=proprio_dim, action_dim=action_dim, camera_names=camera_names)
     # Re-instantiate as DipolePolarityFlowModel sharing the same submodules.
@@ -100,9 +138,12 @@ def build_dipole_flow_policy(
     polar.fusion = base.fusion
     polar.condition_aggregator = base.condition_aggregator
     polar.flow_head = base.flow_head
-    cond_dim = int(polar.condition_aggregator.output_dim)
-    polar.polarity_embedding = nn.Embedding(2, cond_dim)
-    polar._initialize_polarity_embedding(polarity_embedding_init, float(polarity_embedding_init_scale))
+    polar._install_lora(
+        rank=int(lora_rank),
+        alpha=float(lora_alpha),
+        dropout=float(lora_dropout),
+        include_aggregator=bool(lora_include_aggregator),
+    )
     return polar
 
 
@@ -125,17 +166,24 @@ def _sample_guided_action_sequence(
         x = torch.randn(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
     context = model.encode_multimodal_context(images=images, proprio=proprio, language=language)
     guided_context: dict[str, torch.Tensor] | None = None
+    row_mask: torch.Tensor | None = None
     if float(omega) != 0.0:
-        polarity = model.polarity_embedding.weight[[1, 0]]
-        task_scene_cond = context["task_scene_cond"]
+        # Positive condition is the base aggregator output; recompute the negative
+        # condition once via a LoRA aggregator pass (decision: train/eval consistent).
+        pos_cond = context["task_scene_cond"]
+        neg_cond = model.negative_task_scene_cond(context)
         guided_context = {
-            "task_scene_cond": torch.cat(
-                [task_scene_cond + polarity[0], task_scene_cond + polarity[1]],
-                dim=0,
-            ),
+            "task_scene_cond": torch.cat([pos_cond, neg_cond], dim=0),
             "context_tokens": context["context_tokens"].repeat(2, 1, 1),
             "context_padding_mask": context["context_padding_mask"].repeat(2, 1),
         }
+        # First half = positive (base only), second half = negative (base + LoRA).
+        row_mask = torch.cat(
+            [
+                torch.zeros(batch_size, dtype=torch.bool, device=proprio.device),
+                torch.ones(batch_size, dtype=torch.bool, device=proprio.device),
+            ]
+        )
     dt = 1.0 / float(n_steps)
     for step in range(int(n_steps)):
         t = torch.full(
@@ -147,16 +195,17 @@ def _sample_guided_action_sequence(
         if float(omega) == 0.0:
             # omega=0 => v = v_pos exactly; skip the negative branch forward pass
             # (halves the per-ODE-step network cost, identical result).
-            v = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=1)
+            v = model.forward_from_context(x_t=x, t=t, context=context, negative=False)
         else:
-            assert guided_context is not None
-            velocities = model.flow_head(
-                x_t=x.repeat(2, 1, 1),
-                timesteps=t.repeat(2),
-                task_scene_cond=guided_context["task_scene_cond"],
-                context_tokens=guided_context["context_tokens"],
-                context_padding_mask=guided_context["context_padding_mask"],
-            )
+            assert guided_context is not None and row_mask is not None
+            with lora_masked(model.lora_runtime, row_mask):
+                velocities = model.flow_head(
+                    x_t=x.repeat(2, 1, 1),
+                    timesteps=t.repeat(2),
+                    task_scene_cond=guided_context["task_scene_cond"],
+                    context_tokens=guided_context["context_tokens"],
+                    context_padding_mask=guided_context["context_padding_mask"],
+                )
             v_pos = velocities[:batch_size]
             v_neg = velocities[batch_size:]
             v = (1.0 + float(omega)) * v_pos - float(omega) * v_neg
@@ -184,13 +233,34 @@ class DipoleFlowPolicy:
             proprio_dim=int(config.proprio_dim),
             action_dim=int(config.action_dim),
             camera_names=self.camera_names,
-            polarity_embedding_init=str(config.polarity_embedding_init),
-            polarity_embedding_init_scale=float(config.polarity_embedding_init_scale),
+            lora_rank=int(config.lora_rank),
+            lora_alpha=float(config.lora_alpha),
+            lora_dropout=float(config.lora_dropout),
+            lora_include_aggregator=bool(config.lora_include_aggregator),
         ).to(self.device)
+
+        # Two param groups: base backbone at the policy LR, LoRA adapter at adapter_lr.
+        # Decision 1: positive loss updates base at full LR; negative loss updates LoRA
+        # (adapter_lr) AND base (lower LR = base_lr_scale * learning_rate). The lower
+        # base contribution is applied as a gradient scale in ``update`` (see below).
+        lora_params = [
+            param
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and (".lora_A" in name or ".lora_B" in name)
+        ]
+        base_params = [
+            param
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and not (".lora_A" in name or ".lora_B" in name)
+        ]
+        self._base_params = base_params
+        self._lora_params = lora_params
+        self.base_lr_scale = float(config.base_lr_scale)
         self.optimizer = torch.optim.AdamW(
-            [param for param in self.model.parameters() if param.requires_grad],
-            lr=float(config.learning_rate),
-            weight_decay=float(config.weight_decay),
+            [
+                {"params": base_params, "lr": float(config.learning_rate), "weight_decay": float(config.weight_decay)},
+                {"params": lora_params, "lr": float(config.adapter_lr), "weight_decay": 0.0},
+            ]
         )
         self.scaler = torch.amp.GradScaler(enabled=(self.device.type == "cuda"), device=self.device)
 
@@ -483,7 +553,26 @@ class DipoleFlowPolicy:
         w_neg = torch.where(is_int, torch.zeros_like(w_neg), w_neg)
         return w_pos, w_neg, metrics
 
-    def update(self, batch: DipoleBatch) -> dict[str, float]:
+    def _provider_raw_g_for_batch(self, batch: DipoleBatch) -> torch.Tensor:
+        """Provider raw G per sample (before policy g_sign / normalize)."""
+        batch_size = batch.batch_size
+        if self.g_provider is None:
+            return torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+
+        demo_mask = self._resolve_demo_sample_mask(batch, self.device)
+        if demo_mask is not None:
+            raw = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            online_mask = ~demo_mask
+            if bool(online_mask.any().item()):
+                online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
+                online_batch = select_dipole_batch(batch, online_indices)
+                raw_online = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
+                raw[online_mask] = raw_online
+            return raw
+
+        return self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
+
+    def update(self, batch: DipoleBatch, *, collect_diagnostics: bool = False) -> dict[str, float]:
         batch = batch.to(self.device)
         self.model.train(True)
 
@@ -499,67 +588,77 @@ class DipoleFlowPolicy:
 
         w_pos, w_neg, weight_metrics = self._compute_branch_weights(batch)
 
+        def _branch_losses(v_pred: torch.Tensor, weights: torch.Tensor):
+            fp = torch.mean((v_pred - v_target) ** 2, dim=(1, 2))
+            x1 = x_t + (1.0 - timesteps).view(-1, 1, 1) * v_pred
+            ep = torch.mean((x1 - batch.action_sequences) ** 2, dim=(1, 2))
+            if batch.action_sequences.shape[1] > 1:
+                sm = torch.mean((x1[:, 1:] - x1[:, :-1]) ** 2, dim=(1, 2))
+            else:
+                sm = torch.zeros(B, device=self.device, dtype=fp.dtype)
+            flow = _weighted_mean(fp, weights)
+            endpoint = _weighted_mean(ep, weights)
+            smooth = _weighted_mean(sm, weights)
+            loss = (
+                flow
+                + float(self.config.lambda_endpoint) * endpoint
+                + float(self.config.lambda_smooth) * smooth
+            )
+            return loss, flow, endpoint, smooth, fp
+
+        x_t_swapped = x_t.transpose(1, 2)
         self.optimizer.zero_grad(set_to_none=True)
+
+        # --- Positive branch: original pretrained path (LoRA OFF) -> updates base @ full LR.
         with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
             context = self.model.encode_multimodal_context(
                 images=batch.image_obs,
                 proprio=batch.proprio,
                 language=language,
             )
-            x_t_swapped = x_t.transpose(1, 2)
             v_pos = self.model.forward_from_context(
-                x_t=x_t_swapped, t=timesteps, context=context, polarity_idx=1,
+                x_t=x_t_swapped, t=timesteps, context=context, negative=False,
             ).transpose(1, 2)
+            loss_pos, flow_pos, endpoint_pos, smooth_pos, v_pos_mse = _branch_losses(v_pos, w_pos)
+        # retain_graph so the negative backward can still traverse the shared encode graph.
+        self.scaler.scale(loss_pos).backward(retain_graph=True)
+        # Cache base grads from the positive loss, then clear (LoRA has no positive grad).
+        g_pos = {p: p.grad.detach().clone() for p in self._base_params if p.grad is not None}
+        for p in self._base_params:
+            p.grad = None
+
+        # --- Negative branch: base + LoRA -> updates LoRA @ adapter_lr and base @ lower LR.
+        with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
+            neg_context = dict(context)
+            neg_context["task_scene_cond"] = self.model.negative_task_scene_cond(context)
             v_neg = self.model.forward_from_context(
-                x_t=x_t_swapped, t=timesteps, context=context, polarity_idx=0,
+                x_t=x_t_swapped, t=timesteps, context=neg_context, negative=True,
             ).transpose(1, 2)
+            loss_neg, flow_neg, endpoint_neg, smooth_neg, v_neg_mse = _branch_losses(v_neg, w_neg)
+        self.scaler.scale(loss_neg).backward()
 
-            fp_pos = torch.mean((v_pos - v_target) ** 2, dim=(1, 2))
-            fp_neg = torch.mean((v_neg - v_target) ** 2, dim=(1, 2))
-            x1_pos = x_t + (1.0 - timesteps).view(-1, 1, 1) * v_pos
-            x1_neg = x_t + (1.0 - timesteps).view(-1, 1, 1) * v_neg
-            ep_pos = torch.mean((x1_pos - batch.action_sequences) ** 2, dim=(1, 2))
-            ep_neg = torch.mean((x1_neg - batch.action_sequences) ** 2, dim=(1, 2))
-            if batch.action_sequences.shape[1] > 1:
-                sm_pos = torch.mean((x1_pos[:, 1:] - x1_pos[:, :-1]) ** 2, dim=(1, 2))
-                sm_neg = torch.mean((x1_neg[:, 1:] - x1_neg[:, :-1]) ** 2, dim=(1, 2))
+        # Combine base grads: full-LR positive + lower-LR negative. All grads share the
+        # same GradScaler scale, so the base_lr_scale ratio is scale-invariant; the single
+        # AdamW base group (lr=learning_rate) then yields full_lr*g_pos + base_lr_neg*g_neg.
+        for p in self._base_params:
+            gp = g_pos.get(p)
+            if p.grad is None:
+                if gp is not None:
+                    p.grad = gp
+            elif gp is None:
+                p.grad = self.base_lr_scale * p.grad
             else:
-                sm_pos = torch.zeros(B, device=self.device, dtype=fp_pos.dtype)
-                sm_neg = torch.zeros(B, device=self.device, dtype=fp_neg.dtype)
+                p.grad = gp + self.base_lr_scale * p.grad
 
-            flow_pos = _weighted_mean(fp_pos, w_pos)
-            flow_neg = _weighted_mean(fp_neg, w_neg)
-            endpoint_pos = _weighted_mean(ep_pos, w_pos)
-            endpoint_neg = _weighted_mean(ep_neg, w_neg)
-            smooth_pos = _weighted_mean(sm_pos, w_pos)
-            smooth_neg = _weighted_mean(sm_neg, w_neg)
-
-            loss_pos = (
-                flow_pos
-                + float(self.config.lambda_endpoint) * endpoint_pos
-                + float(self.config.lambda_smooth) * smooth_pos
-            )
-            loss_neg = (
-                flow_neg
-                + float(self.config.lambda_endpoint) * endpoint_neg
-                + float(self.config.lambda_smooth) * smooth_neg
-            )
-            loss = loss_pos + loss_neg
-
-        self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.config.grad_clip_norm))
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        pos_row = self.model.polarity_embedding.weight[1].detach()
-        neg_row = self.model.polarity_embedding.weight[0].detach()
-        polarity_pos_norm = float(torch.linalg.vector_norm(pos_row).item())
-        polarity_neg_norm = float(torch.linalg.vector_norm(neg_row).item())
-        cos_denom = (polarity_pos_norm * polarity_neg_norm) + 1e-6
-        polarity_cos = float((pos_row * neg_row).sum().item() / cos_denom)
+        loss = loss_pos + loss_neg
+        lora_metrics = lora_health_metrics(self.model)
 
-        return {
+        metrics: dict[str, Any] = {
             "actor_loss": float(loss.detach().cpu().item()),
             "loss_pos": float(loss_pos.detach().cpu().item()),
             "loss_neg": float(loss_neg.detach().cpu().item()),
@@ -576,15 +675,24 @@ class DipoleFlowPolicy:
             "frac_w_pos_saturated_high": float((w_pos > 0.99).float().mean().item()),
             "frac_w_pos_saturated_low": float((w_pos < 0.01).float().mean().item()),
             "frac_intervention": float(batch.is_intervention.float().mean().item()),
-            "polarity_embedding_pos_norm": polarity_pos_norm,
-            "polarity_embedding_neg_norm": polarity_neg_norm,
-            "polarity_embedding_cos": polarity_cos,
             "flow_loss": float((flow_pos + flow_neg).detach().cpu().item() * 0.5),
             "endpoint_loss": float((endpoint_pos + endpoint_neg).detach().cpu().item() * 0.5),
             "smooth_loss": float((smooth_pos + smooth_neg).detach().cpu().item() * 0.5),
             "mse": float(((endpoint_pos + endpoint_neg) * 0.5).detach().cpu().item()),
+            **lora_metrics,
             **weight_metrics,
         }
+        if collect_diagnostics:
+            with torch.no_grad():
+                g_provider_raw = self._provider_raw_g_for_batch(batch)
+            metrics["_diag"] = {
+                "g_provider_raw": g_provider_raw.detach().cpu().numpy(),
+                "w_pos": w_pos.detach().cpu().numpy(),
+                "w_neg": w_neg.detach().cpu().numpy(),
+                "v_pos_mse": v_pos_mse.detach().cpu().numpy(),
+                "v_neg_mse": v_neg_mse.detach().cpu().numpy(),
+            }
+        return metrics
 
     def sync_inference_policy(self) -> None:
         with self._state_lock:
@@ -609,13 +717,15 @@ class DipoleFlowPolicy:
 
     def load_model_state(self, state_dict: dict[str, Any], *, strict: bool = True) -> None:
         with self._state_lock:
+            state_dict = remap_legacy_cond_keys(state_dict, self.model)
             self.model.load_state_dict(state_dict, strict=strict)
         self.sync_inference_policy()
         self.reset_action_chunk()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         with self._state_lock:
-            self.model.load_state_dict(state_dict["model"])
+            model_state = remap_legacy_cond_keys(state_dict["model"], self.model)
+            self.model.load_state_dict(model_state)
             optimizer_state = state_dict.get("optimizer")
             if optimizer_state is not None:
                 self.optimizer.load_state_dict(optimizer_state)

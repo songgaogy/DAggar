@@ -14,8 +14,8 @@ export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole_offline/PickPlaceCereal/2026-06-24_03-06-10_no-norm/checkpoints/step_00014999.pt"
-OMEGA=1
+POLICY_CKPT="outputs/dipole_offline/PickPlaceCereal/2026-06-29_12-18-39_no-norm/checkpoints/step_00000000.pt"
+OMEGA=0
 EVAL_EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 SAVE_VIDEO=true

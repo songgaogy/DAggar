@@ -64,7 +64,7 @@ algorithm:
 
   advantage_g_provider:
     alpha: 1.0
-    beta: 0.5
+    beta: 0
     advantage_normalization: "batch_zscore"
     disc_normalization: "batch_zscore"
 

@@ -9,6 +9,7 @@ import torch.nn as nn
 from robosuite.pipeline.algorithms.dipole.models.flow import (
     _sample_guided_action_sequence,
 )
+from robosuite.pipeline.algorithms.dipole.models.lora import LoRARuntime
 from robosuite.pipeline.offline.eval_offline_dipole import (
     _resolve_execute_horizon,
 )
@@ -37,20 +38,25 @@ class _CountingFlowHead(nn.Module):
 
 
 class _FakeDipoleModel(nn.Module):
+    """Stub mirroring the LoRA-based DIPOLE model API used by sampling.
+
+    The negative branch differs from the positive branch through
+    ``negative_task_scene_cond`` (emulating the aggregator-side LoRA delta); the
+    stub flow head itself is LoRA-agnostic, so this exercises the sampling
+    orchestration (2x-batch build, row mask plumbing, branch combination).
+    """
+
     def __init__(self, action_dim: int = 3, context_dim: int = 5) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
-        self.polarity_embedding = nn.Embedding(2, context_dim)
+        self.context_dim = int(context_dim)
+        self.lora_runtime = LoRARuntime()
         self.flow_head = _CountingFlowHead()
-        with torch.no_grad():
-            self.polarity_embedding.weight.copy_(
-                torch.tensor(
-                    [
-                        [-0.4, 0.1, 0.2, -0.3, 0.5],
-                        [0.3, -0.2, 0.4, 0.1, -0.1],
-                    ]
-                )
-            )
+        # Fixed negative-branch condition delta (stands in for aggregator LoRA).
+        self.register_buffer(
+            "neg_cond_delta",
+            torch.tensor([0.3, -0.2, 0.4, 0.1, -0.1])[:context_dim],
+        )
 
     def encode_multimodal_context(
         self,
@@ -62,9 +68,9 @@ class _FakeDipoleModel(nn.Module):
         batch_size = proprio.shape[0]
         assert len(language) == batch_size
         base = proprio.mean(dim=1, keepdim=True)
-        task_scene_cond = base.repeat(1, self.polarity_embedding.embedding_dim)
+        task_scene_cond = base.repeat(1, self.context_dim)
         context_tokens = images.mean(dim=(2, 3, 4), keepdim=False).unsqueeze(-1)
-        context_tokens = context_tokens.repeat(1, 1, self.polarity_embedding.embedding_dim)
+        context_tokens = context_tokens.repeat(1, 1, self.context_dim)
         context_padding_mask = torch.zeros(
             batch_size, context_tokens.shape[1], dtype=torch.bool
         )
@@ -72,7 +78,16 @@ class _FakeDipoleModel(nn.Module):
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
             "context_padding_mask": context_padding_mask,
+            # Aggregator inputs (unused by the stub aggregator, present for parity).
+            "fused_tokens": context_tokens,
+            "token_padding_mask": context_padding_mask,
+            "language_global": task_scene_cond,
         }
+
+    def negative_task_scene_cond(
+        self, context: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        return context["task_scene_cond"] + self.neg_cond_delta
 
     def forward_from_context(
         self,
@@ -80,15 +95,12 @@ class _FakeDipoleModel(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         context: dict[str, torch.Tensor],
-        polarity_idx: int,
+        negative: bool,
     ) -> torch.Tensor:
         return self.flow_head(
             x_t=x_t,
             timesteps=t,
-            task_scene_cond=(
-                context["task_scene_cond"]
-                + self.polarity_embedding.weight[int(polarity_idx)]
-            ),
+            task_scene_cond=context["task_scene_cond"],
             context_tokens=context["context_tokens"],
             context_padding_mask=context["context_padding_mask"],
         )
@@ -110,13 +122,15 @@ def _serial_sample(
         proprio=proprio,
         language=["task"] * batch_size,
     )
+    neg_context = dict(context)
+    neg_context["task_scene_cond"] = model.negative_task_scene_cond(context)
     for step in range(n_steps):
         t = torch.full((batch_size,), float(step) / float(n_steps))
         v_pos = model.forward_from_context(
-            x_t=x, t=t, context=context, polarity_idx=1
+            x_t=x, t=t, context=context, negative=False
         )
         v_neg = model.forward_from_context(
-            x_t=x, t=t, context=context, polarity_idx=0
+            x_t=x, t=t, context=neg_context, negative=True
         )
         x = x + ((1.0 + omega) * v_pos - omega * v_neg) / float(n_steps)
     return x.transpose(1, 2)

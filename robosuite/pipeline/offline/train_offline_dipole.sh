@@ -20,7 +20,7 @@ POLICY_CKPT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 IQL_CKPT="outputs/dipole_rl/offline_iql_qv-v2/PickPlaceCereal/iql_state.pt"
 DEVICE="${DEVICE:-cuda:0}"
-NUM_TRAIN_STEPS=15000
+NUM_TRAIN_STEPS=1
 G_NORMALIZATION=false
 RUN_SUBFIX="no-norm"
 # -------------------------------------

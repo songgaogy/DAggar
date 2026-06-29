@@ -25,8 +25,13 @@ class DipoleConfig(FlowDaggerConfig):
     g_sign: str = "negate_raw"            # "negate_raw" | "raw"
     g_normalization: str = "batch_zscore" # "batch_zscore" | "running_zscore" | "minmax" | "none"
     g_clip: float = 10.0
-    polarity_embedding_init: str = "zero_pos"   # "zero_pos" | "zero_neg" | "small_gaussian" | "antipodal"
-    polarity_embedding_init_scale: float = 1e-3
+    # LoRA negative-branch condition injection (replaces the additive polarity embedding).
+    lora_rank: int = 16
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_include_aggregator: bool = True
+    adapter_lr: float = 1e-3              # LoRA param LR (negative branch)
+    base_lr_scale: float = 0.1           # base_lr_neg = base_lr_scale * learning_rate
     # DIPOLE-RL: which frozen nnPU-backed G provider the trainer attaches.
     # Read by train_dipole*.py; DipoleFlowPolicy itself does not consume it.
     g_mode: str = "nnpu_frozen"

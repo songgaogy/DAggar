@@ -42,6 +42,11 @@ from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
 from robosuite.pipeline.envs import build_robosuite_env
 from robosuite.pipeline.factory import build_algorithm
+from robosuite.pipeline.offline.diagnostic_plots import (
+    plot_branch_weight_distribution,
+    plot_raw_g_distribution,
+    plot_v_pos_neg_scatter,
+)
 from robosuite.pipeline.offline.utils import (
     OfflineAdvantageGProvider,
     load_offline_data_transitions,
@@ -61,13 +66,56 @@ from robosuite.pipeline.train_dipole import (
 from robosuite.pipeline.train_dipole_rl import _load_iql_warmup_state
 from robosuite.pipeline.utils import (
     checkpoint_path,
-    maybe_build_tensorboard,
+    maybe_build_metric_logger,
     maybe_log,
+    maybe_log_figure,
     write_resolved_config,
     write_run_info,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _print_policy_param_summary(core: Any) -> None:
+    """Print LoRA adapter vs base trainable parameter counts after policy init."""
+    model = core.model
+    lora_numel = 0
+    base_numel = 0
+    frozen_numel = 0
+    lora_module_paths: list[str] = []
+    for name, param in model.named_parameters():
+        n = int(param.numel())
+        if not param.requires_grad:
+            frozen_numel += n
+            continue
+        if ".lora_A" in name or ".lora_B" in name:
+            lora_numel += n
+            if name.endswith(".lora_A"):
+                lora_module_paths.append(name[: -len(".lora_A")])
+        else:
+            base_numel += n
+
+    trainable_numel = lora_numel + base_numel
+    total_numel = trainable_numel + frozen_numel
+    lora_num_modules = int(getattr(model, "lora_num_modules", len(lora_module_paths)))
+    print(
+        f"[offline] policy trainable params: total={trainable_numel:,} "
+        f"(base={base_numel:,}, lora={lora_numel:,})"
+    )
+    print(
+        f"[offline] policy frozen params: {frozen_numel:,} "
+        f"(all params={total_numel:,})"
+    )
+    print(
+        f"[offline] lora modules={lora_num_modules} "
+        f"(rank={getattr(core.config, 'lora_rank', '?')}, "
+        f"alpha={getattr(core.config, 'lora_alpha', '?')}, "
+        f"include_aggregator={getattr(core.config, 'lora_include_aggregator', '?')})"
+    )
+    if lora_module_paths:
+        print("[offline] lora target paths:")
+        for path in lora_module_paths:
+            print(f"  - {path}")
 
 
 def _freeze_iql(iql: IQLLearner) -> None:
@@ -215,6 +263,7 @@ def main(cfg: DictConfig) -> None:
         )
         agent.load_flow_policy_checkpoint(init_checkpoint, task_name=task_name)
         print(f"[offline] loaded pretrained flow policy from {init_checkpoint}")
+        _print_policy_param_summary(agent.core)
 
         # -------------------------------------------------------------- #
         # Frozen shared encoder + nnPU discriminator + frozen IQL.       #
@@ -380,7 +429,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Logging + run metadata.                                            #
     # ------------------------------------------------------------------ #
-    metric_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=run_dir)
+    metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
     write_resolved_config(cfg, run_dir)
     write_run_info(
         run_dir,
@@ -417,6 +466,8 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     num_steps = int(cfg.offline.num_train_steps)
     log_interval = max(1, int(cfg.offline.log_interval))
+    plot_log_interval_raw = OmegaConf.select(cfg, "offline.plot_log_interval", default=None)
+    plot_log_interval = max(1, int(log_interval if plot_log_interval_raw is None else plot_log_interval_raw))
     checkpoint_interval = max(1, int(cfg.offline.checkpoint_interval))
 
     sample_kwargs = {
@@ -434,7 +485,9 @@ def main(cfg: DictConfig) -> None:
             # so the policy takes the legacy path: full-batch advantage G, then
             # is_intervention (pretrain) rows are overridden to w_pos=1.
             batch = agent.online_buffer.sample(batch_size, **sample_kwargs)
-            metrics = agent.update(batch=batch)
+            collect_diag = (step % plot_log_interval == 0) or (step == num_steps - 1)
+            metrics = agent.core.update(batch=batch, collect_diagnostics=collect_diag)
+            diag = metrics.pop("_diag", None)
             if step % log_interval == 0 or step == num_steps - 1:
                 maybe_log(
                     metric_logger,
@@ -447,6 +500,15 @@ def main(cfg: DictConfig) -> None:
                     f"G_mean={metrics.get('G_mean', 0.0):+.3f} "
                     f"raw_mean={metrics.get('raw_nnpu_score_mean', 0.0):+.3f}"
                 )
+            if diag is not None:
+                fig_g = plot_raw_g_distribution(diag["g_provider_raw"])
+                maybe_log_figure(metric_logger, "train/raw_g_hist", fig_g, step)
+                fig_w_pos = plot_branch_weight_distribution(diag["w_pos"], label="w_pos")
+                maybe_log_figure(metric_logger, "train/w_pos_hist", fig_w_pos, step)
+                fig_w_neg = plot_branch_weight_distribution(diag["w_neg"], label="w_neg")
+                maybe_log_figure(metric_logger, "train/w_neg_hist", fig_w_neg, step)
+                fig_v = plot_v_pos_neg_scatter(diag["v_pos_mse"], diag["v_neg_mse"])
+                maybe_log_figure(metric_logger, "train/v_pos_neg_mse_scatter", fig_v, step)
             if step > 0 and step % checkpoint_interval == 0:
                 step_path = _save(f"step_{step:08d}", step)
                 _save("latest", step)

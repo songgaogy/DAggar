@@ -1,4 +1,4 @@
-from .determinism import EnvRandomReducer
+from .determinism import EnvRandomReducer, assert_disjoint_seed_ranges, ranges_overlap
 from .io import (
     deserialize_transition,
     ensure_directory,
@@ -24,8 +24,11 @@ from .train_utils import (
     checkpoint_step_path,
     format_episode_line,
     load_transition_chunks,
+    maybe_build_metric_logger,
     maybe_build_tensorboard,
+    maybe_init_wandb,
     maybe_log,
+    maybe_log_figure,
     maybe_wrap_visualization,
     now_readable,
     reset_observation_adapter,
@@ -48,6 +51,8 @@ from .train_utils import (
 
 __all__ = [
     "EnvRandomReducer",
+    "assert_disjoint_seed_ranges",
+    "ranges_overlap",
     "deserialize_transition",
     "ensure_directory",
     "list_hdf5_demo_names",
@@ -71,8 +76,11 @@ __all__ = [
     "checkpoint_step_path",
     "format_episode_line",
     "load_transition_chunks",
+    "maybe_build_metric_logger",
     "maybe_build_tensorboard",
+    "maybe_init_wandb",
     "maybe_log",
+    "maybe_log_figure",
     "maybe_wrap_visualization",
     "reset_observation_adapter",
     "resolve_algorithm_devices",

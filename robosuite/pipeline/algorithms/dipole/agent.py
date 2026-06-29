@@ -124,6 +124,7 @@ class DipoleAgent:
         encoder_cfg = cfg_get(cfg, "encoder", None)
         flow_cfg = cfg_get(cfg, "flow", None)
         dipole_cfg = cfg_get(cfg, "dipole", None)
+        lora_cfg = cfg_get(dipole_cfg, "lora", None) if dipole_cfg is not None else None
         online_buffer_cfg = cfg_get(cfg, "online_buffer", None)
         demo_buffer_cfg = cfg_get(cfg, "demo_buffer", None)
         trainer_cfg = cfg_get(cfg, "trainer", None)
@@ -170,8 +171,12 @@ class DipoleAgent:
             g_sign=str(cfg_get(dipole_cfg, "g_sign", "negate_raw")),
             g_normalization=str(cfg_get(dipole_cfg, "g_normalization", "batch_zscore")),
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
-            polarity_embedding_init=str(cfg_get(dipole_cfg, "polarity_embedding_init", "zero_pos")),
-            polarity_embedding_init_scale=float(cfg_get(dipole_cfg, "polarity_embedding_init_scale", 2e-3)),
+            lora_rank=int(cfg_get(lora_cfg, "rank", 16)),
+            lora_alpha=float(cfg_get(lora_cfg, "alpha", 16.0)),
+            lora_dropout=float(cfg_get(lora_cfg, "dropout", 0.0)),
+            lora_include_aggregator=bool(cfg_get(lora_cfg, "include_aggregator", True)),
+            adapter_lr=float(cfg_get(lora_cfg, "adapter_lr", 1e-3)),
+            base_lr_scale=float(cfg_get(lora_cfg, "base_lr_scale", 0.1)),
             g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "nnpu_frozen")),
         )
         online_buffer_config = ReplayBufferConfig(
@@ -386,7 +391,8 @@ class DipoleAgent:
         model_state = payload.get("ema_model", payload.get("model"))
         if model_state is None:
             raise KeyError(f"Checkpoint {path} is missing both 'ema_model' and 'model'.")
-        # strict=False so the new polarity_embedding parameters keep their fresh init.
+        # strict=False so the fresh LoRA adapter params keep their init; legacy
+        # condition-pathway keys are remapped to ``.base.*`` inside load_model_state.
         self.core.load_model_state(model_state, strict=False)
         self.core.set_normalizers(
             action_mean=payload.get("act_mean"),

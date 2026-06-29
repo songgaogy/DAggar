@@ -24,6 +24,7 @@
 #   MAX_VIDEOS=0                     # cap saved videos per omega; <=0 = save all
 #   OUTPUT_ROOT=                     # default: <run_dir>/eval (from CHECKPOINT path)
 #   EVAL_DETERMINISTIC=false         # true => deterministic ODE init (no noise)
+#   SEED=900000                      # eval layout seed band
 #   DEVICE=cuda:0
 #   INIT_CHECKPOINT=                 # optional override (default picks from run_info.json)
 #   SKIP_DIAGNOSTIC=false
@@ -51,6 +52,7 @@ VIDEO_IMAGE_SIZE="${VIDEO_IMAGE_SIZE:-512}"
 MAX_VIDEOS="${MAX_VIDEOS:-0}"
 
 EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-false}"
+SEED="${SEED:-900000}"
 DEVICE="${DEVICE:-cuda:0}"
 INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
 
@@ -146,6 +148,7 @@ build_py_args() {
     --video-height "${VIDEO_IMAGE_SIZE}"
     --video-width "${VIDEO_IMAGE_SIZE}"
     --max-videos "${MAX_VIDEOS}"
+    --seed "${SEED}"
     --device "${DEVICE}"
   )
   if [[ "${EVAL_DETERMINISTIC}" == "true" ]]; then
@@ -163,7 +166,7 @@ for omega_raw in "${OMEGAS[@]}"; do
     continue
   fi
   echo "==========================================================="
-  echo "[eval_dipole] omega=${omega}  episodes=${EPISODES}  output_root=${OUTPUT_ROOT}  ckpt=${CHECKPOINT}"
+  echo "[eval_dipole] omega=${omega}  episodes=${EPISODES}  seed=${SEED}  output_root=${OUTPUT_ROOT}  ckpt=${CHECKPOINT}"
   echo "==========================================================="
   build_py_args "${omega}"
   RUN_OUTPUT_LOG="$(mktemp)"

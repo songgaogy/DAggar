@@ -37,13 +37,14 @@ from robosuite.pipeline.train_dipole import (
     load_init_checkpoint_payload,
     resolve_flow_task_metadata,
 )
-from robosuite.pipeline.utils import resolve_requested_device
+from robosuite.pipeline.utils import EnvRandomReducer, assert_disjoint_seed_ranges, resolve_requested_device
 
 
 DEFAULT_OUTPUT_ROOT = "./outputs/DIPOLE/eval"
 DEFAULT_VIDEO_CAMERA = "agentview"
 DEFAULT_VIDEO_FPS = 20
 DEFAULT_VIDEO_SIZE = 512
+DEFAULT_EVAL_SEED = 900000
 
 
 def _parse_args() -> argparse.Namespace:
@@ -62,6 +63,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--video-width", type=int, default=DEFAULT_VIDEO_SIZE, help="Video frame width.")
     parser.add_argument("--max-videos", type=int, default=0, help="Cap videos saved (<=0 = all).")
     parser.add_argument("--deterministic", action="store_true", help="Deterministic action sampling.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_EVAL_SEED,
+        help=(
+            "Base seed for deterministic episode layouts. Defaults to a high band disjoint from "
+            "training seeds; overlap with the training seed range is hard-asserted when run_info "
+            "contains env_reset_seed."
+        ),
+    )
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
     parser.add_argument("--device", default=None, help="Override eval device (e.g. cuda:0).")
     parser.add_argument("--run-tag", default=None, help="Optional tag appended to the output dir name.")
@@ -98,6 +109,35 @@ def _load_resolved_config(run_dir: Path | None):
     if not config_path.exists():
         return None
     return OmegaConf.load(config_path)
+
+
+def _assert_eval_seeds_disjoint(
+    run_info: dict[str, Any] | None,
+    *,
+    eval_base: int,
+    eval_count: int,
+) -> None:
+    if run_info is None:
+        print("[determinism][warn] no run_info.json found; skipping train/eval seed-disjoint check.")
+        return
+    train_base = run_info.get("env_reset_seed")
+    if train_base is None:
+        print(
+            "[determinism][warn] run_info has no env_reset_seed; "
+            "skipping train/eval seed-disjoint check."
+        )
+        return
+    train_count = int(run_info.get("episode_index", 0) or 0)
+    if train_count <= 0:
+        print("[determinism][warn] run_info episode_index is 0/missing; skipping seed-disjoint check.")
+        return
+    assert_disjoint_seed_ranges(
+        int(train_base), train_count, int(eval_base), int(eval_count), context="train vs eval layouts"
+    )
+    print(
+        f"[determinism] seed-disjoint OK: train=[{train_base}, {int(train_base) + train_count}) "
+        f"eval=[{eval_base}, {int(eval_base) + int(eval_count)})"
+    )
 
 
 def _resolve_init_checkpoint(
@@ -187,8 +227,12 @@ def _build_dipole_policy(
         g_sign=str(flow_cfg.get("g_sign", "negate_raw")),
         g_normalization=str(flow_cfg.get("g_normalization", "batch_zscore")),
         g_clip=float(flow_cfg.get("g_clip", 10.0)),
-        polarity_embedding_init=str(flow_cfg.get("polarity_embedding_init", "zero_pos")),
-        polarity_embedding_init_scale=float(flow_cfg.get("polarity_embedding_init_scale", 1e-3)),
+        lora_rank=int(flow_cfg.get("lora_rank", 16)),
+        lora_alpha=float(flow_cfg.get("lora_alpha", 16.0)),
+        lora_dropout=float(flow_cfg.get("lora_dropout", 0.0)),
+        lora_include_aggregator=bool(flow_cfg.get("lora_include_aggregator", True)),
+        adapter_lr=float(flow_cfg.get("adapter_lr", 1e-3)),
+        base_lr_scale=float(flow_cfg.get("base_lr_scale", 0.1)),
     )
     policy = DipoleFlowPolicy(
         model_cfg=dict(payload["model_cfg"]),
@@ -312,6 +356,10 @@ def main() -> None:
     if video_output:
         video_dir.mkdir(parents=True, exist_ok=True)
 
+    env_random_reducer = EnvRandomReducer(int(args.seed))
+    _assert_eval_seeds_disjoint(run_info, eval_base=int(args.seed), eval_count=int(args.episodes))
+    print(f"[eval] fixed-seed layouts: base_seed={args.seed} (episode i -> seed {args.seed}+i)")
+
     episode_results: list[dict[str, Any]] = []
     success_count = 0
     videos_saved = 0
@@ -323,7 +371,10 @@ def main() -> None:
             dynamic_ncols=True,
         )
         for episode_idx in progress:
+            episode_seed = env_random_reducer.prepare_episode(env, int(episode_idx))
             raw_obs, _ = _reset_env(env)
+            if episode_seed is not None:
+                EnvRandomReducer.seed_global(int(episode_seed))
             obs = convert_env_camera_observation(
                 raw_obs,
                 env=env,
@@ -392,6 +443,7 @@ def main() -> None:
             success_count += int(episode_success)
             episode_result = {
                 "episode_index": int(episode_idx),
+                "episode_seed": int(episode_seed) if episode_seed is not None else None,
                 "return": float(episode_return),
                 "steps": int(episode_steps),
                 "success": bool(episode_success),
@@ -435,6 +487,10 @@ def main() -> None:
             "task_name": str(args.task_name),
             "omega": float(args.omega),
             "deterministic": bool(args.deterministic),
+            "seed": int(args.seed),
+            "seed_rule": "base_seed+episode_index",
+            "env_reset_seed_rule": "base_seed+episode_index",
+            "policy_seed_rule": "base_seed+episode_index",
             "episodes": int(args.episodes),
             "episode_max_steps": int(args.episode_max_steps),
             "video_output": bool(video_output),

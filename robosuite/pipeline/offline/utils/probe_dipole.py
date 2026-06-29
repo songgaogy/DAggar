@@ -2,9 +2,9 @@
 Detect whether DIPOLE pos/neg branches have diverged or collapsed.
 
 Combines:
-1. Static polarity-embedding metrics (no env required).
+1. Static LoRA-adapter metrics (no env required).
 2. Functional probes on observations (optional):
-   - ``task_scene_cond`` scale and polarized-condition divergence;
+   - ``task_scene_cond`` scale and pos/neg condition divergence;
    - instantaneous velocity-field divergence at several ODE timesteps;
    - planned action-chunk divergence across guidance omega values.
 
@@ -67,7 +67,6 @@ from robosuite.pipeline.train_dipole import (
 )
 from robosuite.pipeline.utils import EnvRandomReducer
 
-POLARITY_KEY = "polarity_embedding.weight"
 Hdf5FrameRef = tuple[Path, str, int]
 
 
@@ -263,11 +262,10 @@ def _build_probe_context(
 
 @dataclass(frozen=True)
 class EmbeddingMetrics:
-    pos_norm: float
-    neg_norm: float
-    l2_distance: float
-    cosine: float
-    norm_ratio_max_over_min: float
+    num_lora_layers: int
+    lora_B_norm_mean: float
+    lora_delta_norm_mean: float
+    lora_delta_norm_max: float
 
 
 @dataclass(frozen=True)
@@ -279,8 +277,6 @@ class ConditionMetrics:
     polarized_cond_l2_mean: float
     polarized_cond_l2_relative_mean: float
     polarized_cond_cos_mean: float
-    polarity_emb_l2_relative_mean: float
-    polarity_pos_norm_relative_mean: float
     context_tokens_norm_mean: float
 
 
@@ -298,7 +294,14 @@ class FunctionalMetrics:
     omega_sensitivity_mean: float
 
 
-def _load_polarity_weight(checkpoint_path: Path) -> torch.Tensor:
+def _load_lora_summary(checkpoint_path: Path) -> EmbeddingMetrics:
+    """Aggregate LoRA-adapter magnitude stats from a checkpoint state dict.
+
+    For each wrapped condition Linear the state dict stores ``<path>.lora_A``
+    (r, in) and ``<path>.lora_B`` (out, r). Per-layer delta (unscaled) is the
+    Frobenius norm of ``lora_B @ lora_A`` -- the ``scaling`` factor lives on the
+    live module, not the state dict, so it is omitted here.
+    """
     payload: Any = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise RuntimeError(f"Checkpoint at {checkpoint_path} is not a dict payload.")
@@ -308,30 +311,27 @@ def _load_polarity_weight(checkpoint_path: Path) -> torch.Tensor:
     model_state = core.get("model")
     if not isinstance(model_state, dict):
         raise KeyError(f"Checkpoint {checkpoint_path} is missing 'core.model'.")
-    if POLARITY_KEY not in model_state:
-        raise KeyError(f"State dict has no '{POLARITY_KEY}'.")
-    weight = model_state[POLARITY_KEY]
-    if not isinstance(weight, torch.Tensor) or weight.ndim != 2 or weight.shape[0] != 2:
-        raise ValueError(
-            f"'{POLARITY_KEY}' must be shape (2, cond_dim); got {tuple(weight.shape)}."
-        )
-    return weight.detach().float().cpu()
 
-
-def _embedding_metrics(weight: torch.Tensor) -> EmbeddingMetrics:
-    neg = weight[0]
-    pos = weight[1]
-    pos_norm = float(torch.linalg.vector_norm(pos).item())
-    neg_norm = float(torch.linalg.vector_norm(neg).item())
-    l2_distance = float(torch.linalg.vector_norm(pos - neg).item())
-    cosine = float((pos * neg).sum().item() / (pos_norm * neg_norm + 1e-12))
-    norm_ratio = max(pos_norm, neg_norm) / max(1e-12, min(pos_norm, neg_norm))
+    b_norms: list[float] = []
+    delta_norms: list[float] = []
+    for key, value in model_state.items():
+        if not key.endswith(".lora_B") or not isinstance(value, torch.Tensor):
+            continue
+        lora_b = value.detach().float().cpu()
+        a_key = key[: -len(".lora_B")] + ".lora_A"
+        lora_a = model_state.get(a_key)
+        if not isinstance(lora_a, torch.Tensor):
+            raise KeyError(f"State dict has '{key}' but no matching '{a_key}'.")
+        lora_a = lora_a.detach().float().cpu()
+        b_norms.append(float(torch.linalg.matrix_norm(lora_b).item()))
+        delta_norms.append(float(torch.linalg.matrix_norm(lora_b @ lora_a).item()))
+    if not b_norms:
+        raise KeyError("State dict has no '.lora_B' adapter keys (not a LoRA DIPOLE checkpoint).")
     return EmbeddingMetrics(
-        pos_norm=pos_norm,
-        neg_norm=neg_norm,
-        l2_distance=l2_distance,
-        cosine=cosine,
-        norm_ratio_max_over_min=float(norm_ratio),
+        num_lora_layers=len(b_norms),
+        lora_B_norm_mean=float(sum(b_norms) / len(b_norms)),
+        lora_delta_norm_mean=float(sum(delta_norms) / len(delta_norms)),
+        lora_delta_norm_max=float(max(delta_norms)),
     )
 
 
@@ -339,41 +339,40 @@ def _verdict(
     embedding: EmbeddingMetrics,
     functional: FunctionalMetrics | None,
     *,
-    cos_good: float,
-    cos_warn: float,
-    norm_warn: float,
+    delta_good: float,
+    delta_warn: float,
     action_rel_warn: float,
 ) -> str:
-    max_norm = max(embedding.pos_norm, embedding.neg_norm)
-    if max_norm < norm_warn:
-        return "COLLAPSED: polarity embedding never grew — branches are still at init scale."
+    if embedding.lora_delta_norm_max < delta_warn:
+        return "COLLAPSED: LoRA adapters never grew — negative branch is still ~identical to base."
 
     if functional is not None:
         if (
-            embedding.cosine > cos_warn
+            embedding.lora_delta_norm_mean < delta_good
             and functional.action_relative_l2_mean_omega0_vs_1 < action_rel_warn
         ):
             return (
-                "COLLAPSED: embedding near-collinear and omega=0/1 action chunks are "
+                "COLLAPSED: LoRA delta tiny and omega=0/1 action chunks are "
                 "almost identical — CFG guidance will have little effect."
             )
         if functional.action_relative_l2_mean_omega0_vs_1 < action_rel_warn:
             return (
-                "WEAK: embedding moved but planned actions barely change across omega; "
+                "WEAK: LoRA adapters grew but planned actions barely change across omega; "
                 "sweeping omega is unlikely to help much."
             )
-        if embedding.cosine > cos_warn and functional.velocity_relative_l2_mean < action_rel_warn:
+        if (
+            embedding.lora_delta_norm_mean < delta_good
+            and functional.velocity_relative_l2_mean < action_rel_warn
+        ):
             return (
                 "WEAK: branches differ little in velocity field; omega may only weakly steer policy."
             )
 
-    if embedding.cosine > cos_warn:
+    if embedding.lora_delta_norm_mean < delta_good:
         return (
-            "WEAK: pos/neg embeddings are near-collinear; check functional metrics if env was used."
+            "WEAK: LoRA delta is small; check functional metrics if env was used."
         )
-    if embedding.cosine > cos_good:
-        return "OK: partial embedding divergence; omega sweep is worth trying."
-    return "HEALTHY: branches are clearly separated in embedding space."
+    return "HEALTHY: LoRA adapters are clearly active; branches are separated."
 
 
 @torch.inference_mode()
@@ -412,15 +411,11 @@ def _probe_condition_metrics(
             proprio=proprio_tensor,
             language=[policy.language_instruction],
         )
-    cond = context["task_scene_cond"]
+    cond_pos = context["task_scene_cond"]
+    cond_neg = model.negative_task_scene_cond(context)
     context_tokens = context["context_tokens"]
-    polarity = model.polarity_embedding.weight
-    e_neg = polarity[0]
-    e_pos = polarity[1]
 
-    cond_norm = torch.linalg.vector_norm(cond, dim=1)
-    cond_pos = cond + e_pos.unsqueeze(0)
-    cond_neg = cond + e_neg.unsqueeze(0)
+    cond_norm = torch.linalg.vector_norm(cond_pos, dim=1)
     polarized_delta = cond_pos - cond_neg
     polarized_l2 = torch.linalg.vector_norm(polarized_delta, dim=1)
     polarized_rel = polarized_l2 / (cond_norm + 1e-8)
@@ -429,18 +424,14 @@ def _probe_condition_metrics(
         * torch.linalg.vector_norm(cond_neg, dim=1)
         + 1e-8
     )
-    emb_l2 = torch.linalg.vector_norm((e_pos - e_neg).unsqueeze(0), dim=1).expand_as(cond_norm)
-    emb_pos_norm = torch.linalg.vector_norm(e_pos.unsqueeze(0), dim=1).expand_as(cond_norm)
     token_norm = torch.linalg.vector_norm(context_tokens, dim=2).mean(dim=1)
 
     return {
-        "cond_dim": float(cond.shape[1]),
+        "cond_dim": float(cond_pos.shape[1]),
         "task_scene_cond_norm": float(cond_norm.mean().item()),
         "polarized_cond_l2": float(polarized_l2.mean().item()),
         "polarized_cond_l2_relative": float(polarized_rel.mean().item()),
         "polarized_cond_cos": float(polarized_cos.mean().item()),
-        "polarity_emb_l2_relative": float((emb_l2 / (cond_norm + 1e-8)).mean().item()),
-        "polarity_pos_norm_relative": float((emb_pos_norm / (cond_norm + 1e-8)).mean().item()),
         "context_tokens_norm_mean": float(token_norm.mean().item()),
     }
 
@@ -472,6 +463,8 @@ def _probe_velocity_divergence(
             proprio=proprio_tensor,
             language=[policy.language_instruction],
         )
+    neg_context = dict(context)
+    neg_context["task_scene_cond"] = model.negative_task_scene_cond(context)
 
     l2_vals: list[float] = []
     rel_vals: list[float] = []
@@ -483,8 +476,8 @@ def _probe_velocity_divergence(
             device=proprio_tensor.device,
             dtype=proprio_tensor.dtype,
         )
-        v_pos = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=1)
-        v_neg = model.forward_from_context(x_t=x, t=t, context=context, polarity_idx=0)
+        v_pos = model.forward_from_context(x_t=x, t=t, context=context, negative=False)
+        v_neg = model.forward_from_context(x_t=x, t=t, context=neg_context, negative=True)
         flat_pos = v_pos.reshape(batch_size, -1)
         flat_neg = v_neg.reshape(batch_size, -1)
         flat_diff = flat_pos - flat_neg
@@ -638,8 +631,6 @@ def _functional_metrics(
     polarized_l2: list[float] = []
     polarized_l2_rel: list[float] = []
     polarized_cos: list[float] = []
-    emb_l2_rel: list[float] = []
-    emb_pos_rel: list[float] = []
     token_norms: list[float] = []
     cond_dim = 0
 
@@ -663,8 +654,6 @@ def _functional_metrics(
         polarized_l2.append(cond_probe["polarized_cond_l2"])
         polarized_l2_rel.append(cond_probe["polarized_cond_l2_relative"])
         polarized_cos.append(cond_probe["polarized_cond_cos"])
-        emb_l2_rel.append(cond_probe["polarity_emb_l2_relative"])
-        emb_pos_rel.append(cond_probe["polarity_pos_norm_relative"])
         token_norms.append(cond_probe["context_tokens_norm_mean"])
 
         l2, rel, cos = _probe_velocity_divergence(
@@ -703,8 +692,6 @@ def _functional_metrics(
     polarized_l2_mean, _ = _mean_std(polarized_l2)
     polarized_l2_rel_mean, _ = _mean_std(polarized_l2_rel)
     polarized_cos_mean, _ = _mean_std(polarized_cos)
-    emb_l2_rel_mean, _ = _mean_std(emb_l2_rel)
-    emb_pos_rel_mean, _ = _mean_std(emb_pos_rel)
     token_norm_mean, _ = _mean_std(token_norms)
 
     condition = ConditionMetrics(
@@ -715,8 +702,6 @@ def _functional_metrics(
         polarized_cond_l2_mean=polarized_l2_mean,
         polarized_cond_l2_relative_mean=polarized_l2_rel_mean,
         polarized_cond_cos_mean=polarized_cos_mean,
-        polarity_emb_l2_relative_mean=emb_l2_rel_mean,
-        polarity_pos_norm_relative_mean=emb_pos_rel_mean,
         context_tokens_norm_mean=token_norm_mean,
     )
 
@@ -761,9 +746,8 @@ def _parse_args() -> argparse.Namespace:
         default="0.0,0.5,1.0",
         help="Comma-separated ODE time fractions for velocity probes.",
     )
-    parser.add_argument("--cos-good", type=float, default=0.7, help="Embedding cosine below => well diverged.")
-    parser.add_argument("--cos-warn", type=float, default=0.95, help="Embedding cosine above => near collapse.")
-    parser.add_argument("--norm-warn", type=float, default=0.05, help="Embedding norm below => never trained.")
+    parser.add_argument("--delta-good", type=float, default=0.1, help="Mean LoRA delta norm above => well diverged.")
+    parser.add_argument("--delta-warn", type=float, default=1e-4, help="Max LoRA delta norm below => never trained.")
     parser.add_argument(
         "--action-rel-warn",
         type=float,
@@ -786,7 +770,7 @@ def main() -> int:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
-    embedding = _embedding_metrics(_load_polarity_weight(checkpoint_path))
+    embedding = _load_lora_summary(checkpoint_path)
     functional: FunctionalMetrics | None = None
     probe_source: str | None = None
     probe_data_summary: dict[str, Any] | None = None
@@ -868,36 +852,33 @@ def main() -> int:
     verdict = _verdict(
         embedding,
         functional,
-        cos_good=float(args.cos_good),
-        cos_warn=float(args.cos_warn),
-        norm_warn=float(args.norm_warn),
+        delta_good=float(args.delta_good),
+        delta_warn=float(args.delta_warn),
         action_rel_warn=float(args.action_rel_warn),
     )
 
     summary: dict[str, Any] = {
         "checkpoint": str(checkpoint_path),
-        "embedding": asdict(embedding),
+        "lora": asdict(embedding),
         "functional": None if functional is None else asdict(functional),
         "probe_source": probe_source,
         "probe_data": probe_data_summary,
         "env_name": env_name,
         "task_name": task_name,
         "thresholds": {
-            "cos_good": float(args.cos_good),
-            "cos_warn": float(args.cos_warn),
-            "norm_warn": float(args.norm_warn),
+            "delta_good": float(args.delta_good),
+            "delta_warn": float(args.delta_warn),
             "action_rel_warn": float(args.action_rel_warn),
         },
         "verdict": verdict,
     }
 
     print(f"[detect_dipole] checkpoint = {checkpoint_path}")
-    print("[detect_dipole] --- embedding (static) ---")
-    print(f"[detect_dipole] pos_norm        = {embedding.pos_norm:.4f}")
-    print(f"[detect_dipole] neg_norm        = {embedding.neg_norm:.4f}")
-    print(f"[detect_dipole] ||pos-neg||      = {embedding.l2_distance:.4f}")
-    print(f"[detect_dipole] cos(pos, neg)   = {embedding.cosine:+.4f}")
-    print(f"[detect_dipole] norm ratio      = {embedding.norm_ratio_max_over_min:.2f}")
+    print("[detect_dipole] --- LoRA adapters (static) ---")
+    print(f"[detect_dipole] num_lora_layers     = {embedding.num_lora_layers}")
+    print(f"[detect_dipole] mean ||lora_B||      = {embedding.lora_B_norm_mean:.4f}")
+    print(f"[detect_dipole] mean ||lora_B@lora_A|| = {embedding.lora_delta_norm_mean:.4f}")
+    print(f"[detect_dipole] max  ||lora_B@lora_A|| = {embedding.lora_delta_norm_max:.4f}")
 
     if functional is not None:
         source_label = "hdf5 frames" if probe_source == "hdf5" else "env reset obs"
@@ -915,12 +896,8 @@ def main() -> int:
             f"(std={cond.task_scene_cond_norm_std:.4f})"
         )
         print(
-            f"[detect_dipole] ||(cond+e+) - (cond+e-)|| = {cond.polarized_cond_l2_mean:.4f} "
+            f"[detect_dipole] ||cond_pos - cond_neg|| = {cond.polarized_cond_l2_mean:.4f} "
             f"(rel={cond.polarized_cond_l2_relative_mean:.4f}, cos={cond.polarized_cond_cos_mean:+.4f})"
-        )
-        print(
-            f"[detect_dipole] polarity / cond   = emb_l2_rel {cond.polarity_emb_l2_relative_mean:.4f}, "
-            f"pos_norm_rel {cond.polarity_pos_norm_relative_mean:.4f}"
         )
         print(f"[detect_dipole] ||context_tokens||_mean = {cond.context_tokens_norm_mean:.4f}")
         print(f"[detect_dipole] --- velocity / action ({source_label}) ---")
@@ -953,7 +930,7 @@ def main() -> int:
 
     if args.strict and verdict.startswith("COLLAPSED"):
         return 2
-    if not math.isfinite(embedding.cosine):
+    if not math.isfinite(embedding.lora_delta_norm_mean):
         return 1
     return 0
 

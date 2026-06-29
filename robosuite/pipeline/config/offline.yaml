@@ -14,6 +14,7 @@ offline:
   num_train_steps: 15000
   run_subfix: ""                                   # run dir = "<timestamp>" or "<timestamp>_<run_subfix>"
   log_interval: 200
+  plot_log_interval: null              # null => same as log_interval
   checkpoint_interval: 5000
   preencode_batch_size: 64
   max_pretrain_trajectories: null                  # null = all expert demos

@@ -102,6 +102,57 @@ def _tensorboard_tag(key: str) -> str:
     return str(key).strip().replace(" ", "_")
 
 
+def plt_close(fig) -> None:
+    try:
+        import matplotlib.pyplot as plt
+
+        plt.close(fig)
+    except Exception:
+        pass
+
+
+class CompositeMetricLogger:
+    """TensorBoard + optional WandB logging with a shared interface."""
+
+    def __init__(self, tensorboard_logger: TensorBoardMetricLogger | None, wandb_module: Any) -> None:
+        self._tensorboard = tensorboard_logger
+        self._wandb = wandb_module
+
+    def log(self, payload: dict[str, Any], step: int) -> None:
+        if self._tensorboard is not None:
+            self._tensorboard.log(payload, step=step)
+        if self._wandb is not None:
+            self._wandb.log(payload, step=int(step))
+
+    def log_text(self, tag: str, text: str, step: int = 0) -> None:
+        if self._tensorboard is not None:
+            self._tensorboard.log_text(tag, text, step=step)
+
+    def log_figure(self, tag: str, fig, step: int) -> None:
+        if self._wandb is not None and fig is not None:
+            self._wandb.log({tag: self._wandb.Image(fig)}, step=int(step))
+        if self._tensorboard is not None:
+            self._tensorboard.log_figure(tag, fig, step)
+        elif fig is not None:
+            plt_close(fig)
+
+    def log_histogram(self, tag: str, values: Any, step: int, *, bins: int = 30) -> None:
+        if self._tensorboard is not None:
+            self._tensorboard.log_histogram(tag, values, step, bins=bins)
+        if self._wandb is not None:
+            self._wandb.log({tag: self._wandb.Histogram(np.asarray(values))}, step=int(step))
+
+    def flush(self) -> None:
+        if self._tensorboard is not None:
+            self._tensorboard.flush()
+
+    def close(self) -> None:
+        if self._tensorboard is not None:
+            self._tensorboard.close()
+        if self._wandb is not None:
+            self._wandb.finish()
+
+
 class TensorBoardMetricLogger:
     def __init__(self, writer, log_dir: Path) -> None:
         self.writer = writer
@@ -116,6 +167,13 @@ class TensorBoardMetricLogger:
 
     def log_text(self, tag: str, text: str, step: int = 0) -> None:
         self.writer.add_text(_tensorboard_tag(tag), text, int(step))
+
+    def log_figure(self, tag: str, fig, step: int) -> None:
+        self.writer.add_figure(_tensorboard_tag(tag), fig, global_step=int(step))
+        plt_close(fig)
+
+    def log_histogram(self, tag: str, values: Any, step: int, *, bins: int = 30) -> None:
+        self.writer.add_histogram(_tensorboard_tag(tag), values, global_step=int(step), bins=int(bins))
 
     def flush(self) -> None:
         self.writer.flush()
@@ -145,6 +203,40 @@ def maybe_build_tensorboard(cfg: DictConfig, run_name: str | None = None, run_di
         logger.log_text("run/name", str(run_name), step=0)
     print(f"[tensorboard] log_dir={log_dir}")
     return logger
+
+
+def maybe_init_wandb(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
+    if not bool(getattr(cfg.logging, "use_wandb", False)):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("wandb is not installed, skipping wandb logging.")
+        return None
+
+    entity = getattr(cfg.logging, "entity", None)
+    wandb.init(
+        project=str(getattr(cfg.logging, "project", "DIPOLE_AIR")),
+        entity=None if entity is None or str(entity).strip() == "" else str(entity),
+        name=run_name,
+        mode=str(getattr(cfg.logging, "wandb_mode", "offline")),
+        config=OmegaConf.to_container(cfg, resolve=True),
+        dir=None if run_dir is None else str(run_dir),
+    )
+    print(f"[wandb] mode={getattr(cfg.logging, 'wandb_mode', 'offline')} project={cfg.logging.project}")
+    return wandb
+
+
+def maybe_build_metric_logger(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
+    tensorboard_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=run_dir)
+    wandb_module = maybe_init_wandb(cfg, run_name=run_name, run_dir=run_dir)
+    if tensorboard_logger is None and wandb_module is None:
+        return None
+    if wandb_module is None:
+        return tensorboard_logger
+    if tensorboard_logger is None:
+        return CompositeMetricLogger(None, wandb_module)
+    return CompositeMetricLogger(tensorboard_logger, wandb_module)
 
 
 def resolve_checkpoint_reference(reference: Any) -> Path | None:
@@ -240,6 +332,16 @@ def maybe_log(logger, payload: dict[str, Any], step: int) -> None:
     if logger is None:
         return
     logger.log(payload, step=step)
+
+
+def maybe_log_figure(logger, tag: str, fig, step: int) -> None:
+    if logger is None:
+        plt_close(fig)
+        return
+    if hasattr(logger, "log_figure"):
+        logger.log_figure(tag, fig, step)
+    else:
+        plt_close(fig)
 
 
 def checkpoint_path(checkpoint_dir: Path, tag: str) -> Path:

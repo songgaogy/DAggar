@@ -37,9 +37,11 @@ from tqdm import tqdm
 
 from robosuite.pipeline.envs import build_robosuite_env, sparse_success_reward
 from robosuite.pipeline.eval_dipole import (
+    DEFAULT_EVAL_SEED,
     DEFAULT_VIDEO_CAMERA,
     DEFAULT_VIDEO_FPS,
     DEFAULT_VIDEO_SIZE,
+    _assert_eval_seeds_disjoint,
     _build_dipole_policy,
     _capture_frame,
     _load_json,
@@ -86,9 +88,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
-        help="Fixed base seed. Episode i is reset under seed+i so the env layout (and the policy "
-        "noise stream) is reproducible across runs/checkpoints. Omit for unseeded (random) layouts.",
+        default=DEFAULT_EVAL_SEED,
+        help=(
+            "Base seed for deterministic episode layouts. Episode i is reset under seed+i. "
+            "Defaults to a high band disjoint from training seeds."
+        ),
     )
     parser.add_argument("--init-checkpoint", default=None, help="Optional base flow checkpoint for env metadata.")
     parser.add_argument("--device", default=None, help="Override eval device (e.g. cuda:0).")
@@ -210,11 +214,9 @@ def main() -> None:
     # Fixed-seed eval (sft-style): episode i uses base_seed+i to seed the env
     # layout + global RNG, so all checkpoints see identical task layouts. The
     # policy still samples stochastically, but from a seeded noise stream.
-    env_random_reducer = EnvRandomReducer(args.seed)
-    if env_random_reducer.enabled:
-        print(f"[eval] fixed-seed layouts: base_seed={args.seed} (episode i -> seed {args.seed}+i)")
-    else:
-        print("[eval] no --seed: env layouts and policy noise are unseeded (random run-to-run).")
+    env_random_reducer = EnvRandomReducer(int(args.seed))
+    _assert_eval_seeds_disjoint(run_info, eval_base=int(args.seed), eval_count=int(args.episodes))
+    print(f"[eval] fixed-seed layouts: base_seed={args.seed} (episode i -> seed {args.seed}+i)")
 
     episode_results: list[dict[str, Any]] = []
     success_count = 0
@@ -345,8 +347,10 @@ def main() -> None:
             "checkpoint_execute_horizon": checkpoint_execute_horizon,
             "execute_horizon": int(policy.config.execute_horizon),
             "deterministic": bool(args.deterministic),
-            "seed": int(args.seed) if args.seed is not None else None,
-            "seed_rule": "base_seed+episode_index" if args.seed is not None else None,
+            "seed": int(args.seed),
+            "seed_rule": "base_seed+episode_index",
+            "env_reset_seed_rule": "base_seed+episode_index",
+            "policy_seed_rule": "base_seed+episode_index",
             "episodes": int(args.episodes),
             "episode_max_steps": int(args.episode_max_steps),
             "video_output": bool(video_output),

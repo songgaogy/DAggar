@@ -124,6 +124,12 @@ class MultiModalFlowPolicy(nn.Module):
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
             "context_padding_mask": context_padding_mask,
+            # Aggregator inputs, exposed so callers can recompute task_scene_cond
+            # (e.g. the DIPOLE negative branch re-runs the aggregator under LoRA).
+            # Extra keys are ignored by existing consumers.
+            "fused_tokens": fused_tokens,
+            "token_padding_mask": token_padding_mask,
+            "language_global": language_global,
         }
 
     def encode_context(

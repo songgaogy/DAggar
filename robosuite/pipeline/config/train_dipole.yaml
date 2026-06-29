@@ -110,14 +110,20 @@ algorithm:
 
   dipole:
     condition_scale: 1.0
-    beta: 2.0
+    beta: 1.0
     k: 0.0
     guidance_omega: 2.0
     g_sign: "negate_raw"               # negate_raw | raw
     g_normalization: "batch_zscore"    # batch_zscore | running_zscore | minmax | none
     g_clip: 10.0
-    polarity_embedding_init: "zero_pos"   # zero_pos | zero_neg | small_gaussian | antipodal
-    polarity_embedding_init_scale: 2.0e-3
+    # LoRA negative-branch condition injection (replaces additive polarity embedding).
+    lora:
+      rank: 64
+      alpha: 16.0
+      dropout: 0.1
+      include_aggregator: true
+      adapter_lr: 1.0e-3               # LoRA param LR (negative branch)
+      base_lr_scale: 0.1              # base_lr_neg = base_lr_scale * flow.learning_rate
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
     g_mode: "nnpu_frozen"             # nnpu_frozen | advantage
 
@@ -193,7 +199,7 @@ logging:
   use_wandb: false
   wandb_mode: "offline"
   log_interval: 10
-  checkpoint_interval: 5000
+  checkpoint_interval: 1
 
 hydra:
   run:
