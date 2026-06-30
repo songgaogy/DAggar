@@ -1,4 +1,4 @@
-"""CPU-only direction and normalization tests for AdvantageGProvider."""
+"""CPU-only direction and raw-mixing tests for AdvantageGProvider."""
 
 from __future__ import annotations
 
@@ -85,12 +85,8 @@ def _make_batch(B: int = 4, H: int = 3, D_a: int = 2, D_s: int = 5):
     )
 
 
-def _zscore(t: torch.Tensor) -> torch.Tensor:
-    return (t - t.mean()) / (t.std() + 1e-6)
-
-
 # --------------------------------------------------------------------------- #
-# 1. beta=0 -> raw == -zscore(advantage)                                       #
+# 1. beta=0 -> g == advantage                                                  #
 # --------------------------------------------------------------------------- #
 
 
@@ -104,20 +100,18 @@ def test_g_reduces_to_pure_advantage_when_beta_zero() -> None:
         encoder=_FakeEncoder(context_dim=4),
         alpha=1.0,
         beta=0.0,
-        advantage_normalization="batch_zscore",
-        disc_normalization="batch_zscore",
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
     assert g.shape == (B,)
-    assert torch.allclose(g, -_zscore(adv), atol=1e-5)
+    assert torch.allclose(g, adv, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #
-# 2. alpha=0 -> raw == zscore(failure)                                         #
+# 2. alpha=0 -> g == -failure                                                  #
 # --------------------------------------------------------------------------- #
 
 
-def test_g_reduces_to_negated_disc_when_alpha_zero() -> None:
+def test_g_reduces_to_failure_when_alpha_zero() -> None:
     torch.manual_seed(0)
     B = 6
     logits = torch.linspace(-2.0, 3.0, B)
@@ -127,16 +121,14 @@ def test_g_reduces_to_negated_disc_when_alpha_zero() -> None:
         encoder=_FakeEncoder(context_dim=4),
         alpha=0.0,
         beta=1.0,
-        advantage_normalization="batch_zscore",
-        disc_normalization="batch_zscore",
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
     assert g.shape == (B,)
-    assert torch.allclose(g, _zscore(logits), atol=1e-5)
+    assert torch.allclose(g, -logits, atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #
-# 3. mode="none" -> raw == -alpha*adv + beta*failure                          #
+# 3. g == alpha*adv - beta*failure                                             #
 # --------------------------------------------------------------------------- #
 
 
@@ -150,11 +142,9 @@ def test_linear_mixing_with_none_mode() -> None:
         encoder=_FakeEncoder(context_dim=4),
         alpha=2.0,
         beta=3.0,
-        advantage_normalization="none",
-        disc_normalization="none",
     )
     g = provider.compute_g_for_batch(_make_batch(B=B))
-    expected = -2.0 * adv + 3.0 * logits
+    expected = 2.0 * adv - 3.0 * logits
     assert torch.allclose(g, expected, atol=1e-6)
 
 
@@ -212,52 +202,6 @@ def test_bind_policy_cameras_proxies_to_encoder() -> None:
     cams = ["frontview_image", "wristview_image"]
     provider.bind_policy_cameras(cams)
     assert encoder.bind_calls == [cams]
-
-
-# --------------------------------------------------------------------------- #
-# 7. running_zscore advances EMA state                                         #
-# --------------------------------------------------------------------------- #
-
-
-def test_running_zscore_state_advances() -> None:
-    B = 4
-    adv = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    provider = AdvantageGProvider(
-        iql_learner=_FakeIQL(adv),
-        discriminator=_FakeDisc(torch.zeros(B)),
-        encoder=_FakeEncoder(context_dim=4),
-        alpha=1.0,
-        beta=1.0,
-        advantage_normalization="running_zscore",
-        disc_normalization="running_zscore",
-    )
-    assert provider._adv_running_count == 0
-    assert provider._disc_running_count == 0
-    g1 = provider.compute_g_for_batch(_make_batch(B=B))
-    assert provider._adv_running_count == B
-    assert provider._disc_running_count == B
-    assert torch.isfinite(g1).all()
-    g2 = provider.compute_g_for_batch(_make_batch(B=B))
-    assert provider._adv_running_count == 2 * B
-    assert torch.isfinite(g2).all()
-
-
-# --------------------------------------------------------------------------- #
-# 8. Unknown normalization mode rejected at construction                       #
-# --------------------------------------------------------------------------- #
-
-
-def test_unknown_normalization_mode_rejected() -> None:
-    with pytest.raises(ValueError, match="Unknown normalization mode"):
-        AdvantageGProvider(
-            iql_learner=_FakeIQL(0.0),
-            discriminator=_FakeDisc(0.0),
-            encoder=_FakeEncoder(context_dim=4),
-            alpha=1.0,
-            beta=0.0,
-            advantage_normalization="ema",
-        )
-
 
 def test_agent_attach_g_provider_is_a_method() -> None:
     class Core:

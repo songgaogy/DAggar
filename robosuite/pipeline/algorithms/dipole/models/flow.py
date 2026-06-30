@@ -291,11 +291,6 @@ class DipoleFlowPolicy:
             [0.229, 0.224, 0.225], dtype=torch.float32, device=self.inference_device,
         ).view(1, 1, 3, 1, 1)
 
-        # G-statistics state for running_zscore option.
-        self._g_running_mean: float = 0.0
-        self._g_running_var: float = 1.0
-        self._g_running_count: int = 0
-
         # Optional G provider, injected after construction.
         self.g_provider: Any = None
 
@@ -423,37 +418,6 @@ class DipoleFlowPolicy:
             action_seq = action_seq * self.act_std + self.act_mean
         return action_seq
 
-    def _normalize_g(self, raw_g: torch.Tensor) -> torch.Tensor:
-        # TODO: decide how compute G
-        mode = str(self.config.g_normalization).lower()
-        if mode == "none":
-            return raw_g
-        if mode == "batch_zscore":
-            return (raw_g - raw_g.mean()) / (raw_g.std() + 1e-6)
-        if mode == "running_zscore":
-            with torch.no_grad():
-                batch_mean = float(raw_g.mean().item())
-                batch_var = float(raw_g.var(unbiased=False).item())
-                count = int(raw_g.numel())
-                if self._g_running_count == 0:
-                    self._g_running_mean = batch_mean
-                    self._g_running_var = batch_var if batch_var > 0 else 1.0
-                else:
-                    momentum = 0.1
-                    self._g_running_mean = (1 - momentum) * self._g_running_mean + momentum * batch_mean
-                    self._g_running_var = (1 - momentum) * self._g_running_var + momentum * batch_var
-                self._g_running_count += count
-            mean_t = torch.tensor(self._g_running_mean, dtype=raw_g.dtype, device=raw_g.device)
-            std_t = torch.tensor(self._g_running_var, dtype=raw_g.dtype, device=raw_g.device).clamp_min(1e-6).sqrt()
-            return (raw_g - mean_t) / std_t
-        if mode == "minmax":
-            # symmetric clip to [-1, 1] using batch min/max
-            lo = raw_g.min()
-            hi = raw_g.max()
-            span = (hi - lo).clamp_min(1e-6)
-            return 2.0 * (raw_g - lo) / span - 1.0
-        raise ValueError(f"Unknown g_normalization mode: {mode}")
-
     @staticmethod
     def _resolve_demo_sample_mask(batch: DipoleBatch, device: torch.device) -> torch.Tensor | None:
         """True for rows sampled from demo_buffer (see ``buffer_sources`` metadata)."""
@@ -467,14 +431,9 @@ class DipoleFlowPolicy:
         )
 
     def _g_weights_from_raw(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-        if str(self.config.g_sign).lower() == "negate_raw":
-            g = -raw
-        else:
-            g = raw
-        g_norm = self._normalize_g(g)
-        logit = (float(self.config.beta) * g_norm + float(self.config.k)).clamp(
-            -float(self.config.g_clip), float(self.config.g_clip)
-        )
+        # The G provider already returns the preference G (larger -> more positive branch)
+        g = raw
+        logit = float(self.config.beta) * g + float(self.config.k)
         w_pos = torch.sigmoid(logit)
         w_neg = 1.0 - w_pos
         n = int(raw.numel())
@@ -483,8 +442,8 @@ class DipoleFlowPolicy:
             "raw_nnpu_score_std": float(raw.std().item() if n > 1 else 0.0),
             "raw_nnpu_score_min": float(raw.min().item()),
             "raw_nnpu_score_max": float(raw.max().item()),
-            "G_mean": float(g_norm.mean().item()),
-            "G_std": float(g_norm.std().item() if n > 1 else 0.0),
+            "G_mean": float(g.mean().item()),
+            "G_std": float(g.std().item() if n > 1 else 0.0),
             "logit_mean": float(logit.mean().item()),
             "logit_std": float(logit.std().item() if n > 1 else 0.0),
         }
@@ -498,7 +457,7 @@ class DipoleFlowPolicy:
 
         When ``buffer_sources`` is set (1:1 online/demo training batch):
         - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
-        - online_buffer rows: G / normalization / sigmoid use online rows only
+        - online_buffer rows: raw G and sigmoid use online rows only
         """
         B = batch.batch_size
         demo_mask = self._resolve_demo_sample_mask(batch, self.device)
@@ -554,7 +513,7 @@ class DipoleFlowPolicy:
         return w_pos, w_neg, metrics
 
     def _provider_raw_g_for_batch(self, batch: DipoleBatch) -> torch.Tensor:
-        """Provider raw G per sample (before policy g_sign / normalize)."""
+        """Provider G per sample (before logit/sigmoid weighting)."""
         batch_size = batch.batch_size
         if self.g_provider is None:
             return torch.zeros(batch_size, dtype=torch.float32, device=self.device)
@@ -710,9 +669,6 @@ class DipoleFlowPolicy:
                 "act_std": None if self.act_std is None else torch.as_tensor(self.act_std),
                 "prop_mean": None if self.prop_mean is None else torch.as_tensor(self.prop_mean),
                 "prop_std": None if self.prop_std is None else torch.as_tensor(self.prop_std),
-                "g_running_mean": float(self._g_running_mean),
-                "g_running_var": float(self._g_running_var),
-                "g_running_count": int(self._g_running_count),
             }
 
     def load_model_state(self, state_dict: dict[str, Any], *, strict: bool = True) -> None:
@@ -735,9 +691,6 @@ class DipoleFlowPolicy:
                 proprio_mean=state_dict.get("prop_mean"),
                 proprio_std=state_dict.get("prop_std"),
             )
-            self._g_running_mean = float(state_dict.get("g_running_mean", 0.0))
-            self._g_running_var = float(state_dict.get("g_running_var", 1.0))
-            self._g_running_count = int(state_dict.get("g_running_count", 0))
         self.sync_inference_policy()
         self.reset_action_chunk()
 

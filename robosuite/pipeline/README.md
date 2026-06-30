@@ -66,7 +66,7 @@ export WANDB_MODE=offline
 bash robosuite/pipeline/scripts/train_dipole.sh
 ```
 
-Useful overrides include `LEARNER_DEVICE`, `INFERENCE_DEVICE`, `ACTION_HORIZON`, `EXECUTE_HORIZON`, `OMEGA`, `BETA`, `G_NORMALIZATION`, `DISC_INFERENCE_FPS`, and Hydra overrides passed after the script name.
+Useful overrides include `LEARNER_DEVICE`, `INFERENCE_DEVICE`, `ACTION_HORIZON`, `EXECUTE_HORIZON`, `OMEGA`, `BETA`, `DISC_INFERENCE_FPS`, and Hydra overrides passed after the script name.
 
 ### Initialize IQL Q/V offline
 
@@ -176,7 +176,7 @@ w_neg = 1 - w_pos
 L     = mean(w_pos * L_pos + w_neg * L_neg)
 ```
 
-With the default `g_sign=negate_raw`, discriminator-only DIPOLE uses `G=-failure_score`. DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
+The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
 
 ### DIPOLE-RL critics
 

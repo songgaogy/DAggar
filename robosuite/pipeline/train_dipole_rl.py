@@ -910,8 +910,6 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             encoder=shared_encoder,
             alpha=float(cfg.algorithm.advantage_g_provider.alpha),
             beta=float(cfg.algorithm.advantage_g_provider.beta),
-            advantage_normalization=str(cfg.algorithm.advantage_g_provider.advantage_normalization),
-            disc_normalization=str(cfg.algorithm.advantage_g_provider.disc_normalization),
         )
         advantage_g.bind_policy_cameras(list(agent.camera_names))
         agent.attach_g_provider(advantage_g)

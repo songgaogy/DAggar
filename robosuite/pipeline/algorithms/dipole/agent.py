@@ -168,8 +168,6 @@ class DipoleAgent:
             beta=float(cfg_get(dipole_cfg, "beta", 2.0)),
             k=float(cfg_get(dipole_cfg, "k", 0.0)),
             guidance_omega=float(cfg_get(dipole_cfg, "guidance_omega", 2.0)),
-            g_sign=str(cfg_get(dipole_cfg, "g_sign", "negate_raw")),
-            g_normalization=str(cfg_get(dipole_cfg, "g_normalization", "batch_zscore")),
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
             lora_rank=int(cfg_get(lora_cfg, "rank", 16)),
             lora_alpha=float(cfg_get(lora_cfg, "alpha", 16.0)),

@@ -1,7 +1,7 @@
 """Offline TD-advantage G provider for offline DIPOLE training.
 
 Online DIPOLE-RL weights the two flow branches with
-``raw = -alpha * A_norm + beta * disc_norm`` where ``A = mean(Q) - V``
+``G = alpha * A - beta * disc`` where ``A = mean(Q) - V``
 (:class:`AdvantageGProvider`). README step-4 requires the offline variant to use
 the **TD term** instead::
 
@@ -9,8 +9,8 @@ the **TD term** instead::
 
 with ``V(s)=iql.v(s)``, ``target_V=iql.target_v``, ``gamma^H`` (H=action_horizon)
 and ``r`` the chunk-aggregated reward — a literal drop-in replacement for
-``Q - V``; the downstream ``-alpha * A_norm`` sign and ``g_sign=negate_raw`` are
-unchanged, so a larger advantage still raises ``w_pos`` (the positive branch).
+``Q - V``; the ``+alpha * A`` sign is unchanged, so a larger advantage still
+raises ``w_pos`` (the positive branch).
 
 Because the encoder, IQL critics and nnPU head are all **frozen** in offline
 training, each valid chunk window's ``A`` and failure score are constant for the
@@ -120,8 +120,8 @@ def precompute_offline_advantage(
 class OfflineAdvantageGProvider(AdvantageGProvider):
     """``AdvantageGProvider`` that serves precomputed TD advantage by start index.
 
-    Reuses the parent's ``_normalize`` / running-stats and ``bind_policy_cameras``
-    but replaces ``compute_g_for_batch`` with a cache lookup keyed on
+    Reuses the parent's ``bind_policy_cameras`` but replaces
+    ``compute_g_for_batch`` with a cache lookup keyed on
     ``batch.metadata["start_indices"]``.
     """
 
@@ -133,8 +133,6 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
         encoder: "SharedDynamicsEncoder",
         alpha: float,
         beta: float,
-        advantage_normalization: str,
-        disc_normalization: str,
         advantage_raw: torch.Tensor,
         failure_raw: torch.Tensor,
         start_to_row: dict[int, int],
@@ -145,8 +143,6 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
             encoder=encoder,
             alpha=alpha,
             beta=beta,
-            advantage_normalization=advantage_normalization,
-            disc_normalization=disc_normalization,
         )
         self._advantage_raw = advantage_raw.detach().to("cpu").reshape(-1)
         self._failure_raw = failure_raw.detach().to("cpu").reshape(-1)
@@ -173,10 +169,8 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
         advantage = self._advantage_raw.index_select(0, row_idx).to(device)
         failure = self._failure_raw.index_select(0, row_idx).to(device)
 
-        a_norm = self._normalize(advantage, mode=self.advantage_normalization, stats="advantage")
-        d_norm = self._normalize(failure, mode=self.disc_normalization, stats="disc")
-        raw = -self.alpha * a_norm + self.beta * d_norm
-        return raw.reshape(-1)
+        g = self.alpha * advantage - self.beta * failure
+        return g.reshape(-1)
 
 
 __all__ = ["precompute_offline_advantage", "OfflineAdvantageGProvider"]

@@ -113,9 +113,6 @@ algorithm:
     beta: 1.0
     k: 0.0
     guidance_omega: 2.0
-    g_sign: "negate_raw"               # negate_raw | raw
-    g_normalization: "batch_zscore"    # batch_zscore | running_zscore | minmax | none
-    g_clip: 10.0
     # LoRA negative-branch condition injection (replaces additive polarity embedding).
     lora:
       rank: 64

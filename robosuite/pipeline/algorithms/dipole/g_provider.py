@@ -8,10 +8,10 @@ import torch
 
 
 class NNPUGProvider:
-    """Return calibrated nnPU failure scores through the DIPOLE G contract.
+    """Return the DIPOLE preference ``G = -failure_score``.
 
-    The policy applies ``g_sign=negate_raw`` after this provider, so larger
-    failure scores reduce the positive-branch weight.
+    Negating the calibrated nnPU failure score here means larger failure scores
+    lower ``G`` and therefore reduce the positive-branch weight.
     """
 
     def __init__(self, *, encoder: Any, discriminator: Any) -> None:
@@ -32,7 +32,7 @@ class NNPUGProvider:
             action_chunk=batch.action_sequences_raw,
         )
         score = self.discriminator.failure_score(chunk_feature=chunk_feature)
-        return score.to(batch.action_sequences_raw.device).reshape(-1)
+        return (-score).to(batch.action_sequences_raw.device).reshape(-1)
 
 
 __all__ = ["NNPUGProvider"]

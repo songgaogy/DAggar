@@ -3,7 +3,7 @@
 # Inherits the existing DIPOLE schema and adds three new sections:
 #   - algorithm.q_learning      (IQLConfig + warmup schedule)
 #   - algorithm.discriminator   (inherited frozen nnPU configuration)
-#   - algorithm.advantage_g_provider  (alpha, beta, normalization modes)
+#   - algorithm.advantage_g_provider  (alpha, beta)
 #
 # To activate the advantage-G path:
 #   algorithm.dipole.g_mode: "advantage"
@@ -18,12 +18,6 @@ algorithm:
 
   dipole:
     g_mode: "advantage"   # advantage | nnpu_frozen
-    # Master switch for offline G normalization (read by offline/train_offline_dipole.py).
-    #   true  -> keep batch_zscore on advantage, disc score, and combined g.
-    #   false -> force all three normalization modes to "none"; raw_mean / G_mean become
-    #            real (non-zero) values instead of structurally-zero z-score means.
-    # Independent of the string `dipole.g_normalization` mode inherited from train_dipole.
-    use_norm: false
 
   q_learning:
     enabled: true
@@ -65,8 +59,6 @@ algorithm:
   advantage_g_provider:
     alpha: 1.0
     beta: 0
-    advantage_normalization: "batch_zscore"
-    disc_normalization: "batch_zscore"
 
 # Used only by ``python -m ...q_learning.warmup`` (init_iql_qv.sh).
 warmup:

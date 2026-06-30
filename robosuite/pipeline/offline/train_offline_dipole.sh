@@ -21,7 +21,6 @@ NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPl
 IQL_CKPT="outputs/dipole_rl/offline_iql_qv-v2/PickPlaceCereal/iql_state.pt"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_TRAIN_STEPS=1
-G_NORMALIZATION=false
 RUN_SUBFIX="no-norm"
 # -------------------------------------
 
@@ -39,12 +38,11 @@ HYDRA_OVERRIDES=(
   "algorithm.flow.device=${DEVICE}"
   "algorithm.flow.inference_device=${DEVICE}"
   "offline.num_train_steps=${NUM_TRAIN_STEPS}"
-  "algorithm.dipole.use_norm=${G_NORMALIZATION}"
   "offline.run_subfix=${RUN_SUBFIX}"
 )
 
 echo "[train_offline_dipole] task=${TASK} device=${DEVICE} steps=${NUM_TRAIN_STEPS}"
-echo "[train_offline_dipole] g_normalization(use_norm)=${G_NORMALIZATION} run_subfix=${RUN_SUBFIX}"
+echo "[train_offline_dipole] run_subfix=${RUN_SUBFIX}"
 echo "[train_offline_dipole] policy_ckpt=${POLICY_CKPT}"
 echo "[train_offline_dipole] nnpu_ckpt=${NNPU_CKPT}"
 echo "[train_offline_dipole] iql_ckpt=${IQL_CKPT}"

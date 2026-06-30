@@ -22,8 +22,6 @@ class DipoleConfig(FlowDaggerConfig):
     beta: float = 2.0
     k: float = 0.0
     guidance_omega: float = 2.0
-    g_sign: str = "negate_raw"            # "negate_raw" | "raw"
-    g_normalization: str = "batch_zscore" # "batch_zscore" | "running_zscore" | "minmax" | "none"
     g_clip: float = 10.0
     # LoRA negative-branch condition injection (replaces the additive polarity embedding).
     lora_rank: int = 16

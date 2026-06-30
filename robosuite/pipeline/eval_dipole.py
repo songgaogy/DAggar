@@ -224,8 +224,6 @@ def _build_dipole_policy(
         beta=float(flow_cfg.get("beta", 2.0)),
         k=float(flow_cfg.get("k", 0.0)),
         guidance_omega=float(omega),
-        g_sign=str(flow_cfg.get("g_sign", "negate_raw")),
-        g_normalization=str(flow_cfg.get("g_normalization", "batch_zscore")),
         g_clip=float(flow_cfg.get("g_clip", 10.0)),
         lora_rank=int(flow_cfg.get("lora_rank", 16)),
         lora_alpha=float(flow_cfg.get("lora_alpha", 16.0)),

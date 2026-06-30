@@ -149,24 +149,6 @@ def main(cfg: DictConfig) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # G-normalization master switch (algorithm.dipole.use_norm). When disabled,
-    # force all three normalization channels to "none" so raw_mean / G_mean are
-    # real values rather than structurally-zero batch z-score means. Applied here
-    # (before the agent and provider read these keys) so no Python normalization
-    # logic changes; only the string modes are flipped.
-    use_norm = bool(OmegaConf.select(cfg, "algorithm.dipole.use_norm", default=True))
-    if not use_norm:
-        cfg.algorithm.dipole.g_normalization = "none"
-        cfg.algorithm.advantage_g_provider.advantage_normalization = "none"
-        cfg.algorithm.advantage_g_provider.disc_normalization = "none"
-        print("[offline] use_norm=false -> g/advantage/disc normalization all set to 'none'")
-    else:
-        print(
-            f"[offline] use_norm=true -> g_normalization="
-            f"{cfg.algorithm.dipole.g_normalization}, "
-            f"advantage/disc={cfg.algorithm.advantage_g_provider.advantage_normalization}"
-        )
-
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     if init_checkpoint is None:
         raise RuntimeError(
@@ -411,8 +393,6 @@ def main(cfg: DictConfig) -> None:
         encoder=shared_encoder,
         alpha=float(cfg.algorithm.advantage_g_provider.alpha),
         beta=float(cfg.algorithm.advantage_g_provider.beta),
-        advantage_normalization=str(cfg.algorithm.advantage_g_provider.advantage_normalization),
-        disc_normalization=str(cfg.algorithm.advantage_g_provider.disc_normalization),
         advantage_raw=advantage_raw,
         failure_raw=failure_raw,
         start_to_row=start_to_row,
