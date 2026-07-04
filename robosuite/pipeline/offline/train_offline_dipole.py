@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -140,8 +141,49 @@ def _resolve_required_path(raw: Any, *, what: str) -> str:
     return path
 
 
-@hydra.main(version_base="1.2", config_path="../config", config_name="offline")
-def main(cfg: DictConfig) -> None:
+@dataclass
+class OfflinePipeline:
+    """Everything the offline DIPOLE run needs after setup.
+
+    Built once by :func:`build_offline_pipeline` and consumed both by the
+    training entry (:func:`main`) and by dev tools (e.g. ``dev/vis_batch.py``)
+    that want the fully-populated replay buffer + frozen critics + precomputed
+    TD advantage without re-implementing the setup.
+    """
+
+    agent: Any
+    provider: OfflineAdvantageGProvider
+    iql_learner: IQLLearner
+    discriminator: FrozenNNPUDiscriminator
+    shared_encoder: SharedDynamicsEncoder
+    iql_cfg: IQLConfig
+    advantage_raw: torch.Tensor
+    failure_raw: torch.Tensor
+    start_to_row: dict[int, int]
+    policy_camera_names: list[str]
+    init_checkpoint: str
+    nnpu_ckpt: str
+    warmup_ckpt: str
+    filter_stats: dict[str, Any]
+    num_pretrain_transitions: int
+    num_offline_transitions: int
+    n_valid: int
+    batch_size: int
+    sample_kwargs: dict[str, Any]
+
+
+def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
+    """Construct the full offline DIPOLE pipeline (no run_dir / training loop).
+
+    Builds the env (headless, proprio only), the DIPOLE agent with the loaded
+    pretrained flow policy, the frozen shared encoder + nnPU discriminator +
+    frozen IQL critics, loads and filters the pretrain + offline data into the
+    mixed replay buffer, fits normalizers, precomputes the TD advantage for
+    every valid window, and attaches the :class:`OfflineAdvantageGProvider`.
+
+    This is the exact setup the training entry used to perform inline; it is
+    factored out so read-only tooling can reuse it verbatim.
+    """
     maybe_set_seed(getattr(cfg, "seed", None))
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
@@ -169,18 +211,6 @@ def main(cfg: DictConfig) -> None:
         for key, value in dict(getattr(cfg.algorithm.flow, "camera_aliases", {}) or {}).items()
     }
 
-    # ------------------------------------------------------------------ #
-    # Run directory: outputs/dipole_offline/<task>/<timestamp>/          #
-    # ------------------------------------------------------------------ #
-    output_root = Path(to_absolute_path(str(cfg.logging.output_root)))
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_subfix = str(OmegaConf.select(cfg, "offline.run_subfix", default="") or "").strip()
-    dir_name = f"{timestamp}_{run_subfix}" if run_subfix else timestamp
-    run_name = f"{task_name}__offline__{dir_name}"
-    run_dir = output_root / task_name / dir_name
-    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-    print(f"[offline] run={run_name}")
-    print(f"[offline] run_dir={run_dir}")
     print(f"[offline] init_checkpoint={init_checkpoint}")
 
     img_height = int(cfg.env.img_height)
@@ -406,6 +436,57 @@ def main(cfg: DictConfig) -> None:
         f"(alpha={cfg.algorithm.advantage_g_provider.alpha}, beta={cfg.algorithm.advantage_g_provider.beta})"
     )
 
+    sample_kwargs = {
+        "action_mean": agent.core.act_mean,
+        "action_std": agent.core.act_std,
+        "proprio_mean": agent.core.prop_mean,
+        "proprio_std": agent.core.prop_std,
+        "device": agent.core.device,
+        "augment": True,
+    }
+    return OfflinePipeline(
+        agent=agent,
+        provider=provider,
+        iql_learner=iql_learner,
+        discriminator=discriminator,
+        shared_encoder=shared_encoder,
+        iql_cfg=iql_cfg,
+        advantage_raw=advantage_raw,
+        failure_raw=failure_raw,
+        start_to_row=start_to_row,
+        policy_camera_names=list(policy_camera_names),
+        init_checkpoint=str(init_checkpoint),
+        nnpu_ckpt=nnpu_ckpt,
+        warmup_ckpt=warmup_ckpt,
+        filter_stats=filter_stats,
+        num_pretrain_transitions=int(len(pretrain_transitions)),
+        num_offline_transitions=int(len(offline_transitions)),
+        n_valid=int(n_valid),
+        batch_size=batch_size,
+        sample_kwargs=sample_kwargs,
+    )
+
+
+@hydra.main(version_base="1.2", config_path="../config", config_name="offline")
+def main(cfg: DictConfig) -> None:
+    pipe = build_offline_pipeline(cfg)
+    agent = pipe.agent
+    task_name = str(cfg.env.environment)
+    policy_camera_names = pipe.policy_camera_names
+
+    # ------------------------------------------------------------------ #
+    # Run directory: outputs/dipole_offline/<task>/<timestamp>/          #
+    # ------------------------------------------------------------------ #
+    output_root = Path(to_absolute_path(str(cfg.logging.output_root)))
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_subfix = str(OmegaConf.select(cfg, "offline.run_subfix", default="") or "").strip()
+    dir_name = f"{timestamp}_{run_subfix}" if run_subfix else timestamp
+    run_name = f"{task_name}__offline__{dir_name}"
+    run_dir = output_root / task_name / dir_name
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    print(f"[offline] run={run_name}")
+    print(f"[offline] run_dir={run_dir}")
+
     # ------------------------------------------------------------------ #
     # Logging + run metadata.                                            #
     # ------------------------------------------------------------------ #
@@ -420,15 +501,15 @@ def main(cfg: DictConfig) -> None:
             "env_name": task_name,
             "task_name": task_name,
             "policy_camera_names": list(policy_camera_names),
-            "initialized_checkpoint": str(init_checkpoint),
-            "nnpu_checkpoint": nnpu_ckpt,
-            "iql_warmup_checkpoint": warmup_ckpt,
+            "initialized_checkpoint": str(pipe.init_checkpoint),
+            "nnpu_checkpoint": pipe.nnpu_ckpt,
+            "iql_warmup_checkpoint": pipe.warmup_ckpt,
             "g_mode": "advantage_offline_td",
             "algorithm_type": "dipole_offline",
-            "filter_stats": filter_stats,
-            "replay_valid_windows": int(n_valid),
-            "num_pretrain_transitions": int(len(pretrain_transitions)),
-            "num_offline_transitions": int(len(offline_transitions)),
+            "filter_stats": pipe.filter_stats,
+            "replay_valid_windows": int(pipe.n_valid),
+            "num_pretrain_transitions": int(pipe.num_pretrain_transitions),
+            "num_offline_transitions": int(pipe.num_offline_transitions),
         },
     )
 
@@ -450,14 +531,8 @@ def main(cfg: DictConfig) -> None:
     plot_log_interval = max(1, int(log_interval if plot_log_interval_raw is None else plot_log_interval_raw))
     checkpoint_interval = max(1, int(cfg.offline.checkpoint_interval))
 
-    sample_kwargs = {
-        "action_mean": agent.core.act_mean,
-        "action_std": agent.core.act_std,
-        "proprio_mean": agent.core.prop_mean,
-        "proprio_std": agent.core.prop_std,
-        "device": agent.core.device,
-        "augment": True,
-    }
+    batch_size = pipe.batch_size
+    sample_kwargs = pipe.sample_kwargs
     print(f"[offline] training for {num_steps} steps (batch_size={batch_size})")
     try:
         for step in range(num_steps):
@@ -466,6 +541,8 @@ def main(cfg: DictConfig) -> None:
             # is_intervention (pretrain) rows are overridden to w_pos=1.
             batch = agent.online_buffer.sample(batch_size, **sample_kwargs)
             collect_diag = (step % plot_log_interval == 0) or (step == num_steps - 1)
+
+            # update
             metrics = agent.core.update(batch=batch, collect_diagnostics=collect_diag)
             diag = metrics.pop("_diag", None)
             if step % log_interval == 0 or step == num_steps - 1:

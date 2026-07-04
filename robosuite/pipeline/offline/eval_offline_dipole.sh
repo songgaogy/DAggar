@@ -10,12 +10,12 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole_offline/PickPlaceCereal/2026-06-29_12-18-39_no-norm/checkpoints/step_00000000.pt"
-OMEGA=0
+POLICY_CKPT="outputs/dipole_offline/PickPlaceCereal/2026-07-01_23-02-14_no-norm_beta8/checkpoints/step_00014999.pt"
+OMEGA=15
 EVAL_EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 SAVE_VIDEO=true

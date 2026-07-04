@@ -15,11 +15,11 @@ Observation sources for the functional probe:
 Usage::
 
     # Static only (embedding weights):
-    python -m robosuite.pipeline.offline.utils.detect_dipole \
+    python -m robosuite.pipeline.offline.utils.probe_dipole \
         --checkpoint outputs/dipole_offline/.../checkpoints/step_00014999.pt
 
     # action probe on expert HDF5 frames:
-    python -m robosuite.pipeline.offline.utils.detect_dipole \
+    python -m robosuite.pipeline.offline.utils.probe_dipole \
         --checkpoint outputs/dipole_offline/.../checkpoints/step_00014999.pt \
         --probe-data ./data/PickPlaceCereal/expert
 """

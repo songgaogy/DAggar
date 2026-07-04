@@ -110,7 +110,7 @@ algorithm:
 
   dipole:
     condition_scale: 1.0
-    beta: 1.0
+    beta: 8.0
     k: 0.0
     guidance_omega: 2.0
     # LoRA negative-branch condition injection (replaces additive polarity embedding).
@@ -195,8 +195,8 @@ logging:
   tensorboard_dir: "tensorboard"
   use_wandb: false
   wandb_mode: "offline"
-  log_interval: 10
-  checkpoint_interval: 1
+  log_interval: 200
+  checkpoint_interval: 5000
 
 hydra:
   run:
