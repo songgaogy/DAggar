@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any
 
 import hydra
-import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -41,8 +40,6 @@ from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEn
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
 from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
 from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
-from robosuite.pipeline.envs import build_robosuite_env
-from robosuite.pipeline.factory import build_algorithm
 from robosuite.pipeline.offline.diagnostic_plots import (
     plot_branch_weight_distribution,
     plot_raw_g_distribution,
@@ -55,19 +52,15 @@ from robosuite.pipeline.offline.utils import (
     populate_replay_buffer,
     precompute_offline_advantage,
 )
-from robosuite.pipeline.offline.utils.naive_g_provider import NaiveNegativeGProvider
-from robosuite.pipeline.offline.utils.neg_all_g_provider import (
+from robosuite.pipeline.offline.utils.hard_label_providers import (
+    NaiveNegativeGProvider,
     NegAllGProvider,
     precompute_neg_all_membership,
 )
-from robosuite.pipeline.train_dipole import (
-    bind_flow_proprio_extractor,
-    build_flow_runtime_cfg,
-    load_hdf5_demos_into_flow_transitions,
-    load_init_checkpoint_payload,
-    maybe_set_seed,
-    resolve_camera_names,
-    resolve_flow_task_metadata,
+from robosuite.pipeline.offline.utils.setup import (
+    build_agent_env,
+    finalize_normalizers,
+    make_hdf5_loader,
 )
 from robosuite.pipeline.train_dipole_rl import _load_iql_warmup_state
 from robosuite.pipeline.utils import (
@@ -80,52 +73,6 @@ from robosuite.pipeline.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _print_policy_param_summary(core: Any) -> None:
-    """Print LoRA adapter vs base trainable parameter counts after policy init.
-
-    With the dual-LoRA architecture the backbone is frozen, so ``base`` (trainable
-    non-LoRA) should be 0; only the pos/neg adapters train.
-    """
-    model = core.model
-    lora_numel = 0
-    base_numel = 0
-    frozen_numel = 0
-    lora_module_paths: list[str] = []
-    for name, param in model.named_parameters():
-        n = int(param.numel())
-        if not param.requires_grad:
-            frozen_numel += n
-            continue
-        if ".pos_lora_" in name or ".neg_lora_" in name:
-            lora_numel += n
-            if name.endswith(".pos_lora_A"):
-                lora_module_paths.append(name[: -len(".pos_lora_A")])
-        else:
-            base_numel += n
-
-    trainable_numel = lora_numel + base_numel
-    total_numel = trainable_numel + frozen_numel
-    lora_num_modules = int(getattr(model, "lora_num_modules", len(lora_module_paths)))
-    print(
-        f"[offline] policy trainable params: total={trainable_numel:,} "
-        f"(base={base_numel:,}, lora={lora_numel:,})"
-    )
-    print(
-        f"[offline] policy frozen params: {frozen_numel:,} "
-        f"(all params={total_numel:,})"
-    )
-    print(
-        f"[offline] lora modules={lora_num_modules} "
-        f"(rank={getattr(core.config, 'lora_rank', '?')}, "
-        f"alpha={getattr(core.config, 'lora_alpha', '?')}, "
-        f"include_aggregator={getattr(core.config, 'lora_include_aggregator', '?')})"
-    )
-    if lora_module_paths:
-        print("[offline] lora target paths:")
-        for path in lora_module_paths:
-            print(f"  - {path}")
 
 
 def _freeze_iql(iql: IQLLearner) -> None:
@@ -172,6 +119,7 @@ class OfflinePipeline:
     n_valid: int
     batch_size: int
     sample_kwargs: dict[str, Any]
+    static_cache: Any | None = None
     # RL-stack fields: populated in "normal" mode, left None in "naive" mode.
     iql_learner: IQLLearner | None = None
     discriminator: FrozenNNPUDiscriminator | None = None
@@ -196,104 +144,18 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
     This is the exact setup the training entry used to perform inline; it is
     factored out so read-only tooling can reuse it verbatim.
     """
-    maybe_set_seed(getattr(cfg, "seed", None))
-    torch.set_float32_matmul_precision("high")
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
     mode = str(OmegaConf.select(cfg, "offline.mode", default="normal")).strip().lower()
     if mode not in ("normal", "naive", "neg_all"):
         raise ValueError(f"offline.mode must be 'normal', 'naive' or 'neg_all', got {mode!r}.")
     print(f"[offline] mode={mode}")
 
-    init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
-    if init_checkpoint is None:
-        raise RuntimeError(
-            "Offline DIPOLE requires runtime.init_checkpoint (the pretrained flow "
-            "policy) to be set."
-        )
-    task_name = str(cfg.env.environment)
-    requested_camera_names = resolve_camera_names(cfg)
-    flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
-    if bool(getattr(cfg.runtime, "use_init_checkpoint_camera_names", True)) and init_payload is not None:
-        policy_camera_names = [str(name) for name in init_payload.get("camera_names", [])]
-        if len(policy_camera_names) == 0:
-            policy_camera_names = list(requested_camera_names)
-    else:
-        policy_camera_names = list(requested_camera_names)
-    camera_aliases = {
-        str(key): str(value)
-        for key, value in dict(getattr(cfg.algorithm.flow, "camera_aliases", {}) or {}).items()
-    }
-
-    print(f"[offline] init_checkpoint={init_checkpoint}")
-
-    img_height = int(cfg.env.img_height)
-    img_width = int(cfg.env.img_width)
-    reward_mode = str(cfg.algorithm.q_learning.config.reward_mode)
-
-    # Headless env for HDF5 proprio extraction only (no rendering), like warmup.
-    main_runtime_cfg = build_flow_runtime_cfg(
-        cfg,
-        env_metadata=flow_env_metadata,
-        camera_names=policy_camera_names,
-        has_renderer=False,
-        has_offscreen_renderer=False,
-        use_camera_obs=False,
-        renderer=str(cfg.env.renderer),
-    )
-    env = build_robosuite_env(main_runtime_cfg)
+    ctx = build_agent_env(cfg, log_tag="offline")
+    agent = ctx.agent
+    task_name = ctx.task_name
+    policy_camera_names = ctx.policy_camera_names
+    img_height = ctx.img_height
+    init_checkpoint = ctx.init_checkpoint
     try:
-        env.reset()
-        extractor = bind_flow_proprio_extractor(env, flow_env_metadata)
-        proprio_vec = np.asarray(
-            extractor.extract(env.sim.get_state().flatten()), dtype=np.float32
-        )
-        observation_example: dict[str, Any] = {"state": proprio_vec}
-        for camera_name in policy_camera_names:
-            observation_example[camera_name] = np.zeros((img_height, img_width, 3), dtype=np.uint8)
-        action_low, action_high = env.action_spec
-        action_low = np.asarray(action_low, dtype=np.float32)
-        action_high = np.asarray(action_high, dtype=np.float32)
-
-        # -------------------------------------------------------------- #
-        # Build the DIPOLE agent and load the pretrained flow policy.    #
-        # -------------------------------------------------------------- #
-        algorithm_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
-        assert isinstance(algorithm_cfg, dict)
-        algorithm_cfg["camera_names"] = list(policy_camera_names)
-        algorithm_cfg["task_name"] = task_name
-        flow_cfg = algorithm_cfg.setdefault("flow", {})
-        flow_cfg.setdefault("image_size", img_height)
-        if bool(getattr(cfg.runtime, "use_init_checkpoint_model", True)) and init_payload is not None:
-            if "model_cfg" in init_payload:
-                flow_cfg["model"] = init_payload["model_cfg"]
-            if "task_prompt_map" in init_payload:
-                flow_cfg["task_prompt_map"] = init_payload["task_prompt_map"]
-            if init_payload.get("act_mean") is not None:
-                flow_cfg["action_horizon"] = int(np.asarray(init_payload["act_mean"]).shape[0])
-                flow_cfg.setdefault("execute_horizon", 1)
-        model_cfg = flow_cfg.setdefault("model", {})
-        image_encoder_cfg = model_cfg.get("image_encoder", None)
-        if isinstance(image_encoder_cfg, dict) and image_encoder_cfg.get("pretrained_path"):
-            image_encoder_cfg["pretrained_path"] = to_absolute_path(str(image_encoder_cfg["pretrained_path"]))
-        language_encoder_cfg = model_cfg.get("language_encoder", None)
-        if isinstance(language_encoder_cfg, dict) and language_encoder_cfg.get("pretrained_name"):
-            language_encoder_cfg["pretrained_name"] = to_absolute_path(str(language_encoder_cfg["pretrained_name"]))
-
-        agent = build_algorithm(
-            algorithm_cfg,
-            observation_example=observation_example,
-            sample_action=np.zeros_like(action_low, dtype=np.float32),
-            action_low=action_low,
-            action_high=action_high,
-        )
-        agent.load_flow_policy_checkpoint(init_checkpoint, task_name=task_name)
-        print(f"[offline] loaded pretrained flow policy from {init_checkpoint}")
-        _print_policy_param_summary(agent.core)
-
         # -------------------------------------------------------------- #
         # Frozen shared encoder + nnPU discriminator + frozen IQL.       #
         # (normal mode only; naive mode is a pure hard-label split.)     #
@@ -368,20 +230,7 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
         # -------------------------------------------------------------- #
         # Load + filter offline data into the replay buffer.             #
         # -------------------------------------------------------------- #
-        def hdf5_loader(path, demo_names=None):
-            return load_hdf5_demos_into_flow_transitions(
-                path,
-                policy_camera_names=policy_camera_names,
-                camera_aliases=camera_aliases,
-                img_height=img_height,
-                img_width=img_width,
-                proprio_keys=tuple(cfg.env.proprio_keys or []),
-                renderer=str(cfg.env.renderer),
-                control_freq=int(cfg.env.control_freq),
-                demo_names=demo_names,
-                state_extractor=extractor,
-                reward_mode=reward_mode,
-            )
+        hdf5_loader = make_hdf5_loader(ctx, cfg)
 
         max_pretrain = OmegaConf.select(cfg, "offline.max_pretrain_trajectories", default=None)
         max_pretrain = None if max_pretrain is None else int(max_pretrain)
@@ -440,7 +289,7 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
             filter_stats["naive_success_transitions"] = int(len(success_transitions))
             filter_stats["naive_fail_transitions"] = int(len(fail_transitions))
     finally:
-        env.close()
+        ctx.env.close()
 
     if not pretrain_transitions and not offline_transitions:
         raise RuntimeError("Offline DIPOLE loaded zero transitions; check data paths.")
@@ -456,18 +305,10 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
         f"demo_buffer empty ({len(agent.demo_buffer)})"
     )
 
-    if not agent.has_normalizers():
-        agent.fit_normalizers_from_transitions(pretrain_transitions)
-        print("[offline] fitted flow normalizers from pretrain transitions.")
-    else:
-        print("[offline] reusing flow normalizers from the pretrained checkpoint.")
-
-    batch_size = int(cfg.algorithm.trainer.batch_size)
-    if agent.online_buffer.num_valid_sequences() < batch_size:
-        raise RuntimeError(
-            f"replay_buffer has only {agent.online_buffer.num_valid_sequences()} valid "
-            f"windows (< batch_size={batch_size}); add more data or lower batch_size."
-        )
+    batch_size = finalize_normalizers(
+        agent, cfg, pretrain_transitions,
+        log_tag="offline", norm_desc="pretrain transitions",
+    )
 
     advantage_raw = None
     failure_raw = None
@@ -536,6 +377,12 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
         "device": agent.core.device,
         "augment": True,
     }
+    static_cache = agent.online_buffer.build_static_cache(pin_memory=True)
+    cache_mib = float(static_cache.estimated_bytes) / (1024.0 * 1024.0)
+    print(
+        f"[offline] static_cache rows={len(static_cache)} estimated={cache_mib:.1f} MiB "
+        f"device=cpu pin_memory={static_cache.pin_memory}"
+    )
     return OfflinePipeline(
         agent=agent,
         provider=provider,
@@ -556,6 +403,7 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
         n_valid=int(n_valid),
         batch_size=batch_size,
         sample_kwargs=sample_kwargs,
+        static_cache=static_cache,
     )
 
 
@@ -612,6 +460,9 @@ def main(cfg: DictConfig) -> None:
             "replay_valid_windows": int(pipe.n_valid),
             "num_pretrain_transitions": int(pipe.num_pretrain_transitions),
             "num_offline_transitions": int(pipe.num_offline_transitions),
+            "static_cache_enabled": pipe.static_cache is not None,
+            "static_cache_pin_memory": bool(getattr(pipe.static_cache, "pin_memory", False)),
+            "static_cache_estimated_bytes": int(getattr(pipe.static_cache, "estimated_bytes", 0)),
         },
     )
 
@@ -635,13 +486,18 @@ def main(cfg: DictConfig) -> None:
 
     batch_size = pipe.batch_size
     sample_kwargs = pipe.sample_kwargs
-    print(f"[offline] training for {num_steps} steps (batch_size={batch_size})")
+    static_cache = pipe.static_cache
+    sampler_name = "static_cache" if static_cache is not None else "replay_buffer"
+    print(f"[offline] training for {num_steps} steps (batch_size={batch_size}, sampler={sampler_name})")
     try:
         for step in range(num_steps):
             # Uniform draw from the single mixed buffer. No buffer_sources is set,
             # so the policy takes the legacy path: full-batch advantage G, then
             # is_intervention (pretrain) rows are overridden to w_pos=1.
-            batch = agent.online_buffer.sample(batch_size, **sample_kwargs)
+            if static_cache is not None:
+                batch = static_cache.sample(batch_size, **sample_kwargs)
+            else:
+                batch = agent.online_buffer.sample(batch_size, **sample_kwargs)
             collect_diag = (step % plot_log_interval == 0) or (step == num_steps - 1)
 
             # update

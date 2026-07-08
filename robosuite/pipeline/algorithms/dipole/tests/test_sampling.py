@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
 
+from robosuite.pipeline.algorithms.dipole.common import DipoleBatch
 from robosuite.pipeline.algorithms.dipole.models.flow import (
+    DipoleFlowPolicy,
     _sample_guided_action_sequence,
 )
 from robosuite.pipeline.algorithms.dipole.models.lora import LoRARuntime
@@ -195,6 +199,100 @@ def test_zero_omega_uses_only_positive_branch() -> None:
 
     assert output.shape == (2, 4, model.action_dim)
     assert model.flow_head.calls == 6
+
+
+class _FakeMaskedFlowHead(nn.Module):
+    def __init__(self, owner: "_FakeUpdateModel") -> None:
+        super().__init__()
+        object.__setattr__(self, "owner", owner)
+        self.calls = 0
+
+    def forward(
+        self,
+        *,
+        x_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        task_scene_cond: torch.Tensor,
+        context_tokens: torch.Tensor,
+        context_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        self.calls += 1
+        _ = timesteps, task_scene_cond, context_tokens, context_padding_mask
+        row_mask = self.owner.lora_runtime.row_mask
+        assert row_mask is not None
+        scale = torch.where(row_mask, self.owner.neg_lora_param, self.owner.pos_lora_param)
+        return torch.ones_like(x_t) * scale.view(-1, 1, 1)
+
+
+class _FakeUpdateModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_runtime = LoRARuntime()
+        self.pos_lora_param = nn.Parameter(torch.tensor(0.1))
+        self.neg_lora_param = nn.Parameter(torch.tensor(-0.1))
+        self.flow_head = _FakeMaskedFlowHead(self)
+
+    def encode_multimodal_context(
+        self,
+        *,
+        images: torch.Tensor,
+        proprio: torch.Tensor,
+        language: list[str],
+    ) -> dict[str, torch.Tensor]:
+        batch_size = int(proprio.shape[0])
+        assert len(language) == batch_size
+        return {
+            "task_scene_cond": torch.zeros(batch_size, 1),
+            "context_tokens": torch.zeros(batch_size, 1, 1),
+            "context_padding_mask": torch.zeros(batch_size, 1, dtype=torch.bool),
+            "fused_tokens": torch.zeros(batch_size, 1, 1),
+            "token_padding_mask": torch.zeros(batch_size, 1, dtype=torch.bool),
+            "language_global": torch.zeros(batch_size, 1),
+        }
+
+    def branch_task_scene_cond(
+        self, context: dict[str, torch.Tensor], *, branch: str
+    ) -> torch.Tensor:
+        assert branch in ("pos", "neg")
+        return context["task_scene_cond"]
+
+
+def test_update_uses_single_masked_branch_forward() -> None:
+    policy = object.__new__(DipoleFlowPolicy)
+    policy.device = torch.device("cpu")
+    policy.model = _FakeUpdateModel()
+    policy.config = SimpleNamespace(
+        beta=0.0,
+        k=0.0,
+        lambda_endpoint=0.0,
+        lambda_smooth=0.0,
+        grad_clip_norm=10.0,
+        branch_weight_mode="coupled",
+    )
+    policy.language_instruction = "task"
+    policy.g_provider = None
+    policy._lora_params = [policy.model.pos_lora_param, policy.model.neg_lora_param]
+    policy.optimizer = torch.optim.SGD(policy._lora_params, lr=0.01)
+    policy.scaler = torch.amp.GradScaler(enabled=False, device=policy.device)
+
+    batch = DipoleBatch(
+        image_obs=torch.zeros(3, 1, 3, 4, 4),
+        image_obs_raw=torch.zeros(3, 1, 3, 4, 4),
+        proprio=torch.zeros(3, 2),
+        proprio_raw=torch.zeros(3, 2),
+        action_sequences=torch.zeros(3, 2, 2),
+        action_sequences_raw=torch.zeros(3, 2, 2),
+        is_intervention=torch.zeros(3, dtype=torch.bool),
+        metadata={},
+    )
+
+    metrics = policy.update(batch)
+
+    assert policy.model.flow_head.calls == 1
+    assert "loss_pos" in metrics
+    assert "loss_neg" in metrics
+    assert policy.model.pos_lora_param.grad is not None
+    assert policy.model.neg_lora_param.grad is not None
 
 
 @pytest.mark.parametrize("requested", [1, 4, 8])

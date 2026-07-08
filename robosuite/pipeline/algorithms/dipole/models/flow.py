@@ -655,35 +655,40 @@ class DipoleFlowPolicy:
                 language=language,
             )
 
-        # --- Positive branch: base + pos_LoRA -> updates pos_LoRA only.
+        # Fused branch pass: false rows use pos LoRA, true rows use neg LoRA.
         with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
-            pos_context = dict(context)
-            pos_context["task_scene_cond"] = self.model.branch_task_scene_cond(context, branch="pos")
-            v_pos = self.model.forward_from_context(
-                x_t=x_t_swapped, t=timesteps, context=pos_context, negative=False,
-            ).transpose(1, 2)
+            pos_cond = self.model.branch_task_scene_cond(context, branch="pos")
+            neg_cond = self.model.branch_task_scene_cond(context, branch="neg")
+            row_mask = torch.cat(
+                [
+                    torch.zeros(B, dtype=torch.bool, device=self.device),
+                    torch.ones(B, dtype=torch.bool, device=self.device),
+                ],
+                dim=0,
+            )
+            with lora_masked(self.model.lora_runtime, row_mask):
+                velocities = self.model.flow_head(
+                    x_t=x_t_swapped.repeat(2, 1, 1),
+                    timesteps=timesteps.repeat(2),
+                    task_scene_cond=torch.cat([pos_cond, neg_cond], dim=0),
+                    context_tokens=context["context_tokens"].repeat(2, 1, 1),
+                    context_padding_mask=context["context_padding_mask"].repeat(2, 1),
+                ).transpose(1, 2)
+            v_pos = velocities[:B]
+            v_neg = velocities[B:]
             loss_pos, flow_pos, endpoint_pos, smooth_pos, v_pos_mse = _branch_losses(v_pos, w_pos)
-        # retain_graph so the negative backward can still traverse the shared encode graph.
-        self.scaler.scale(loss_pos).backward(retain_graph=True)
-
-        # --- Negative branch: base + neg_LoRA -> updates neg_LoRA only.
-        with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
-            neg_context = dict(context)
-            neg_context["task_scene_cond"] = self.model.branch_task_scene_cond(context, branch="neg")
-            v_neg = self.model.forward_from_context(
-                x_t=x_t_swapped, t=timesteps, context=neg_context, negative=True,
-            ).transpose(1, 2)
             loss_neg, flow_neg, endpoint_neg, smooth_neg, v_neg_mse = _branch_losses(v_neg, w_neg)
-        self.scaler.scale(loss_neg).backward()
+            loss = loss_pos + loss_neg
 
-        # base is frozen and pos/neg adapters are disjoint parameter sets, so each
-        # backward populates its own adapter grads -- no manual combination needed.
+        self.scaler.scale(loss).backward()
+
+        # Base is frozen and pos/neg adapters are disjoint; the fused backward
+        # populates each adapter's grads from its own branch rows.
         self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self._lora_params, max_norm=float(self.config.grad_clip_norm))
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        loss = loss_pos + loss_neg
         lora_metrics = lora_health_metrics(self.model)
 
         metrics: dict[str, Any] = {

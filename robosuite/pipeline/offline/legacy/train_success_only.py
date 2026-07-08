@@ -29,29 +29,16 @@ from __future__ import annotations
 import datetime
 import logging
 from pathlib import Path
-from typing import Any
 
 import hydra
-import numpy as np
-import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from robosuite.pipeline.envs import build_robosuite_env
-from robosuite.pipeline.factory import build_algorithm
-from robosuite.pipeline.offline.train_offline_dipole import _print_policy_param_summary
 from robosuite.pipeline.offline.utils import (
+    build_agent_env,
+    finalize_normalizers,
     load_offline_data_transitions,
     populate_replay_buffer,
-)
-from robosuite.pipeline.train_dipole import (
-    bind_flow_proprio_extractor,
-    build_flow_runtime_cfg,
-    load_hdf5_demos_into_flow_transitions,
-    load_init_checkpoint_payload,
-    maybe_set_seed,
-    resolve_camera_names,
-    resolve_flow_task_metadata,
 )
 from robosuite.pipeline.utils import (
     checkpoint_path,
@@ -65,118 +52,36 @@ logger = logging.getLogger(__name__)
 
 
 def _build_success_only_agent(cfg: DictConfig):
-    """Build the DIPOLE agent + load the pretrained flow policy (no critics).
+    """Build the DIPOLE agent + load ONLY the success_rollout split (no critics).
 
-    Mirrors the env/agent setup in ``build_offline_pipeline`` but omits the
-    IQL/nnPU/discriminator/advantage machinery. Returns
-    ``(agent, policy_camera_names, init_checkpoint, img_height)``.
+    Reuses the shared env/agent setup (:func:`build_agent_env`) and skips the
+    IQL/nnPU/discriminator/advantage machinery entirely; every kept frame is
+    forced to the positive branch (``mark_intervention=True``).
     """
-    maybe_set_seed(getattr(cfg, "seed", None))
-    torch.set_float32_matmul_precision("high")
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-
-    init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
-    if init_checkpoint is None:
-        raise RuntimeError(
-            "Success-only SFT requires runtime.init_checkpoint (the pretrained "
-            "flow policy the LoRA adapters attach to) to be set."
-        )
-    task_name = str(cfg.env.environment)
-    requested_camera_names = resolve_camera_names(cfg)
-    flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
-    if bool(getattr(cfg.runtime, "use_init_checkpoint_camera_names", True)) and init_payload is not None:
-        policy_camera_names = [str(name) for name in init_payload.get("camera_names", [])]
-        if len(policy_camera_names) == 0:
-            policy_camera_names = list(requested_camera_names)
-    else:
-        policy_camera_names = list(requested_camera_names)
-
-    print(f"[success_only] init_checkpoint={init_checkpoint}")
-
-    img_height = int(cfg.env.img_height)
-    img_width = int(cfg.env.img_width)
-
-    # Headless env for HDF5 proprio extraction only (no rendering), like warmup.
-    main_runtime_cfg = build_flow_runtime_cfg(
-        cfg,
-        env_metadata=flow_env_metadata,
-        camera_names=policy_camera_names,
-        has_renderer=False,
-        has_offscreen_renderer=False,
-        use_camera_obs=False,
-        renderer=str(cfg.env.renderer),
-    )
-    env = build_robosuite_env(main_runtime_cfg)
+    ctx = build_agent_env(cfg, log_tag="success_only")
+    agent = ctx.agent
     try:
-        env.reset()
-        extractor = bind_flow_proprio_extractor(env, flow_env_metadata)
-        proprio_vec = np.asarray(
-            extractor.extract(env.sim.get_state().flatten()), dtype=np.float32
-        )
-        observation_example: dict[str, Any] = {"state": proprio_vec}
-        for camera_name in policy_camera_names:
-            observation_example[camera_name] = np.zeros((img_height, img_width, 3), dtype=np.uint8)
-        action_low, action_high = env.action_spec
-        action_low = np.asarray(action_low, dtype=np.float32)
-        action_high = np.asarray(action_high, dtype=np.float32)
-
-        algorithm_cfg = OmegaConf.to_container(cfg.algorithm, resolve=True)
-        assert isinstance(algorithm_cfg, dict)
-        algorithm_cfg["camera_names"] = list(policy_camera_names)
-        algorithm_cfg["task_name"] = task_name
-        flow_cfg = algorithm_cfg.setdefault("flow", {})
-        flow_cfg.setdefault("image_size", img_height)
-        if bool(getattr(cfg.runtime, "use_init_checkpoint_model", True)) and init_payload is not None:
-            if "model_cfg" in init_payload:
-                flow_cfg["model"] = init_payload["model_cfg"]
-            if "task_prompt_map" in init_payload:
-                flow_cfg["task_prompt_map"] = init_payload["task_prompt_map"]
-            if init_payload.get("act_mean") is not None:
-                flow_cfg["action_horizon"] = int(np.asarray(init_payload["act_mean"]).shape[0])
-                flow_cfg.setdefault("execute_horizon", 1)
-        model_cfg = flow_cfg.setdefault("model", {})
-        image_encoder_cfg = model_cfg.get("image_encoder", None)
-        if isinstance(image_encoder_cfg, dict) and image_encoder_cfg.get("pretrained_path"):
-            image_encoder_cfg["pretrained_path"] = to_absolute_path(str(image_encoder_cfg["pretrained_path"]))
-        language_encoder_cfg = model_cfg.get("language_encoder", None)
-        if isinstance(language_encoder_cfg, dict) and language_encoder_cfg.get("pretrained_name"):
-            language_encoder_cfg["pretrained_name"] = to_absolute_path(str(language_encoder_cfg["pretrained_name"]))
-
-        agent = build_algorithm(
-            algorithm_cfg,
-            observation_example=observation_example,
-            sample_action=np.zeros_like(action_low, dtype=np.float32),
-            action_low=action_low,
-            action_high=action_high,
-        )
-        agent.load_flow_policy_checkpoint(init_checkpoint, task_name=task_name)
-        print(f"[success_only] loaded pretrained flow policy from {init_checkpoint}")
-        _print_policy_param_summary(agent.core)
-
         # ------------------------------------------------------------------ #
         # Load ONLY success_rollout trajectories, forced to positive branch. #
         # ------------------------------------------------------------------ #
         success_transitions, _, filter_stats = load_offline_data_transitions(
             data_root=str(cfg.offline.data_root),
-            task_name=task_name,
+            task_name=ctx.task_name,
             offline_data_dir=str(cfg.offline.offline_data_dir),
             action_horizon=int(agent.flow_config.action_horizon),
-            camera_names=policy_camera_names,
-            image_size=img_height,
+            camera_names=ctx.policy_camera_names,
+            image_size=ctx.img_height,
             episode_index_base=0,
             keep_kinds={"success"},
             mark_intervention=True,
         )
     finally:
-        env.close()
+        ctx.env.close()
 
     if not success_transitions:
         raise RuntimeError(
             "Success-only SFT loaded zero success transitions; check that "
-            f"{cfg.offline.data_root}/{task_name}/{cfg.offline.offline_data_dir}/"
+            f"{cfg.offline.data_root}/{ctx.task_name}/{cfg.offline.offline_data_dir}/"
             "iql_offline_transitions.pt exists and contains success_rollout data."
         )
     n_valid = populate_replay_buffer(agent.online_buffer, success_transitions)
@@ -186,24 +91,16 @@ def _build_success_only_agent(cfg: DictConfig):
         f"demo_buffer empty ({len(agent.demo_buffer)})"
     )
 
-    if not agent.has_normalizers():
-        agent.fit_normalizers_from_transitions(success_transitions)
-        print("[success_only] fitted flow normalizers from success transitions.")
-    else:
-        print("[success_only] reusing flow normalizers from the pretrained checkpoint.")
-
-    batch_size = int(cfg.algorithm.trainer.batch_size)
-    if agent.online_buffer.num_valid_sequences() < batch_size:
-        raise RuntimeError(
-            f"replay_buffer has only {agent.online_buffer.num_valid_sequences()} valid "
-            f"windows (< batch_size={batch_size}); add more data or lower batch_size."
-        )
+    batch_size = finalize_normalizers(
+        agent, cfg, success_transitions,
+        log_tag="success_only", norm_desc="success transitions",
+    )
 
     return (
         agent,
-        list(policy_camera_names),
-        str(init_checkpoint),
-        img_height,
+        list(ctx.policy_camera_names),
+        str(ctx.init_checkpoint),
+        ctx.img_height,
         filter_stats,
         int(n_valid),
         int(len(success_transitions)),

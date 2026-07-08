@@ -22,6 +22,7 @@ NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPl
 IQL_CKPT="outputs/dipole_rl-iql/offline_iql_qv-v2-disc0p02/PickPlaceCereal/iql_state.pt"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_TRAIN_STEPS=15000
+BATCH_SIZE="${BATCH_SIZE:-256}"
 RUN_SUBFIX="no-norm_beta4"
 # -------------------------------------
 
@@ -38,11 +39,12 @@ HYDRA_OVERRIDES=(
   "algorithm.discriminator.learner_device=${DEVICE}"
   "algorithm.flow.device=${DEVICE}"
   "algorithm.flow.inference_device=${DEVICE}"
+  "algorithm.trainer.batch_size=${BATCH_SIZE}"
   "offline.num_train_steps=${NUM_TRAIN_STEPS}"
   "offline.run_subfix=${RUN_SUBFIX}"
 )
 
-echo "[train_offline_dipole] task=${TASK} device=${DEVICE} steps=${NUM_TRAIN_STEPS}"
+echo "[train_offline_dipole] task=${TASK} device=${DEVICE} steps=${NUM_TRAIN_STEPS} batch_size=${BATCH_SIZE}"
 echo "[train_offline_dipole] run_subfix=${RUN_SUBFIX}"
 echo "[train_offline_dipole] policy_ckpt=${POLICY_CKPT}"
 echo "[train_offline_dipole] nnpu_ckpt=${NNPU_CKPT}"
