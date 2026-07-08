@@ -34,10 +34,10 @@ export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEED=1
-SPLIT="fail_rollout-val"    # success_rollout or fail_rollout
-TARGET_PATH="offline_iql_qv-v1"
-BRANCH_NAME="dipole_rl"
+SEEDS=(1 2 3)               # demo-selection seeds; one run per seed
+SPLIT="success_rollout-val"    # success_rollout or fail_rollout
+TARGET_PATH="offline_iql_qv-v2-disc0p02"
+BRANCH_NAME="dipole_rl-iql"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
@@ -68,24 +68,12 @@ if [[ -z "${NNPU_CKPT}" || ! -f "${NNPU_CKPT}" ]]; then
   exit 1
 fi
 
-echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seed=${SEED}"
+echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seeds=${SEEDS[*]}"
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
 echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 echo "[vis_iql_qv] device=${DEVICE}"
 
 EXTRA_ARGS=()
-if [[ -n "${MAX_WINDOWS:-}" ]]; then
-  EXTRA_ARGS+=(--max-windows "${MAX_WINDOWS}")
-fi
-if [[ "${NO_DISC_VIZ:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--no-disc-viz)
-fi
-if [[ "${NO_FLIP_VERTICAL:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--no-flip-vertical)
-fi
-if [[ -n "${DISC_VIZ_CAMERA:-}" ]]; then
-  EXTRA_ARGS+=(--disc-viz-camera "${DISC_VIZ_CAMERA}")
-fi
 EXTRA_ARGS+=(
   --video-fps "${VIDEO_FPS}"
   --disc-viz-border-thickness "${DISC_VIZ_BORDER}"
@@ -98,13 +86,16 @@ EXTRA_ARGS+=(
   # --q-candidate-action-high "${Q_DIAG_ACTION_HIGH}"
 )
 
-exec "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
-  --iql-ckpt "${IQL_CKPT}" \
-  --output-root "${OUTPUT_DIR}" \
-  --task-data-name "${DEMO_TASK_NAME}" \
-  --disc-ckpt "${NNPU_CKPT}" \
-  --split "${SPLIT}" \
-  --seed "${SEED}" \
-  --device "${DEVICE}" \
-  "${EXTRA_ARGS[@]}" \
-  "$@"
+for SEED in "${SEEDS[@]}"; do
+  echo "[vis_iql_qv] === running seed=${SEED} ==="
+  "${PY}" -m robosuite.pipeline.algorithms.q_learning.utils.vis_qv \
+    --iql-ckpt "${IQL_CKPT}" \
+    --output-root "${OUTPUT_DIR}" \
+    --task-data-name "${DEMO_TASK_NAME}" \
+    --disc-ckpt "${NNPU_CKPT}" \
+    --split "${SPLIT}" \
+    --seed "${SEED}" \
+    --device "${DEVICE}" \
+    "${EXTRA_ARGS[@]}" \
+    "$@"
+done

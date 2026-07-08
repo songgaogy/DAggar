@@ -112,15 +112,17 @@ algorithm:
     condition_scale: 1.0
     beta: 8.0
     k: 0.0
-    guidance_omega: 2.0
-    # LoRA negative-branch condition injection (replaces additive polarity embedding).
+    guidance_omega: 2.0               # eval-only: v=(1+w)v_pos - w v_neg (rollout is pos-only)
+    # Dual symmetric LoRA on a FROZEN backbone:
+    #   positive policy = base + pos_LoRA, negative policy = base + neg_LoRA.
+    # Both adapters share these hyperparameters.
     lora:
-      rank: 64
+      rank: 32
       alpha: 16.0
       dropout: 0.1
       include_aggregator: true
-      adapter_lr: 1.0e-3               # LoRA param LR (negative branch)
-      base_lr_scale: 0.1              # base_lr_neg = base_lr_scale * flow.learning_rate
+      include_conv: true               # also LoRA the UNet denoising Conv1d pathway (needed under frozen base)
+      adapter_lr: 2.0e-4               # LoRA param LR (both pos and neg adapters)
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
     g_mode: "nnpu_frozen"             # nnpu_frozen | advantage
 

@@ -182,6 +182,9 @@ TRAIN_DIPOLE_CMD=(
   algorithm.dipole.k="${K}" \
   algorithm.dipole.guidance_omega="${EFFECTIVE_OMEGA}" \
   algorithm.dipole.g_clip="${G_CLIP}" \
+  `# NOTE: guidance_omega is eval-only now (online rollout uses the positive policy` \
+  `# base+pos_LoRA only). The polarity_embedding_init* overrides below are STALE` \
+  `# (DipoleConfig has no such field since the dual-LoRA migration) -- left untouched here.` \
   algorithm.dipole.polarity_embedding_init="${POLARITY_INIT}" \
   algorithm.dipole.polarity_embedding_init_scale="${POLARITY_INIT_SCALE}" \
   algorithm.discriminator.checkpoint="${NNPU_CKPT}" \

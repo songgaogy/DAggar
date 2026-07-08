@@ -295,12 +295,14 @@ class FunctionalMetrics:
 
 
 def _load_lora_summary(checkpoint_path: Path) -> EmbeddingMetrics:
-    """Aggregate LoRA-adapter magnitude stats from a checkpoint state dict.
+    """Aggregate dual-LoRA branch-divergence stats from a checkpoint state dict.
 
-    For each wrapped condition Linear the state dict stores ``<path>.lora_A``
-    (r, in) and ``<path>.lora_B`` (out, r). Per-layer delta (unscaled) is the
-    Frobenius norm of ``lora_B @ lora_A`` -- the ``scaling`` factor lives on the
-    live module, not the state dict, so it is omitted here.
+    Each wrapped condition Linear stores ``<path>.pos_lora_A/pos_lora_B`` and
+    ``<path>.neg_lora_A/neg_lora_B``. The per-layer delta reported here is the
+    Frobenius norm of the positive/negative branch difference
+    ``(neg_B @ neg_A) - (pos_B @ pos_A)`` -- what actually drives CFG guidance.
+    The ``scaling`` factor lives on the live module, not the state dict, so it is
+    omitted here.
     """
     payload: Any = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -312,26 +314,34 @@ def _load_lora_summary(checkpoint_path: Path) -> EmbeddingMetrics:
     if not isinstance(model_state, dict):
         raise KeyError(f"Checkpoint {checkpoint_path} is missing 'core.model'.")
 
-    b_norms: list[float] = []
-    delta_norms: list[float] = []
+    def _delta(prefix: str) -> torch.Tensor | None:
+        b = model_state.get(prefix + "_B")
+        a = model_state.get(prefix + "_A")
+        if not isinstance(b, torch.Tensor) or not isinstance(a, torch.Tensor):
+            return None
+        return b.detach().float().cpu() @ a.detach().float().cpu()
+
+    neg_b_norms: list[float] = []
+    diff_norms: list[float] = []
     for key, value in model_state.items():
-        if not key.endswith(".lora_B") or not isinstance(value, torch.Tensor):
+        if not key.endswith(".neg_lora_B") or not isinstance(value, torch.Tensor):
             continue
-        lora_b = value.detach().float().cpu()
-        a_key = key[: -len(".lora_B")] + ".lora_A"
-        lora_a = model_state.get(a_key)
-        if not isinstance(lora_a, torch.Tensor):
-            raise KeyError(f"State dict has '{key}' but no matching '{a_key}'.")
-        lora_a = lora_a.detach().float().cpu()
-        b_norms.append(float(torch.linalg.matrix_norm(lora_b).item()))
-        delta_norms.append(float(torch.linalg.matrix_norm(lora_b @ lora_a).item()))
-    if not b_norms:
-        raise KeyError("State dict has no '.lora_B' adapter keys (not a LoRA DIPOLE checkpoint).")
+        path = key[: -len(".neg_lora_B")]
+        neg_delta = _delta(path + ".neg_lora")
+        pos_delta = _delta(path + ".pos_lora")
+        if neg_delta is None:
+            raise KeyError(f"State dict has '{key}' but is missing its neg_lora_A pair.")
+        if pos_delta is None:
+            pos_delta = torch.zeros_like(neg_delta)
+        neg_b_norms.append(float(torch.linalg.matrix_norm(value.detach().float().cpu()).item()))
+        diff_norms.append(float(torch.linalg.matrix_norm(neg_delta - pos_delta).item()))
+    if not neg_b_norms:
+        raise KeyError("State dict has no '.neg_lora_B' adapter keys (not a dual-LoRA DIPOLE checkpoint).")
     return EmbeddingMetrics(
-        num_lora_layers=len(b_norms),
-        lora_B_norm_mean=float(sum(b_norms) / len(b_norms)),
-        lora_delta_norm_mean=float(sum(delta_norms) / len(delta_norms)),
-        lora_delta_norm_max=float(max(delta_norms)),
+        num_lora_layers=len(neg_b_norms),
+        lora_B_norm_mean=float(sum(neg_b_norms) / len(neg_b_norms)),
+        lora_delta_norm_mean=float(sum(diff_norms) / len(diff_norms)),
+        lora_delta_norm_max=float(max(diff_norms)),
     )
 
 
@@ -411,8 +421,9 @@ def _probe_condition_metrics(
             proprio=proprio_tensor,
             language=[policy.language_instruction],
         )
-    cond_pos = context["task_scene_cond"]
-    cond_neg = model.negative_task_scene_cond(context)
+    # Both branches diverge from base at the aggregator; use each adapter's cond.
+    cond_pos = model.branch_task_scene_cond(context, branch="pos")
+    cond_neg = model.branch_task_scene_cond(context, branch="neg")
     context_tokens = context["context_tokens"]
 
     cond_norm = torch.linalg.vector_norm(cond_pos, dim=1)
@@ -463,8 +474,10 @@ def _probe_velocity_divergence(
             proprio=proprio_tensor,
             language=[policy.language_instruction],
         )
+    pos_context = dict(context)
+    pos_context["task_scene_cond"] = model.branch_task_scene_cond(context, branch="pos")
     neg_context = dict(context)
-    neg_context["task_scene_cond"] = model.negative_task_scene_cond(context)
+    neg_context["task_scene_cond"] = model.branch_task_scene_cond(context, branch="neg")
 
     l2_vals: list[float] = []
     rel_vals: list[float] = []
@@ -476,7 +489,7 @@ def _probe_velocity_divergence(
             device=proprio_tensor.device,
             dtype=proprio_tensor.dtype,
         )
-        v_pos = model.forward_from_context(x_t=x, t=t, context=context, negative=False)
+        v_pos = model.forward_from_context(x_t=x, t=t, context=pos_context, negative=False)
         v_neg = model.forward_from_context(x_t=x, t=t, context=neg_context, negative=True)
         flat_pos = v_pos.reshape(batch_size, -1)
         flat_neg = v_neg.reshape(batch_size, -1)

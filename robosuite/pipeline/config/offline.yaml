@@ -18,6 +18,7 @@ offline:
   checkpoint_interval: 5000
   preencode_batch_size: 64
   max_pretrain_trajectories: null                  # null = all expert demos
+  mode: "normal"                                    # "naive" or "normal" or "neg_all"
   eval:                                            # consumed by eval_offline_dipole.sh
     omega: 0.2
     episodes: 50

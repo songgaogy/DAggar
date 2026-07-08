@@ -42,48 +42,56 @@ def _load_model_state(checkpoint_path: Path) -> dict[str, Any]:
 
 
 def _lora_summary(model_state: dict[str, Any]) -> dict[str, float]:
-    """Aggregate LoRA-adapter magnitude stats from a model state dict.
+    """Aggregate dual-LoRA branch-divergence stats from a model state dict.
 
-    For each wrapped condition Linear the state dict stores ``<path>.lora_A``
-    (r, in) and ``<path>.lora_B`` (out, r). Per-layer delta (unscaled) is the
-    Frobenius norm of ``lora_B @ lora_A`` -- the scaling factor lives on the live
-    module, not the state dict, so it is omitted here.
+    Each wrapped condition Linear stores ``<path>.pos_lora_A/pos_lora_B`` and
+    ``<path>.neg_lora_A/neg_lora_B``. What matters for CFG guidance is how far the
+    two branches diverge, so the per-layer delta reported here is the Frobenius
+    norm of ``(neg_B @ neg_A) - (pos_B @ pos_A)`` -- the positive/negative branch
+    difference. The scaling factor lives on the live module, not the state dict,
+    so it is omitted here.
     """
-    b_norms: list[float] = []
-    delta_norms: list[float] = []
+
+    def _delta(prefix: str) -> torch.Tensor | None:
+        b = model_state.get(prefix + "_B")
+        a = model_state.get(prefix + "_A")
+        if not isinstance(b, torch.Tensor) or not isinstance(a, torch.Tensor):
+            return None
+        return b.detach().float().cpu() @ a.detach().float().cpu()
+
+    neg_b_norms: list[float] = []
+    diff_norms: list[float] = []
     for key, value in model_state.items():
-        if not key.endswith(".lora_B"):
+        if not key.endswith(".neg_lora_B") or not isinstance(value, torch.Tensor):
             continue
-        if not isinstance(value, torch.Tensor):
-            continue
-        lora_b = value.detach().float().cpu()
-        a_key = key[: -len(".lora_B")] + ".lora_A"
-        lora_a = model_state.get(a_key)
-        if not isinstance(lora_a, torch.Tensor):
-            raise KeyError(f"State dict has '{key}' but no matching '{a_key}'.")
-        lora_a = lora_a.detach().float().cpu()
-        b_norms.append(float(torch.linalg.matrix_norm(lora_b).item()))
-        delta = lora_b @ lora_a
-        delta_norms.append(float(torch.linalg.matrix_norm(delta).item()))
-    if not b_norms:
+        path = key[: -len(".neg_lora_B")]
+        neg_delta = _delta(path + ".neg_lora")
+        pos_delta = _delta(path + ".pos_lora")
+        if neg_delta is None:
+            raise KeyError(f"State dict has '{key}' but is missing its neg_lora_A pair.")
+        if pos_delta is None:
+            pos_delta = torch.zeros_like(neg_delta)
+        neg_b_norms.append(float(torch.linalg.matrix_norm(value.detach().float().cpu()).item()))
+        diff_norms.append(float(torch.linalg.matrix_norm(neg_delta - pos_delta).item()))
+    if not neg_b_norms:
         raise KeyError(
-            "State dict has no '.lora_B' adapter keys. Either this is not a "
-            "LoRA-based DIPOLE checkpoint or the adapters were renamed."
+            "State dict has no '.neg_lora_B' adapter keys. Either this is not a "
+            "dual-LoRA DIPOLE checkpoint or the adapters were renamed."
         )
     return {
-        "num_lora_layers": float(len(b_norms)),
-        "lora_B_norm_mean": float(sum(b_norms) / len(b_norms)),
-        "lora_delta_norm_mean": float(sum(delta_norms) / len(delta_norms)),
-        "lora_delta_norm_max": float(max(delta_norms)),
+        "num_lora_layers": float(len(neg_b_norms)),
+        "lora_B_norm_mean": float(sum(neg_b_norms) / len(neg_b_norms)),
+        "lora_delta_norm_mean": float(sum(diff_norms) / len(diff_norms)),
+        "lora_delta_norm_max": float(max(diff_norms)),
     }
 
 
 def _verdict(delta_max: float, delta_mean: float, *, delta_good: float, delta_warn: float) -> str:
     if delta_max < delta_warn:
-        return "BAD: LoRA adapters never grew — negative branch is still ~identical to base."
+        return "BAD: pos/neg adapters never diverged — the two branches are still ~identical."
     if delta_mean < delta_good:
-        return "OK-ish: partial LoRA growth. Worth scanning omega; watch action quality."
-    return "GOOD: LoRA adapters are clearly active; CFG has room to move policy aggressiveness."
+        return "OK-ish: partial pos/neg divergence. Worth scanning omega; watch action quality."
+    return "GOOD: pos/neg branches clearly diverge; CFG has room to move policy aggressiveness."
 
 
 def main() -> int:

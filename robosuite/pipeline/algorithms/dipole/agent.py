@@ -173,8 +173,8 @@ class DipoleAgent:
             lora_alpha=float(cfg_get(lora_cfg, "alpha", 16.0)),
             lora_dropout=float(cfg_get(lora_cfg, "dropout", 0.0)),
             lora_include_aggregator=bool(cfg_get(lora_cfg, "include_aggregator", True)),
+            lora_include_conv=bool(cfg_get(lora_cfg, "include_conv", True)),
             adapter_lr=float(cfg_get(lora_cfg, "adapter_lr", 1e-3)),
-            base_lr_scale=float(cfg_get(lora_cfg, "base_lr_scale", 0.1)),
             g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "nnpu_frozen")),
         )
         online_buffer_config = ReplayBufferConfig(
@@ -214,10 +214,12 @@ class DipoleAgent:
         self.core.discriminator = discriminator
 
     def select_action(self, obs, deterministic: bool = False):
-        return self.core.select_action(obs=obs, deterministic=deterministic)
+        # Online rollout uses the positive policy only (base + pos_LoRA); the two-branch
+        # omega guidance is an eval-only path (see DipoleFlowPolicy.select_action).
+        return self.core.select_action(obs=obs, deterministic=deterministic, guided=False)
 
     def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
-        return self.core.plan_action_chunk(obs=obs, deterministic=deterministic)
+        return self.core.plan_action_chunk(obs=obs, deterministic=deterministic, guided=False)
 
     def needs_action_chunk(self) -> bool:
         return self.core.needs_action_chunk()

@@ -38,12 +38,13 @@ class _CountingFlowHead(nn.Module):
 
 
 class _FakeDipoleModel(nn.Module):
-    """Stub mirroring the LoRA-based DIPOLE model API used by sampling.
+    """Stub mirroring the dual-LoRA DIPOLE model API used by sampling.
 
     The negative branch differs from the positive branch through
-    ``negative_task_scene_cond`` (emulating the aggregator-side LoRA delta); the
-    stub flow head itself is LoRA-agnostic, so this exercises the sampling
-    orchestration (2x-batch build, row mask plumbing, branch combination).
+    ``branch_task_scene_cond`` (emulating the aggregator-side neg LoRA delta; the
+    pos adapter is a no-op here, mirroring its zero-init at start); the stub flow
+    head itself is LoRA-agnostic, so this exercises the sampling orchestration
+    (2x-batch build, row mask plumbing, branch combination).
     """
 
     def __init__(self, action_dim: int = 3, context_dim: int = 5) -> None:
@@ -52,7 +53,7 @@ class _FakeDipoleModel(nn.Module):
         self.context_dim = int(context_dim)
         self.lora_runtime = LoRARuntime()
         self.flow_head = _CountingFlowHead()
-        # Fixed negative-branch condition delta (stands in for aggregator LoRA).
+        # Fixed negative-branch condition delta (stands in for the neg aggregator LoRA).
         self.register_buffer(
             "neg_cond_delta",
             torch.tensor([0.3, -0.2, 0.4, 0.1, -0.1])[:context_dim],
@@ -84,10 +85,18 @@ class _FakeDipoleModel(nn.Module):
             "language_global": task_scene_cond,
         }
 
+    def branch_task_scene_cond(
+        self, context: dict[str, torch.Tensor], *, branch: str
+    ) -> torch.Tensor:
+        # pos adapter is a no-op (zero delta); neg adapter adds a fixed delta.
+        if branch == "neg":
+            return context["task_scene_cond"] + self.neg_cond_delta
+        return context["task_scene_cond"]
+
     def negative_task_scene_cond(
         self, context: dict[str, torch.Tensor]
     ) -> torch.Tensor:
-        return context["task_scene_cond"] + self.neg_cond_delta
+        return self.branch_task_scene_cond(context, branch="neg")
 
     def forward_from_context(
         self,

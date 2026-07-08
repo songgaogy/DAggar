@@ -21,18 +21,28 @@ class DipoleConfig(FlowDaggerConfig):
     # CFG-style guidance + sigmoid weighting params
     beta: float = 2.0
     k: float = 0.0
-    guidance_omega: float = 2.0
+    guidance_omega: float = 2.0          # eval-only: v=(1+w)v_pos - w v_neg (rollout is pos-only)
     g_clip: float = 10.0
-    # LoRA negative-branch condition injection (replaces the additive polarity embedding).
+    # Dual symmetric LoRA condition injection on a FROZEN backbone:
+    #   positive policy = base + pos_LoRA, negative policy = base + neg_LoRA.
+    # Both adapters share this single set of hyperparameters.
     lora_rank: int = 16
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
     lora_include_aggregator: bool = True
-    adapter_lr: float = 1e-3              # LoRA param LR (negative branch)
-    base_lr_scale: float = 0.1           # base_lr_neg = base_lr_scale * learning_rate
+    lora_include_conv: bool = True       # also adapt the UNet denoising Conv1d pathway
+    adapter_lr: float = 1e-3             # LoRA param LR (both pos and neg adapters)
     # DIPOLE-RL: which frozen nnPU-backed G provider the trainer attaches.
     # Read by train_dipole*.py; DipoleFlowPolicy itself does not consume it.
     g_mode: str = "nnpu_frozen"
+    # Branch-weight scheme consumed by DipoleFlowPolicy._compute_branch_weights:
+    #   "coupled" (default) -> w_neg = 1 - w_pos with the intervention override
+    #     (normal / naive offline modes);
+    #   "neg_all" -> decoupled hard labels: w_pos = is_intervention, and w_neg is
+    #     the attached provider's per-frame membership (0/1), NOT 1 - w_pos and
+    #     NOT zeroed on intervention rows. Used by offline.mode == "neg_all" so
+    #     success frames drive BOTH branches (w_pos = w_neg = 1).
+    branch_weight_mode: str = "coupled"
 
 
 @dataclass

@@ -55,6 +55,11 @@ from robosuite.pipeline.offline.utils import (
     populate_replay_buffer,
     precompute_offline_advantage,
 )
+from robosuite.pipeline.offline.utils.naive_g_provider import NaiveNegativeGProvider
+from robosuite.pipeline.offline.utils.neg_all_g_provider import (
+    NegAllGProvider,
+    precompute_neg_all_membership,
+)
 from robosuite.pipeline.train_dipole import (
     bind_flow_proprio_extractor,
     build_flow_runtime_cfg,
@@ -78,7 +83,11 @@ logger = logging.getLogger(__name__)
 
 
 def _print_policy_param_summary(core: Any) -> None:
-    """Print LoRA adapter vs base trainable parameter counts after policy init."""
+    """Print LoRA adapter vs base trainable parameter counts after policy init.
+
+    With the dual-LoRA architecture the backbone is frozen, so ``base`` (trainable
+    non-LoRA) should be 0; only the pos/neg adapters train.
+    """
     model = core.model
     lora_numel = 0
     base_numel = 0
@@ -89,10 +98,10 @@ def _print_policy_param_summary(core: Any) -> None:
         if not param.requires_grad:
             frozen_numel += n
             continue
-        if ".lora_A" in name or ".lora_B" in name:
+        if ".pos_lora_" in name or ".neg_lora_" in name:
             lora_numel += n
-            if name.endswith(".lora_A"):
-                lora_module_paths.append(name[: -len(".lora_A")])
+            if name.endswith(".pos_lora_A"):
+                lora_module_paths.append(name[: -len(".pos_lora_A")])
         else:
             base_numel += n
 
@@ -152,24 +161,27 @@ class OfflinePipeline:
     """
 
     agent: Any
-    provider: OfflineAdvantageGProvider
-    iql_learner: IQLLearner
-    discriminator: FrozenNNPUDiscriminator
-    shared_encoder: SharedDynamicsEncoder
-    iql_cfg: IQLConfig
-    advantage_raw: torch.Tensor
-    failure_raw: torch.Tensor
-    start_to_row: dict[int, int]
+    # ``provider`` is OfflineAdvantageGProvider in normal mode, NaiveNegativeGProvider
+    # in naive mode; the RL-stack fields at the bottom are None in naive mode.
+    provider: Any
     policy_camera_names: list[str]
     init_checkpoint: str
-    nnpu_ckpt: str
-    warmup_ckpt: str
     filter_stats: dict[str, Any]
     num_pretrain_transitions: int
     num_offline_transitions: int
     n_valid: int
     batch_size: int
     sample_kwargs: dict[str, Any]
+    # RL-stack fields: populated in "normal" mode, left None in "naive" mode.
+    iql_learner: IQLLearner | None = None
+    discriminator: FrozenNNPUDiscriminator | None = None
+    shared_encoder: SharedDynamicsEncoder | None = None
+    iql_cfg: IQLConfig | None = None
+    advantage_raw: torch.Tensor | None = None
+    failure_raw: torch.Tensor | None = None
+    start_to_row: dict[int, int] | None = None
+    nnpu_ckpt: str | None = None
+    warmup_ckpt: str | None = None
 
 
 def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
@@ -190,6 +202,11 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    mode = str(OmegaConf.select(cfg, "offline.mode", default="normal")).strip().lower()
+    if mode not in ("normal", "naive", "neg_all"):
+        raise ValueError(f"offline.mode must be 'normal', 'naive' or 'neg_all', got {mode!r}.")
+    print(f"[offline] mode={mode}")
 
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     if init_checkpoint is None:
@@ -279,64 +296,74 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
 
         # -------------------------------------------------------------- #
         # Frozen shared encoder + nnPU discriminator + frozen IQL.       #
+        # (normal mode only; naive mode is a pure hard-label split.)     #
         # -------------------------------------------------------------- #
-        nnpu_ckpt = _resolve_required_path(
-            cfg.algorithm.discriminator.checkpoint,
-            what="algorithm.discriminator.checkpoint (NNPU_CKPT)",
-        )
-        cfg.algorithm.discriminator.checkpoint = nnpu_ckpt
-        rl_device = str(cfg.algorithm.q_learning.config.device)
-        camera_to_view = {
-            str(k): str(v)
-            for k, v in dict(getattr(cfg.algorithm.discriminator, "camera_to_view", {}) or {}).items()
-        }
-        encoder_override = getattr(cfg.algorithm.discriminator, "encoder_ckpt", None)
-        encoder_ckpt = (
-            None
-            if encoder_override is None or str(encoder_override).strip().lower() in ("", "null")
-            else to_absolute_path(str(encoder_override))
-        )
-        shared_encoder = SharedDynamicsEncoder(
-            nnpu_ckpt_path=nnpu_ckpt,
-            encoder_ckpt=encoder_ckpt,
-            device=rl_device,
-            camera_to_view=camera_to_view,
-        )
-        shared_encoder.bind_policy_cameras(list(agent.camera_names))
-        discriminator = FrozenNNPUDiscriminator(
-            nnpu_ckpt_path=nnpu_ckpt,
-            task_name=task_name,
-            device=rl_device,
-            encoder=shared_encoder,
-        )
-        print(
-            f"[offline] encoder ckpt={nnpu_ckpt} device={rl_device} "
-            f"state_dim={shared_encoder.state_feature_dim} chunk_dim={shared_encoder.chunk_feature_dim}"
-        )
+        nnpu_ckpt = None
+        warmup_ckpt = None
+        iql_cfg = None
+        shared_encoder = None
+        discriminator = None
+        iql_learner = None
+        if mode == "normal":
+            nnpu_ckpt = _resolve_required_path(
+                cfg.algorithm.discriminator.checkpoint,
+                what="algorithm.discriminator.checkpoint (NNPU_CKPT)",
+            )
+            cfg.algorithm.discriminator.checkpoint = nnpu_ckpt
+            rl_device = str(cfg.algorithm.q_learning.config.device)
+            camera_to_view = {
+                str(k): str(v)
+                for k, v in dict(getattr(cfg.algorithm.discriminator, "camera_to_view", {}) or {}).items()
+            }
+            encoder_override = getattr(cfg.algorithm.discriminator, "encoder_ckpt", None)
+            encoder_ckpt = (
+                None
+                if encoder_override is None or str(encoder_override).strip().lower() in ("", "null")
+                else to_absolute_path(str(encoder_override))
+            )
+            shared_encoder = SharedDynamicsEncoder(
+                nnpu_ckpt_path=nnpu_ckpt,
+                encoder_ckpt=encoder_ckpt,
+                device=rl_device,
+                camera_to_view=camera_to_view,
+            )
+            shared_encoder.bind_policy_cameras(list(agent.camera_names))
+            discriminator = FrozenNNPUDiscriminator(
+                nnpu_ckpt_path=nnpu_ckpt,
+                task_name=task_name,
+                device=rl_device,
+                encoder=shared_encoder,
+            )
+            print(
+                f"[offline] encoder ckpt={nnpu_ckpt} device={rl_device} "
+                f"state_dim={shared_encoder.state_feature_dim} chunk_dim={shared_encoder.chunk_feature_dim}"
+            )
 
-        policy_action_dim = int(agent.flow_config.action_dim)
-        iql_cfg = IQLConfig(**OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True))
-        iql_learner = IQLLearner(
-            iql_cfg,
-            state_feature_dim=int(shared_encoder.state_feature_dim),
-            chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
-            action_dim=policy_action_dim,
-            n_tokens=int(shared_encoder.inner_encoder.num_patches),
-            proprio_dim=int(shared_encoder.inner_encoder.proprio_emb_dim),
-        )
-        warmup_ckpt = _resolve_required_path(
-            cfg.algorithm.q_learning.warmup_ckpt,
-            what="algorithm.q_learning.warmup_ckpt (IQL warmup state)",
-        )
-        _load_iql_warmup_state(
-            iql_learner,
-            warmup_ckpt,
-            expected_state_feature_dim=int(shared_encoder.state_feature_dim),
-            expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
-            expected_action_dim=policy_action_dim,
-        )
-        _freeze_iql(iql_learner)
-        print(f"[offline] loaded + froze IQL critics from {warmup_ckpt}")
+            policy_action_dim = int(agent.flow_config.action_dim)
+            iql_cfg = IQLConfig(**OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True))
+            iql_learner = IQLLearner(
+                iql_cfg,
+                state_feature_dim=int(shared_encoder.state_feature_dim),
+                chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
+                action_dim=policy_action_dim,
+                n_tokens=int(shared_encoder.inner_encoder.num_patches),
+                proprio_dim=int(shared_encoder.inner_encoder.proprio_emb_dim),
+            )
+            warmup_ckpt = _resolve_required_path(
+                cfg.algorithm.q_learning.warmup_ckpt,
+                what="algorithm.q_learning.warmup_ckpt (IQL warmup state)",
+            )
+            _load_iql_warmup_state(
+                iql_learner,
+                warmup_ckpt,
+                expected_state_feature_dim=int(shared_encoder.state_feature_dim),
+                expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
+                expected_action_dim=policy_action_dim,
+            )
+            _freeze_iql(iql_learner)
+            print(f"[offline] loaded + froze IQL critics from {warmup_ckpt}")
+        else:
+            print("[offline][naive] skipping encoder/discriminator/IQL construction (hard-label split).")
 
         # -------------------------------------------------------------- #
         # Load + filter offline data into the replay buffer.             #
@@ -366,15 +393,52 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
             max_num_trajectories=max_pretrain,
             episode_index_base=0,
         )
-        offline_transitions, episode_base, filter_stats = load_offline_data_transitions(
-            data_root=str(cfg.offline.data_root),
-            task_name=task_name,
-            offline_data_dir=str(cfg.offline.offline_data_dir),
-            action_horizon=int(iql_cfg.action_horizon),
-            camera_names=policy_camera_names,
-            image_size=img_height,
-            episode_index_base=episode_base,
-        )
+        if mode == "normal":
+            offline_transitions, episode_base, filter_stats = load_offline_data_transitions(
+                data_root=str(cfg.offline.data_root),
+                task_name=task_name,
+                offline_data_dir=str(cfg.offline.offline_data_dir),
+                action_horizon=int(iql_cfg.action_horizon),
+                camera_names=policy_camera_names,
+                image_size=img_height,
+                episode_index_base=episode_base,
+            )
+        else:
+            # naive / neg_all share the same hard-label data split:
+            # success_rollout is marked is_intervention=True (-> positive branch),
+            # fail_rollout is marked is_intervention=False. The negative-branch
+            # weighting then differs by mode (naive: constant-negative G provider;
+            # neg_all: per-frame membership provider + branch_weight_mode=neg_all).
+            action_horizon = int(agent.flow_config.action_horizon)
+            success_transitions, episode_base, success_stats = load_offline_data_transitions(
+                data_root=str(cfg.offline.data_root),
+                task_name=task_name,
+                offline_data_dir=str(cfg.offline.offline_data_dir),
+                action_horizon=action_horizon,
+                camera_names=policy_camera_names,
+                image_size=img_height,
+                episode_index_base=episode_base,
+                keep_kinds={"success"},
+                mark_intervention=True,
+            )
+            fail_transitions, episode_base, fail_stats = load_offline_data_transitions(
+                data_root=str(cfg.offline.data_root),
+                task_name=task_name,
+                offline_data_dir=str(cfg.offline.offline_data_dir),
+                action_horizon=action_horizon,
+                camera_names=policy_camera_names,
+                image_size=img_height,
+                episode_index_base=episode_base,
+                keep_kinds={"fail"},
+                mark_intervention=False,
+            )
+            offline_transitions = list(success_transitions) + list(fail_transitions)
+            filter_stats = {
+                key: int(success_stats.get(key, 0)) + int(fail_stats.get(key, 0))
+                for key in set(success_stats) | set(fail_stats)
+            }
+            filter_stats["naive_success_transitions"] = int(len(success_transitions))
+            filter_stats["naive_fail_transitions"] = int(len(fail_transitions))
     finally:
         env.close()
 
@@ -384,10 +448,11 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
     # is_intervention=True (forced w_pos=1); offline_data rows are advantage-weighted.
     all_transitions = list(pretrain_transitions) + list(offline_transitions)
     n_valid = populate_replay_buffer(agent.online_buffer, all_transitions)
+    offline_role = "advantage-weighted" if mode == "normal" else "hard-labeled (success->pos, fail->neg)"
     print(
         f"[offline] replay_buffer (mixed): {len(agent.online_buffer)} transitions, "
         f"{n_valid} valid windows (pretrain={len(pretrain_transitions)} as w_pos=1, "
-        f"offline_data={len(offline_transitions)} advantage-weighted); "
+        f"offline_data={len(offline_transitions)} {offline_role}); "
         f"demo_buffer empty ({len(agent.demo_buffer)})"
     )
 
@@ -404,37 +469,64 @@ def build_offline_pipeline(cfg: DictConfig) -> OfflinePipeline:
             f"windows (< batch_size={batch_size}); add more data or lower batch_size."
         )
 
-    # Precompute TD advantage (+ failure score) for every valid window once.
-    # The provider scores the whole batch; pretrain (is_intervention) rows have
-    # their weight overridden to w_pos=1 afterwards by the policy, so their
-    # advantage value is computed but unused.
-    advantage_raw, failure_raw, start_to_row = precompute_offline_advantage(
-        base_buffer=agent.online_buffer,
-        iql_learner=iql_learner,
-        encoder=shared_encoder,
-        discriminator=discriminator,
-        iql_cfg=iql_cfg,
-        device=rl_device,
-        encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
-    )
-    provider = OfflineAdvantageGProvider(
-        iql_learner=iql_learner,
-        discriminator=discriminator,
-        encoder=shared_encoder,
-        alpha=float(cfg.algorithm.advantage_g_provider.alpha),
-        beta=float(cfg.algorithm.advantage_g_provider.beta),
-        advantage_raw=advantage_raw,
-        failure_raw=failure_raw,
-        start_to_row=start_to_row,
-    )
-    provider.bind_policy_cameras(list(agent.camera_names))
-    agent.attach_iql_learner(iql_learner)
-    agent.attach_discriminator(discriminator)
-    agent.attach_g_provider(provider)
-    print(
-        f"[offline] attached OfflineAdvantageGProvider "
-        f"(alpha={cfg.algorithm.advantage_g_provider.alpha}, beta={cfg.algorithm.advantage_g_provider.beta})"
-    )
+    advantage_raw = None
+    failure_raw = None
+    start_to_row = None
+    if mode == "normal":
+        # Precompute TD advantage (+ failure score) for every valid window once.
+        # The provider scores the whole batch; pretrain (is_intervention) rows have
+        # their weight overridden to w_pos=1 afterwards by the policy, so their
+        # advantage value is computed but unused.
+        advantage_raw, failure_raw, start_to_row = precompute_offline_advantage(
+            base_buffer=agent.online_buffer,
+            iql_learner=iql_learner,
+            encoder=shared_encoder,
+            discriminator=discriminator,
+            iql_cfg=iql_cfg,
+            device=rl_device,
+            encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
+        )
+        provider = OfflineAdvantageGProvider(
+            iql_learner=iql_learner,
+            discriminator=discriminator,
+            encoder=shared_encoder,
+            alpha=float(cfg.algorithm.advantage_g_provider.alpha),
+            beta=float(cfg.algorithm.advantage_g_provider.beta),
+            advantage_raw=advantage_raw,
+            failure_raw=failure_raw,
+            start_to_row=start_to_row,
+        )
+        provider.bind_policy_cameras(list(agent.camera_names))
+        agent.attach_iql_learner(iql_learner)
+        agent.attach_discriminator(discriminator)
+        agent.attach_g_provider(provider)
+        print(
+            f"[offline] attached OfflineAdvantageGProvider "
+            f"(alpha={cfg.algorithm.advantage_g_provider.alpha}, beta={cfg.algorithm.advantage_g_provider.beta})"
+        )
+    elif mode == "naive":
+        # naive: fail frames (is_intervention=False) are the only provider-scored
+        # rows; a constant negative G sends them to the negative branch (w_neg=1).
+        provider = NaiveNegativeGProvider()
+        agent.attach_g_provider(provider)
+        print(
+            "[offline][naive] attached NaiveNegativeGProvider "
+            "(fail -> w_neg=1; success/expert forced w_pos=1)."
+        )
+    else:
+        # neg_all: decoupled hard labels via the policy's branch_weight_mode.
+        # w_pos = is_intervention (expert + success), w_neg = offline_data
+        # membership (success + fail -> 1, expert -> 0). The negative branch
+        # trains on ALL offline_data; the positive branch on success only.
+        agent.core.config.branch_weight_mode = "neg_all"
+        neg_raw, neg_start_to_row = precompute_neg_all_membership(agent.online_buffer)
+        provider = NegAllGProvider(neg_raw, neg_start_to_row)
+        agent.attach_g_provider(provider)
+        print(
+            f"[offline][neg_all] set branch_weight_mode=neg_all; attached "
+            f"NegAllGProvider (neg windows={int(neg_raw.sum().item())}/{int(neg_raw.numel())}, "
+            "expert->w_neg=0)."
+        )
 
     sample_kwargs = {
         "action_mean": agent.core.act_mean,
@@ -490,6 +582,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Logging + run metadata.                                            #
     # ------------------------------------------------------------------ #
+    mode = str(OmegaConf.select(cfg, "offline.mode", default="normal")).strip().lower()
     metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
     write_resolved_config(cfg, run_dir)
     write_run_info(
@@ -504,8 +597,17 @@ def main(cfg: DictConfig) -> None:
             "initialized_checkpoint": str(pipe.init_checkpoint),
             "nnpu_checkpoint": pipe.nnpu_ckpt,
             "iql_warmup_checkpoint": pipe.warmup_ckpt,
-            "g_mode": "advantage_offline_td",
-            "algorithm_type": "dipole_offline",
+            "offline_mode": mode,
+            "g_mode": {
+                "normal": "advantage_offline_td",
+                "naive": "naive_hard_split",
+                "neg_all": "neg_all_hard_split",
+            }[mode],
+            "algorithm_type": {
+                "normal": "dipole_offline",
+                "naive": "dipole_naive",
+                "neg_all": "dipole_neg_all",
+            }[mode],
             "filter_stats": pipe.filter_stats,
             "replay_valid_windows": int(pipe.n_valid),
             "num_pretrain_transitions": int(pipe.num_pretrain_transitions),

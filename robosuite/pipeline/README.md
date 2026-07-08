@@ -162,13 +162,27 @@ The discriminator path is tensor-native; training does not round-trip features t
 
 ### DIPOLE policy
 
-The policy shares one flow backbone and adds a two-row polarity embedding. It trains positive and negative velocity branches and combines them at inference:
+The policy shares one **frozen** flow backbone and expresses polarity through two symmetric low-rank adapters:
+
+```text
+positive policy = base + pos_LoRA
+negative policy = base + neg_LoRA
+```
+
+Each adapter covers two layer families of the flow head so the frozen backbone has real adaptation capacity:
+- the **condition pathway** `nn.Linear` modules (FiLM `cond_proj`, gated cross-attention, condition MLPs) and, optionally, the condition aggregator (`LoRALinear`); and
+- the **UNet denoising pathway** `nn.Conv1d` modules (`input_proj`, every residual-block `conv1`/`conv2`, up/down samples, `output_conv`) via `LoRAConv1d` (toggle `lora.include_conv`).
+
+Conv coverage matters under a frozen base: the denoising convs hold most of the flow head's capacity, so a condition-only adapter set cannot fit the data — it just drives the FiLM/LoRA deltas to blow up while the loss stalls. Both adapters are zero-initialized (`pos == neg == base` at start) and share the same rank/alpha/dropout/`adapter_lr`. Only the two adapters train; the entire backbone is frozen.
+
+- **Online rollout** uses the positive policy only (`base + pos_LoRA`), a single forward per ODE step (no omega combination).
+- **Evaluation** keeps two-branch guidance, combining the branches at inference:
 
 ```text
 v_guided = (1 + omega) * v_pos - omega * v_neg
 ```
 
-Human-intervention samples explicitly force the positive branch weight to one. For non-intervention samples, the two flow-matching losses are weighted by:
+`omega` is therefore an eval-only knob (`algorithm.dipole.guidance_omega`). Human-intervention samples explicitly force the positive branch weight to one. For non-intervention samples, the two flow-matching losses are weighted by:
 
 ```text
 w_pos = sigmoid(clamp(beta_dipole * normalize(G) + k, -g_clip, g_clip))
@@ -176,7 +190,7 @@ w_neg = 1 - w_pos
 L     = mean(w_pos * L_pos + w_neg * L_neg)
 ```
 
-The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
+The positive loss (`w_pos`) updates `pos_LoRA`; the negative loss (`w_neg`) updates `neg_LoRA`. Because the backbone is frozen and the two adapters are disjoint parameter sets, training is two independent backwards then one optimizer step — no gradient combination. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
 
 ### DIPOLE-RL critics
 
@@ -293,8 +307,8 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
   2. Use the pretrained flow policy and IQL checkpoint to run the DIPOLE-RL update offline. **note**: when compute dipole weight G, use TD term $Adv= V - \gamma*V' - r$ rather then current $Adv=Q-V$
   3. for code structure, make codebase moduler, leave tool functions under `robosuite/pipeline/offline/utils`
   4. implement evaluation logic: evaluate success rate for finetuned policy. For video saving logic and saving directory arrangement, you can refer to `pipeline/sft` folder in branch `dagger/v0-pu-bce`
-- [ ] step 5: Replace the current condition-injection positive/negative policy architecture with a LoRA-like negative branch.
-  - Positive branch should use the original policy path and update all policy network parameters.
-  - Negative branch should add an adapter module; during negative updates, train the adapter and base policy together, with the base-policy learning rate lower than the adapter learning rate.
-  - Online rollout should use only the positive branch.
-  - Evaluation should keep DIPOLE two-branch inference with `(1 + omega)` and `omega` weighting.
+- [x] step 5: Replace the condition-injection positive/negative policy architecture with dual LoRA adapters on a frozen backbone. **note**: the design evolved past the original single-negative-adapter plan — it is now a symmetric **two-adapter** scheme:
+  - The backbone is **frozen**; polarity is carried by two symmetric adapters: `positive = base + pos_LoRA`, `negative = base + neg_LoRA` (both zero-init, shared hyperparameters). This supersedes the earlier "train the adapter and base together with a lower base LR" bullet — base is no longer trained.
+  - Positive loss (`w_pos`) trains `pos_LoRA`; negative loss (`w_neg`) trains `neg_LoRA`. Disjoint parameter sets ⇒ two independent backwards, no gradient combination and no `base_lr_scale`.
+  - Online rollout uses only the positive policy (`base + pos_LoRA`); `guidance_omega` is eval-only.
+  - Evaluation keeps DIPOLE two-branch inference with `(1 + omega)` and `omega` weighting.

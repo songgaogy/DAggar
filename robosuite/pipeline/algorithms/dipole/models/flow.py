@@ -16,9 +16,11 @@ from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
 from .lora import (
     LoRARuntime,
     apply_lora,
+    apply_lora_conv1d,
     default_selector,
-    lora_disabled,
-    lora_full,
+    freeze_base_params,
+    is_lora_param,
+    lora_branch,
     lora_health_metrics,
     lora_masked,
     remap_legacy_cond_keys,
@@ -33,13 +35,19 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 
 
 class DipolePolarityFlowModel(MultiModalFlowPolicy):
-    """Shared backbone + LoRA negative branch for DIPOLE CFG-style guidance.
+    """Frozen backbone + dual LoRA adapters for DIPOLE CFG-style guidance.
 
-    The positive branch is the original pretrained path (LoRA OFF). The negative
-    branch is ``base + LoRA delta`` on the condition-pathway ``nn.Linear`` modules
-    of the flow head (and, optionally, the condition aggregator). Branch selection
-    is carried by a shared :class:`LoRARuntime` so the existing single 2x-batch
-    ``flow_head`` call can apply the delta to only the negative half via a row mask.
+    The shared backbone is frozen; polarity comes from two symmetric low-rank
+    adapters on the condition-pathway ``nn.Linear`` modules of the flow head (and,
+    optionally, the condition aggregator):
+
+    - positive policy = ``base + pos_LoRA``
+    - negative policy = ``base + neg_LoRA``
+
+    Both adapters start at zero delta (``pos == neg == base``). Branch selection is
+    carried by a shared :class:`LoRARuntime` so the existing single 2x-batch
+    ``flow_head`` call can apply the pos adapter to the positive half and the neg
+    adapter to the negative half via a row mask.
     """
 
     def __init__(
@@ -49,6 +57,7 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.0,
         lora_include_aggregator: bool = True,
+        lora_include_conv: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -57,6 +66,7 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
             alpha=lora_alpha,
             dropout=lora_dropout,
             include_aggregator=lora_include_aggregator,
+            include_conv=lora_include_conv,
         )
 
     def _install_lora(
@@ -66,8 +76,10 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
         alpha: float,
         dropout: float,
         include_aggregator: bool,
+        include_conv: bool = True,
     ) -> None:
         self.lora_runtime = LoRARuntime()
+        # (1) Condition-pathway Linears (FiLM/cross-attn/cond MLPs + aggregator).
         self.lora_num_modules = apply_lora(
             self.flow_head,
             self.condition_aggregator if include_aggregator else None,
@@ -77,22 +89,45 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
             selector=default_selector(),
             runtime=self.lora_runtime,
         )
+        # (2) UNet denoising Conv1d pathway (input_proj / conv1,conv2 / up-down
+        # samples / output_conv). Without this the frozen convs cannot adapt and
+        # only the conditioning can move -- insufficient capacity to fit the data.
+        self.lora_num_conv_modules = (
+            apply_lora_conv1d(
+                self.flow_head,
+                rank=int(rank),
+                alpha=float(alpha),
+                dropout=float(dropout),
+                runtime=self.lora_runtime,
+            )
+            if include_conv
+            else 0
+        )
+        # Freeze the whole backbone; only the two LoRA adapters train.
+        self.lora_frozen_numel = freeze_base_params(self)
 
-    def negative_task_scene_cond(self, context: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Re-run the aggregator under LoRA to get the negative-branch condition.
+    def branch_task_scene_cond(
+        self, context: dict[str, torch.Tensor], *, branch: str
+    ) -> torch.Tensor:
+        """Re-run the aggregator under the ``branch`` adapter to get its condition.
 
-        ``encode_multimodal_context`` runs the aggregator with LoRA disabled, so
-        ``context['task_scene_cond']`` is the positive (base) condition. The
-        aggregator sits before the 2x split, so the per-row mask cannot reach it;
-        instead we recompute the negative condition with a cheap second aggregator
-        pass (once per inference, not per ODE step).
+        ``encode_multimodal_context`` runs the aggregator base-only, so
+        ``context['task_scene_cond']`` is the base condition. The aggregator is
+        LoRA-wrapped and sits before the 2x split, so the per-row mask cannot reach
+        it; instead we recompute each branch's condition with a cheap aggregator
+        pass (once per inference, not per ODE step). Both the positive and negative
+        branches diverge from base here.
         """
-        with lora_full(self.lora_runtime):
+        with lora_branch(self.lora_runtime, branch):
             return self.condition_aggregator(
                 fused_tokens=context["fused_tokens"],
                 token_padding_mask=context["token_padding_mask"],
                 language_global=context["language_global"],
             )
+
+    def negative_task_scene_cond(self, context: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Backwards-compatible alias for ``branch_task_scene_cond(branch='neg')``."""
+        return self.branch_task_scene_cond(context, branch="neg")
 
     def forward_from_context(
         self,
@@ -102,8 +137,8 @@ class DipolePolarityFlowModel(MultiModalFlowPolicy):
         *,
         negative: bool,
     ) -> torch.Tensor:
-        manager = lora_full(self.lora_runtime) if negative else lora_disabled(self.lora_runtime)
-        with manager:
+        branch = "neg" if negative else "pos"
+        with lora_branch(self.lora_runtime, branch):
             return self.flow_head(
                 x_t=x_t,
                 timesteps=t,
@@ -123,6 +158,7 @@ def build_dipole_flow_policy(
     lora_alpha: float,
     lora_dropout: float,
     lora_include_aggregator: bool,
+    lora_include_conv: bool = True,
 ) -> DipolePolarityFlowModel:
     base = build_flow_policy(cfg, proprio_dim=proprio_dim, action_dim=action_dim, camera_names=camera_names)
     # Re-instantiate as DipolePolarityFlowModel sharing the same submodules.
@@ -143,6 +179,7 @@ def build_dipole_flow_policy(
         alpha=float(lora_alpha),
         dropout=float(lora_dropout),
         include_aggregator=bool(lora_include_aggregator),
+        include_conv=bool(lora_include_conv),
     )
     return polar
 
@@ -165,19 +202,24 @@ def _sample_guided_action_sequence(
     else:
         x = torch.randn(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
     context = model.encode_multimodal_context(images=images, proprio=proprio, language=language)
+    # The aggregator is LoRA-wrapped, so ``context['task_scene_cond']`` is base-only.
+    # The positive policy is ``base + pos_LoRA`` everywhere, so recompute the
+    # positive condition under the pos adapter (used by both the omega==0 fast path
+    # and the guided path below).
+    context["task_scene_cond"] = model.branch_task_scene_cond(context, branch="pos")
     guided_context: dict[str, torch.Tensor] | None = None
     row_mask: torch.Tensor | None = None
     if float(omega) != 0.0:
-        # Positive condition is the base aggregator output; recompute the negative
-        # condition once via a LoRA aggregator pass (decision: train/eval consistent).
+        # Positive condition uses the pos adapter; recompute the negative condition
+        # once via a neg-adapter aggregator pass (decision: train/eval consistent).
         pos_cond = context["task_scene_cond"]
-        neg_cond = model.negative_task_scene_cond(context)
+        neg_cond = model.branch_task_scene_cond(context, branch="neg")
         guided_context = {
             "task_scene_cond": torch.cat([pos_cond, neg_cond], dim=0),
             "context_tokens": context["context_tokens"].repeat(2, 1, 1),
             "context_padding_mask": context["context_padding_mask"].repeat(2, 1),
         }
-        # First half = positive (base only), second half = negative (base + LoRA).
+        # First half = positive (base + pos_LoRA), second half = negative (base + neg_LoRA).
         row_mask = torch.cat(
             [
                 torch.zeros(batch_size, dtype=torch.bool, device=proprio.device),
@@ -193,8 +235,9 @@ def _sample_guided_action_sequence(
             dtype=proprio.dtype,
         )
         if float(omega) == 0.0:
-            # omega=0 => v = v_pos exactly; skip the negative branch forward pass
-            # (halves the per-ODE-step network cost, identical result).
+            # omega=0 => v = v_pos exactly (positive policy = base + pos_LoRA); skip
+            # the negative branch forward pass (halves the per-ODE-step network cost).
+            # This is the online-rollout path (guided=False).
             v = model.forward_from_context(x_t=x, t=t, context=context, negative=False)
         else:
             assert guided_context is not None and row_mask is not None
@@ -237,28 +280,29 @@ class DipoleFlowPolicy:
             lora_alpha=float(config.lora_alpha),
             lora_dropout=float(config.lora_dropout),
             lora_include_aggregator=bool(config.lora_include_aggregator),
+            lora_include_conv=bool(config.lora_include_conv),
         ).to(self.device)
 
-        # Two param groups: base backbone at the policy LR, LoRA adapter at adapter_lr.
-        # Decision 1: positive loss updates base at full LR; negative loss updates LoRA
-        # (adapter_lr) AND base (lower LR = base_lr_scale * learning_rate). The lower
-        # base contribution is applied as a gradient scale in ``update`` (see below).
+        # Frozen backbone + two symmetric adapters: the only trainable parameters are
+        # the pos/neg LoRA adapters, both at adapter_lr. The positive loss updates
+        # pos_LoRA, the negative loss updates neg_LoRA; base is frozen so there is no
+        # gradient combination and base_lr_scale is obsolete.
         lora_params = [
             param
             for name, param in self.model.named_parameters()
-            if param.requires_grad and (".lora_A" in name or ".lora_B" in name)
+            if param.requires_grad and is_lora_param(name)
         ]
-        base_params = [
-            param
+        trainable_non_lora = [
+            name
             for name, param in self.model.named_parameters()
-            if param.requires_grad and not (".lora_A" in name or ".lora_B" in name)
+            if param.requires_grad and not is_lora_param(name)
         ]
-        self._base_params = base_params
+        assert not trainable_non_lora, (
+            f"backbone must be frozen; found trainable non-LoRA params: {trainable_non_lora[:4]}"
+        )
         self._lora_params = lora_params
-        self.base_lr_scale = float(config.base_lr_scale)
         self.optimizer = torch.optim.AdamW(
             [
-                {"params": base_params, "lr": float(config.learning_rate), "weight_decay": float(config.weight_decay)},
                 {"params": lora_params, "lr": float(config.adapter_lr), "weight_decay": 0.0},
             ]
         )
@@ -346,7 +390,10 @@ class DipoleFlowPolicy:
             return None
         return np.asarray(self.current_chunk, dtype=np.float32).copy()
 
-    def select_action(self, obs, deterministic: bool = False) -> np.ndarray:
+    def select_action(self, obs, deterministic: bool = False, *, guided: bool = True) -> np.ndarray:
+        # guided=True  -> two-branch omega guidance (eval): v=(1+w)v_pos - w v_neg
+        # guided=False -> positive-only rollout (base + pos_LoRA), single forward
+        omega = float(self.config.guidance_omega) if guided else 0.0
         if self.needs_action_chunk():
             images = []
             for camera_name in self.camera_names:
@@ -370,7 +417,7 @@ class DipoleFlowPolicy:
                     language=[self.language_instruction],
                     action_horizon=int(self.config.action_horizon),
                     n_steps=int(self.config.n_ode_steps),
-                    omega=float(self.config.guidance_omega),
+                    omega=float(omega),
                     deterministic=bool(deterministic),
                 )[0].detach().cpu().numpy().astype(np.float32)
             if self.act_mean is not None and self.act_std is not None:
@@ -383,13 +430,15 @@ class DipoleFlowPolicy:
         return action
 
     @torch.inference_mode()
-    def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
+    def plan_action_chunk(self, obs, deterministic: bool = False, *, guided: bool = True) -> np.ndarray:
         """Plan a fresh action chunk from ``obs`` without mutating ``current_chunk``.
 
         Mirrors the inference path inside :meth:`select_action` but returns the full
         un-normalized ``(horizon, action_dim)`` chunk, so callers (e.g. the live
-        discriminator display) can feed it to a G provider.
+        discriminator display) can feed it to a G provider. ``guided=False`` plans
+        with the positive policy only (base + pos_LoRA), matching online rollout.
         """
+        omega = float(self.config.guidance_omega) if guided else 0.0
         images = []
         for camera_name in self.camera_names:
             image = np.asarray(obs[camera_name], dtype=np.uint8)
@@ -411,7 +460,7 @@ class DipoleFlowPolicy:
                 language=[self.language_instruction],
                 action_horizon=int(self.config.action_horizon),
                 n_steps=int(self.config.n_ode_steps),
-                omega=float(self.config.guidance_omega),
+                omega=float(omega),
                 deterministic=bool(deterministic),
             )[0].detach().cpu().numpy().astype(np.float32)
         if self.act_mean is not None and self.act_std is not None:
@@ -449,6 +498,32 @@ class DipoleFlowPolicy:
         }
         return w_pos, w_neg, metrics
 
+    def _neg_all_branch_weights(
+        self,
+        batch: DipoleBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        """Decoupled hard-label weights for ``offline.mode == "neg_all"``.
+
+        - ``w_pos = is_intervention`` (expert + success_rollout -> 1, fail -> 0):
+          the positive branch trains on success data only.
+        - ``w_neg`` = the attached provider's per-frame membership (offline_data
+          rows -> 1, expert -> 0): the negative branch trains on ALL offline_data
+          with weight 1.
+
+        Unlike the coupled path, ``w_neg`` is neither ``1 - w_pos`` nor zeroed on
+        intervention rows, so success frames drive BOTH branches
+        (``w_pos = w_neg = 1``).
+        """
+        B = batch.batch_size
+        w_pos = batch.is_intervention.to(self.device).float().reshape(-1)
+        if self.g_provider is None:
+            w_neg = torch.ones(B, dtype=torch.float32, device=self.device)
+        else:
+            raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
+            w_neg = raw.clamp(0.0, 1.0)
+        metrics = {"neg_membership_mean": float(w_neg.mean().item())}
+        return w_pos, w_neg, metrics
+
     def _compute_branch_weights(
         self,
         batch: DipoleBatch,
@@ -459,6 +534,9 @@ class DipoleFlowPolicy:
         - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
         - online_buffer rows: raw G and sigmoid use online rows only
         """
+        if getattr(self.config, "branch_weight_mode", "coupled") == "neg_all":
+            return self._neg_all_branch_weights(batch)
+
         B = batch.batch_size
         demo_mask = self._resolve_demo_sample_mask(batch, self.device)
 
@@ -568,49 +646,40 @@ class DipoleFlowPolicy:
         x_t_swapped = x_t.transpose(1, 2)
         self.optimizer.zero_grad(set_to_none=True)
 
-        # --- Positive branch: original pretrained path (LoRA OFF) -> updates base @ full LR.
+        # Shared frozen backbone: encode once. The aggregator is recomputed per branch
+        # under its adapter (base task_scene_cond is unused).
         with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
             context = self.model.encode_multimodal_context(
                 images=batch.image_obs,
                 proprio=batch.proprio,
                 language=language,
             )
+
+        # --- Positive branch: base + pos_LoRA -> updates pos_LoRA only.
+        with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
+            pos_context = dict(context)
+            pos_context["task_scene_cond"] = self.model.branch_task_scene_cond(context, branch="pos")
             v_pos = self.model.forward_from_context(
-                x_t=x_t_swapped, t=timesteps, context=context, negative=False,
+                x_t=x_t_swapped, t=timesteps, context=pos_context, negative=False,
             ).transpose(1, 2)
             loss_pos, flow_pos, endpoint_pos, smooth_pos, v_pos_mse = _branch_losses(v_pos, w_pos)
         # retain_graph so the negative backward can still traverse the shared encode graph.
         self.scaler.scale(loss_pos).backward(retain_graph=True)
-        # Cache base grads from the positive loss, then clear (LoRA has no positive grad).
-        g_pos = {p: p.grad.detach().clone() for p in self._base_params if p.grad is not None}
-        for p in self._base_params:
-            p.grad = None
 
-        # --- Negative branch: base + LoRA -> updates LoRA @ adapter_lr and base @ lower LR.
+        # --- Negative branch: base + neg_LoRA -> updates neg_LoRA only.
         with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
             neg_context = dict(context)
-            neg_context["task_scene_cond"] = self.model.negative_task_scene_cond(context)
+            neg_context["task_scene_cond"] = self.model.branch_task_scene_cond(context, branch="neg")
             v_neg = self.model.forward_from_context(
                 x_t=x_t_swapped, t=timesteps, context=neg_context, negative=True,
             ).transpose(1, 2)
             loss_neg, flow_neg, endpoint_neg, smooth_neg, v_neg_mse = _branch_losses(v_neg, w_neg)
         self.scaler.scale(loss_neg).backward()
 
-        # Combine base grads: full-LR positive + lower-LR negative. All grads share the
-        # same GradScaler scale, so the base_lr_scale ratio is scale-invariant; the single
-        # AdamW base group (lr=learning_rate) then yields full_lr*g_pos + base_lr_neg*g_neg.
-        for p in self._base_params:
-            gp = g_pos.get(p)
-            if p.grad is None:
-                if gp is not None:
-                    p.grad = gp
-            elif gp is None:
-                p.grad = self.base_lr_scale * p.grad
-            else:
-                p.grad = gp + self.base_lr_scale * p.grad
-
+        # base is frozen and pos/neg adapters are disjoint parameter sets, so each
+        # backward populates its own adapter grads -- no manual combination needed.
         self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.config.grad_clip_norm))
+        torch.nn.utils.clip_grad_norm_(self._lora_params, max_norm=float(self.config.grad_clip_norm))
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -684,7 +753,12 @@ class DipoleFlowPolicy:
             self.model.load_state_dict(model_state)
             optimizer_state = state_dict.get("optimizer")
             if optimizer_state is not None:
-                self.optimizer.load_state_dict(optimizer_state)
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                except (ValueError, KeyError) as exc:
+                    # A legacy 2-group (base + LoRA) optimizer state does not match the
+                    # new single LoRA group; skip it and start the optimizer fresh.
+                    print(f"[dipole] skipping incompatible optimizer state: {exc}")
             self.set_normalizers(
                 action_mean=state_dict.get("act_mean"),
                 action_std=state_dict.get("act_std"),

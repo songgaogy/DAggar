@@ -12,16 +12,17 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 TASK="PickPlaceCereal"
 POLICY_CKPT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
-IQL_CKPT="outputs/dipole_rl/offline_iql_qv-v2/PickPlaceCereal/iql_state.pt"
+# weight: 5:1
+IQL_CKPT="outputs/dipole_rl-iql/offline_iql_qv-v2-disc0p02/PickPlaceCereal/iql_state.pt"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_TRAIN_STEPS=15000
-RUN_SUBFIX="no-norm_beta8"
+RUN_SUBFIX="no-norm_beta4"
 # -------------------------------------
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"

@@ -14,8 +14,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole_offline/PickPlaceCereal/2026-07-01_23-02-14_no-norm_beta8/checkpoints/step_00014999.pt"
-OMEGA=15
+POLICY_CKPT="/home/dodo/Documents/DAggar/robosuite/outputs/dipole_offline/PickPlaceCereal/2026-07-08_02-35-39_neg_all/checkpoints/latest.pt"
+OMEGAS=(0 1 5)
+# OMEGAS=(0.5 2 10)
 EVAL_EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 SAVE_VIDEO=true
@@ -30,23 +31,24 @@ VIDEO_SIZE=256    # square video frame size; 256 renders 4x fewer pixels than th
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HYDRA_FULL_ERROR=1
 
-EVAL_ARGS=(
-  --checkpoint "${POLICY_CKPT}"
-  --env-name "${TASK}"
-  --task-name "${TASK}"
-  --omega "${OMEGA}"
-  --episodes "${EVAL_EPISODES}"
-  --episode-max-steps "${EVAL_EPISODE_MAX_STEPS}"
-  --video-output "${SAVE_VIDEO}"
-  --video-height "${VIDEO_SIZE}"
-  --video-width "${VIDEO_SIZE}"
-  --seed "${SEED}"
-  --device "${DEVICE}"
-)
-if [[ -n "${INIT_CHECKPOINT}" ]]; then
-  EVAL_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT}")
-fi
+for OMEGA in "${OMEGAS[@]}"; do
+  EVAL_ARGS=(
+    --checkpoint "${POLICY_CKPT}"
+    --env-name "${TASK}"
+    --task-name "${TASK}"
+    --omega "${OMEGA}"
+    --episodes "${EVAL_EPISODES}"
+    --episode-max-steps "${EVAL_EPISODE_MAX_STEPS}"
+    --video-output "${SAVE_VIDEO}"
+    --video-height "${VIDEO_SIZE}"
+    --video-width "${VIDEO_SIZE}"
+    --seed "${SEED}"
+    --device "${DEVICE}"
+  )
+  if [[ -n "${INIT_CHECKPOINT}" ]]; then
+    EVAL_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT}")
+  fi
 
-echo "[eval_offline_dipole] task=${TASK} ckpt=${POLICY_CKPT} omega=${OMEGA} episodes=${EVAL_EPISODES} seed=${SEED} video=${SAVE_VIDEO} video_size=${VIDEO_SIZE}"
-
-"${PY}" -m robosuite.pipeline.offline.eval_offline_dipole "${EVAL_ARGS[@]}"
+  echo "[eval_offline_dipole] task=${TASK} ckpt=${POLICY_CKPT} omega=${OMEGA} episodes=${EVAL_EPISODES} seed=${SEED} video=${SAVE_VIDEO} video_size=${VIDEO_SIZE}"
+  "${PY}" -m robosuite.pipeline.offline.eval_offline_dipole "${EVAL_ARGS[@]}"
+done

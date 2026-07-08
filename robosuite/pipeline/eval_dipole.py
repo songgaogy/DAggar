@@ -229,8 +229,8 @@ def _build_dipole_policy(
         lora_alpha=float(flow_cfg.get("lora_alpha", 16.0)),
         lora_dropout=float(flow_cfg.get("lora_dropout", 0.0)),
         lora_include_aggregator=bool(flow_cfg.get("lora_include_aggregator", True)),
+        lora_include_conv=bool(flow_cfg.get("lora_include_conv", True)),
         adapter_lr=float(flow_cfg.get("adapter_lr", 1e-3)),
-        base_lr_scale=float(flow_cfg.get("base_lr_scale", 0.1)),
     )
     policy = DipoleFlowPolicy(
         model_cfg=dict(payload["model_cfg"]),

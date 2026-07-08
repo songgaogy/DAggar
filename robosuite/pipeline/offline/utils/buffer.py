@@ -234,11 +234,19 @@ def load_offline_data_transitions(
     camera_names: list[str],
     image_size: int,
     episode_index_base: int = 0,
+    keep_kinds: set[str] | None = None,
+    mark_intervention: bool | None = None,
 ) -> tuple[list[Transition], int, dict[str, int]]:
     """Load + filter the warmup-exported offline transitions.
 
     Returns ``(transitions, next_episode_index_base, stats)``. ``stats`` counts
     kept/dropped frames per trajectory kind for logging/verification.
+
+    ``keep_kinds`` optionally restricts which trajectory kinds are kept (``None``
+    keeps the default success + fail; e.g. ``{"success"}`` drops fail entirely for
+    a success-only run). ``mark_intervention`` is forwarded to
+    :func:`_materialize_run` to override ``is_intervention`` on every kept frame
+    (``True`` forces the policy's ``w_pos=1`` positive-branch-only update).
     """
     offline_dir = Path(data_root) / str(task_name) / str(offline_data_dir)
     offline_path = offline_dir / "iql_offline_transitions.pt"
@@ -268,6 +276,7 @@ def load_offline_data_transitions(
         "fail_dropped": 0,
         "expert_skipped": 0,
         "unknown_kept": 0,
+        "kind_skipped": 0,
     }
 
     out: list[Transition] = []
@@ -279,6 +288,10 @@ def load_offline_data_transitions(
         kind = _trajectory_kind(namespace)
         if kind == "expert":
             stats["expert_skipped"] += len(episode)
+            continue
+        if keep_kinds is not None and kind not in keep_kinds:
+            # e.g. success-only run drops fail (and unknown) trajectories entirely.
+            stats["kind_skipped"] += len(episode)
             continue
         kept = [t for t in episode if _keep_frame(t, kind)]
         dropped = len(episode) - len(kept)
@@ -295,14 +308,19 @@ def load_offline_data_transitions(
         # A filtered episode may have temporal gaps -> split into adjacent runs.
         for run in _contiguous_runs(kept):
             out.extend(
-                _materialize_run(run, episode_index=next_index, namespace=namespace)
+                _materialize_run(
+                    run,
+                    episode_index=next_index,
+                    namespace=namespace,
+                    mark_intervention=mark_intervention,
+                )
             )
             next_index += 1
 
     logger.info(
         "[offline] offline_data: %d transitions kept "
         "(success_kept=%d/dropped=%d, fail_kept=%d/dropped=%d, "
-        "expert_skipped=%d, unknown_kept=%d) -> %d episodes",
+        "expert_skipped=%d, unknown_kept=%d, kind_skipped=%d) -> %d episodes",
         len(out),
         stats["success_kept"],
         stats["success_dropped"],
@@ -310,6 +328,7 @@ def load_offline_data_transitions(
         stats["fail_dropped"],
         stats["expert_skipped"],
         stats["unknown_kept"],
+        stats["kind_skipped"],
         next_index - int(episode_index_base),
     )
     return out, next_index, stats

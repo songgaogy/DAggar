@@ -47,7 +47,7 @@ algorithm:
       weight_decay: 1.0e-6
       device: "cuda:1"
       output_reward_coef: 0.1
-      disc_reward_coef: 0.0
+      disc_reward_coef: 0
       update_freq: 1
     warmup_value_steps: 10000
     warmup_full_steps: 5000
