@@ -3,10 +3,8 @@
 A deliberately stripped-down sibling of ``train_offline_dipole.py`` used as a
 control experiment:
 
-- Loads **only the ``success_rollout`` split** (the 50 success trajectories the
-  IQL warmup exported into ``iql_offline_transitions.pt``), keeping only the
-  pre-success frames (``info["success"]`` is False) — no expert ``pretrain_data``
-  and no ``fail_rollout``.
+- Loads the same positive data as ``offline.mode in {naive, neg_all}``: expert
+  ``pretrain_data`` plus the ``success_rollout`` split (pre-success frames only).
 - Every kept frame is marked ``is_intervention=True`` so the DIPOLE update forces
   ``w_pos=1, w_neg=0``: this is a plain positive-branch flow-matching SFT. The
   negative adapter (``neg_LoRA``) stays at its zero init, so ``neg == base`` and
@@ -19,7 +17,7 @@ control experiment:
 
 Run as a Hydra module (config inherits ``offline``)::
 
-    python -m robosuite.pipeline.offline.train_success_only \\
+    python -m robosuite.pipeline.offline.legacy.train_success_only \\
         env.environment=PickPlaceCereal \\
         runtime.init_checkpoint=checkpoints/.../flow.pt
 """
@@ -38,6 +36,8 @@ from robosuite.pipeline.offline.utils import (
     build_agent_env,
     finalize_normalizers,
     load_offline_data_transitions,
+    load_pretrain_transitions,
+    make_hdf5_loader,
     populate_replay_buffer,
 )
 from robosuite.pipeline.utils import (
@@ -52,18 +52,29 @@ logger = logging.getLogger(__name__)
 
 
 def _build_success_only_agent(cfg: DictConfig):
-    """Build the DIPOLE agent + load ONLY the success_rollout split (no critics).
+    """Build the DIPOLE agent + load positive-only data (no critics).
 
     Reuses the shared env/agent setup (:func:`build_agent_env`) and skips the
-    IQL/nnPU/discriminator/advantage machinery entirely; every kept frame is
-    forced to the positive branch (``mark_intervention=True``).
+    IQL/nnPU/discriminator/advantage machinery entirely. Expert pretrain and
+    success_rollout frames are forced to the positive branch.
     """
     ctx = build_agent_env(cfg, log_tag="success_only")
     agent = ctx.agent
     try:
         # ------------------------------------------------------------------ #
-        # Load ONLY success_rollout trajectories, forced to positive branch. #
+        # Load expert + success_rollout trajectories for the positive branch. #
         # ------------------------------------------------------------------ #
+        hdf5_loader = make_hdf5_loader(ctx, cfg)
+        max_pretrain = OmegaConf.select(cfg, "offline.max_pretrain_trajectories", default=None)
+        max_pretrain = None if max_pretrain is None else int(max_pretrain)
+        pretrain_transitions, episode_base = load_pretrain_transitions(
+            data_root=str(cfg.offline.data_root),
+            task_name=ctx.task_name,
+            pretrain_dir=str(cfg.offline.pretrain_dir),
+            hdf5_loader=hdf5_loader,
+            max_num_trajectories=max_pretrain,
+            episode_index_base=0,
+        )
         success_transitions, _, filter_stats = load_offline_data_transitions(
             data_root=str(cfg.offline.data_root),
             task_name=ctx.task_name,
@@ -71,29 +82,30 @@ def _build_success_only_agent(cfg: DictConfig):
             action_horizon=int(agent.flow_config.action_horizon),
             camera_names=ctx.policy_camera_names,
             image_size=ctx.img_height,
-            episode_index_base=0,
+            episode_index_base=episode_base,
             keep_kinds={"success"},
             mark_intervention=True,
         )
     finally:
         ctx.env.close()
 
-    if not success_transitions:
+    if not pretrain_transitions and not success_transitions:
         raise RuntimeError(
-            "Success-only SFT loaded zero success transitions; check that "
-            f"{cfg.offline.data_root}/{ctx.task_name}/{cfg.offline.offline_data_dir}/"
-            "iql_offline_transitions.pt exists and contains success_rollout data."
+            "Success-only SFT loaded zero positive transitions; check offline.pretrain_dir "
+            "and offline.offline_data_dir."
         )
-    n_valid = populate_replay_buffer(agent.online_buffer, success_transitions)
+    all_transitions = list(pretrain_transitions) + list(success_transitions)
+    n_valid = populate_replay_buffer(agent.online_buffer, all_transitions)
     print(
         f"[success_only] replay_buffer: {len(agent.online_buffer)} transitions "
-        f"(success only, all w_pos=1), {n_valid} valid windows; "
+        f"(pretrain={len(pretrain_transitions)} + success={len(success_transitions)}, "
+        f"all w_pos=1), {n_valid} valid windows; "
         f"demo_buffer empty ({len(agent.demo_buffer)})"
     )
 
     batch_size = finalize_normalizers(
-        agent, cfg, success_transitions,
-        log_tag="success_only", norm_desc="success transitions",
+        agent, cfg, pretrain_transitions if pretrain_transitions else all_transitions,
+        log_tag="success_only", norm_desc="pretrain transitions",
     )
 
     return (
@@ -103,12 +115,14 @@ def _build_success_only_agent(cfg: DictConfig):
         ctx.img_height,
         filter_stats,
         int(n_valid),
+        int(len(pretrain_transitions)),
         int(len(success_transitions)),
+        int(len(all_transitions)),
         batch_size,
     )
 
 
-@hydra.main(version_base="1.2", config_path="../config", config_name="success_only")
+@hydra.main(version_base="1.2", config_path="../../config", config_name="success_only")
 def main(cfg: DictConfig) -> None:
     (
         agent,
@@ -117,7 +131,9 @@ def main(cfg: DictConfig) -> None:
         _img_height,
         filter_stats,
         n_valid,
+        num_pretrain_transitions,
         num_success_transitions,
+        num_total_transitions,
         batch_size,
     ) = _build_success_only_agent(cfg)
     task_name = str(cfg.env.environment)
@@ -152,7 +168,9 @@ def main(cfg: DictConfig) -> None:
             "algorithm_type": "dipole_success_only",
             "filter_stats": filter_stats,
             "replay_valid_windows": int(n_valid),
+            "num_pretrain_transitions": int(num_pretrain_transitions),
             "num_success_transitions": int(num_success_transitions),
+            "num_total_transitions": int(num_total_transitions),
         },
     )
 
@@ -185,7 +203,7 @@ def main(cfg: DictConfig) -> None:
         for step in range(num_steps):
             batch = agent.online_buffer.sample(batch_size, **sample_kwargs)
             # No g_provider attached + all rows is_intervention=True => w_pos=1,
-            # w_neg=0: plain positive-branch flow-matching SFT.
+            # w_neg=0: expert+success positive-branch flow-matching SFT.
             metrics = agent.core.update(batch=batch, collect_diagnostics=False)
             metrics.pop("_diag", None)
             if step % log_interval == 0 or step == num_steps - 1:

@@ -29,6 +29,8 @@ VIS_CELL_PX="${VIS_CELL_PX:-384}"  # per-sample cell resolution in the grid
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HYDRA_FULL_ERROR=1
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 HYDRA_OVERRIDES=(
   "env.environment=${TASK}"
@@ -47,6 +49,7 @@ HYDRA_OVERRIDES=(
   "+vis.seed=${VIS_SEED}"
   "+vis.cell_px=${VIS_CELL_PX}"
 )
+HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[vis_batch] task=${TASK} device=${DEVICE}"
 echo "[vis_batch] vis_batch_size=${VIS_BATCH_SIZE} num_batches=${VIS_NUM_BATCHES} fps=${VIS_FPS}"

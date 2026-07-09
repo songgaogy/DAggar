@@ -62,6 +62,7 @@ from robosuite.pipeline.train_dipole import (
 from robosuite.pipeline.utils import resolve_task_demo_paths
 from robosuite.pipeline.utils.io import list_hdf5_demo_names, load_transition_shard
 from robosuite.pipeline.utils.train_utils import (
+    TensorBoardMetricLogger,
     resolve_camera_names,
     resolve_demo_task_name,
     resolve_requested_device,
@@ -73,6 +74,59 @@ print = partial(builtins.print, flush=True)
 
 # Robosuite task dirs use these folder names (see flow_multi/generate_rollout_data.py).
 DEFAULT_WARMUP_DEMO_SPLITS: tuple[str, ...] = ("expert", "success_rollout", "fail_rollout")
+
+
+def _build_warmup_tensorboard(
+    cfg: DictConfig,
+    *,
+    output_path: Path,
+) -> TensorBoardMetricLogger | None:
+    raw_dir = OmegaConf.select(cfg, "warmup.tensorboard_dir", default=None)
+    log_dir = (
+        Path(str(raw_dir))
+        if raw_dir is not None
+        else output_path.parent / "tensorboard"
+    )
+    if not log_dir.is_absolute():
+        log_dir = Path(to_absolute_path(str(log_dir)))
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("[warmup][tensorboard] tensorboard is not installed; skipping.")
+        return None
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logger = TensorBoardMetricLogger(SummaryWriter(log_dir=str(log_dir)), log_dir)
+    resolved_cfg = OmegaConf.to_yaml(cfg, resolve=True)
+    logger.log_text("run/config_resolved", f"```\n{resolved_cfg}\n```", step=0)
+    logger.log_text("run/iql_output_path", str(output_path), step=0)
+    print(f"[warmup][tensorboard] log_dir={log_dir}")
+    return logger
+
+
+@torch.no_grad()
+def _iql_batch_debug_metrics(batch: Any, *, prefix: str) -> dict[str, float]:
+    rewards = batch.rewards.detach()
+    dones = batch.dones.detach()
+    actions = batch.action_chunk.detach()
+    return {
+        f"{prefix}/batch_reward_mean": float(rewards.mean().item()),
+        f"{prefix}/batch_reward_std": float(rewards.std(unbiased=False).item()),
+        f"{prefix}/batch_reward_min": float(rewards.min().item()),
+        f"{prefix}/batch_reward_max": float(rewards.max().item()),
+        f"{prefix}/batch_done_ratio": float(dones.mean().item()),
+        f"{prefix}/batch_action_abs_mean": float(actions.abs().mean().item()),
+        f"{prefix}/batch_action_l2_mean": float(
+            actions.flatten(start_dim=1).norm(dim=1).mean().item()
+        ),
+        f"{prefix}/batch_online_ratio": float(batch.is_online.detach().mean().item()),
+        f"{prefix}/batch_intervention_ratio": float(
+            batch.is_intervention.detach().mean().item()
+        ),
+    }
+
+
+def _prefixed_metrics(metrics: dict[str, float], *, prefix: str) -> dict[str, float]:
+    return {f"{prefix}/{key}": float(value) for key, value in metrics.items()}
 
 
 def _resolve_warmup_num_load_workers(cfg: DictConfig) -> int:
@@ -501,6 +555,7 @@ def main(cfg: DictConfig) -> None:
         )
     output_path = Path(to_absolute_path(str(warmup_cfg.output_path)))
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    tb_logger = _build_warmup_tensorboard(cfg, output_path=output_path)
 
     q_cfg_block = cfg.algorithm.q_learning
     value_steps = int(getattr(q_cfg_block, "warmup_value_steps", 20000))
@@ -764,6 +819,51 @@ def main(cfg: DictConfig) -> None:
             f"IQL warmup buffer has too few valid chunks ({buffer.num_valid_sequences()}) "
             f"to fill batch_size={batch_size}."
         )
+    if tb_logger is not None:
+        tb_logger.log(
+            {
+                "run/seed": float(seed),
+                "run/batch_size": float(batch_size),
+                "run/value_steps": float(value_steps),
+                "run/full_steps": float(full_steps),
+                "data/transitions": float(len(buffer)),
+                "data/valid_starts": float(buffer.num_valid_sequences()),
+                "data/freeze_post_success": float(freeze_post_success),
+                "iql/discount": float(iql_cfg.discount),
+                "iql/expectile_tau": float(iql_cfg.expectile_tau),
+                "iql/q_lr": float(iql_cfg.q_lr),
+                "iql/v_lr": float(iql_cfg.v_lr),
+                "iql/target_polyak": float(iql_cfg.target_polyak),
+                "iql/grad_clip_norm": float(iql_cfg.grad_clip_norm),
+                "reward/output_reward_coef": float(iql_cfg.output_reward_coef),
+                "reward/disc_reward_coef": float(iql_cfg.disc_reward_coef),
+                "reward/nnpu_threshold": float(
+                    discriminator.threshold if discriminator is not None else float("nan")
+                ),
+            },
+            step=0,
+        )
+        tb_logger.log_text(
+            "run/warmup_paths",
+            json.dumps(
+                {
+                    "output_path": str(output_path),
+                    "init_checkpoint": str(init_checkpoint),
+                    "nnpu_checkpoint": str(nnpu_ckpt),
+                    "task_env": task_name,
+                    "task_data": task_data_name,
+                    "demo_splits": list(demo_splits),
+                    "split_caps": {str(k): split_caps[k] for k in demo_splits},
+                    "device": str(device),
+                    "preencode_cache": bool(
+                        OmegaConf.select(cfg, "warmup.preencode_cache", default=True)
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            step=0,
+        )
 
     print(
         f"[warmup] disc_reward: frozen nnPU scores on chunk features "
@@ -810,12 +910,22 @@ def main(cfg: DictConfig) -> None:
             device=device,
         )
         metrics = iql.warmup_value_only(batch)
+        if tb_logger is not None:
+            tb_logger.log(
+                {
+                    **_prefixed_metrics(metrics, prefix="train/value"),
+                    **_iql_batch_debug_metrics(batch, prefix="train/value"),
+                },
+                step=step,
+            )
         if step % max(1, value_steps // 20) == 0 or step == value_steps - 1:
             print(
                 f"[warmup][value]  step={step:6d} "
                 f"v_loss={metrics['v_loss']:.4f} v_mean={metrics['v_mean']:+.3f} "
                 f"target_mean={metrics['target_mean']:+.3f}"
             )
+            if tb_logger is not None:
+                tb_logger.flush()
 
     print(f"[warmup] starting full IQL update loop for {full_steps} steps")
     for step in range(full_steps):
@@ -826,6 +936,15 @@ def main(cfg: DictConfig) -> None:
             device=device,
         )
         metrics = iql.update(batch)
+        global_step = value_steps + step
+        if tb_logger is not None:
+            tb_logger.log(
+                {
+                    **_prefixed_metrics(metrics, prefix="train/full"),
+                    **_iql_batch_debug_metrics(batch, prefix="train/full"),
+                },
+                step=global_step,
+            )
         if step % max(1, full_steps // 20) == 0 or step == full_steps - 1:
             print(
                 f"[warmup][full]   step={step:6d} "
@@ -833,6 +952,8 @@ def main(cfg: DictConfig) -> None:
                 f"q1={metrics['q1_mean']:+.3f} v={metrics['v_mean']:+.3f} "
                 f"td={metrics['td_error_abs_mean']:.4f}"
             )
+            if tb_logger is not None:
+                tb_logger.flush()
 
     payload = {
         "iql_state": iql.state_dict(),
@@ -873,6 +994,9 @@ def main(cfg: DictConfig) -> None:
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")
+    if tb_logger is not None:
+        tb_logger.flush()
+        tb_logger.close()
 
 
 

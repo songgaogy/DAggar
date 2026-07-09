@@ -24,6 +24,7 @@
 #   SAVE_DATA         — "true"/"false": save assembled offline transitions to
 #                        <data_root>/<task>/<SAVE_DIR>/ (unset = config default).
 #   SAVE_DIR          — subdir name for the saved offline data (default offline_data).
+#   TENSORBOARD_DIR   — tensorboard event dir (default <OUTPUT_DIR>/tensorboard).
 
 set -euo pipefail
 
@@ -49,6 +50,7 @@ DEVICE="${DEVICE:-cuda:0}"
 PREENCODE_CACHE_DEVICE="${PREENCODE_CACHE_DEVICE:-cpu}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
+TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 INIT_CHECKPOINT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 mkdir -p "${OUTPUT_DIR}"
 
@@ -58,6 +60,8 @@ mkdir -p "${OUTPUT_DIR}"
 # MUJOCO_GL is unused unless you override warmup to enable rendering.
 export MUJOCO_GL="egl"
 export HYDRA_FULL_ERROR=1
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 HYDRA_OVERRIDES=(
   "seed=${SEED}"
@@ -67,6 +71,7 @@ HYDRA_OVERRIDES=(
   "algorithm.discriminator.checkpoint=${NNPU_CKPT}"
   "algorithm.q_learning.config.device=${DEVICE}"
   "+warmup.output_path=${OUTPUT_FILE}"
+  "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
   "warmup.preencode_cache_device=${PREENCODE_CACHE_DEVICE}"
 )
@@ -80,9 +85,11 @@ HYDRA_OVERRIDES+=("warmup.num_trajectories.save_dir=offline_data")
 # FREEZE_POST_SUCCESS=false to keep the raw post-success drift frames.
 FREEZE_POST_SUCCESS="${FREEZE_POST_SUCCESS:-true}"
 HYDRA_OVERRIDES+=("warmup.freeze_post_success=${FREEZE_POST_SUCCESS}")
+HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"
+echo "[init_iql_qv] tensorboard=${TENSORBOARD_DIR}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"
 echo "[init_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 
@@ -90,3 +97,5 @@ echo "[init_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 
 echo "[init_iql_qv] done. Reuse with:"
 echo "  IQL_WARMUP_CKPT=${OUTPUT_FILE} bash robosuite/pipeline/scripts/train_dipole_rl.sh"
+echo "[init_iql_qv] tensorboard:"
+echo "  tensorboard --logdir ${TENSORBOARD_DIR}"

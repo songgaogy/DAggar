@@ -18,6 +18,8 @@ set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 if [[ "${INTERACTIVE:-true}" == "true" ]]; then
   export MUJOCO_GL="${MUJOCO_GL:-glfw}"
@@ -56,6 +58,7 @@ HYDRA_ARGS=(
 [[ -n "${INTERACTIVE:-}" ]]           && HYDRA_ARGS+=("runtime.interactive=${INTERACTIVE}")
 [[ -n "${VIEWER_ENABLED:-}" ]]        && HYDRA_ARGS+=("runtime.viewer_enabled=${VIEWER_ENABLED}")
 [[ -n "${INTERVENTION_ENABLED:-}" ]]  && HYDRA_ARGS+=("intervention.enabled=${INTERVENTION_ENABLED}")
+HYDRA_ARGS+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 # Forward any additional CLI args (e.g. ``runtime.max_steps=500``).
 exec "$PY" -m robosuite.pipeline.train_dipole_rl "${HYDRA_ARGS[@]}" "$@"

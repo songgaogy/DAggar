@@ -117,6 +117,8 @@ if [[ "${INTERVENTION_ENABLED}" == "true" && -z "${DISPLAY:-}" ]]; then
 fi
 
 cd "${ROOT_DIR}"
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 if [[ -n "${LOAD}" && "${LOAD}" != "null" ]]; then
   if [[ -d "${LOAD}" ]]; then
@@ -196,8 +198,7 @@ TRAIN_DIPOLE_CMD=(
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.log_interval="${LOG_INTERVAL}" \
   logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \
-  hydra/hydra_logging=none \
-  hydra/job_logging=none \
+  "${HYDRA_DISABLE_LOG_OVERRIDES[@]}" \
   "${EXTRA_ARGS[@]}"
 )
 

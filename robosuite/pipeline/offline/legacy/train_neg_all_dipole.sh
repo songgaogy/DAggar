@@ -23,6 +23,8 @@ RUN_SUBFIX="neg_all"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HYDRA_FULL_ERROR=1
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 HYDRA_OVERRIDES=(
   "offline.mode=neg_all"
@@ -33,6 +35,7 @@ HYDRA_OVERRIDES=(
   "offline.num_train_steps=${NUM_TRAIN_STEPS}"
   "offline.run_subfix=${RUN_SUBFIX}"
 )
+HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[train_neg_all_dipole] mode=neg_all task=${TASK} device=${DEVICE} steps=${NUM_TRAIN_STEPS}"
 echo "[train_neg_all_dipole] run_subfix=${RUN_SUBFIX}"

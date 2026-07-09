@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
-# Visualize IQL Q/V on HDF5 rollout windows (see algorithms/q_learning/utils/vis_qv.py).
+# Visualize IQL Q/V on the offline buffer exported by init_iql_qv.sh.
 # Env vars mirror init_iql_qv.sh so nnPU / IQL paths stay consistent.
 #
 # Experiment constants:
 #   ENVIRONMENT, SEED, SPLIT, TARGET_PATH, and BRANCH_NAME are intentionally
 #   set below. Edit them for a different experiment.
 # Optional env vars:
-#   DEMO_TASK_NAME    — HDF5 subdir under data/ (default: ENVIRONMENT).
+#   DEMO_TASK_NAME    — task subdir under data/ (default: ENVIRONMENT).
 #   NNPU_CKPT         — nnPU head for r_disc + discriminator HUD.
 #   OUTPUT_DIR        — IQL warmup output dir (default: outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
 #   IQL_CKPT          — trained IQL state (default: ${OUTPUT_DIR}/iql_state.pt).
-#   SPLIT             — HDF5 subdir split (success_rollout | fail_rollout; BON only for success_rollout).
-#   SEED              — demo selection seed (default 42).
+#   OFFLINE_BUFFER    — saved warmup transitions (default: data/<task>/offline_data/iql_offline_transitions.pt).
+#   SPLIT             — episode namespace filter (success_rollout | fail_rollout; BON only for success-like splits).
+#   SEED              — offline episode selection seed (default 42).
 #   DEVICE            — torch device (default cuda:1).
 #   NO_DISC_VIZ       — set to 1 to skip the discriminator/ subdir (CSV+plot+HUD video).
 #   VIDEO_FPS         — fps for rollout + discriminator HUD videos (default: CONTROL_FREQ/20).
 #   DISC_VIZ_CAMERA   — camera to render for videos (default: agentview, else first policy cam).
+#   DISC_VIZ_IMAGE_SIZE — square resolution for discriminator HUD MP4 (default: 256).
 #   DISC_VIZ_BORDER   — red-border thickness on predicted-failure frames (default 10).
 #   NO_FLIP_VERTICAL  — set to 1 to NOT flip rendered frames vertically.
-#   Q_DIAG_NOISE_SIGMAS     — comma-separated full-chunk Gaussian sigmas (default 0.05,0.10,0.20).
-#   Q_DIAG_NUM_RANDOM       — uniform random chunks per window (default 16).
-#   Q_DIAG_SINGLE_DIM_SIGMA — Gaussian sigma for one-action-dim perturbation (default 0.20).
-#   Q_DIAG_SINGLE_DIM_N     — number of action dims to perturb; 0 means all dims.
-#   Q_DIAG_SEED             — candidate RNG seed (default: SEED).
 #   MAX_WINDOWS             — optional cap for quick smoke tests.
 
 set -euo pipefail
@@ -30,12 +27,12 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
 SEEDS=(1 2 3)               # demo-selection seeds; one run per seed
-SPLIT="success_rollout-val"    # success_rollout or fail_rollout
+SPLIT="fail"      # success or fail
 TARGET_PATH="offline_iql_qv-v2-disc0p02"
 BRANCH_NAME="dipole_rl-iql"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
@@ -43,18 +40,13 @@ NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPl
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 TARGET_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}/${ENVIRONMENT}"
-IQL_CKPT="${TARGET_DIR}/iql_state.pt"
-OUTPUT_DIR="${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis"
+IQL_CKPT="${IQL_CKPT:-${TARGET_DIR}/iql_state.pt}"
+OFFLINE_BUFFER="${OFFLINE_BUFFER:-${ROOT_DIR}/data/${DEMO_TASK_NAME}/offline_data/iql_offline_transitions.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${TARGET_PATH}-vis}"
 DEVICE="${DEVICE:-cuda}"
-# Q_DIAG_NOISE_SIGMAS="${Q_DIAG_NOISE_SIGMAS:-0.05,0.10,0.20}"
-# Q_DIAG_NUM_RANDOM="${Q_DIAG_NUM_RANDOM:-16}"
-# Q_DIAG_SINGLE_DIM_SIGMA="${Q_DIAG_SINGLE_DIM_SIGMA:-0.20}"
-# Q_DIAG_SINGLE_DIM_N="${Q_DIAG_SINGLE_DIM_N:-0}"
-# Q_DIAG_SEED="${Q_DIAG_SEED:-${SEED}}"
-# Q_DIAG_ACTION_LOW="${Q_DIAG_ACTION_LOW:--1.0}"
-# Q_DIAG_ACTION_HIGH="${Q_DIAG_ACTION_HIGH:-1.0}"
 VIDEO_FPS="${VIDEO_FPS:-${CONTROL_FREQ:-20}}"
 DISC_VIZ_BORDER="${DISC_VIZ_BORDER:-10}"
+DISC_VIZ_IMAGE_SIZE="${DISC_VIZ_IMAGE_SIZE:-256}"
 
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
@@ -70,20 +62,15 @@ fi
 
 echo "[vis_iql_qv] env=${ENVIRONMENT} task_data=${DEMO_TASK_NAME} split=${SPLIT} seeds=${SEEDS[*]}"
 echo "[vis_iql_qv] iql_ckpt=${IQL_CKPT}"
+echo "[vis_iql_qv] offline_buffer=${OFFLINE_BUFFER}"
 echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 echo "[vis_iql_qv] device=${DEVICE}"
 
 EXTRA_ARGS=()
 EXTRA_ARGS+=(
   --video-fps "${VIDEO_FPS}"
+  --disc-viz-image-size "${DISC_VIZ_IMAGE_SIZE}"
   --disc-viz-border-thickness "${DISC_VIZ_BORDER}"
-  # --q-candidate-noise-sigmas "${Q_DIAG_NOISE_SIGMAS}"
-  # --q-candidate-random-n "${Q_DIAG_NUM_RANDOM}"
-  # --q-candidate-single-dim-sigma "${Q_DIAG_SINGLE_DIM_SIGMA}"
-  # --q-candidate-single-dim-n "${Q_DIAG_SINGLE_DIM_N}"
-  # --q-candidate-seed "${Q_DIAG_SEED}"
-  # --q-candidate-action-low "${Q_DIAG_ACTION_LOW}"
-  # --q-candidate-action-high "${Q_DIAG_ACTION_HIGH}"
 )
 
 for SEED in "${SEEDS[@]}"; do
@@ -93,6 +80,7 @@ for SEED in "${SEEDS[@]}"; do
     --output-root "${OUTPUT_DIR}" \
     --task-data-name "${DEMO_TASK_NAME}" \
     --disc-ckpt "${NNPU_CKPT}" \
+    --offline-buffer "${OFFLINE_BUFFER}" \
     --split "${SPLIT}" \
     --seed "${SEED}" \
     --device "${DEVICE}" \

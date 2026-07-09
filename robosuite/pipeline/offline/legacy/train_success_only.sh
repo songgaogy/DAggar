@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Success-only SFT for the DIPOLE flow policy (positive-branch only). Fine-tunes
-# the pretrained flow policy on ONLY the success_rollout split (pre-success
-# frames), training just the positive LoRA branch — no expert pretrain, no fail
-# data, and no IQL / nnPU / discriminator / advantage. Config: config/success_only.yaml.
+# the pretrained flow policy on the same positive data as naive / neg_all
+# (expert pretrain + success_rollout pre-success frames), training just the
+# positive LoRA branch — no fail data and no IQL / nnPU / discriminator /
+# advantage. Config: config/success_only.yaml.
 #
 # Experiment constants below are intentionally hardcoded; edit for another task
 # or base policy.
@@ -24,6 +25,8 @@ RUN_SUBFIX="success_only"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HYDRA_FULL_ERROR=1
+# shellcheck disable=SC1091
+source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 
 HYDRA_OVERRIDES=(
   "env.environment=${TASK}"
@@ -33,9 +36,10 @@ HYDRA_OVERRIDES=(
   "offline.num_train_steps=${NUM_TRAIN_STEPS}"
   "offline.run_subfix=${RUN_SUBFIX}"
 )
+HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[train_success_only] task=${TASK} device=${DEVICE} steps=${NUM_TRAIN_STEPS}"
 echo "[train_success_only] run_subfix=${RUN_SUBFIX}"
 echo "[train_success_only] policy_ckpt=${POLICY_CKPT}"
 
-"${PY}" -m robosuite.pipeline.offline.train_success_only "${HYDRA_OVERRIDES[@]}"
+"${PY}" -m robosuite.pipeline.offline.legacy.train_success_only "${HYDRA_OVERRIDES[@]}"

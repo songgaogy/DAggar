@@ -34,6 +34,22 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return torch.sum(values * weights) / weight_sum
 
 
+def _freeze_running_stat_norms(module: nn.Module) -> None:
+    """Keep frozen backbone BN / IN buffers fixed while LoRA stays trainable."""
+    norm_types = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.SyncBatchNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+    )
+    for child in module.modules():
+        if isinstance(child, norm_types) and getattr(child, "track_running_stats", False):
+            child.eval()
+
+
 class DipolePolarityFlowModel(MultiModalFlowPolicy):
     """Frozen backbone + dual LoRA adapters for DIPOLE CFG-style guidance.
 
@@ -612,6 +628,7 @@ class DipoleFlowPolicy:
     def update(self, batch: DipoleBatch, *, collect_diagnostics: bool = False) -> dict[str, float]:
         batch = batch.to(self.device)
         self.model.train(True)
+        _freeze_running_stat_norms(self.model)
 
         B = batch.batch_size
         noise = torch.randn_like(batch.action_sequences)
