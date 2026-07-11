@@ -124,7 +124,6 @@ class DipoleAgent:
         encoder_cfg = cfg_get(cfg, "encoder", None)
         flow_cfg = cfg_get(cfg, "flow", None)
         dipole_cfg = cfg_get(cfg, "dipole", None)
-        lora_cfg = cfg_get(dipole_cfg, "lora", None) if dipole_cfg is not None else None
         online_buffer_cfg = cfg_get(cfg, "online_buffer", None)
         demo_buffer_cfg = cfg_get(cfg, "demo_buffer", None)
         trainer_cfg = cfg_get(cfg, "trainer", None)
@@ -169,12 +168,6 @@ class DipoleAgent:
             k=float(cfg_get(dipole_cfg, "k", 0.0)),
             guidance_omega=float(cfg_get(dipole_cfg, "guidance_omega", 2.0)),
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
-            lora_rank=int(cfg_get(lora_cfg, "rank", 16)),
-            lora_alpha=float(cfg_get(lora_cfg, "alpha", 16.0)),
-            lora_dropout=float(cfg_get(lora_cfg, "dropout", 0.0)),
-            lora_include_aggregator=bool(cfg_get(lora_cfg, "include_aggregator", True)),
-            lora_include_conv=bool(cfg_get(lora_cfg, "include_conv", True)),
-            adapter_lr=float(cfg_get(lora_cfg, "adapter_lr", 1e-3)),
             g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "nnpu_frozen")),
         )
         online_buffer_config = ReplayBufferConfig(
@@ -391,8 +384,9 @@ class DipoleAgent:
         model_state = payload.get("ema_model", payload.get("model"))
         if model_state is None:
             raise KeyError(f"Checkpoint {path} is missing both 'ema_model' and 'model'.")
-        # strict=False so the fresh LoRA adapter params keep their init; legacy
-        # condition-pathway keys are remapped to ``.base.*`` inside load_model_state.
+        # strict=False tolerates EMA/buffer key diffs; the same base flow-policy
+        # weights are loaded into BOTH the positive and negative policies so they
+        # start identical (see DipoleFlowPolicy.load_model_state).
         self.core.load_model_state(model_state, strict=False)
         self.core.set_normalizers(
             action_mean=payload.get("act_mean"),

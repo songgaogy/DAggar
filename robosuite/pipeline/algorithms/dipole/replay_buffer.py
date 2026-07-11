@@ -43,6 +43,7 @@ class DipoleOfflineStaticCache:
             is_intervention = []
             episode_ids = []
             episode_steps = []
+            routes = []
             for start in valid_starts:
                 sequence = buffer._storage[int(start) : int(start) + self.action_horizon]  # noqa: SLF001
                 first = sequence[0]
@@ -64,7 +65,9 @@ class DipoleOfflineStaticCache:
                 is_intervention.append(bool(first.is_intervention))
                 episode_ids.append(int(info.get("episode_index", -1)))
                 episode_steps.append(int(info.get("episode_step", -1)))
+                routes.append(str(info.get("route", "advantage")))
 
+        self.routes = routes
         self.images = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
         self.proprio_raw = torch.from_numpy(np.ascontiguousarray(np.stack(proprio_batch, axis=0))).float()
         self.actions_raw = torch.from_numpy(np.ascontiguousarray(np.stack(action_batch, axis=0))).float()
@@ -160,6 +163,7 @@ class DipoleOfflineStaticCache:
         start_indices = self.start_indices.index_select(0, row_idx).tolist()
         episode_ids = self.episode_ids.index_select(0, row_idx).tolist()
         episode_steps = self.episode_steps.index_select(0, row_idx).tolist()
+        row_list = row_idx.tolist()
         return DipoleBatch(
             image_obs=image_tensor_norm,
             image_obs_raw=image_tensor_unit,
@@ -172,6 +176,7 @@ class DipoleOfflineStaticCache:
                 "start_indices": [int(x) for x in start_indices],
                 "episode_ids": [int(x) for x in episode_ids],
                 "episode_steps": [int(x) for x in episode_steps],
+                "route": [self.routes[int(i)] for i in row_list],
             },
         )
 
@@ -213,6 +218,7 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
         episode_ids = []
         episode_steps = []
         is_intervention_batch = []
+        routes = []
         for sequence in transitions:
             first = sequence[0]
             obs = first.obs
@@ -232,6 +238,7 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
             episode_ids.append(int(info.get("episode_index", -1)))
             episode_steps.append(int(info.get("episode_step", -1)))
             is_intervention_batch.append(bool(first.is_intervention))
+            routes.append(str(info.get("route", "advantage")))
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
         proprio_tensor_raw = torch.from_numpy(np.ascontiguousarray(np.stack(proprio_batch, axis=0))).float()
@@ -268,6 +275,7 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
                 "start_indices": start_indices,
                 "episode_ids": episode_ids,
                 "episode_steps": episode_steps,
+                "route": routes,
             },
         )
         if device is not None:

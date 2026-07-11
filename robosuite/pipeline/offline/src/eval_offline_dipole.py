@@ -14,7 +14,7 @@ under the training run directory by default::
 
 Example::
 
-    MUJOCO_GL=egl python -m robosuite.pipeline.offline.eval_offline_dipole \\
+    MUJOCO_GL=egl python -m robosuite.pipeline.offline.src.eval_offline_dipole \\
         --checkpoint outputs/dipole_offline/PickPlaceCereal/<ts>/checkpoints/latest.pt \\
         --env-name PickPlaceCereal --task-name PickPlaceCereal \\
         --omega 0.2 --episodes 50 --episode-max-steps 500

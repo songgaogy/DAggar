@@ -23,15 +23,10 @@ class DipoleConfig(FlowDaggerConfig):
     k: float = 0.0
     guidance_omega: float = 2.0          # eval-only: v=(1+w)v_pos - w v_neg (rollout is pos-only)
     g_clip: float = 10.0
-    # Dual symmetric LoRA condition injection on a FROZEN backbone:
-    #   positive policy = base + pos_LoRA, negative policy = base + neg_LoRA.
-    # Both adapters share this single set of hyperparameters.
-    lora_rank: int = 16
-    lora_alpha: float = 16.0
-    lora_dropout: float = 0.0
-    lora_include_aggregator: bool = True
-    lora_include_conv: bool = True       # also adapt the UNet denoising Conv1d pathway
-    adapter_lr: float = 1e-3             # LoRA param LR (both pos and neg adapters)
+    # Two independent, fully finetuned flow policies (positive + negative). Each is
+    # trained full-tune under the base flow-policy freeze regime; there are no LoRA
+    # adapters. The learning rate / weight decay come from the inherited
+    # ``learning_rate`` / ``weight_decay`` (FlowDaggerConfig).
     # DIPOLE-RL: which frozen nnPU-backed G provider the trainer attaches.
     # Read by train_dipole*.py; DipoleFlowPolicy itself does not consume it.
     g_mode: str = "nnpu_frozen"
@@ -90,7 +85,7 @@ def select_dipole_batch(batch: DipoleBatch, indices: torch.Tensor) -> DipoleBatc
     idx = indices.to(device=batch.image_obs.device, dtype=torch.long).reshape(-1)
     index_list = idx.detach().cpu().tolist()
     metadata: dict[str, Any] = {}
-    for key in ("start_indices", "episode_ids", "episode_steps", "buffer_sources"):
+    for key in ("start_indices", "episode_ids", "episode_steps", "buffer_sources", "route"):
         values = batch.metadata.get(key)
         if values is None:
             continue
@@ -144,6 +139,7 @@ def concat_dipole_batches(*batches: DipoleBatch) -> DipoleBatch:
             "episode_ids": _merge_meta("episode_ids"),
             "episode_steps": _merge_meta("episode_steps"),
             "buffer_sources": buffer_sources,
+            "route": _merge_meta("route"),
         },
     )
 

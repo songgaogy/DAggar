@@ -6,25 +6,12 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from robosuite.pipeline.algorithms.flow_dagger.models.flow import _center_crop_resize
 from robosuite.pipeline.common.utils import clone_array_tree
 from robosuite.policy.flow_multi_update.model import MultiModalFlowPolicy, build_flow_policy
 
 from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
-from .lora import (
-    LoRARuntime,
-    apply_lora,
-    apply_lora_conv1d,
-    default_selector,
-    freeze_base_params,
-    is_lora_param,
-    lora_branch,
-    lora_health_metrics,
-    lora_masked,
-    remap_legacy_cond_keys,
-)
 
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -34,175 +21,10 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return torch.sum(values * weights) / weight_sum
 
 
-def _freeze_running_stat_norms(module: nn.Module) -> None:
-    """Keep frozen backbone BN / IN buffers fixed while LoRA stays trainable."""
-    norm_types = (
-        nn.BatchNorm1d,
-        nn.BatchNorm2d,
-        nn.BatchNorm3d,
-        nn.SyncBatchNorm,
-        nn.InstanceNorm1d,
-        nn.InstanceNorm2d,
-        nn.InstanceNorm3d,
-    )
-    for child in module.modules():
-        if isinstance(child, norm_types) and getattr(child, "track_running_stats", False):
-            child.eval()
-
-
-class DipolePolarityFlowModel(MultiModalFlowPolicy):
-    """Frozen backbone + dual LoRA adapters for DIPOLE CFG-style guidance.
-
-    The shared backbone is frozen; polarity comes from two symmetric low-rank
-    adapters on the condition-pathway ``nn.Linear`` modules of the flow head (and,
-    optionally, the condition aggregator):
-
-    - positive policy = ``base + pos_LoRA``
-    - negative policy = ``base + neg_LoRA``
-
-    Both adapters start at zero delta (``pos == neg == base``). Branch selection is
-    carried by a shared :class:`LoRARuntime` so the existing single 2x-batch
-    ``flow_head`` call can apply the pos adapter to the positive half and the neg
-    adapter to the negative half via a row mask.
-    """
-
-    def __init__(
-        self,
-        *args,
-        lora_rank: int = 16,
-        lora_alpha: float = 16.0,
-        lora_dropout: float = 0.0,
-        lora_include_aggregator: bool = True,
-        lora_include_conv: bool = True,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self._install_lora(
-            rank=lora_rank,
-            alpha=lora_alpha,
-            dropout=lora_dropout,
-            include_aggregator=lora_include_aggregator,
-            include_conv=lora_include_conv,
-        )
-
-    def _install_lora(
-        self,
-        *,
-        rank: int,
-        alpha: float,
-        dropout: float,
-        include_aggregator: bool,
-        include_conv: bool = True,
-    ) -> None:
-        self.lora_runtime = LoRARuntime()
-        # (1) Condition-pathway Linears (FiLM/cross-attn/cond MLPs + aggregator).
-        self.lora_num_modules = apply_lora(
-            self.flow_head,
-            self.condition_aggregator if include_aggregator else None,
-            rank=int(rank),
-            alpha=float(alpha),
-            dropout=float(dropout),
-            selector=default_selector(),
-            runtime=self.lora_runtime,
-        )
-        # (2) UNet denoising Conv1d pathway (input_proj / conv1,conv2 / up-down
-        # samples / output_conv). Without this the frozen convs cannot adapt and
-        # only the conditioning can move -- insufficient capacity to fit the data.
-        self.lora_num_conv_modules = (
-            apply_lora_conv1d(
-                self.flow_head,
-                rank=int(rank),
-                alpha=float(alpha),
-                dropout=float(dropout),
-                runtime=self.lora_runtime,
-            )
-            if include_conv
-            else 0
-        )
-        # Freeze the whole backbone; only the two LoRA adapters train.
-        self.lora_frozen_numel = freeze_base_params(self)
-
-    def branch_task_scene_cond(
-        self, context: dict[str, torch.Tensor], *, branch: str
-    ) -> torch.Tensor:
-        """Re-run the aggregator under the ``branch`` adapter to get its condition.
-
-        ``encode_multimodal_context`` runs the aggregator base-only, so
-        ``context['task_scene_cond']`` is the base condition. The aggregator is
-        LoRA-wrapped and sits before the 2x split, so the per-row mask cannot reach
-        it; instead we recompute each branch's condition with a cheap aggregator
-        pass (once per inference, not per ODE step). Both the positive and negative
-        branches diverge from base here.
-        """
-        with lora_branch(self.lora_runtime, branch):
-            return self.condition_aggregator(
-                fused_tokens=context["fused_tokens"],
-                token_padding_mask=context["token_padding_mask"],
-                language_global=context["language_global"],
-            )
-
-    def negative_task_scene_cond(self, context: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Backwards-compatible alias for ``branch_task_scene_cond(branch='neg')``."""
-        return self.branch_task_scene_cond(context, branch="neg")
-
-    def forward_from_context(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        context: dict[str, torch.Tensor],
-        *,
-        negative: bool,
-    ) -> torch.Tensor:
-        branch = "neg" if negative else "pos"
-        with lora_branch(self.lora_runtime, branch):
-            return self.flow_head(
-                x_t=x_t,
-                timesteps=t,
-                task_scene_cond=context["task_scene_cond"],
-                context_tokens=context["context_tokens"],
-                context_padding_mask=context["context_padding_mask"],
-            )
-
-
-def build_dipole_flow_policy(
-    cfg: Any,
-    *,
-    proprio_dim: int,
-    action_dim: int,
-    camera_names: list[str],
-    lora_rank: int,
-    lora_alpha: float,
-    lora_dropout: float,
-    lora_include_aggregator: bool,
-    lora_include_conv: bool = True,
-) -> DipolePolarityFlowModel:
-    base = build_flow_policy(cfg, proprio_dim=proprio_dim, action_dim=action_dim, camera_names=camera_names)
-    # Re-instantiate as DipolePolarityFlowModel sharing the same submodules.
-    polar = DipolePolarityFlowModel.__new__(DipolePolarityFlowModel)
-    nn.Module.__init__(polar)
-    polar.camera_names = list(base.camera_names)
-    polar.action_dim = int(base.action_dim)
-    polar.feature_dim = int(base.feature_dim)
-    polar.image_encoder = base.image_encoder
-    polar.proprio_tokenizer = base.proprio_tokenizer
-    polar.language_encoder = base.language_encoder
-    polar.language_guided_modulation = base.language_guided_modulation
-    polar.fusion = base.fusion
-    polar.condition_aggregator = base.condition_aggregator
-    polar.flow_head = base.flow_head
-    polar._install_lora(
-        rank=int(lora_rank),
-        alpha=float(lora_alpha),
-        dropout=float(lora_dropout),
-        include_aggregator=bool(lora_include_aggregator),
-        include_conv=bool(lora_include_conv),
-    )
-    return polar
-
-
 @torch.inference_mode()
 def _sample_guided_action_sequence(
-    model: DipolePolarityFlowModel,
+    model_pos: MultiModalFlowPolicy,
+    model_neg: MultiModalFlowPolicy | None,
     *,
     images: torch.Tensor,
     proprio: torch.Tensor,
@@ -212,36 +34,26 @@ def _sample_guided_action_sequence(
     omega: float,
     deterministic: bool,
 ) -> torch.Tensor:
+    """CFG-style guided sampling over two independent flow policies.
+
+    ``v = (1 + omega) * v_pos - omega * v_neg``. With ``omega == 0`` (online
+    rollout / ``guided=False``) only the positive policy runs -- the negative
+    policy is never encoded or forwarded, halving the per-ODE-step cost.
+    """
     batch_size = proprio.shape[0]
     if deterministic:
-        x = torch.zeros(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
+        x = torch.zeros(batch_size, model_pos.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
     else:
-        x = torch.randn(batch_size, model.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
-    context = model.encode_multimodal_context(images=images, proprio=proprio, language=language)
-    # The aggregator is LoRA-wrapped, so ``context['task_scene_cond']`` is base-only.
-    # The positive policy is ``base + pos_LoRA`` everywhere, so recompute the
-    # positive condition under the pos adapter (used by both the omega==0 fast path
-    # and the guided path below).
-    context["task_scene_cond"] = model.branch_task_scene_cond(context, branch="pos")
-    guided_context: dict[str, torch.Tensor] | None = None
-    row_mask: torch.Tensor | None = None
-    if float(omega) != 0.0:
-        # Positive condition uses the pos adapter; recompute the negative condition
-        # once via a neg-adapter aggregator pass (decision: train/eval consistent).
-        pos_cond = context["task_scene_cond"]
-        neg_cond = model.branch_task_scene_cond(context, branch="neg")
-        guided_context = {
-            "task_scene_cond": torch.cat([pos_cond, neg_cond], dim=0),
-            "context_tokens": context["context_tokens"].repeat(2, 1, 1),
-            "context_padding_mask": context["context_padding_mask"].repeat(2, 1),
-        }
-        # First half = positive (base + pos_LoRA), second half = negative (base + neg_LoRA).
-        row_mask = torch.cat(
-            [
-                torch.zeros(batch_size, dtype=torch.bool, device=proprio.device),
-                torch.ones(batch_size, dtype=torch.bool, device=proprio.device),
-            ]
-        )
+        x = torch.randn(batch_size, model_pos.action_dim, action_horizon, device=proprio.device, dtype=proprio.dtype)
+
+    context_pos = model_pos.encode_multimodal_context(images=images, proprio=proprio, language=language)
+    use_guidance = float(omega) != 0.0 and model_neg is not None
+    context_neg = (
+        model_neg.encode_multimodal_context(images=images, proprio=proprio, language=language)
+        if use_guidance
+        else None
+    )
+
     dt = 1.0 / float(n_steps)
     for step in range(int(n_steps)):
         t = torch.full(
@@ -250,29 +62,45 @@ def _sample_guided_action_sequence(
             device=proprio.device,
             dtype=proprio.dtype,
         )
-        if float(omega) == 0.0:
-            # omega=0 => v = v_pos exactly (positive policy = base + pos_LoRA); skip
-            # the negative branch forward pass (halves the per-ODE-step network cost).
-            # This is the online-rollout path (guided=False).
-            v = model.forward_from_context(x_t=x, t=t, context=context, negative=False)
-        else:
-            assert guided_context is not None and row_mask is not None
-            with lora_masked(model.lora_runtime, row_mask):
-                velocities = model.flow_head(
-                    x_t=x.repeat(2, 1, 1),
-                    timesteps=t.repeat(2),
-                    task_scene_cond=guided_context["task_scene_cond"],
-                    context_tokens=guided_context["context_tokens"],
-                    context_padding_mask=guided_context["context_padding_mask"],
-                )
-            v_pos = velocities[:batch_size]
-            v_neg = velocities[batch_size:]
+        v_pos = model_pos.flow_head(
+            x_t=x,
+            timesteps=t,
+            task_scene_cond=context_pos["task_scene_cond"],
+            context_tokens=context_pos["context_tokens"],
+            context_padding_mask=context_pos["context_padding_mask"],
+        )
+        if use_guidance:
+            assert context_neg is not None
+            v_neg = model_neg.flow_head(
+                x_t=x,
+                timesteps=t,
+                task_scene_cond=context_neg["task_scene_cond"],
+                context_tokens=context_neg["context_tokens"],
+                context_padding_mask=context_neg["context_padding_mask"],
+            )
             v = (1.0 + float(omega)) * v_pos - float(omega) * v_neg
+        else:
+            v = v_pos
         x = x + dt * v
     return x.transpose(1, 2)
 
 
 class DipoleFlowPolicy:
+    """Two independent, fully finetuned flow policies (positive + negative).
+
+    Polarity is carried by two separate :class:`MultiModalFlowPolicy` instances
+    (``model_pos``/``model_neg``), each trained full-tune under the base
+    flow-policy freeze regime (built by ``build_flow_policy``: ResNet layer3/4
+    trainable, stem/layer1/layer2 + CLIP frozen). The positive policy is trained
+    with per-sample weight ``w_pos``, the negative with ``w_neg`` -- both the
+    soft-weight (coupled) and hard-split (naive/neg_all) offline schemes reduce
+    to this via :meth:`_compute_branch_weights`.
+
+    Evaluation combines the two policies with CFG-style guidance
+    ``v=(1+omega)v_pos-omega v_neg``; online rollout uses the positive policy
+    only (``omega=0``).
+    """
+
     def __init__(
         self,
         *,
@@ -287,47 +115,42 @@ class DipoleFlowPolicy:
         self.inference_device = torch.device(config.inference_device or config.device)
         self.language_instruction = str(config.language_instruction or config.task_name or "perform the task")
 
-        self.model = build_dipole_flow_policy(
-            self.model_cfg,
-            proprio_dim=int(config.proprio_dim),
-            action_dim=int(config.action_dim),
-            camera_names=self.camera_names,
-            lora_rank=int(config.lora_rank),
-            lora_alpha=float(config.lora_alpha),
-            lora_dropout=float(config.lora_dropout),
-            lora_include_aggregator=bool(config.lora_include_aggregator),
-            lora_include_conv=bool(config.lora_include_conv),
-        ).to(self.device)
+        def _build() -> MultiModalFlowPolicy:
+            return build_flow_policy(
+                self.model_cfg,
+                proprio_dim=int(config.proprio_dim),
+                action_dim=int(config.action_dim),
+                camera_names=self.camera_names,
+            ).to(self.device)
 
-        # Frozen backbone + two symmetric adapters: the only trainable parameters are
-        # the pos/neg LoRA adapters, both at adapter_lr. The positive loss updates
-        # pos_LoRA, the negative loss updates neg_LoRA; base is frozen so there is no
-        # gradient combination and base_lr_scale is obsolete.
-        lora_params = [
-            param
-            for name, param in self.model.named_parameters()
-            if param.requires_grad and is_lora_param(name)
-        ]
-        trainable_non_lora = [
-            name
-            for name, param in self.model.named_parameters()
-            if param.requires_grad and not is_lora_param(name)
-        ]
-        assert not trainable_non_lora, (
-            f"backbone must be frozen; found trainable non-LoRA params: {trainable_non_lora[:4]}"
-        )
-        self._lora_params = lora_params
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": lora_params, "lr": float(config.adapter_lr), "weight_decay": 0.0},
-            ]
-        )
-        self.scaler = torch.amp.GradScaler(enabled=(self.device.type == "cuda"), device=self.device)
+        # Two fully independent full-tune policies. The freeze regime (frozen CLIP
+        # + ResNet stem/layer1/layer2, trainable layer3/layer4 + heads) is applied
+        # inside build_flow_policy from model_cfg, so each instance is correctly
+        # frozen on its own.
+        self.model_pos = _build()
+        self.model_neg = _build()
 
-        self.inference_model = copy.deepcopy(self.model).to(self.inference_device)
-        self.inference_model.eval()
-        self._inference_shadow_model = copy.deepcopy(self.inference_model).to(self.inference_device)
-        self._inference_shadow_model.eval()
+        def _optimizer(model: MultiModalFlowPolicy) -> torch.optim.Optimizer:
+            return torch.optim.AdamW(
+                [param for param in model.parameters() if param.requires_grad],
+                lr=float(config.learning_rate),
+                weight_decay=float(config.weight_decay),
+            )
+
+        self.optimizer_pos = _optimizer(self.model_pos)
+        self.optimizer_neg = _optimizer(self.model_neg)
+        self.scaler_pos = torch.amp.GradScaler(enabled=(self.device.type == "cuda"), device=self.device)
+        self.scaler_neg = torch.amp.GradScaler(enabled=(self.device.type == "cuda"), device=self.device)
+
+        # Per-model double-buffered inference copies.
+        self.inference_model_pos = copy.deepcopy(self.model_pos).to(self.inference_device)
+        self.inference_model_pos.eval()
+        self._inference_shadow_model_pos = copy.deepcopy(self.inference_model_pos).to(self.inference_device)
+        self._inference_shadow_model_pos.eval()
+        self.inference_model_neg = copy.deepcopy(self.model_neg).to(self.inference_device)
+        self.inference_model_neg.eval()
+        self._inference_shadow_model_neg = copy.deepcopy(self.inference_model_neg).to(self.inference_device)
+        self._inference_shadow_model_neg.eval()
         self._state_lock = threading.RLock()
         self._inference_lock = threading.Lock()
 
@@ -353,11 +176,24 @@ class DipoleFlowPolicy:
 
         # Optional G provider, injected after construction.
         self.g_provider: Any = None
+        # Optional pluggable branch-weight policy (offline DIPOLE). When set it
+        # fully overrides _compute_branch_weights; see offline/utils/branch_weights.py.
+        self.branch_weight_policy: Any = None
 
         self.sync_inference_policy()
 
     def set_g_provider(self, provider: Any) -> None:
         self.g_provider = provider
+
+    def set_branch_weight_policy(self, policy: Any) -> None:
+        """Attach a pluggable per-sample branch-weight policy (offline DIPOLE).
+
+        ``policy`` is called as
+        ``policy(batch, g_provider=..., sigmoid_fn=self._g_weights_from_raw,
+        device=self.device, want_metrics=...) -> (w_pos, w_neg, metrics)`` and,
+        when set, short-circuits the built-in coupled/neg_all weighting.
+        """
+        self.branch_weight_policy = policy
 
     def set_language_instruction(self, language_instruction: str) -> None:
         self.language_instruction = str(language_instruction)
@@ -406,28 +242,32 @@ class DipoleFlowPolicy:
             return None
         return np.asarray(self.current_chunk, dtype=np.float32).copy()
 
+    def _prepare_inference_inputs(self, obs) -> tuple[torch.Tensor, torch.Tensor]:
+        images = []
+        for camera_name in self.camera_names:
+            image = np.asarray(obs[camera_name], dtype=np.uint8)
+            image = _center_crop_resize(image, int(self.config.image_size))
+            images.append(np.transpose(image.astype(np.float32) / 255.0, (2, 0, 1)))
+        image_tensor = torch.from_numpy(np.stack(images, axis=0)).unsqueeze(0).to(self.inference_device)
+        image_tensor = (image_tensor - self._inference_image_mean) / self._inference_image_std
+
+        proprio = np.asarray(obs["state"], dtype=np.float32)
+        if self.prop_mean is not None and self.prop_std is not None:
+            proprio = (proprio - self.prop_mean) / (self.prop_std + 1e-6)
+        proprio_tensor = torch.from_numpy(proprio).unsqueeze(0).to(self.inference_device)
+        return image_tensor, proprio_tensor
+
     def select_action(self, obs, deterministic: bool = False, *, guided: bool = True) -> np.ndarray:
-        # guided=True  -> two-branch omega guidance (eval): v=(1+w)v_pos - w v_neg
-        # guided=False -> positive-only rollout (base + pos_LoRA), single forward
+        # guided=True  -> two-policy omega guidance (eval): v=(1+w)v_pos - w v_neg
+        # guided=False -> positive-policy-only rollout, single forward per ODE step
         omega = float(self.config.guidance_omega) if guided else 0.0
         if self.needs_action_chunk():
-            images = []
-            for camera_name in self.camera_names:
-                image = np.asarray(obs[camera_name], dtype=np.uint8)
-                image = _center_crop_resize(image, int(self.config.image_size))
-                images.append(np.transpose(image.astype(np.float32) / 255.0, (2, 0, 1)))
-            image_tensor = torch.from_numpy(np.stack(images, axis=0)).unsqueeze(0).to(self.inference_device)
-            image_tensor = (image_tensor - self._inference_image_mean) / self._inference_image_std
-
-            proprio = np.asarray(obs["state"], dtype=np.float32)
-            if self.prop_mean is not None and self.prop_std is not None:
-                proprio = (proprio - self.prop_mean) / (self.prop_std + 1e-6)
-            proprio_tensor = torch.from_numpy(proprio).unsqueeze(0).to(self.inference_device)
+            image_tensor, proprio_tensor = self._prepare_inference_inputs(obs)
 
             with self._inference_lock:
-                inference_model = self.inference_model
                 action_seq = _sample_guided_action_sequence(
-                    inference_model,
+                    self.inference_model_pos,
+                    self.inference_model_neg,
                     images=image_tensor,
                     proprio=proprio_tensor,
                     language=[self.language_instruction],
@@ -452,25 +292,15 @@ class DipoleFlowPolicy:
         Mirrors the inference path inside :meth:`select_action` but returns the full
         un-normalized ``(horizon, action_dim)`` chunk, so callers (e.g. the live
         discriminator display) can feed it to a G provider. ``guided=False`` plans
-        with the positive policy only (base + pos_LoRA), matching online rollout.
+        with the positive policy only, matching online rollout.
         """
         omega = float(self.config.guidance_omega) if guided else 0.0
-        images = []
-        for camera_name in self.camera_names:
-            image = np.asarray(obs[camera_name], dtype=np.uint8)
-            image = _center_crop_resize(image, int(self.config.image_size))
-            images.append(np.transpose(image.astype(np.float32) / 255.0, (2, 0, 1)))
-        image_tensor = torch.from_numpy(np.stack(images, axis=0)).unsqueeze(0).to(self.inference_device)
-        image_tensor = (image_tensor - self._inference_image_mean) / self._inference_image_std
-
-        proprio = np.asarray(obs["state"], dtype=np.float32)
-        if self.prop_mean is not None and self.prop_std is not None:
-            proprio = (proprio - self.prop_mean) / (self.prop_std + 1e-6)
-        proprio_tensor = torch.from_numpy(proprio).unsqueeze(0).to(self.inference_device)
+        image_tensor, proprio_tensor = self._prepare_inference_inputs(obs)
 
         with self._inference_lock:
             action_seq = _sample_guided_action_sequence(
-                self.inference_model,
+                self.inference_model_pos,
+                self.inference_model_neg,
                 images=image_tensor,
                 proprio=proprio_tensor,
                 language=[self.language_instruction],
@@ -495,12 +325,16 @@ class DipoleFlowPolicy:
             dtype=torch.bool,
         )
 
-    def _g_weights_from_raw(self, raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    def _g_weights_from_raw(
+        self, raw: torch.Tensor, *, want_metrics: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         # The G provider already returns the preference G (larger -> more positive branch)
         g = raw
         logit = float(self.config.beta) * g + float(self.config.k)
         w_pos = torch.sigmoid(logit)
         w_neg = 1.0 - w_pos
+        if not want_metrics:
+            return w_pos, w_neg, {}
         n = int(raw.numel())
         metrics = {
             "raw_nnpu_score_mean": float(raw.mean().item()),
@@ -517,6 +351,8 @@ class DipoleFlowPolicy:
     def _neg_all_branch_weights(
         self,
         batch: DipoleBatch,
+        *,
+        want_metrics: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         """Decoupled hard-label weights for ``offline.mode == "neg_all"``.
 
@@ -537,21 +373,34 @@ class DipoleFlowPolicy:
         else:
             raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
             w_neg = raw.clamp(0.0, 1.0)
-        metrics = {"neg_membership_mean": float(w_neg.mean().item())}
+        metrics = {"neg_membership_mean": float(w_neg.mean().item())} if want_metrics else {}
         return w_pos, w_neg, metrics
 
     def _compute_branch_weights(
         self,
         batch: DipoleBatch,
+        *,
+        want_metrics: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         """Return (w_pos, w_neg, metrics) tensors of shape (B,).
 
         When ``buffer_sources`` is set (1:1 online/demo training batch):
         - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
         - online_buffer rows: raw G and sigmoid use online rows only
+
+        ``want_metrics=False`` skips every scalar readback so the training hot
+        path incurs no GPU->CPU sync on non-logging steps.
         """
+        if self.branch_weight_policy is not None:
+            return self.branch_weight_policy(
+                batch,
+                g_provider=self.g_provider,
+                sigmoid_fn=self._g_weights_from_raw,
+                device=self.device,
+                want_metrics=want_metrics,
+            )
         if getattr(self.config, "branch_weight_mode", "coupled") == "neg_all":
-            return self._neg_all_branch_weights(batch)
+            return self._neg_all_branch_weights(batch, want_metrics=want_metrics)
 
         B = batch.batch_size
         demo_mask = self._resolve_demo_sample_mask(batch, self.device)
@@ -560,46 +409,51 @@ class DipoleFlowPolicy:
             w_pos = torch.ones(B, dtype=torch.float32, device=self.device)
             w_neg = torch.zeros(B, dtype=torch.float32, device=self.device)
             online_mask = ~demo_mask
-            metrics: dict[str, float] = {
-                "frac_demo_buffer": float(demo_mask.float().mean().item()),
-                "w_pos_mean_demo": 1.0,
-                "raw_nnpu_score_mean": 0.0,
-                "raw_nnpu_score_std": 0.0,
-                "raw_nnpu_score_min": 0.0,
-                "raw_nnpu_score_max": 0.0,
-                "G_mean": 0.0,
-                "G_std": 0.0,
-                "logit_mean": 0.0,
-                "logit_std": 0.0,
-            }
+            metrics: dict[str, float] = (
+                {
+                    "frac_demo_buffer": float(demo_mask.float().mean().item()),
+                    "w_pos_mean_demo": 1.0,
+                    "raw_nnpu_score_mean": 0.0,
+                    "raw_nnpu_score_std": 0.0,
+                    "raw_nnpu_score_min": 0.0,
+                    "raw_nnpu_score_max": 0.0,
+                    "G_mean": 0.0,
+                    "G_std": 0.0,
+                    "logit_mean": 0.0,
+                    "logit_std": 0.0,
+                }
+                if want_metrics
+                else {}
+            )
             if not bool(online_mask.any().item()):
                 return w_pos, w_neg, metrics
 
             online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
             if self.g_provider is None:
                 zero_g = torch.zeros(int(online_indices.numel()), dtype=torch.float32, device=self.device)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(zero_g)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
             else:
                 with torch.no_grad():
                     online_batch = select_dipole_batch(batch, online_indices)
                     raw = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(raw)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
 
             w_pos[online_mask] = w_online_pos
             w_neg[online_mask] = w_online_neg
-            metrics.update(g_metrics)
-            metrics["w_pos_mean_online"] = float(w_online_pos.mean().item())
-            metrics["w_neg_mean_online"] = float(w_online_neg.mean().item())
+            if want_metrics:
+                metrics.update(g_metrics)
+                metrics["w_pos_mean_online"] = float(w_online_pos.mean().item())
+                metrics["w_neg_mean_online"] = float(w_online_neg.mean().item())
             return w_pos, w_neg, metrics
 
         # Legacy path: demo-only batch without buffer_sources (full-batch G + intervention mask).
         if self.g_provider is None:
             zero_g = torch.zeros(B, dtype=torch.float32, device=self.device)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(zero_g)
+            w_pos, w_neg, metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
         else:
             with torch.no_grad():
                 raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(raw)
+            w_pos, w_neg, metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
 
         is_int = batch.is_intervention.to(self.device).bool().reshape(-1)
         w_pos = torch.where(is_int, torch.ones_like(w_pos), w_pos)
@@ -611,6 +465,23 @@ class DipoleFlowPolicy:
         batch_size = batch.batch_size
         if self.g_provider is None:
             return torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+
+        # Offline routed weighting: only "advantage"-route rows have a meaningful
+        # provider G; pos_only/neg_only rows are forced-weight and their advantage
+        # (though precomputed) must not pollute the diagnostic G histogram.
+        if self.branch_weight_policy is not None:
+            routes = batch.metadata.get("route")
+            raw = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            if routes is not None and len(routes) == batch_size:
+                adv_rows = [i for i, r in enumerate(routes) if str(r) == "advantage"]
+                if adv_rows:
+                    adv_idx = torch.tensor(adv_rows, device=self.device, dtype=torch.long)
+                    sub = select_dipole_batch(batch, adv_idx)
+                    raw_adv = self.g_provider.compute_g_for_batch(sub).to(self.device).reshape(-1)
+                    raw[adv_idx] = raw_adv
+            else:
+                raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
+            return raw
 
         demo_mask = self._resolve_demo_sample_mask(batch, self.device)
         if demo_mask is not None:
@@ -625,10 +496,15 @@ class DipoleFlowPolicy:
 
         return self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
 
-    def update(self, batch: DipoleBatch, *, collect_diagnostics: bool = False) -> dict[str, float]:
+    def update(
+        self,
+        batch: DipoleBatch,
+        *,
+        want_metrics: bool = True,
+        collect_diagnostics: bool = False,
+    ) -> dict[str, float]:
         batch = batch.to(self.device)
-        self.model.train(True)
-        _freeze_running_stat_norms(self.model)
+        want_metrics = bool(want_metrics or collect_diagnostics)
 
         B = batch.batch_size
         noise = torch.randn_like(batch.action_sequences)
@@ -639,8 +515,9 @@ class DipoleFlowPolicy:
         )
         v_target = batch.action_sequences - noise
         language = [self.language_instruction] * B
+        x_t_swapped = x_t.transpose(1, 2)
 
-        w_pos, w_neg, weight_metrics = self._compute_branch_weights(batch)
+        w_pos, w_neg, weight_metrics = self._compute_branch_weights(batch, want_metrics=want_metrics)
 
         def _branch_losses(v_pred: torch.Tensor, weights: torch.Tensor):
             fp = torch.mean((v_pred - v_target) ** 2, dim=(1, 2))
@@ -660,53 +537,46 @@ class DipoleFlowPolicy:
             )
             return loss, flow, endpoint, smooth, fp
 
-        x_t_swapped = x_t.transpose(1, 2)
-        self.optimizer.zero_grad(set_to_none=True)
-
-        # Shared frozen backbone: encode once. The aggregator is recomputed per branch
-        # under its adapter (base task_scene_cond is unused).
-        with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
-            context = self.model.encode_multimodal_context(
-                images=batch.image_obs,
-                proprio=batch.proprio,
-                language=language,
-            )
-
-        # Fused branch pass: false rows use pos LoRA, true rows use neg LoRA.
-        with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
-            pos_cond = self.model.branch_task_scene_cond(context, branch="pos")
-            neg_cond = self.model.branch_task_scene_cond(context, branch="neg")
-            row_mask = torch.cat(
-                [
-                    torch.zeros(B, dtype=torch.bool, device=self.device),
-                    torch.ones(B, dtype=torch.bool, device=self.device),
-                ],
-                dim=0,
-            )
-            with lora_masked(self.model.lora_runtime, row_mask):
-                velocities = self.model.flow_head(
-                    x_t=x_t_swapped.repeat(2, 1, 1),
-                    timesteps=timesteps.repeat(2),
-                    task_scene_cond=torch.cat([pos_cond, neg_cond], dim=0),
-                    context_tokens=context["context_tokens"].repeat(2, 1, 1),
-                    context_padding_mask=context["context_padding_mask"].repeat(2, 1),
+        def _train_one(
+            model: MultiModalFlowPolicy,
+            optimizer: torch.optim.Optimizer,
+            scaler: torch.amp.GradScaler,
+            weights: torch.Tensor,
+        ):
+            model.train(True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(enabled=(self.device.type == "cuda"), device_type=self.device.type):
+                v_pred = model(
+                    x_t=x_t_swapped,
+                    t=timesteps,
+                    images=batch.image_obs,
+                    proprio=batch.proprio,
+                    language=language,
                 ).transpose(1, 2)
-            v_pos = velocities[:B]
-            v_neg = velocities[B:]
-            loss_pos, flow_pos, endpoint_pos, smooth_pos, v_pos_mse = _branch_losses(v_pos, w_pos)
-            loss_neg, flow_neg, endpoint_neg, smooth_neg, v_neg_mse = _branch_losses(v_neg, w_neg)
-            loss = loss_pos + loss_neg
+                loss, flow, endpoint, smooth, fp = _branch_losses(v_pred, weights)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float(self.config.grad_clip_norm)
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            return loss, flow, endpoint, smooth, fp, grad_norm
 
-        self.scaler.scale(loss).backward()
+        # Two independent full-tune policies: the positive policy trains on w_pos,
+        # the negative on w_neg. Both branches always run -- rows with weight 0
+        # drop out of _weighted_mean, and keeping both forwards busy is what we
+        # want for GPU utilization.
+        loss_pos, flow_pos, endpoint_pos, smooth_pos, v_pos_mse, gnorm_pos = _train_one(
+            self.model_pos, self.optimizer_pos, self.scaler_pos, w_pos
+        )
+        loss_neg, flow_neg, endpoint_neg, smooth_neg, v_neg_mse, gnorm_neg = _train_one(
+            self.model_neg, self.optimizer_neg, self.scaler_neg, w_neg
+        )
+        loss = loss_pos + loss_neg
 
-        # Base is frozen and pos/neg adapters are disjoint; the fused backward
-        # populates each adapter's grads from its own branch rows.
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self._lora_params, max_norm=float(self.config.grad_clip_norm))
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        lora_metrics = lora_health_metrics(self.model)
+        if not want_metrics:
+            return {}
 
         metrics: dict[str, Any] = {
             "actor_loss": float(loss.detach().cpu().item()),
@@ -718,6 +588,8 @@ class DipoleFlowPolicy:
             "endpoint_loss_neg": float(endpoint_neg.detach().cpu().item()),
             "smooth_loss_pos": float(smooth_pos.detach().cpu().item()),
             "smooth_loss_neg": float(smooth_neg.detach().cpu().item()),
+            "grad_norm_pos": float(gnorm_pos.detach().cpu().item()),
+            "grad_norm_neg": float(gnorm_neg.detach().cpu().item()),
             "w_pos_mean": float(w_pos.mean().item()),
             "w_pos_std": float(w_pos.std().item() if B > 1 else 0.0),
             "w_neg_mean": float(w_neg.mean().item()),
@@ -729,7 +601,6 @@ class DipoleFlowPolicy:
             "endpoint_loss": float((endpoint_pos + endpoint_neg).detach().cpu().item() * 0.5),
             "smooth_loss": float((smooth_pos + smooth_neg).detach().cpu().item() * 0.5),
             "mse": float(((endpoint_pos + endpoint_neg) * 0.5).detach().cpu().item()),
-            **lora_metrics,
             **weight_metrics,
         }
         if collect_diagnostics:
@@ -746,16 +617,31 @@ class DipoleFlowPolicy:
 
     def sync_inference_policy(self) -> None:
         with self._state_lock:
-            self._inference_shadow_model.load_state_dict(self.model.state_dict())
-            self._inference_shadow_model.eval()
+            self._inference_shadow_model_pos.load_state_dict(self.model_pos.state_dict())
+            self._inference_shadow_model_pos.eval()
+            self._inference_shadow_model_neg.load_state_dict(self.model_neg.state_dict())
+            self._inference_shadow_model_neg.eval()
         with self._inference_lock:
-            self.inference_model, self._inference_shadow_model = self._inference_shadow_model, self.inference_model
+            self.inference_model_pos, self._inference_shadow_model_pos = (
+                self._inference_shadow_model_pos,
+                self.inference_model_pos,
+            )
+            self.inference_model_neg, self._inference_shadow_model_neg = (
+                self._inference_shadow_model_neg,
+                self.inference_model_neg,
+            )
 
     def state_dict(self) -> dict[str, Any]:
         with self._state_lock:
             return {
-                "model": self.model.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
+                "core_pos": {
+                    "model": self.model_pos.state_dict(),
+                    "optimizer": self.optimizer_pos.state_dict(),
+                },
+                "core_neg": {
+                    "model": self.model_neg.state_dict(),
+                    "optimizer": self.optimizer_neg.state_dict(),
+                },
                 "act_mean": None if self.act_mean is None else torch.as_tensor(self.act_mean),
                 "act_std": None if self.act_std is None else torch.as_tensor(self.act_std),
                 "prop_mean": None if self.prop_mean is None else torch.as_tensor(self.prop_mean),
@@ -763,24 +649,30 @@ class DipoleFlowPolicy:
             }
 
     def load_model_state(self, state_dict: dict[str, Any], *, strict: bool = True) -> None:
+        """Load one base flow-policy state dict into BOTH policies.
+
+        Used for pretrained initialization: the positive and negative policies
+        start from the same weights, so ``v_pos == v_neg`` at step 0 and CFG
+        guidance is well-conditioned before the two diverge during training.
+        """
         with self._state_lock:
-            state_dict = remap_legacy_cond_keys(state_dict, self.model)
-            self.model.load_state_dict(state_dict, strict=strict)
+            self.model_pos.load_state_dict(state_dict, strict=strict)
+            self.model_neg.load_state_dict(state_dict, strict=strict)
         self.sync_inference_policy()
         self.reset_action_chunk()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         with self._state_lock:
-            model_state = remap_legacy_cond_keys(state_dict["model"], self.model)
-            self.model.load_state_dict(model_state)
-            optimizer_state = state_dict.get("optimizer")
-            if optimizer_state is not None:
-                try:
-                    self.optimizer.load_state_dict(optimizer_state)
-                except (ValueError, KeyError) as exc:
-                    # A legacy 2-group (base + LoRA) optimizer state does not match the
-                    # new single LoRA group; skip it and start the optimizer fresh.
-                    print(f"[dipole] skipping incompatible optimizer state: {exc}")
+            core_pos = state_dict["core_pos"]
+            core_neg = state_dict["core_neg"]
+            self.model_pos.load_state_dict(core_pos["model"])
+            self.model_neg.load_state_dict(core_neg["model"])
+            opt_pos_state = core_pos.get("optimizer")
+            if opt_pos_state is not None:
+                self.optimizer_pos.load_state_dict(opt_pos_state)
+            opt_neg_state = core_neg.get("optimizer")
+            if opt_neg_state is not None:
+                self.optimizer_neg.load_state_dict(opt_neg_state)
             self.set_normalizers(
                 action_mean=state_dict.get("act_mean"),
                 action_std=state_dict.get("act_std"),
@@ -796,6 +688,4 @@ class DipoleFlowPolicy:
 
 __all__ = [
     "DipoleFlowPolicy",
-    "DipolePolarityFlowModel",
-    "build_dipole_flow_policy",
 ]

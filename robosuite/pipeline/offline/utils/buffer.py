@@ -40,6 +40,7 @@ from robosuite.pipeline.algorithms.flow_dagger.common import (
 )
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
 from robosuite.pipeline.common.types import Transition
+from robosuite.pipeline.offline.utils.episode_dataset import ROUTE_POS_ONLY
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ def _materialize_run(
     episode_index: int,
     namespace: str,
     mark_intervention: bool | None = None,
+    route: str | None = None,
 ) -> list[Transition]:
     """Re-stamp a contiguous run as a standalone episode.
 
@@ -139,6 +141,8 @@ def _materialize_run(
         info["episode_step"] = int(step)
         info["episode_namespace"] = str(namespace)
         info["buffer_role"] = "offline"
+        if route is not None:
+            info["route"] = str(route)
         is_intervention = (
             bool(src.is_intervention) if mark_intervention is None else bool(mark_intervention)
         )
@@ -175,18 +179,24 @@ def load_pretrain_transitions(
     :func:`load_hdf5_demos_into_flow_transitions` (it owns the env + proprio
     extractor).
     """
-    pretrain_subdir = str(pretrain_dir).strip().lstrip("/")
-    demo_dir = Path(data_root) / str(task_name) / pretrain_subdir
+    raw_pretrain = Path(str(pretrain_dir).strip())
+    if raw_pretrain.exists():
+        demo_dir = raw_pretrain
+    else:
+        demo_dir = Path(data_root) / str(task_name) / str(pretrain_dir).strip().lstrip("/")
     if not demo_dir.exists():
         raise FileNotFoundError(
             f"pretrain_data dir not found: {demo_dir} "
-            "(check offline.data_root / task_name / pretrain_dir)."
+            "(check offline.pretrain_data_path or offline.data_root / task_name / pretrain_dir)."
         )
-    demo_paths = [
-        path
-        for path in sorted(demo_dir.iterdir())
-        if path.is_file() and path.suffix.lower() in {".hdf5", ".h5"}
-    ]
+    if demo_dir.is_file() and demo_dir.suffix.lower() in {".hdf5", ".h5"}:
+        demo_paths = [demo_dir]
+    else:
+        demo_paths = [
+            path
+            for path in sorted(demo_dir.iterdir())
+            if path.is_file() and path.suffix.lower() in {".hdf5", ".h5"}
+        ]
     if not demo_paths:
         raise FileNotFoundError(f"pretrain_data dir has no .hdf5/.h5 files: {demo_dir}")
 
@@ -211,8 +221,9 @@ def load_pretrain_transitions(
                 episode_index=next_index,
                 namespace=f"{task_name}/pretrain_expert",
                 # Pretrain rows update only the positive branch (w_pos=1): the
-                # policy forces this on is_intervention rows.
+                # routed weight policy forces this on pos_only rows.
                 mark_intervention=True,
+                route=ROUTE_POS_ONLY,
             )
         )
         next_index += 1

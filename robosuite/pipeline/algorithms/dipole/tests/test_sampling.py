@@ -1,4 +1,4 @@
-"""CPU-only tests for DIPOLE guided action sampling."""
+"""CPU-only tests for DIPOLE guided action sampling (two-policy architecture)."""
 
 from __future__ import annotations
 
@@ -13,16 +13,16 @@ from robosuite.pipeline.algorithms.dipole.models.flow import (
     DipoleFlowPolicy,
     _sample_guided_action_sequence,
 )
-from robosuite.pipeline.algorithms.dipole.models.lora import LoRARuntime
-from robosuite.pipeline.offline.eval_offline_dipole import (
+from robosuite.pipeline.offline.src.eval_offline_dipole import (
     _resolve_execute_horizon,
 )
 
 
 class _CountingFlowHead(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, cond_offset: float = 0.0) -> None:
         super().__init__()
         self.calls = 0
+        self.cond_offset = float(cond_offset)
 
     def forward(
         self,
@@ -37,31 +37,23 @@ class _CountingFlowHead(nn.Module):
         context_scale = context_tokens.masked_fill(
             context_padding_mask.unsqueeze(-1), 0.0
         ).mean(dim=(1, 2))
-        scale = task_scene_cond.mean(dim=1) + context_scale + timesteps
+        scale = task_scene_cond.mean(dim=1) + context_scale + timesteps + self.cond_offset
         return torch.tanh(x_t + scale[:, None, None])
 
 
-class _FakeDipoleModel(nn.Module):
-    """Stub mirroring the dual-LoRA DIPOLE model API used by sampling.
+class _FakeFlowModel(nn.Module):
+    """Stub with the minimal ``MultiModalFlowPolicy`` surface the sampler uses.
 
-    The negative branch differs from the positive branch through
-    ``branch_task_scene_cond`` (emulating the aggregator-side neg LoRA delta; the
-    pos adapter is a no-op here, mirroring its zero-init at start); the stub flow
-    head itself is LoRA-agnostic, so this exercises the sampling orchestration
-    (2x-batch build, row mask plumbing, branch combination).
+    Each policy (positive / negative) is now a fully independent model; the two
+    differ by ``cond_offset`` (standing in for the two diverged full-tune policies),
+    so the guided combination ``v=(1+omega)v_pos - omega v_neg`` is non-trivial.
     """
 
-    def __init__(self, action_dim: int = 3, context_dim: int = 5) -> None:
+    def __init__(self, action_dim: int = 3, context_dim: int = 5, cond_offset: float = 0.0) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
         self.context_dim = int(context_dim)
-        self.lora_runtime = LoRARuntime()
-        self.flow_head = _CountingFlowHead()
-        # Fixed negative-branch condition delta (stands in for the neg aggregator LoRA).
-        self.register_buffer(
-            "neg_cond_delta",
-            torch.tensor([0.3, -0.2, 0.4, 0.1, -0.1])[:context_dim],
-        )
+        self.flow_head = _CountingFlowHead(cond_offset=cond_offset)
 
     def encode_multimodal_context(
         self,
@@ -83,44 +75,12 @@ class _FakeDipoleModel(nn.Module):
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
             "context_padding_mask": context_padding_mask,
-            # Aggregator inputs (unused by the stub aggregator, present for parity).
-            "fused_tokens": context_tokens,
-            "token_padding_mask": context_padding_mask,
-            "language_global": task_scene_cond,
         }
-
-    def branch_task_scene_cond(
-        self, context: dict[str, torch.Tensor], *, branch: str
-    ) -> torch.Tensor:
-        # pos adapter is a no-op (zero delta); neg adapter adds a fixed delta.
-        if branch == "neg":
-            return context["task_scene_cond"] + self.neg_cond_delta
-        return context["task_scene_cond"]
-
-    def negative_task_scene_cond(
-        self, context: dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        return self.branch_task_scene_cond(context, branch="neg")
-
-    def forward_from_context(
-        self,
-        *,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        context: dict[str, torch.Tensor],
-        negative: bool,
-    ) -> torch.Tensor:
-        return self.flow_head(
-            x_t=x_t,
-            timesteps=t,
-            task_scene_cond=context["task_scene_cond"],
-            context_tokens=context["context_tokens"],
-            context_padding_mask=context["context_padding_mask"],
-        )
 
 
 def _serial_sample(
-    model: _FakeDipoleModel,
+    model_pos: _FakeFlowModel,
+    model_neg: _FakeFlowModel,
     *,
     images: torch.Tensor,
     proprio: torch.Tensor,
@@ -129,21 +89,25 @@ def _serial_sample(
     omega: float,
 ) -> torch.Tensor:
     batch_size = proprio.shape[0]
-    x = torch.zeros(batch_size, model.action_dim, action_horizon)
-    context = model.encode_multimodal_context(
-        images=images,
-        proprio=proprio,
-        language=["task"] * batch_size,
-    )
-    neg_context = dict(context)
-    neg_context["task_scene_cond"] = model.negative_task_scene_cond(context)
+    x = torch.zeros(batch_size, model_pos.action_dim, action_horizon)
+    language = ["task"] * batch_size
+    context_pos = model_pos.encode_multimodal_context(images=images, proprio=proprio, language=language)
+    context_neg = model_neg.encode_multimodal_context(images=images, proprio=proprio, language=language)
     for step in range(n_steps):
         t = torch.full((batch_size,), float(step) / float(n_steps))
-        v_pos = model.forward_from_context(
-            x_t=x, t=t, context=context, negative=False
+        v_pos = model_pos.flow_head(
+            x_t=x,
+            timesteps=t,
+            task_scene_cond=context_pos["task_scene_cond"],
+            context_tokens=context_pos["context_tokens"],
+            context_padding_mask=context_pos["context_padding_mask"],
         )
-        v_neg = model.forward_from_context(
-            x_t=x, t=t, context=neg_context, negative=True
+        v_neg = model_neg.flow_head(
+            x_t=x,
+            timesteps=t,
+            task_scene_cond=context_neg["task_scene_cond"],
+            context_tokens=context_neg["context_tokens"],
+            context_padding_mask=context_neg["context_padding_mask"],
         )
         x = x + ((1.0 + omega) * v_pos - omega * v_neg) / float(n_steps)
     return x.transpose(1, 2)
@@ -151,26 +115,28 @@ def _serial_sample(
 
 @pytest.mark.parametrize("batch_size", [1, 3])
 @pytest.mark.parametrize("omega", [0.2, 1.0])
-def test_batched_guidance_matches_serial_reference(
-    batch_size: int, omega: float
-) -> None:
+def test_guidance_matches_serial_reference(batch_size: int, omega: float) -> None:
     torch.manual_seed(0)
     images = torch.randn(batch_size, 2, 3, 4, 4)
     proprio = torch.randn(batch_size, 4)
-    reference_model = _FakeDipoleModel()
-    batched_model = _FakeDipoleModel()
-    batched_model.load_state_dict(reference_model.state_dict())
+    model_pos = _FakeFlowModel(cond_offset=0.0)
+    model_neg = _FakeFlowModel(cond_offset=0.5)
 
     expected = _serial_sample(
-        reference_model,
+        model_pos,
+        model_neg,
         images=images,
         proprio=proprio,
         action_horizon=4,
         n_steps=5,
         omega=omega,
     )
+    # Reset call counters consumed by the reference pass.
+    model_pos.flow_head.calls = 0
+    model_neg.flow_head.calls = 0
     actual = _sample_guided_action_sequence(
-        batched_model,
+        model_pos,
+        model_neg,
         images=images,
         proprio=proprio,
         language=["task"] * batch_size,
@@ -181,13 +147,16 @@ def test_batched_guidance_matches_serial_reference(
     )
 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
-    assert batched_model.flow_head.calls == 5
+    assert model_pos.flow_head.calls == 5
+    assert model_neg.flow_head.calls == 5
 
 
-def test_zero_omega_uses_only_positive_branch() -> None:
-    model = _FakeDipoleModel()
+def test_zero_omega_uses_only_positive_policy() -> None:
+    model_pos = _FakeFlowModel(cond_offset=0.0)
+    model_neg = _FakeFlowModel(cond_offset=0.5)
     output = _sample_guided_action_sequence(
-        model,
+        model_pos,
+        model_neg,
         images=torch.randn(2, 2, 3, 4, 4),
         proprio=torch.randn(2, 4),
         language=["task", "task"],
@@ -197,70 +166,40 @@ def test_zero_omega_uses_only_positive_branch() -> None:
         deterministic=True,
     )
 
-    assert output.shape == (2, 4, model.action_dim)
-    assert model.flow_head.calls == 6
+    assert output.shape == (2, 4, model_pos.action_dim)
+    # omega=0 => positive policy only; the negative policy is never touched.
+    assert model_pos.flow_head.calls == 6
+    assert model_neg.flow_head.calls == 0
 
 
-class _FakeMaskedFlowHead(nn.Module):
-    def __init__(self, owner: "_FakeUpdateModel") -> None:
+class _FakeUpdateModel(nn.Module):
+    """Trainable stub with the ``MultiModalFlowPolicy.forward`` signature."""
+
+    def __init__(self, scale: float = 0.1) -> None:
         super().__init__()
-        object.__setattr__(self, "owner", owner)
+        self.param = nn.Parameter(torch.tensor(float(scale)))
         self.calls = 0
 
     def forward(
         self,
         *,
         x_t: torch.Tensor,
-        timesteps: torch.Tensor,
-        task_scene_cond: torch.Tensor,
-        context_tokens: torch.Tensor,
-        context_padding_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        self.calls += 1
-        _ = timesteps, task_scene_cond, context_tokens, context_padding_mask
-        row_mask = self.owner.lora_runtime.row_mask
-        assert row_mask is not None
-        scale = torch.where(row_mask, self.owner.neg_lora_param, self.owner.pos_lora_param)
-        return torch.ones_like(x_t) * scale.view(-1, 1, 1)
-
-
-class _FakeUpdateModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.lora_runtime = LoRARuntime()
-        self.pos_lora_param = nn.Parameter(torch.tensor(0.1))
-        self.neg_lora_param = nn.Parameter(torch.tensor(-0.1))
-        self.flow_head = _FakeMaskedFlowHead(self)
-
-    def encode_multimodal_context(
-        self,
-        *,
+        t: torch.Tensor,
         images: torch.Tensor,
         proprio: torch.Tensor,
         language: list[str],
-    ) -> dict[str, torch.Tensor]:
-        batch_size = int(proprio.shape[0])
-        assert len(language) == batch_size
-        return {
-            "task_scene_cond": torch.zeros(batch_size, 1),
-            "context_tokens": torch.zeros(batch_size, 1, 1),
-            "context_padding_mask": torch.zeros(batch_size, 1, dtype=torch.bool),
-            "fused_tokens": torch.zeros(batch_size, 1, 1),
-            "token_padding_mask": torch.zeros(batch_size, 1, dtype=torch.bool),
-            "language_global": torch.zeros(batch_size, 1),
-        }
-
-    def branch_task_scene_cond(
-        self, context: dict[str, torch.Tensor], *, branch: str
     ) -> torch.Tensor:
-        assert branch in ("pos", "neg")
-        return context["task_scene_cond"]
+        self.calls += 1
+        _ = t, images, proprio, language
+        # x_t is (B, action_dim, horizon); return same shape, dependent on param.
+        return x_t * self.param + self.param
 
 
-def test_update_uses_single_masked_branch_forward() -> None:
+def test_update_trains_both_policies_independently() -> None:
     policy = object.__new__(DipoleFlowPolicy)
     policy.device = torch.device("cpu")
-    policy.model = _FakeUpdateModel()
+    policy.model_pos = _FakeUpdateModel(scale=0.1)
+    policy.model_neg = _FakeUpdateModel(scale=-0.1)
     policy.config = SimpleNamespace(
         beta=0.0,
         k=0.0,
@@ -271,28 +210,70 @@ def test_update_uses_single_masked_branch_forward() -> None:
     )
     policy.language_instruction = "task"
     policy.g_provider = None
-    policy._lora_params = [policy.model.pos_lora_param, policy.model.neg_lora_param]
-    policy.optimizer = torch.optim.SGD(policy._lora_params, lr=0.01)
-    policy.scaler = torch.amp.GradScaler(enabled=False, device=policy.device)
+    policy.optimizer_pos = torch.optim.SGD(policy.model_pos.parameters(), lr=0.01)
+    policy.optimizer_neg = torch.optim.SGD(policy.model_neg.parameters(), lr=0.01)
+    policy.scaler_pos = torch.amp.GradScaler(enabled=False, device=policy.device)
+    policy.scaler_neg = torch.amp.GradScaler(enabled=False, device=policy.device)
 
     batch = DipoleBatch(
         image_obs=torch.zeros(3, 1, 3, 4, 4),
         image_obs_raw=torch.zeros(3, 1, 3, 4, 4),
         proprio=torch.zeros(3, 2),
         proprio_raw=torch.zeros(3, 2),
-        action_sequences=torch.zeros(3, 2, 2),
+        action_sequences=torch.randn(3, 2, 2),
         action_sequences_raw=torch.zeros(3, 2, 2),
         is_intervention=torch.zeros(3, dtype=torch.bool),
         metadata={},
     )
 
-    metrics = policy.update(batch)
+    metrics = policy.update(batch, want_metrics=True)
 
-    assert policy.model.flow_head.calls == 1
+    # One forward per policy (no fused 2x pass anymore).
+    assert policy.model_pos.calls == 1
+    assert policy.model_neg.calls == 1
     assert "loss_pos" in metrics
     assert "loss_neg" in metrics
-    assert policy.model.pos_lora_param.grad is not None
-    assert policy.model.neg_lora_param.grad is not None
+    # Both policies received gradients and are optimized independently.
+    assert policy.model_pos.param.grad is not None
+    assert policy.model_neg.param.grad is not None
+
+
+def test_update_skips_metrics_when_not_requested() -> None:
+    policy = object.__new__(DipoleFlowPolicy)
+    policy.device = torch.device("cpu")
+    policy.model_pos = _FakeUpdateModel(scale=0.1)
+    policy.model_neg = _FakeUpdateModel(scale=-0.1)
+    policy.config = SimpleNamespace(
+        beta=0.0,
+        k=0.0,
+        lambda_endpoint=0.0,
+        lambda_smooth=0.0,
+        grad_clip_norm=10.0,
+        branch_weight_mode="coupled",
+    )
+    policy.language_instruction = "task"
+    policy.g_provider = None
+    policy.optimizer_pos = torch.optim.SGD(policy.model_pos.parameters(), lr=0.01)
+    policy.optimizer_neg = torch.optim.SGD(policy.model_neg.parameters(), lr=0.01)
+    policy.scaler_pos = torch.amp.GradScaler(enabled=False, device=policy.device)
+    policy.scaler_neg = torch.amp.GradScaler(enabled=False, device=policy.device)
+
+    batch = DipoleBatch(
+        image_obs=torch.zeros(3, 1, 3, 4, 4),
+        image_obs_raw=torch.zeros(3, 1, 3, 4, 4),
+        proprio=torch.zeros(3, 2),
+        proprio_raw=torch.zeros(3, 2),
+        action_sequences=torch.randn(3, 2, 2),
+        action_sequences_raw=torch.zeros(3, 2, 2),
+        is_intervention=torch.zeros(3, dtype=torch.bool),
+        metadata={},
+    )
+
+    # want_metrics=False still trains (grads present) but returns no scalar metrics.
+    metrics = policy.update(batch, want_metrics=False)
+    assert metrics == {}
+    assert policy.model_pos.param.grad is not None
+    assert policy.model_neg.param.grad is not None
 
 
 @pytest.mark.parametrize("requested", [1, 4, 8])

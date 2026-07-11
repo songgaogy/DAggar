@@ -78,7 +78,7 @@ HYDRA_OVERRIDES=(
 
 # Save assembled offline transitions for future reuse (offline DIPOLE etc.).
 HYDRA_OVERRIDES+=("warmup.num_trajectories.save_data=true")
-HYDRA_OVERRIDES+=("warmup.num_trajectories.save_dir=offline_data")
+HYDRA_OVERRIDES+=("warmup.num_trajectories.save_dir=offline_data-iql")
 
 # Collapse each success demo's post-success drift into one frozen absorbing
 # (s, a) anchor (see warmup.freeze_post_success). Default on; set

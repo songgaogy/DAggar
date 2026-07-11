@@ -1,3 +1,3 @@
-from .flow import DipoleFlowPolicy, DipolePolarityFlowModel
+from .flow import DipoleFlowPolicy
 
-__all__ = ["DipoleFlowPolicy", "DipolePolarityFlowModel"]
+__all__ = ["DipoleFlowPolicy"]

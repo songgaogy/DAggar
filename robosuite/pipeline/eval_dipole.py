@@ -225,12 +225,6 @@ def _build_dipole_policy(
         k=float(flow_cfg.get("k", 0.0)),
         guidance_omega=float(omega),
         g_clip=float(flow_cfg.get("g_clip", 10.0)),
-        lora_rank=int(flow_cfg.get("lora_rank", 16)),
-        lora_alpha=float(flow_cfg.get("lora_alpha", 16.0)),
-        lora_dropout=float(flow_cfg.get("lora_dropout", 0.0)),
-        lora_include_aggregator=bool(flow_cfg.get("lora_include_aggregator", True)),
-        lora_include_conv=bool(flow_cfg.get("lora_include_conv", True)),
-        adapter_lr=float(flow_cfg.get("adapter_lr", 1e-3)),
     )
     policy = DipoleFlowPolicy(
         model_cfg=dict(payload["model_cfg"]),

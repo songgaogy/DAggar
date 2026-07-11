@@ -6,7 +6,7 @@ defaults:
   - train_dipole_rl
   - _self_
 
-# Offline-specific knobs (read by offline/train_offline_dipole.py).
+# Offline-specific knobs (read by offline/src/train_offline_dipole.py).
 offline:
   data_root: "/home/dodo/Documents/DAggar/robosuite/data"
   pretrain_dir: "pretrain_data-20260615_174814"   # <data_root>/<task>/<pretrain_dir>, expert HDF5, all frames
@@ -19,7 +19,7 @@ offline:
   preencode_batch_size: 64
   max_pretrain_trajectories: null                  # null = all expert demos
   mode: "normal"                                    # "naive" or "normal" or "neg_all"
-  eval:                                            # consumed by eval_offline_dipole.sh
+  eval:                                            # consumed by offline/scripts/eval_offline_dipole.sh
     omega: 0.2
     episodes: 50
     episode_max_steps: 500

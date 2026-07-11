@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Headless success-rate + video eval for an offline-finetuned DIPOLE checkpoint
-# (README step-4). Uses DIPOLE two-branch guidance with OMEGA. Results land under
+# (PROMPT.md [tbd]). Uses DIPOLE two-branch guidance with OMEGA. Results land under
 # the training run dir (<run_dir>/eval/...) by default.
 #
-# Set POLICY_CKPT to the offline-finetuned checkpoint (e.g. .../checkpoints/latest.pt).
+# Set POLICY_CKPT to the offline-finetuned checkpoint written by
+# train_offline_dipole.sh, i.e. data/dipole-rl-offline/<task>_<ts>_<postfix>/checkpoints/latest.pt.
 
 set -euo pipefail
 
@@ -14,9 +15,9 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole_success_only/PickPlaceCereal/2026-07-09_00-22-43_success_only/checkpoints/step_00014999.pt"
-# OMEGAS=(0 1 5)
-# OMEGAS=(0.5 2 10)
+POLICY_CKPT="outputs/dipole-rl-offline/PickPlaceCereal_20260711_124405_dagger-with_success/checkpoints/step_00014999.pt"
+# OMEGAS=(0 0.2 1)
+# OMEGAS=(0.1 0.5 2)
 OMEGAS=(0)
 EVAL_EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
@@ -51,5 +52,5 @@ for OMEGA in "${OMEGAS[@]}"; do
   fi
 
   echo "[eval_offline_dipole] task=${TASK} ckpt=${POLICY_CKPT} omega=${OMEGA} episodes=${EVAL_EPISODES} seed=${SEED} video=${SAVE_VIDEO} video_size=${VIDEO_SIZE}"
-  "${PY}" -m robosuite.pipeline.offline.eval_offline_dipole "${EVAL_ARGS[@]}"
+  "${PY}" -m robosuite.pipeline.offline.src.eval_offline_dipole "${EVAL_ARGS[@]}"
 done

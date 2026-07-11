@@ -296,18 +296,26 @@ def build_nnpu_runtime(
 
 def render_nnpu_hud(out: Any, status: NNPUStatus, *, step: int, episode_step: int) -> None:
     """Render one compact terminal line; all output failures are ignored."""
+    red = "\033[1;31m"
+    green = "\033[1;32m"
+    yellow = "\033[1;33m"
+    reset = "\033[0m"
     if status.paused:
         label = "FAIL · PAUSED (ENTER/SpaceMouse to resume)"
+        color = yellow
     elif status.pred == 1:
         label = "FAIL"
+        color = red
     elif status.pred == 0:
         label = "SAFE"
+        color = green
     else:
         label = "...."
+        color = yellow
     score = "n/a" if not np.isfinite(status.score) else f"{status.score:+.3f}"
     try:
         out.write(
-            f"\r[nnPU {label}] step={step} epstep={episode_step} "
+            f"\r[nnPU {color}{label}{reset}] step={step} epstep={episode_step} "
             f"score={score} tau={status.threshold:+.3f}\033[K"
         )
         out.flush()

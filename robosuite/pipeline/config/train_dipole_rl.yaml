@@ -26,8 +26,8 @@ algorithm:
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
       expectile_tau: 0.7
-      q_lr: 3.0e-4
-      v_lr: 3.0e-4
+      q_lr: 1.0e-4
+      v_lr: 1.0e-4
       target_polyak: 0.005
       n_step_aggregate: true
       # Head width AFTER the Token/Group projector (the projector — not the

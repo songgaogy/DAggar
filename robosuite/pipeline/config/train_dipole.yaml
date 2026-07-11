@@ -115,16 +115,9 @@ algorithm:
     beta: 8.0
     k: 0.0
     guidance_omega: 2.0               # eval-only: v=(1+w)v_pos - w v_neg (rollout is pos-only)
-    # Dual symmetric LoRA on a FROZEN backbone:
-    #   positive policy = base + pos_LoRA, negative policy = base + neg_LoRA.
-    # Both adapters share these hyperparameters.
-    lora:
-      rank: 32
-      alpha: 16.0
-      dropout: 0.1
-      include_aggregator: true
-      include_conv: true               # also LoRA the UNet denoising Conv1d pathway (needed under frozen base)
-      adapter_lr: 2.0e-4               # LoRA param LR (both pos and neg adapters)
+    # Two independent full-tune flow policies (positive + negative). No LoRA:
+    # each policy trains full-tune under the base freeze regime, using the flow
+    # section's learning_rate / weight_decay.
     intervention_g: "+inf"             # manifest only; code uses an explicit mask
     g_mode: "nnpu_frozen"             # nnpu_frozen | advantage
 

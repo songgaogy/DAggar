@@ -6,8 +6,8 @@ thing before they diverge on data selection / critics:
 
 1. seed + CUDA matmul flags,
 2. a headless robosuite env (proprio only, no rendering) + proprio extractor,
-3. the DIPOLE agent with the pretrained flow policy loaded and its LoRA-vs-base
-   parameter summary printed,
+3. the DIPOLE agent with the pretrained flow policy loaded and its per-policy
+   (positive / negative) trainable-vs-frozen parameter summary printed,
 4. after each caller populates the replay buffer: flow normalizers (fit once) +
    a batch-size sanity check.
 
@@ -42,49 +42,32 @@ from robosuite.pipeline.train_dipole import (
 
 
 def print_policy_param_summary(core: Any, *, log_tag: str = "offline") -> None:
-    """Print LoRA adapter vs base trainable parameter counts after policy init.
+    """Print per-policy trainable-vs-frozen parameter counts after policy init.
 
-    With the dual-LoRA architecture the backbone is frozen, so ``base`` (trainable
-    non-LoRA) should be 0; only the pos/neg adapters train.
+    DIPOLE now trains two independent full-tune flow policies (``model_pos`` /
+    ``model_neg``), each under the base freeze regime (frozen CLIP + ResNet
+    stem/layer1/layer2, trainable layer3/layer4 + heads). ``trainable`` should be
+    identical for the two policies and equal to a stock ``build_flow_policy`` model.
     """
-    model = core.model
-    lora_numel = 0
-    base_numel = 0
-    frozen_numel = 0
-    lora_module_paths: list[str] = []
-    for name, param in model.named_parameters():
-        n = int(param.numel())
-        if not param.requires_grad:
-            frozen_numel += n
-            continue
-        if ".pos_lora_" in name or ".neg_lora_" in name:
-            lora_numel += n
-            if name.endswith(".pos_lora_A"):
-                lora_module_paths.append(name[: -len(".pos_lora_A")])
-        else:
-            base_numel += n
 
-    trainable_numel = lora_numel + base_numel
-    total_numel = trainable_numel + frozen_numel
-    lora_num_modules = int(getattr(model, "lora_num_modules", len(lora_module_paths)))
-    print(
-        f"[{log_tag}] policy trainable params: total={trainable_numel:,} "
-        f"(base={base_numel:,}, lora={lora_numel:,})"
-    )
-    print(
-        f"[{log_tag}] policy frozen params: {frozen_numel:,} "
-        f"(all params={total_numel:,})"
-    )
-    print(
-        f"[{log_tag}] lora modules={lora_num_modules} "
-        f"(rank={getattr(core.config, 'lora_rank', '?')}, "
-        f"alpha={getattr(core.config, 'lora_alpha', '?')}, "
-        f"include_aggregator={getattr(core.config, 'lora_include_aggregator', '?')})"
-    )
-    if lora_module_paths:
-        print(f"[{log_tag}] lora target paths:")
-        for path in lora_module_paths:
-            print(f"  - {path}")
+    def _counts(model: Any) -> tuple[int, int]:
+        trainable = 0
+        frozen = 0
+        for _, param in model.named_parameters():
+            n = int(param.numel())
+            if param.requires_grad:
+                trainable += n
+            else:
+                frozen += n
+        return trainable, frozen
+
+    for branch, model in (("pos", core.model_pos), ("neg", core.model_neg)):
+        trainable, frozen = _counts(model)
+        total = trainable + frozen
+        print(
+            f"[{log_tag}] policy[{branch}] trainable={trainable:,} "
+            f"frozen={frozen:,} (all params={total:,})"
+        )
 
 
 @dataclass

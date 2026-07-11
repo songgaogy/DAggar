@@ -162,21 +162,17 @@ The discriminator path is tensor-native; training does not round-trip features t
 
 ### DIPOLE policy
 
-The policy shares one **frozen** flow backbone and expresses polarity through two symmetric low-rank adapters:
+The policy is **two independent, fully finetuned flow policies** — a positive policy and a negative policy:
 
 ```text
-positive policy = base + pos_LoRA
-negative policy = base + neg_LoRA
+positive policy = MultiModalFlowPolicy (full-tune)
+negative policy = MultiModalFlowPolicy (full-tune)
 ```
 
-Each adapter covers two layer families of the flow head so the frozen backbone has real adaptation capacity:
-- the **condition pathway** `nn.Linear` modules (FiLM `cond_proj`, gated cross-attention, condition MLPs) and, optionally, the condition aggregator (`LoRALinear`); and
-- the **UNet denoising pathway** `nn.Conv1d` modules (`input_proj`, every residual-block `conv1`/`conv2`, up/down samples, `output_conv`) via `LoRAConv1d` (toggle `lora.include_conv`).
+Each is a plain `MultiModalFlowPolicy` built by `build_flow_policy`, trained full-tune under the **base flow-policy freeze regime**: the ResNet image encoder trains only `layer3`/`layer4` (stem/`layer1`/`layer2` frozen), the CLIP text encoder is fully frozen, and everything else (proprio tokenizer, fusion, condition aggregator, flow head) trains. There are **no LoRA adapters** — each policy has its own AdamW optimizer at the flow `learning_rate`/`weight_decay`, its own GradScaler, and its own double-buffered inference copy. Both policies start from the same pretrained init checkpoint, so `v_pos == v_neg` at step 0 and diverge as training proceeds.
 
-Conv coverage matters under a frozen base: the denoising convs hold most of the flow head's capacity, so a condition-only adapter set cannot fit the data — it just drives the FiLM/LoRA deltas to blow up while the loss stalls. Both adapters are zero-initialized (`pos == neg == base` at start) and share the same rank/alpha/dropout/`adapter_lr`. Only the two adapters train; the entire backbone is frozen.
-
-- **Online rollout** uses the positive policy only (`base + pos_LoRA`), a single forward per ODE step (no omega combination).
-- **Evaluation** keeps two-branch guidance, combining the branches at inference:
+- **Online rollout** uses the positive policy only, a single forward per ODE step (no omega combination); the negative policy is never encoded or forwarded when `omega == 0`.
+- **Evaluation** combines the two policies with CFG-style guidance at inference:
 
 ```text
 v_guided = (1 + omega) * v_pos - omega * v_neg
@@ -187,10 +183,12 @@ v_guided = (1 + omega) * v_pos - omega * v_neg
 ```text
 w_pos = sigmoid(clamp(beta_dipole * normalize(G) + k, -g_clip, g_clip))
 w_neg = 1 - w_pos
-L     = mean(w_pos * L_pos + w_neg * L_neg)
+L     = w_pos * L_pos + w_neg * L_neg     # per-policy weighted mean
 ```
 
-The positive loss (`w_pos`) updates `pos_LoRA`; the negative loss (`w_neg`) updates `neg_LoRA`. Because the backbone is frozen and the two adapters are disjoint parameter sets, training is two independent backwards then one optimizer step — no gradient combination. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
+The positive policy trains on the `w_pos`-weighted loss, the negative policy on the `w_neg`-weighted loss — two independent forward/backward passes and two optimizer steps per update. The soft-weight scheme above (`offline.mode == "normal"`) and the hard-split schemes (`naive`/`neg_all`, where `w_pos`/`w_neg` become ~{0,1} membership) both reduce to this same two-policy weighted update. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
+
+> Note: this two-policy scheme is a clean break from the earlier dual-LoRA-on-frozen-backbone design — old dual-LoRA checkpoints do not load. Training two full policies is ~2x the compute/VRAM of the LoRA scheme; online rollout stays positive-only so the negative policy's inference copies sit idle during rollout.
 
 ### DIPOLE-RL critics
 
@@ -307,8 +305,8 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
   2. Use the pretrained flow policy and IQL checkpoint to run the DIPOLE-RL update offline. **note**: when compute dipole weight G, use TD term $Adv= V - \gamma*V' - r$ rather then current $Adv=Q-V$
   3. for code structure, make codebase moduler, leave tool functions under `robosuite/pipeline/offline/utils`
   4. implement evaluation logic: evaluate success rate for finetuned policy. For video saving logic and saving directory arrangement, you can refer to `pipeline/sft` folder in branch `dagger/v0-pu-bce`
-- [x] step 5: Replace the condition-injection positive/negative policy architecture with dual LoRA adapters on a frozen backbone. **note**: the design evolved past the original single-negative-adapter plan — it is now a symmetric **two-adapter** scheme:
-  - The backbone is **frozen**; polarity is carried by two symmetric adapters: `positive = base + pos_LoRA`, `negative = base + neg_LoRA` (both zero-init, shared hyperparameters). This supersedes the earlier "train the adapter and base together with a lower base LR" bullet — base is no longer trained.
-  - Positive loss (`w_pos`) trains `pos_LoRA`; negative loss (`w_neg`) trains `neg_LoRA`. Disjoint parameter sets ⇒ two independent backwards, no gradient combination and no `base_lr_scale`.
-  - Online rollout uses only the positive policy (`base + pos_LoRA`); `guidance_omega` is eval-only.
-  - Evaluation keeps DIPOLE two-branch inference with `(1 + omega)` and `omega` weighting.
+- [x] step 5: Represent polarity as **two independent, fully finetuned flow policies** (positive + negative). **note**: this supersedes the earlier dual-LoRA-on-frozen-backbone scheme (which itself superseded the original single-negative-adapter / condition-injection plans) — it is a clean break, and old dual-LoRA checkpoints do not load.
+  - Each policy is a plain `MultiModalFlowPolicy` (`build_flow_policy`), full-tune under the base freeze regime (ResNet `layer3`/`layer4` + heads trainable, ResNet stem/`layer1`/`layer2` + CLIP frozen). Both start from the same pretrained init, so `v_pos == v_neg` at step 0.
+  - Positive policy trains on the `w_pos`-weighted loss, negative on `w_neg` — two independent forward/backward passes, two optimizers, at the flow `learning_rate`/`weight_decay`. Soft-weight (`normal`) and hard-split (`naive`/`neg_all`) both reduce to this.
+  - Online rollout uses only the positive policy; `guidance_omega` is eval-only.
+  - Evaluation keeps DIPOLE two-policy inference with `(1 + omega)` and `omega` weighting.
