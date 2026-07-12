@@ -428,6 +428,39 @@ def _sparse_env_step_reward(env, state: np.ndarray, action: np.ndarray, reward_m
     return float(reward), bool(success)
 
 
+def _sparse_reward_from_success(success: bool, reward_mode: str) -> float:
+    if reward_mode == "0/1":
+        return 1.0 if success else 0.0
+    if reward_mode == "-1/0":
+        return 0.0 if success else -1.0
+    raise ValueError(f"Invalid reward mode: {reward_mode}")
+
+
+def _post_action_success_from_hdf5_labels(
+    is_success: np.ndarray,
+    *,
+    demo_success_attr: bool,
+    path: str | Path,
+    demo_name: str,
+    expected_len: int,
+) -> np.ndarray:
+    labels = np.asarray(is_success, dtype=np.bool_).reshape(-1)
+    if int(labels.shape[0]) != int(expected_len):
+        raise ValueError(
+            f"{path}:{demo_name} is_success length {labels.shape[0]} != actions length {expected_len}"
+        )
+    if np.any(labels[:-1] & ~labels[1:]):
+        raise ValueError(f"{path}:{demo_name} is_success must be monotonic false->true.")
+
+    # Rollout generation stores pre-action success. The transition reward needs
+    # post-action success, so shift left by one step.
+    post = np.zeros_like(labels, dtype=np.bool_)
+    if len(labels) > 1:
+        post[:-1] = labels[1:]
+    post[-1] = bool(labels[-1] or (demo_success_attr and not labels[:-1].any()))
+    return post
+
+
 def load_hdf5_demos_into_flow_transitions(
     path: str | Path,
     *,
@@ -440,7 +473,9 @@ def load_hdf5_demos_into_flow_transitions(
     control_freq: int,
     demo_names: list[str] | None,
     state_extractor: RobosuiteProprioExtractor,
-    reward_mode: str = "-1/0"
+    reward_mode: str = "-1/0",
+    prefer_hdf5_success_labels: bool = False,
+    bulk_read_hdf5_images: bool = False,
 ) -> list:
     _ = proprio_keys
     _ = renderer
@@ -465,7 +500,17 @@ def load_hdf5_demos_into_flow_transitions(
             if isinstance(model_xml, bytes):
                 model_xml = model_xml.decode("utf-8")
             model_xml = str(model_xml) if model_xml else None
-            _reset_flow_env_for_demo(env, state_extractor, model_xml)
+            hdf5_step_success: np.ndarray | None = None
+            if bool(prefer_hdf5_success_labels) and "is_success" in demo_group:
+                hdf5_step_success = _post_action_success_from_hdf5_labels(
+                    np.asarray(demo_group["is_success"][:], dtype=np.bool_),
+                    demo_success_attr=demo_success_attr,
+                    path=path,
+                    demo_name=str(demo_name),
+                    expected_len=len(actions),
+                )
+            if hdf5_step_success is None:
+                _reset_flow_env_for_demo(env, state_extractor, model_xml)
             if "intervention_labels" in demo_group:
                 intervention_labels = np.asarray(demo_group["intervention_labels"], dtype=np.bool_)
             else:
@@ -498,12 +543,22 @@ def load_hdf5_demos_into_flow_transitions(
             for camera_name in required_hdf5_camera_names:
                 if camera_name not in obs_group:
                     raise KeyError(f"Missing camera '{camera_name}' in {path}:{demo_name}")
+            image_arrays = None
+            if bool(bulk_read_hdf5_images):
+                image_arrays = {
+                    camera_name: np.asarray(obs_group[camera_name]["images"][:], dtype=np.uint8)
+                    for camera_name in required_hdf5_camera_names
+                }
 
             for step_idx in range(len(actions)):
                 next_idx = min(step_idx + 1, len(actions) - 1)
                 raw_obs_images = {
                     camera_name: _center_crop_resize_image(
-                        np.asarray(obs_group[camera_name]["images"][step_idx], dtype=np.uint8),
+                        (
+                            image_arrays[camera_name][step_idx]
+                            if image_arrays is not None
+                            else np.asarray(obs_group[camera_name]["images"][step_idx], dtype=np.uint8)
+                        ),
                         img_height=img_height,
                         img_width=img_width,
                     )
@@ -511,7 +566,11 @@ def load_hdf5_demos_into_flow_transitions(
                 }
                 raw_next_obs_images = {
                     camera_name: _center_crop_resize_image(
-                        np.asarray(obs_group[camera_name]["images"][next_idx], dtype=np.uint8),
+                        (
+                            image_arrays[camera_name][next_idx]
+                            if image_arrays is not None
+                            else np.asarray(obs_group[camera_name]["images"][next_idx], dtype=np.uint8)
+                        ),
                         img_height=img_height,
                         img_width=img_width,
                     )
@@ -533,7 +592,13 @@ def load_hdf5_demos_into_flow_transitions(
                     camera_aliases=camera_aliases,
                 )
                 is_last_step = step_idx == len(actions) - 1
-                reward, step_success = _sparse_env_step_reward(env, states[step_idx], actions[step_idx], reward_mode=reward_mode)
+                if hdf5_step_success is not None:
+                    step_success = bool(hdf5_step_success[step_idx])
+                    reward = _sparse_reward_from_success(step_success, reward_mode)
+                else:
+                    reward, step_success = _sparse_env_step_reward(
+                        env, states[step_idx], actions[step_idx], reward_mode=reward_mode
+                    )
                 transitions.append(
                     Transition(
                         obs=obs_images,

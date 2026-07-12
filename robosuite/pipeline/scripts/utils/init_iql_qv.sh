@@ -33,29 +33,39 @@ cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 export CUDA_VISIBLE_DEVICES=1
 
+BRANCH_NAME="dipole_rl-iql"
+
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v2-01"
-BRANCH_NAME="dipole_rl-iql"
+NAME="offline_iql_qv-v2_explore-ensemble"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE=512
 DEVICE="${DEVICE:-cuda:0}"
 # Where to hold the pre-encoded chunk cache: "cpu" (default; no VRAM growth) or
 # "learner"/"device" (cache on the IQL GPU — faster sampling but OOMs on large
 # datasets since it stores one ~14k-float feature row per valid chunk in VRAM).
 PREENCODE_CACHE_DEVICE="${PREENCODE_CACHE_DEVICE:-cpu}"
+PREFER_HDF5_SUCCESS_LABELS="${PREFER_HDF5_SUCCESS_LABELS:-true}"
+BULK_READ_HDF5_IMAGES="${BULK_READ_HDF5_IMAGES:-true}"
+# V-only value fit (V_ONLY_ADVANTAGE_DESIGN.md §4): expectile optimism +
+# N-head soft-LCB (mean-beta*std) with per-head Bernoulli bootstrap masks.
+EXPECTILE_TAU="${EXPECTILE_TAU:-0.5}"
+V_ENSEMBLE_SIZE="${V_ENSEMBLE_SIZE:-5}"
+LCB_BETA="${LCB_BETA:-0.5}"
+BOOTSTRAP_PROB="${BOOTSTRAP_PROB:-0.5}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 INIT_CHECKPOINT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 mkdir -p "${OUTPUT_DIR}"
 
-# IQL warmup is offline (HDF5 images + proprio); sparse r_env is replayed through
-# the robosuite env per step (actual task success), not HDF5 split/last-frame labels.
+# IQL warmup is offline (HDF5 images + proprio). By default, rollout HDF5
+# `is_success` labels are shifted to post-action rewards; set
+# PREFER_HDF5_SUCCESS_LABELS=false to replay sparse r_env through robosuite.
 # Env is built without offscreen rendering.
 # MUJOCO_GL is unused unless you override warmup to enable rendering.
 export MUJOCO_GL="egl"
@@ -70,10 +80,16 @@ HYDRA_OVERRIDES=(
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
   "algorithm.discriminator.checkpoint=${NNPU_CKPT}"
   "algorithm.q_learning.config.device=${DEVICE}"
+  "algorithm.q_learning.config.expectile_tau=${EXPECTILE_TAU}"
+  "algorithm.q_learning.config.v_ensemble_size=${V_ENSEMBLE_SIZE}"
+  "algorithm.q_learning.config.ensemble_lcb_beta=${LCB_BETA}"
+  "algorithm.q_learning.config.ensemble_bootstrap_prob=${BOOTSTRAP_PROB}"
   "+warmup.output_path=${OUTPUT_FILE}"
   "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
   "warmup.preencode_cache_device=${PREENCODE_CACHE_DEVICE}"
+  "warmup.prefer_hdf5_success_labels=${PREFER_HDF5_SUCCESS_LABELS}"
+  "warmup.bulk_read_hdf5_images=${BULK_READ_HDF5_IMAGES}"
 )
 
 # Save assembled offline transitions for future reuse (offline DIPOLE etc.).
@@ -88,6 +104,7 @@ HYDRA_OVERRIDES+=("warmup.freeze_post_success=${FREEZE_POST_SUCCESS}")
 HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
+echo "[init_iql_qv] value: expectile_tau=${EXPECTILE_TAU} v_ensemble_size=${V_ENSEMBLE_SIZE} lcb_beta=${LCB_BETA} bootstrap_prob=${BOOTSTRAP_PROB}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"
 echo "[init_iql_qv] tensorboard=${TENSORBOARD_DIR}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"

@@ -126,11 +126,8 @@ class _BatchPrefetcher:
 
 
 def _freeze_iql(iql: IQLLearner) -> None:
-    """Disable grads on every IQL module so Phase B never updates the critics."""
+    """Disable grads on the IQL value modules so Phase B never updates them."""
     for module in (
-        iql.chunk_projector,
-        iql.action_projector,
-        iql.q_ensemble,
         iql.v,
         iql.target_v,
     ):

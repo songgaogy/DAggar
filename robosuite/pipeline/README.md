@@ -1,6 +1,6 @@
 # DIPOLE Pipeline
 
-This directory implements the online human-in-the-loop training stack used by DIPOLE and DIPOLE-RL. Both algorithms train the same polarity-conditioned flow policy and follow the Flow-DAgger rollout protocol. DIPOLE uses a frozen nnPU failure discriminator to weight the two policy branches; DIPOLE-RL additionally learns offline-to-online IQL critics and uses their advantage in the branch weighting signal.
+This directory implements the online human-in-the-loop training stack used by DIPOLE and DIPOLE-RL. Both algorithms train the same polarity-conditioned flow policy and follow the Flow-DAgger rollout protocol. DIPOLE uses a frozen nnPU failure discriminator to weight the two policy branches; DIPOLE-RL additionally learns an offline-to-online **V-only** IQL value (no Q head) and uses its **TD-residual advantage** in the branch weighting signal. (Under the deterministic dynamics + single-action coverage here the Q step is redundant — `Q(s,a)=r+γV(s')` holds exactly, so Q cancels out of the value fit; see [V_ONLY_ADVANTAGE_DESIGN.md](./V_ONLY_ADVANTAGE_DESIGN.md).)
 
 The pipeline is intended for research runs with robosuite, a SpaceMouse, and one or two CUDA devices. The default Python interpreter is:
 
@@ -13,7 +13,7 @@ The pipeline is intended for research runs with robosuite, a SpaceMouse, and one
 | Mode | `algorithm.dipole.g_mode` | Training signal |
 |---|---|---|
 | DIPOLE | `nnpu_frozen` | Frozen nnPU failure score |
-| DIPOLE-RL | `advantage` | IQL advantage minus frozen nnPU failure score |
+| DIPOLE-RL | `advantage` | V-only TD-residual advantage minus frozen nnPU failure score |
 
 The shared actor is the flow model in `robosuite.policy.flow_multi_update`. Its architecture and checkpoint parameter names are compatible with the pre-refactor flow-multi-update checkpoints.
 
@@ -23,12 +23,11 @@ observations + proposed action chunk
              +--> DIPOLE flow policy --> environment or human override
              |
              +--> frozen DynEncoder
-                    |-- state feature ----------------------> V(s)
+                    |-- state feature ----------------------> V(s), target_V(s')
                     `-- action-conditioned chunk feature --> frozen nnPU head
-                                                        `--> Q token projector + action projector
 
 DIPOLE:    G = -failure_score
-DIPOLE-RL: G = alpha * normalized_advantage
+DIPOLE-RL: G = alpha * normalized_advantage        # advantage = r + γ^H·V(s') - V(s)
                - beta * normalized_failure_score
 ```
 
@@ -68,9 +67,9 @@ bash robosuite/pipeline/scripts/train_dipole.sh
 
 Useful overrides include `LEARNER_DEVICE`, `INFERENCE_DEVICE`, `ACTION_HORIZON`, `EXECUTE_HORIZON`, `OMEGA`, `BETA`, `DISC_INFERENCE_FPS`, and Hydra overrides passed after the script name.
 
-### Initialize IQL Q/V offline
+### Initialize IQL V offline
 
-DIPOLE-RL should normally start from a task-specific Q/V warmup checkpoint:
+DIPOLE-RL should normally start from a task-specific V warmup checkpoint:
 
 ```bash
 bash robosuite/pipeline/scripts/utils/init_iql_qv.sh
@@ -86,9 +85,9 @@ The warmup is seed-controlled (`SEED`, default 42): it seeds python/numpy/torch 
 
 With `warmup.num_trajectories.save_data=true` (forced by `init_iql_qv.sh`), the assembled raw offline transitions are also saved to `<data_root>/<task>/<save_dir>/iql_offline_transitions.pt` (plus a `.meta.json` sidecar). These reload verbatim via `FlowDaggerReplayBuffer.load`. The export is implemented, but the offline DIPOLE training entry under `pipeline/offline` is still a placeholder.
 
-With `FREEZE_POST_SUCCESS=true` (default, via `warmup.freeze_post_success`), each success demo's post-success tail is collapsed into a single frozen absorbing anchor before the IQL critics consume it. Recorded `success_rollout` demos are fixed-length (e.g. 400 steps) but keep running the live policy after success, so the frames after the first success are real *drift* (moving state, non-zero actions). Fitting Q/V on those many distinct, meaningless states is a burden, while their dense sampling is what anchors the terminal value `V≈0` and stabilizes TD. The warmup therefore overwrites every frame strictly after the first success frame `t_s` with a copy of that frame: `obs` (images + proprio), `next_obs`, and `action` all become the `t_s` values, and the frozen-tail reward is set to `0.0`. The first success frame keeps its real `(s, a)`; `fail_rollout` and demos without a success frame are untouched. The freeze is applied after the offline-data save, so the persisted `offline_data` keeps the raw drift frames; only the in-memory buffer the IQL warmup trains on is frozen. Set `FREEZE_POST_SUCCESS=false` to disable.
+With `FREEZE_POST_SUCCESS=true` (default, via `warmup.freeze_post_success`), each success demo's post-success tail is collapsed into a single frozen absorbing anchor before the IQL value consumes it. Recorded `success_rollout` demos are fixed-length (e.g. 400 steps) but keep running the live policy after success, so the frames after the first success are real *drift* (moving state, non-zero actions). Fitting V on those many distinct, meaningless states is a burden, while their dense sampling is what anchors the terminal value `V≈0` and stabilizes TD. The warmup therefore overwrites every frame strictly after the first success frame `t_s` with a copy of that frame: `obs` (images + proprio), `next_obs`, and `action` all become the `t_s` values, and the frozen-tail reward is set to `0.0`. The first success frame keeps its real `(s, a)`; `fail_rollout` and demos without a success frame are untouched. The freeze is applied after the offline-data save, so the persisted `offline_data` keeps the raw drift frames; only the in-memory buffer the IQL warmup trains on is frozen. Set `FREEZE_POST_SUCCESS=false` to disable.
 
-Current IQL warmup uses schema version 3. It compresses the frozen encoder features with Token/Group projectors before the Q/V heads, re-injects the raw `action_chunk` into Q through an action projector, and defaults to a lighter head (`hidden_dims=[256,256]`, `chunk_proj_dim=128`, `state_proj_dim=128`). The Hydra defaults run `10000` V-only steps followed by `5000` full IQL steps, with `reward_mode="-1/0"`, `output_reward_coef=0.1`, and `disc_reward_coef=0.0`.
+Current IQL warmup uses schema version 5 (V-only; no Q head; N-head V-ensemble with expectile-TD + soft-LCB). It compresses the frozen encoder state feature with a Token/Group projector before each V head and defaults to a lighter head (`hidden_dims=[256,256]`, `state_proj_dim=128`). The value is learned V-only by a single expectile-TD loop over `warmup_value_steps + warmup_full_steps` steps (the former two-phase value-only → full-IQL split no longer applies); see *DIPOLE-RL value* below for the expectile/ensemble/LCB knobs. Reward composition (`reward_mode`, `output_reward_coef`, `disc_reward_coef`) is set in `train_dipole_rl.yaml`.
 
 This is an experiment-specific entrance: `ENVIRONMENT`, `INIT_CHECKPOINT`, and `NNPU_CKPT` are intentionally hardcoded near the top of the script. Edit those constants directly for another task, base policy, or nnPU artifact. `SEED`, `BATCH_SIZE`, `DEVICE`, `OUTPUT_DIR`, `OUTPUT_FILE`, `PREENCODE_CACHE_DEVICE`, and `FREEZE_POST_SUCCESS` retain environment-variable overrides.
 
@@ -117,14 +116,14 @@ bash robosuite/pipeline/scripts/eval_dipole.sh
 
 Evaluation is headless, can save MP4 rollouts, runs a branch-divergence diagnostic, and writes one `summary.json` per guidance value plus an optional `sweep_summary.json`.
 
-### Inspect Q/V and discriminator reward
+### Inspect V and discriminator reward
 
 ```bash
 NNPU_CKPT=/abs/path/to/pu_bce_head.pth \
 bash robosuite/pipeline/scripts/utils/vis_iql_qv.sh
 ```
 
-This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and Q/V schema as training.
+This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and V (schema v5) checkpoint as training. It produces a 4-subplot figure: `V_lcb` (with the ensemble ±std band) / target-V, the V differences, the **advantage subplot** (the one-macro-step TD residual overlaid with the GAE(λ) advantage on `V_lcb`), and the per-frame discriminator reward (no Q curves; the old best-of-n Q diagnostic has been removed). GAE recurs in chunk periods (`γ_eff = γ^action_horizon`) and is evaluated densely at every window start; set `GAE_LAMBDA` (default `0.95`) to change λ.
 
 ## Human-in-the-loop runtime
 
@@ -139,7 +138,7 @@ Interactive training follows the current Flow-DAgger behavior:
 
 The runtime requires a desktop `DISPLAY` when interactive input is enabled. Set `INTERACTIVE=false`, disable intervention, and use `MUJOCO_GL=egl` for headless runs.
 
-HUD or optional display initialization failures are non-fatal: training may continue without visualization. A missing or incompatible nnPU checkpoint is fatal when it is required for G, Q/V features, or reward computation.
+HUD or optional display initialization failures are non-fatal: training may continue without visualization. A missing or incompatible nnPU checkpoint is fatal when it is required for G, V features, or reward computation.
 
 ## Core behavior
 
@@ -186,23 +185,26 @@ w_neg = 1 - w_pos
 L     = w_pos * L_pos + w_neg * L_neg     # per-policy weighted mean
 ```
 
-The positive policy trains on the `w_pos`-weighted loss, the negative policy on the `w_neg`-weighted loss — two independent forward/backward passes and two optimizer steps per update. The soft-weight scheme above (`offline.mode == "normal"`) and the hard-split schemes (`naive`/`neg_all`, where `w_pos`/`w_neg` become ~{0,1} membership) both reduce to this same two-policy weighted update. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(Q-V)-beta*normalize(failure_score)`. The advantage and failure channels have independent normalization state.
+The positive policy trains on the `w_pos`-weighted loss, the negative policy on the `w_neg`-weighted loss — two independent forward/backward passes and two optimizer steps per update. The soft-weight scheme above (`offline.mode == "normal"`) and the hard-split schemes (`naive`/`neg_all`, where `w_pos`/`w_neg` become ~{0,1} membership) both reduce to this same two-policy weighted update. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(A)-beta*normalize(failure_score)` where the advantage is the V-only TD residual `A = r + γ^H·target_V(s') - V(s)`. The advantage and failure channels have independent normalization state.
 
 > Note: this two-policy scheme is a clean break from the earlier dual-LoRA-on-frozen-backbone design — old dual-LoRA checkpoints do not load. Training two full policies is ~2x the compute/VRAM of the LoRA scheme; online rollout stays positive-only so the negative policy's inference copies sit idle during rollout.
 
-### DIPOLE-RL critics
+### DIPOLE-RL value (V-only, expectile + soft-LCB ensemble)
 
-Q first compresses the action-conditioned chunk feature with a shared Token/Group projector, separately embeds the raw action chunk with an `ActionProjector`, then feeds the concatenated projection to each Q head. V and target-V consume the action-free state feature through their own Token/Group projector. For an H-step replay window, the learner computes:
+There is no Q head. The value is a **V-ensemble** of `v_ensemble_size` (default 2) independent heads, each with its own Token/Group projector; a full target-ensemble Polyak-tracks it. The scalar value consumed everywhere is the soft lower-confidence bound `V_lcb = mean_k V_k - beta*std_k V_k` (`ensemble_lcb_beta`, default 0.5 — soft, not hard min, so the recoverable-state lift in the high-disagreement region is kept). For an H-step replay window, every head regresses onto the shared **1-step** LCB bootstrap target by an **expectile** loss (optimism knob `expectile_tau`, default 0.85 > 0.5, turning the behavior value `V^beta` into the optimistic `V*`):
 
 ```text
 R_H   = sum(i=0..H-1) gamma^i * r_total_i
-y     = R_H + gamma^H * (1 - done_H) * target_V(s_next)
-L_Q   = mean_k MSE(Q_k(s, a_chunk), y)
-delta = min(Q_subset(s, a_chunk)) - V(s)
-L_V   = mean(abs(expectile_tau - 1[delta < 0]) * delta^2)
+y     = R_H + gamma^H * (1 - done_H) * V_lcb_target(s_next)     # shared across heads
+mask_k ~ Bernoulli(ensemble_bootstrap_prob)                    # per-head, per-sample
+L_V   = expectile_tau( y - V_k(s) )  weighted by mask_k         # summed over heads
 ```
 
-Only target-V receives a Polyak update. Each learner tick performs the IQL update before the flow-policy update; there is no discriminator update. Q uses an ensemble (`q_ensemble_size=10` by default), V uses the minimum over a random subset (`v_subset_size=2` by default), and the actor advantage uses the ensemble output through `compute_ensemble_advantage`.
+The per-head Bernoulli **bootstrap mask** (keep-prob `ensemble_bootstrap_prob`, default 0.5) diversifies the heads so the LCB std does not collapse. `v_ensemble_size=1` recovers a single head (std ≡ 0, `beta`/mask inert). The TD target stays **1-step** (n-step propagation was tried and reverted — see [V_ONLY_ADVANTAGE_DESIGN.md](./V_ONLY_ADVANTAGE_DESIGN.md) §4); `λ` survives only in the read-out GAE.
+
+> **Empirical update (`V_ONLY_ADVANTAGE_DESIGN.md` §4/§7-6):** the expectile *optimism* was tested and **rejected** — it gave no gain and degraded results. Runs therefore set `expectile_tau=0.5`, at which `expectile_tau(y - V_k)` reduces to `0.5·MSE` (asymmetry inert) → the value fit is plain **MSE-TD**. The **ensemble soft-LCB is the axis that works**, run with `v_ensemble_size=5`. Both are applied via `init_iql_qv.sh` env overrides (`EXPECTILE_TAU=0.5`, `V_ENSEMBLE_SIZE=5`); the in-code defaults (0.85 / 2) still hold the original hypothesis.
+
+Only target heads receive a Polyak update. Each learner tick performs the V update before the flow-policy update; there is no discriminator update. The per-step advantage consumed by the flow branch weighting is the TD residual on the LCB value `A = r + gamma^H·(1-done)·V_lcb_target(s') - V_lcb(s)` (`IQLLearner.compute_td_advantage`); the offline path precomputes the same residual by window start index (`offline/utils/advantage.py`).
 
 ## Configuration and repository layout
 
@@ -245,11 +247,12 @@ algorithm:
     config:
       reward_mode: "-1/0"
       hidden_dims: [256, 256]
-      chunk_proj_dim: 128
       state_proj_dim: 128
-      action_proj_dim: 64
-      q_ensemble_size: 10
-      v_subset_size: 2
+      proprio_proj_dim: 32
+      expectile_tau: 0.85         # optimism knob (expectile-TD value fit)
+      v_ensemble_size: 2          # N V heads for the soft-LCB
+      ensemble_lcb_beta: 0.5      # V_lcb = mean_k - beta*std_k
+      ensemble_bootstrap_prob: 0.5  # per-head bootstrap-mask keep-prob
 ```
 
 `camera_to_view` maps a policy camera name to the view name expected by the dynamics encoder. Leave it empty when names match.
@@ -273,8 +276,8 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 
 - Existing flow policy checkpoints remain compatible because the actor architecture and state-dict keys are unchanged.
 - Old LPB v2 BCE or online-BCE discriminator artifacts are not valid `NNPU_CKPT` inputs.
-- Old Q/V warmup checkpoints that contain one LPB context feature, separate `q1/q2`, omit `state_feature_dim` / `chunk_feature_dim`, or predate schema version 3 are rejected. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder.
-- A Q/V checkpoint is tied to the nnPU encoder, task, camera views, action dimension, horizon, ensemble size, token count, proprio width, and projector dimensions recorded in its metadata.
+- Any warmup checkpoint that contains a Q head (`q_ensemble`/`q1`) — i.e. every pre-V-only schema (v2/v3) — is rejected by the V-only learner. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder to produce a schema-v4 V-only checkpoint.
+- A V checkpoint is tied to the nnPU encoder, task, camera views, horizon, token count, proprio width, and V-projector dimensions recorded in its metadata.
 
 ## Troubleshooting
 
@@ -284,11 +287,11 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 | Task threshold missing | Use the task name stored in `pu_bce_detector.thresholds`, or recalibrate the nnPU artifact for the task. |
 | Dynamics checkpoint cannot be found | Set `NNPU_ENCODER_CKPT` to the matching encoder checkpoint; do not substitute a different model. |
 | Missing encoder view | Add the camera to `env.camera_names` or configure `algorithm.discriminator.camera_to_view`. |
-| Legacy Q/V schema error | Re-run offline Q/V warmup; old LPB/single-feature caches are intentionally incompatible. |
+| Q-head checkpoint rejected / `v_ensemble_size` mismatch | Re-run offline V warmup (schema v5); pre-V-only Q-containing caches and single-head v4 checkpoints are intentionally incompatible. |
 | Interactive run has no input/window | Verify `DISPLAY`, use `MUJOCO_GL=glfw`, and confirm SpaceMouse permissions. |
-| CUDA device mismatch | Align learner, inference, encoder, and Q/V device settings; remember that `CUDA_VISIBLE_DEVICES` renumbers devices. |
+| CUDA device mismatch | Align learner, inference, encoder, and V device settings; remember that `CUDA_VISIBLE_DEVICES` renumbers devices. |
 | HUD fails but learning continues | This is expected for optional visualization. Check the log for the display error separately. |
-| NaN/Inf critic values | Verify the actor and nnPU normalizers match their checkpoints, then inspect reward scale and the Q/V diagnostic outputs. |
+| NaN/Inf V values | Verify the actor and nnPU normalizers match their checkpoints, then inspect reward scale and the V diagnostic outputs. |
 
 # TODO List
 
@@ -310,3 +313,8 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
   - Positive policy trains on the `w_pos`-weighted loss, negative on `w_neg` — two independent forward/backward passes, two optimizers, at the flow `learning_rate`/`weight_decay`. Soft-weight (`normal`) and hard-split (`naive`/`neg_all`) both reduce to this.
   - Online rollout uses only the positive policy; `guidance_omega` is eval-only.
   - Evaluation keeps DIPOLE two-policy inference with `(1 + omega)` and `omega` weighting.
+- [x] step 6: Remove the Q head across the codebase and learn the value V-only (schema v4). Under deterministic dynamics + single-action coverage, `Q(s,a)=r+γV(s')` holds exactly so Q is redundant; see [V_ONLY_ADVANTAGE_DESIGN.md](./V_ONLY_ADVANTAGE_DESIGN.md).
+  1. `IQLLearner` drops the Q ensemble / action projector / optimizer; `update` becomes a single V-only MSE-TD step; add `compute_td_advantage` (`A = r + γ^H·(1-done)·target_V(s') - V(s)`). Warmup runs one V-only loop; checkpoint schema bumped to v4 and old Q checkpoints are rejected.
+  2. `vis_iql_qv.sh` / `vis_qv.py` drop the Q curves and the best-of-n Q diagnostic; only V / target-V / TD-advantage / reward are plotted.
+  3. The online `AdvantageGProvider` is a stub (`NotImplementedError`): the online `DipoleBatch` carries no next-state/reward, so threading those through the online sampler is deferred. The offline path (`OfflineAdvantageGProvider`) already serves the precomputed TD residual.
+  4. `expectile_tau` is retained as a reserved knob for a future expectile-TD ("optimism") value fit; the current path is plain MSE-TD.

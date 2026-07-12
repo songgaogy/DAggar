@@ -1,16 +1,21 @@
-"""G provider that mixes Q-V advantage with frozen nnPU failure scores.
+"""G provider that mixes a V-only TD advantage with frozen nnPU failure scores.
 
 Replaces `NNPUGProvider` when DipoleConfig.g_mode == "advantage".
-Implements the exact same `compute_g_for_batch(batch) -> (B,)` contract so
-`DipoleFlowPolicy.update()` is unchanged.
 
-Math:
-    A(s, a)        = mean(Q_1(s, a), ..., Q_K(s, a)) - V(s)
+Intended math (V-only, no Q head):
+    A(s, a)        = r + gamma^H * target_V(s') - V(s)      # TD residual
     failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
     G              = alpha * A - beta * failure
 
 The flow policy then maps G -> w_pos = sigmoid(beta_policy * G + k), so a
 larger advantage raises the positive-branch weight.
+
+STATUS: the online ``compute_g_for_batch`` is a stub. Computing the TD residual
+requires the next state ``s'`` and the chunk reward ``r`` for each sampled
+window, which the online :class:`DipoleBatch` does not currently carry (the
+offline path precomputes the residual by start index instead — see
+``offline/utils/advantage.py``). Wiring next-state/reward through the online
+sampler is deferred; until then this provider raises ``NotImplementedError``.
 
 This object owns nothing it doesn't construct: the IQL learner, the
 discriminator, and the encoder are all injected.
@@ -21,8 +26,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
-
-from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
 
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
@@ -62,38 +65,23 @@ class AdvantageGProvider:
 
     @torch.no_grad()
     def compute_g_for_batch(self, batch: Any) -> torch.Tensor:
-        """Args:
-            batch: `DipoleBatch`. We use `image_obs_raw`, `proprio_raw`,
-                   `action_sequences_raw` to build the IQL/disc inputs.
-        Returns:
-            (B,) tensor of G values on the same device as
-            `batch.action_sequences_raw`.
+        """Online TD-advantage G — NOT YET WIRED.
+
+        The V-only advantage is the TD residual
+        ``r + gamma^H * target_V(s') - V(s)``, which needs the next state
+        ``s'`` and chunk reward ``r`` for each window. The online
+        :class:`DipoleBatch` does not carry those (only ``s`` and the action
+        chunk). Until next-state/reward is threaded through the online sampler,
+        this method raises. The offline DIPOLE path uses
+        :class:`OfflineAdvantageGProvider` (precomputed TD residual) instead.
         """
-        action_chunk_raw = batch.action_sequences_raw.to(
-            device=torch.device(self.encoder.device), dtype=torch.float32
+        raise NotImplementedError(
+            "Online AdvantageGProvider.compute_g_for_batch is not implemented for "
+            "the V-only TD residual: the online DipoleBatch carries no next state "
+            "or chunk reward. Use the offline OfflineAdvantageGProvider (precomputed "
+            "TD advantage), or thread next_obs/reward through the online sampler "
+            "before enabling g_mode='advantage' online."
         )
-        state_feature, chunk_feature = self.encoder.encode_state_and_chunk(
-            image_obs_raw=batch.image_obs_raw,
-            proprio_raw=batch.proprio_raw,
-            action_chunk=action_chunk_raw,
-        )
-
-        actor_batch = IQLActorBatch(
-            q_chunk_feature=chunk_feature,
-            v_state_feature=state_feature,
-            action_chunk=action_chunk_raw,
-            metadata={},
-        )
-
-        advantage = self.iql_learner.compute_advantage_for_batch(actor_batch)
-        advantage = advantage.reshape(-1)
-
-        failure_score = self.discriminator.failure_score(
-            chunk_feature=chunk_feature
-        ).reshape(-1)
-
-        g = self.alpha * advantage - self.beta * failure_score
-        return g.to(batch.action_sequences_raw.device).reshape(-1)
 
     @torch.no_grad()
     def compute_g_for_observation(self, *args: Any, **kwargs: Any) -> torch.Tensor:

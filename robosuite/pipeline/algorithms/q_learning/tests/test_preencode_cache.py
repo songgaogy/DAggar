@@ -47,6 +47,18 @@ class _FakeEncoder:
         state = state + torch.arange(STATE_DIM, dtype=state.dtype).view(1, 1, -1)
         return state, chunk
 
+    def encode_state_and_chunk(self, *, image_obs_raw, proprio_raw, action_chunk):
+        # frame-0 fast path: identical to encode_features step 0 (base uses the
+        # frame-0 action + frame-0 proprio).
+        base0 = action_chunk[:, 0].sum(dim=-1) + proprio_raw.sum(dim=-1)  # (B,)
+        state = base0.unsqueeze(-1).repeat(1, STATE_DIM) + torch.arange(
+            STATE_DIM, dtype=base0.dtype
+        ).view(1, -1)
+        chunk = base0.unsqueeze(-1).repeat(1, CONTEXT_DIM) + torch.arange(
+            CONTEXT_DIM, dtype=base0.dtype
+        ).view(1, -1)
+        return state, chunk
+
     def encode_state(self, *, image_obs_raw, proprio_raw):
         base = proprio_raw.sum(dim=-1)
         state = base.unsqueeze(-1).repeat(1, STATE_DIM)

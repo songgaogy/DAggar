@@ -1,16 +1,17 @@
-"""Visualize nnPU-backed IQL Q/V values on one recorded or offline trajectory.
+"""Visualize the nnPU-backed V-only IQL value on one recorded or offline trajectory.
 
-Outputs (per run, under ``<output-root>/<task>_iql-qv/<split>_seed<seed>_<ts>/``):
-  * ``steps.csv``                    — per-window Q/V/advantage/reward metrics.
+Outputs (per run, under ``<output-root>/<split>_seed<seed>_<ts>/``):
+  * ``steps.csv``                    — per-window V / TD-advantage / GAE / reward metrics.
   * ``qv_timeseries.png``            — 4-subplot diagnostics over overlapping windows.
   * ``qv_timeseries_nonoverlap.png`` — same plot restricted to disjoint chunks (stride=H).
   * ``rollout_policy_obs.mp4``       — raw policy-camera rollout video.
-  * ``BON/``                         — best-of-n counterfactual Q diagnostics.
   * ``discriminator/``               — per-frame nnPU failure scores: CSV + plot + HUD video.
   * ``summary.json``                 — run metadata and output paths.
 
-The 4-subplot layout and metric semantics mirror the ``dipole-rl/v0-kingback``
-branch; the discriminator path is adapted to the frozen nnPU head.
+The value is V-only (no Q head). The advantage subplot overlays two curves: the
+one-macro-step TD residual ``r + γ^H V(s') - V(s)`` and the GAE(λ) advantage on
+``V*`` (chunk-period recursion, evaluated densely at every window start). The
+discriminator path uses the frozen nnPU head.
 """
 
 from __future__ import annotations
@@ -103,14 +104,6 @@ class PerStepNNPUDisc:
         return int(self.failure_score.shape[0])
 
 
-@dataclass(frozen=True)
-class QCandidateInputs:
-    starts: list[int]
-    images_np: np.ndarray
-    proprio_cpu: torch.Tensor
-    actions_cpu: torch.Tensor
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iql-ckpt", required=True)
@@ -131,6 +124,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-windows", type=int, default=None)
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=0.95,
+        help=(
+            "λ for the GAE(λ) advantage overlaid on the TD advantage subplot. "
+            "GAE recurs in chunk periods (γ_eff = γ^action_horizon). λ→1 approaches "
+            "the Monte-Carlo return; λ<1 keeps the bootstrap/stitching."
+        ),
+    )
     parser.add_argument("--output-root", default="outputs/DIPOLE_rl/iql_qv_cache-vis")
     parser.add_argument("--renderer", default=None)
     parser.add_argument("--control-freq", type=int, default=None)
@@ -142,11 +145,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-disc-reward", action="store_true")
     parser.add_argument("--no-disc-viz", action="store_true")
-    parser.add_argument(
-        "--no-bon",
-        action="store_true",
-        help="Skip Best-of-n Q diagnostics even on success-like splits.",
-    )
     # Discriminator HUD / rollout video controls.
     parser.add_argument(
         "--disc-viz-image-size",
@@ -158,13 +156,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disc-viz-camera", default=None)
     parser.add_argument("--disc-viz-border-thickness", type=int, default=10)
     parser.add_argument("--no-flip-vertical", action="store_true")
-    parser.add_argument("--q-candidate-noise-sigmas", default="0.05,0.10,0.20")
-    parser.add_argument("--q-candidate-random-n", type=int, default=16)
-    parser.add_argument("--q-candidate-single-dim-sigma", type=float, default=0.20)
-    parser.add_argument("--q-candidate-single-dim-n", type=int, default=0)
-    parser.add_argument("--q-candidate-seed", type=int, default=None)
-    parser.add_argument("--q-candidate-action-low", type=float, default=-1.0)
-    parser.add_argument("--q-candidate-action-high", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -173,11 +164,12 @@ def load_iql_payload(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"IQL checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     schema_version = int(payload.get("schema_version", -1))
-    if schema_version not in (2, 3):
+    if schema_version != 5:
         raise ValueError(
             f"Unsupported IQL checkpoint schema_version={schema_version}. "
-            "Legacy LPB checkpoints are incompatible with nnPU features; "
-            "re-run offline Q/V warmup."
+            "This visualizer expects the V-only ensemble schema (v5); the "
+            "single-head v4 and legacy Q-containing v2/v3 checkpoints are "
+            "incompatible — re-run offline V warmup."
         )
     for key in ("iql_state", "cfg", "encoder_meta"):
         if key not in payload:
@@ -664,7 +656,6 @@ def build_models(
         proprio_dim=int(encoder.inner_encoder.proprio_emb_dim),
     )
     learner.load_state_dict(payload["iql_state"], strict=True)
-    learner.q_ensemble.eval()
     learner.v.eval()
     learner.target_v.eval()
     return learner, encoder, discriminator, cfg, meta
@@ -682,8 +673,9 @@ def compute_metrics(
     batch_size: int,
     max_windows: int | None,
     use_disc_reward: bool,
-) -> tuple[list[dict[str, float]], PerStepNNPUDisc, QCandidateInputs]:
-    """Compute per-window Q/V metrics and a per-frame nnPU failure series.
+    gae_lambda: float,
+) -> tuple[list[dict[str, float]], PerStepNNPUDisc]:
+    """Compute per-window V/TD metrics and a per-frame nnPU failure series.
 
     The per-frame discriminator series reuses the per-frame chunk features that
     are already encoded for every sliding window, so it costs no extra encoder
@@ -779,17 +771,13 @@ def compute_metrics(
         total_steps = float(cfg.output_reward_coef) * rewards + float(cfg.disc_reward_coef) * disc_steps
         aggregated = aggregate_chunk_reward(total_steps, float(cfg.discount)).to(learner.cfg.device)
         done = chunk_done_mask(dones).to(learner.cfg.device)
-        q_values = learner._q_values(  # noqa: SLF001
-            chunk_features[:, 0], actions.to(learner.cfg.device)
-        )
-        v = learner.v(state_features[:, 0])
-        next_v = learner.target_v(next_state)
+        v_all = learner.v(state_features[:, 0])          # (B, N) per-head
+        v = learner._lcb(v_all)                          # (B, 1) soft-LCB value
+        v_std = v_all.std(dim=-1, unbiased=False, keepdim=True)  # ensemble band
+        next_v = learner.target_v_lcb(next_state)
         bootstrap_v = bootstrap_discount * (1.0 - done) * next_v
         td_target = aggregated + bootstrap_v
-        q_mean = q_values.mean(dim=0)
         for index, start in enumerate(batch_starts):
-            q_min = float(q_values[:, index].min().item())
-            q_max = float(q_values[:, index].max().item())
             v_val = float(v[index].item())
             td_target_val = float(td_target[index].item())
             done_flag = float(done[index].item()) > 0.5
@@ -811,16 +799,12 @@ def compute_metrics(
                 {
                     "window_start": float(start),
                     "step": float(start),
-                    "q_mean": float(q_mean[index].item()),
-                    "q_min": q_min,
-                    "q_max": q_max,
                     "v": v_val,
+                    "v_std": float(v_std[index].item()),
                     "next_v": float(next_v[index].item()),
                     "bootstrap_v": float(bootstrap_v[index].item()),
-                    "advantage": float(q_mean[index].item()) - v_val,
                     "advantage_td1": td_target_val - v_val,
                     "td_target": td_target_val,
-                    "td_residual": td_target_val - q_min,
                     "env_reward_horizon": float(env_aggregated[index].item()),
                     "disc_reward_horizon": float(disc_aggregated[index].item()),
                     "total_reward_horizon": float(aggregated[index].item()),
@@ -830,6 +814,40 @@ def compute_metrics(
                     "has_valid_next": float(has_valid_next),
                 }
             )
+    # ---- GAE(λ) advantage on V*, dense chunk-period recursion --------------
+    # Each row is one macro-step of the chunk-MDP the value was trained on
+    # (effective discount γ^H). Its one-macro-step TD residual is
+    #   δ_t = r_chunk(t) + γ^H·mask_t·V(s_{t+H}) − V(s_t),
+    # which equals ``advantage_td1`` when the bootstrap is valid; at a
+    # terminal/OOD window (``has_valid_next`` == 0) the bootstrap is dropped so
+    # the recursion never propagates through an off-support next_v.
+    # GAE walks forward in chunk periods (t, t+H, t+2H, …):
+    #   A_t = δ_t + (γ^H λ)·mask_t·A_{t+H}
+    # and is evaluated at every window start, giving a stride-1-dense curve
+    # aligned with the TD one. ``starts`` is contiguous from 0, so the list
+    # index equals the window start and the chunk successor is index t+H.
+    n_rows = len(rows)
+    gamma_h = float(cfg.discount) ** horizon
+    lam = float(gae_lambda)
+    mask = np.array(
+        [1.0 if float(r["has_valid_next"]) > 0.5 else 0.0 for r in rows], dtype=np.float32
+    )
+    delta = np.array(
+        [
+            float(r["total_reward_horizon"]) + gamma_h * mask[i] * float(r["next_v"]) - float(r["v"])
+            for i, r in enumerate(rows)
+        ],
+        dtype=np.float32,
+    )
+    adv_gae = np.zeros(n_rows, dtype=np.float32)
+    for i in range(n_rows - 1, -1, -1):
+        nxt = i + horizon
+        future = float(adv_gae[nxt]) if nxt < n_rows else 0.0
+        adv_gae[i] = delta[i] + gamma_h * lam * mask[i] * future
+    for i, r in enumerate(rows):
+        r["advantage_gae"] = float(adv_gae[i])
+    # ------------------------------------------------------------------------
+
     per_step_disc = _per_step_disc_from_windows(
         starts=starts,
         horizon=horizon,
@@ -838,13 +856,7 @@ def compute_metrics(
         disc_intrinsic_wh=disc_intrinsic_wh,
         threshold=threshold,
     )
-    q_candidate_inputs = QCandidateInputs(
-        starts=list(starts),
-        images_np=np.ascontiguousarray(images_np),
-        proprio_cpu=proprio_cpu.detach().cpu(),
-        actions_cpu=actions_cpu.detach().cpu(),
-    )
-    return rows, per_step_disc, q_candidate_inputs
+    return rows, per_step_disc
 
 
 def _per_step_disc_from_windows(
@@ -897,19 +909,28 @@ def _save_qv_timeseries_png(
     *,
     action_horizon: int,
     per_step_disc: PerStepNNPUDisc | None = None,
+    gae_lambda: float | None = None,
 ) -> Path:
     """Render the 4-subplot Q/V diagnostics (layout from dipole-rl/v0-kingback)."""
     if not metrics:
         raise ValueError("Cannot plot Q/V timeseries with empty metrics.")
     steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
-    q_min = np.asarray([row["q_min"] for row in metrics], dtype=np.float32)
-    q_mean = np.asarray([row["q_mean"] for row in metrics], dtype=np.float32)
-    q_max = np.asarray([row["q_max"] for row in metrics], dtype=np.float32)
     v = np.asarray([row["v"] for row in metrics], dtype=np.float32)
+    has_v_std = any("v_std" in row for row in metrics)
+    v_std = (
+        np.asarray([row.get("v_std", 0.0) for row in metrics], dtype=np.float32)
+        if has_v_std
+        else None
+    )
     next_v = np.asarray([row["next_v"] for row in metrics], dtype=np.float32)
     td_target = np.asarray([row["td_target"] for row in metrics], dtype=np.float32)
-    advantage = np.asarray([row["advantage"] for row in metrics], dtype=np.float32)
     advantage_td1 = np.asarray([row["advantage_td1"] for row in metrics], dtype=np.float32)
+    has_gae = any("advantage_gae" in row for row in metrics)
+    advantage_gae = (
+        np.asarray([row.get("advantage_gae", np.nan) for row in metrics], dtype=np.float32)
+        if has_gae
+        else None
+    )
     bootstrap_v = np.asarray([row["bootstrap_v"] for row in metrics], dtype=np.float32)
     env_rewards = np.asarray([row["env_reward_horizon"] for row in metrics], dtype=np.float32)
     total_rewards = np.asarray([row["total_reward_horizon"] for row in metrics], dtype=np.float32)
@@ -937,15 +958,25 @@ def _save_qv_timeseries_png(
         td_target[no_s_prime] = np.nan
         advantage_td1[no_s_prime] = np.nan
         bootstrap_v[no_s_prime] = np.nan
+        if advantage_gae is not None:
+            advantage_gae = advantage_gae.copy()
+            advantage_gae[no_s_prime] = np.nan
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
 
-    axes[0].plot(steps, q_mean, label="Q mean", color="tab:blue")
-    axes[0].fill_between(steps, q_min, q_max, color="tab:blue", alpha=0.18, label="Q min/max")
-    axes[0].plot(steps, v, label="V", color="tab:orange")
+    axes[0].plot(steps, v, label="V_lcb", color="tab:orange")
+    if v_std is not None:
+        axes[0].fill_between(
+            steps,
+            v - v_std,
+            v + v_std,
+            color="tab:orange",
+            alpha=0.2,
+            label="ensemble ±std",
+        )
     axes[0].plot(steps, next_v, label="target next V", color="tab:green", alpha=0.8)
-    axes[0].set_ylabel("Q / V")
+    axes[0].set_ylabel("V")
     axes[0].legend(loc="best")
     axes[0].grid(True, alpha=0.3)
 
@@ -968,7 +999,6 @@ def _save_qv_timeseries_png(
     axes[1].legend(loc="best", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(steps, advantage, label="advantage Qmean - V", color="tab:brown")
     axes[2].plot(
         steps,
         advantage_td1,
@@ -976,9 +1006,22 @@ def _save_qv_timeseries_png(
         color="tab:red",
         alpha=0.85,
     )
+    if advantage_gae is not None:
+        gae_label = (
+            "advantage GAE(λ)"
+            if gae_lambda is None
+            else f"advantage GAE(λ={float(gae_lambda):g}, γ^H recursion)"
+        )
+        axes[2].plot(
+            steps,
+            advantage_gae,
+            label=gae_label,
+            color="tab:blue",
+            alpha=0.85,
+        )
     axes[2].axhline(0.0, color="black", linewidth=1)
     axes[2].set_ylabel("Advantage")
-    axes[2].legend(loc="best")
+    axes[2].legend(loc="best", fontsize=8)
     axes[2].grid(True, alpha=0.3)
 
     axes[3].step(steps, total_rewards, where="post", label="total chunk reward (Bellman r)", color="tab:gray")
@@ -1028,6 +1071,7 @@ def plot_qv(
     *,
     action_horizon: int,
     per_step_disc: PerStepNNPUDisc | None = None,
+    gae_lambda: float | None = None,
 ) -> dict[str, Path]:
     """Write overlapping-window and non-overlapping-chunk Q/V plots (PNG)."""
     plot_paths: dict[str, Path] = {}
@@ -1037,6 +1081,7 @@ def plot_qv(
         title,
         action_horizon=int(action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=gae_lambda,
     )
     nonoverlap_metrics = filter_nonoverlap_chunk_metrics(metrics, int(action_horizon))
     nonoverlap_base = path_base.parent / f"{path_base.name}_nonoverlap"
@@ -1046,6 +1091,7 @@ def plot_qv(
         f"{title} (non-overlapping chunks, stride={int(action_horizon)})",
         action_horizon=int(action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=gae_lambda,
     )
     return plot_paths
 
@@ -1058,421 +1104,8 @@ def write_metrics_csv(csv_path: Path, rows: list[dict[str, float]]) -> None:
         writer.writerows(rows)
 
 
-def parse_float_csv(value: str) -> list[float]:
-    items: list[float] = []
-    for raw in str(value).split(","):
-        item = raw.strip()
-        if item:
-            items.append(float(item))
-    return items
-
-
-def selected_single_action_dims(action_dim: int, requested: int) -> list[int]:
-    dim = int(action_dim)
-    if dim <= 0:
-        raise ValueError(f"action_dim must be positive, got {action_dim}")
-    count = dim if int(requested) <= 0 else min(dim, int(requested))
-    if count >= dim:
-        return list(range(dim))
-    return sorted({int(x) for x in np.linspace(0, dim - 1, count, dtype=np.int64)})
-
-
-def build_q_candidate_actions(
-    actions_cpu: torch.Tensor,
-    *,
-    noise_sigmas: list[float],
-    random_n: int,
-    single_dim_sigma: float,
-    single_dim_n: int,
-    seed: int,
-    action_low: float,
-    action_high: float,
-) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    base = actions_cpu.detach().cpu().numpy().astype(np.float32, copy=True)
-    if base.ndim != 3:
-        raise ValueError(f"actions_cpu expected (W, H, D), got shape {base.shape}")
-    action_dim = int(base.shape[-1])
-    low = float(action_low)
-    high = float(action_high)
-    if not low < high:
-        raise ValueError(f"q candidate action bounds must satisfy low < high, got {low}, {high}")
-    rng = np.random.default_rng(int(seed))
-
-    candidates: list[np.ndarray] = [base.copy()]
-    specs: list[dict[str, Any]] = [
-        {
-            "candidate_type": "demo",
-            "candidate_group": "demo",
-            "candidate_label": "demo",
-            "noise_sigma": None,
-            "action_dim": None,
-            "random_index": None,
-        }
-    ]
-
-    for sigma in noise_sigmas:
-        sigma_f = float(sigma)
-        if sigma_f <= 0.0:
-            continue
-        noise = rng.normal(loc=0.0, scale=sigma_f, size=base.shape).astype(np.float32)
-        candidates.append(np.clip(base + noise, low, high).astype(np.float32))
-        specs.append(
-            {
-                "candidate_type": "noise",
-                "candidate_group": f"noise_sigma_{sigma_f:g}",
-                "candidate_label": f"noise_sigma_{sigma_f:g}",
-                "noise_sigma": sigma_f,
-                "action_dim": None,
-                "random_index": None,
-            }
-        )
-
-    if float(single_dim_sigma) > 0.0:
-        for dim in selected_single_action_dims(action_dim, int(single_dim_n)):
-            noise = np.zeros_like(base)
-            noise[:, :, int(dim)] = rng.normal(
-                loc=0.0,
-                scale=float(single_dim_sigma),
-                size=base.shape[:2],
-            ).astype(np.float32)
-            candidates.append(np.clip(base + noise, low, high).astype(np.float32))
-            specs.append(
-                {
-                    "candidate_type": "single_dim_noise",
-                    "candidate_group": "single_dim_noise",
-                    "candidate_label": f"single_dim_noise_sigma_{float(single_dim_sigma):g}_dim_{int(dim)}",
-                    "noise_sigma": float(single_dim_sigma),
-                    "action_dim": int(dim),
-                    "random_index": None,
-                }
-            )
-
-    for random_index in range(max(0, int(random_n))):
-        random_action = rng.uniform(low=low, high=high, size=base.shape).astype(np.float32)
-        candidates.append(random_action)
-        specs.append(
-            {
-                "candidate_type": "random_uniform",
-                "candidate_group": "random_uniform",
-                "candidate_label": f"random_uniform_{int(random_index)}",
-                "noise_sigma": None,
-                "action_dim": None,
-                "random_index": int(random_index),
-            }
-        )
-
-    return np.stack(candidates, axis=1), specs
-
-
-@torch.no_grad()
-def compute_q_candidate_rows(
-    *,
-    learner: IQLLearner,
-    encoder: SharedDynamicsEncoder,
-    inputs: QCandidateInputs,
-    noise_sigmas: list[float],
-    random_n: int,
-    single_dim_sigma: float,
-    single_dim_n: int,
-    seed: int,
-    action_low: float,
-    action_high: float,
-    batch_size: int,
-    device: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    candidate_actions, specs = build_q_candidate_actions(
-        inputs.actions_cpu,
-        noise_sigmas=noise_sigmas,
-        random_n=int(random_n),
-        single_dim_sigma=float(single_dim_sigma),
-        single_dim_n=int(single_dim_n),
-        seed=int(seed),
-        action_low=float(action_low),
-        action_high=float(action_high),
-    )
-    num_windows, num_candidates, horizon, action_dim = candidate_actions.shape
-    total = int(num_windows * num_candidates)
-    flat_actions_np = np.ascontiguousarray(
-        candidate_actions.reshape(total, horizon, action_dim)
-    )
-    flat_actions = torch.from_numpy(flat_actions_np).float()
-    q_min_flat = np.empty((total,), dtype=np.float32)
-    q_mean_flat = np.empty((total,), dtype=np.float32)
-    q_max_flat = np.empty((total,), dtype=np.float32)
-    q_std_flat = np.empty((total,), dtype=np.float32)
-
-    eval_batch_size = max(1, int(batch_size))
-    eval_offsets = range(0, total, eval_batch_size)
-    for start in tqdm(
-        eval_offsets,
-        desc="[vis_qv] BON Q candidates",
-        unit="batch",
-        total=(total + eval_batch_size - 1) // eval_batch_size,
-    ):
-        end = min(total, start + eval_batch_size)
-        flat_indices = np.arange(start, end, dtype=np.int64)
-        window_indices = flat_indices // int(num_candidates)
-        batch_images_np = inputs.images_np[window_indices]
-        batch_proprio = inputs.proprio_cpu.index_select(
-            0, torch.from_numpy(window_indices).long()
-        )
-        batch_actions = flat_actions[start:end]
-        batch, _, views, channels, height, width = batch_images_np.shape
-        images = _image_tensor(
-            batch_images_np.reshape(batch * horizon, views, channels, height, width)
-        ).view(batch, horizon, views, channels, height, width)
-        _, chunk_features = encoder.encode_features(
-            chunk_images=images,
-            chunk_proprio=batch_proprio,
-            chunk_actions=batch_actions,
-        )
-        q_values = learner._q_values(  # noqa: SLF001
-            chunk_features[:, 0], batch_actions.to(device)
-        )
-        q_min_flat[start:end] = q_values.min(dim=0).values.view(-1).detach().cpu().numpy()
-        q_mean_flat[start:end] = q_values.mean(dim=0).view(-1).detach().cpu().numpy()
-        q_max_flat[start:end] = q_values.max(dim=0).values.view(-1).detach().cpu().numpy()
-        q_std_flat[start:end] = q_values.std(dim=0, unbiased=False).view(-1).detach().cpu().numpy()
-
-    q_min = q_min_flat.reshape(num_windows, num_candidates)
-    q_mean = q_mean_flat.reshape(num_windows, num_candidates)
-    q_max = q_max_flat.reshape(num_windows, num_candidates)
-    q_std = q_std_flat.reshape(num_windows, num_candidates)
-    ranks = np.empty_like(q_min, dtype=np.int64)
-    best_indices = np.empty((num_windows,), dtype=np.int64)
-    for window_index in range(num_windows):
-        order = np.argsort(-q_min[window_index], kind="mergesort")
-        best_indices[window_index] = int(order[0])
-        ranks[window_index, order] = np.arange(1, num_candidates + 1, dtype=np.int64)
-
-    rows: list[dict[str, Any]] = []
-    for window_index in range(num_windows):
-        demo_q_min = float(q_min[window_index, 0])
-        for candidate_index, spec in enumerate(specs):
-            row = {
-                "window_index": int(window_index),
-                "step": int(inputs.starts[window_index]),
-                "candidate_index": int(candidate_index),
-                "candidate_rank_by_q_min": int(ranks[window_index, candidate_index]),
-                "is_best": bool(candidate_index == int(best_indices[window_index])),
-                "is_demo": bool(candidate_index == 0),
-                "q_min": float(q_min[window_index, candidate_index]),
-                "q_mean": float(q_mean[window_index, candidate_index]),
-                "q_max": float(q_max[window_index, candidate_index]),
-                "q_std": float(q_std[window_index, candidate_index]),
-                "delta_q_min_vs_demo": float(q_min[window_index, candidate_index] - demo_q_min),
-            }
-            row.update(spec)
-            rows.append(row)
-
-    summary = summarize_q_candidate_rows(
-        rows,
-        num_windows=num_windows,
-        num_candidates=num_candidates,
-        noise_sigmas=noise_sigmas,
-        random_n=int(random_n),
-        single_dim_sigma=float(single_dim_sigma),
-        single_dim_n=int(single_dim_n),
-        action_low=float(action_low),
-        action_high=float(action_high),
-        seed=int(seed),
-    )
-    return rows, summary
-
-
-def summarize_q_candidate_rows(
-    rows: list[dict[str, Any]],
-    *,
-    num_windows: int,
-    num_candidates: int,
-    noise_sigmas: list[float],
-    random_n: int,
-    single_dim_sigma: float,
-    single_dim_n: int,
-    action_low: float,
-    action_high: float,
-    seed: int,
-) -> dict[str, Any]:
-    demo_rows = [row for row in rows if bool(row["is_demo"])]
-    best_rows = [row for row in rows if bool(row["is_best"])]
-    demo_ranks = np.asarray([int(row["candidate_rank_by_q_min"]) for row in demo_rows], dtype=np.int64)
-    best_margin = np.asarray(
-        [
-            max(float(row["delta_q_min_vs_demo"]) for row in rows if int(row["window_index"]) == window_index)
-            for window_index in range(int(num_windows))
-        ],
-        dtype=np.float32,
-    )
-
-    def count_by(key: str, source_rows: list[dict[str, Any]]) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for row in source_rows:
-            value = str(row[key])
-            counts[value] = counts.get(value, 0) + 1
-        return counts
-
-    def mean_delta_by(key: str) -> dict[str, float]:
-        values: dict[str, list[float]] = {}
-        for row in rows:
-            if bool(row["is_demo"]):
-                continue
-            value = str(row[key])
-            values.setdefault(value, []).append(float(row["delta_q_min_vs_demo"]))
-        return {key_value: float(np.mean(items)) for key_value, items in sorted(values.items())}
-
-    return {
-        "num_windows": int(num_windows),
-        "num_candidates_per_window": int(num_candidates),
-        "ranking_score": "q_min",
-        "noise_sigmas": [float(item) for item in noise_sigmas],
-        "random_n": int(random_n),
-        "single_dim_sigma": float(single_dim_sigma),
-        "single_dim_n": int(single_dim_n),
-        "action_low": float(action_low),
-        "action_high": float(action_high),
-        "seed": int(seed),
-        "demo_rank1_rate": float(np.mean(demo_ranks == 1)) if demo_ranks.size else 0.0,
-        "demo_top3_rate": float(np.mean(demo_ranks <= 3)) if demo_ranks.size else 0.0,
-        "demo_rank_mean": float(np.mean(demo_ranks)) if demo_ranks.size else 0.0,
-        "demo_rank_min": int(demo_ranks.min()) if demo_ranks.size else 0,
-        "demo_rank_max": int(demo_ranks.max()) if demo_ranks.size else 0,
-        "best_margin_q_min_over_demo_mean": float(best_margin.mean()) if best_margin.size else 0.0,
-        "best_margin_q_min_over_demo_max": float(best_margin.max()) if best_margin.size else 0.0,
-        "best_candidate_type_counts": count_by("candidate_type", best_rows),
-        "best_candidate_group_counts": count_by("candidate_group", best_rows),
-        "mean_delta_q_min_by_type": mean_delta_by("candidate_type"),
-        "mean_delta_q_min_by_group": mean_delta_by("candidate_group"),
-    }
-
-
-def write_q_candidate_rows(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "window_index",
-        "step",
-        "candidate_index",
-        "candidate_type",
-        "candidate_group",
-        "candidate_label",
-        "candidate_rank_by_q_min",
-        "is_best",
-        "is_demo",
-        "noise_sigma",
-        "action_dim",
-        "random_index",
-        "q_min",
-        "q_mean",
-        "q_max",
-        "q_std",
-        "delta_q_min_vs_demo",
-    ]
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _save_q_candidate_rank_hist(path: Path, rows: list[dict[str, Any]]) -> Path:
-    demo_ranks = np.asarray(
-        [int(row["candidate_rank_by_q_min"]) for row in rows if bool(row["is_demo"])],
-        dtype=np.int64,
-    )
-    if demo_ranks.size == 0:
-        raise ValueError("Cannot plot candidate rank histogram with no demo rows.")
-    fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-    bins = np.arange(1, int(demo_ranks.max()) + 3) - 0.5
-    ax.hist(demo_ranks, bins=bins, color="tab:blue", alpha=0.85)
-    ax.set_xlabel("Demo action rank by Q_min")
-    ax.set_ylabel("Windows")
-    ax.set_title("Best-of-n diagnostic: demo action rank")
-    ax.grid(True, alpha=0.3)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    return path
-
-
-def _save_q_candidate_delta_by_type(path: Path, rows: list[dict[str, Any]]) -> Path:
-    groups: dict[str, list[float]] = {}
-    for row in rows:
-        if bool(row["is_demo"]):
-            continue
-        groups.setdefault(str(row["candidate_group"]), []).append(float(row["delta_q_min_vs_demo"]))
-    if not groups:
-        raise ValueError("Cannot plot candidate deltas with no non-demo candidates.")
-    labels = list(sorted(groups))
-    data = [groups[label] for label in labels]
-    fig, ax = plt.subplots(1, 1, figsize=(max(8, len(labels) * 1.3), 5))
-    ax.boxplot(data, labels=labels, showfliers=False)
-    ax.axhline(0.0, color="black", linewidth=1)
-    ax.set_ylabel("Q_min(candidate) - Q_min(demo)")
-    ax.set_title("Counterfactual action Q deltas")
-    ax.tick_params(axis="x", rotation=30)
-    ax.grid(True, axis="y", alpha=0.3)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    return path
-
-
-def _save_q_candidate_timeseries(path: Path, rows: list[dict[str, Any]]) -> Path:
-    by_window: dict[int, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_window.setdefault(int(row["window_index"]), []).append(row)
-    window_ids = sorted(by_window)
-    steps = np.asarray([int(by_window[window_id][0]["step"]) for window_id in window_ids], dtype=np.float32)
-    demo_q = np.asarray(
-        [next(float(row["q_min"]) for row in by_window[window_id] if bool(row["is_demo"])) for window_id in window_ids],
-        dtype=np.float32,
-    )
-    best_rows = [next(row for row in by_window[window_id] if bool(row["is_best"])) for window_id in window_ids]
-    best_q = np.asarray([float(row["q_min"]) for row in best_rows], dtype=np.float32)
-    demo_rank = np.asarray(
-        [
-            next(int(row["candidate_rank_by_q_min"]) for row in by_window[window_id] if bool(row["is_demo"]))
-            for window_id in window_ids
-        ],
-        dtype=np.float32,
-    )
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
-    axes[0].plot(steps, demo_q, label="demo Q_min", color="tab:blue")
-    axes[0].plot(steps, best_q, label="best candidate Q_min", color="tab:red", alpha=0.8)
-    axes[0].fill_between(steps, demo_q, best_q, color="tab:red", alpha=0.12)
-    axes[0].set_ylabel("Q_min")
-    axes[0].set_title("Best-of-n diagnostic over rollout windows")
-    axes[0].legend(loc="best")
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].step(steps, demo_rank, where="post", label="demo rank", color="tab:purple")
-    axes[1].axhline(1.0, color="black", linewidth=1)
-    axes[1].set_ylabel("Rank")
-    axes[1].set_xlabel("Step")
-    axes[1].invert_yaxis()
-    axes[1].legend(loc="best")
-    axes[1].grid(True, alpha=0.3)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    return path
-
-
-def plot_q_candidate_diagnostics(bon_dir: Path, rows: list[dict[str, Any]]) -> dict[str, Path]:
-    bon_dir.mkdir(parents=True, exist_ok=True)
-    return {
-        "rank_hist": _save_q_candidate_rank_hist(bon_dir / "rank_hist.png", rows),
-        "delta_by_type": _save_q_candidate_delta_by_type(bon_dir / "delta_by_type.png", rows),
-        "timeseries": _save_q_candidate_timeseries(bon_dir / "timeseries.png", rows),
-    }
-
-
 def main() -> None:
     args = parse_args()
-    run_bon_diagnostics = is_success_related_split(str(args.split)) and not bool(args.no_bon)
     checkpoint = resolve_cli_path(args.iql_ckpt)
     payload = load_iql_payload(checkpoint)
     device = resolve_device(args.device, str(payload["cfg"].get("device", "cpu")))
@@ -1580,7 +1213,7 @@ def main() -> None:
             f"{disc_viz_load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
         )
 
-    rows, per_step_disc, q_candidate_inputs = compute_metrics(
+    rows, per_step_disc = compute_metrics(
         transitions,
         learner=learner,
         encoder=encoder,
@@ -1590,11 +1223,11 @@ def main() -> None:
         batch_size=args.batch_size,
         max_windows=args.max_windows,
         use_disc_reward=not args.no_disc_reward,
+        gae_lambda=args.gae_lambda,
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = (
         resolve_cli_path(args.output_root)
-        / f"{task}_iql-qv"
         / f"{args.split}_seed{args.seed}_{timestamp}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1615,6 +1248,7 @@ def main() -> None:
         ),
         action_horizon=int(cfg.action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=float(args.gae_lambda),
     )
     rollout_video = write_rollout_video(
         output_dir / "rollout_policy_obs.mp4",
@@ -1624,58 +1258,6 @@ def main() -> None:
         fps=video_fps,
         flip_vertical=flip_vertical,
     )
-
-    bon_outputs: dict[str, Any] | None = None
-    q_candidate_summary: dict[str, Any] | None = None
-    if run_bon_diagnostics:
-        bon_dir = output_dir / "BON"
-        bon_dir.mkdir(parents=True, exist_ok=True)
-        q_candidate_csv_path = bon_dir / "q_candidates.csv"
-        q_candidate_summary_path = bon_dir / "summary.json"
-        q_candidate_seed = int(args.seed) if args.q_candidate_seed is None else int(args.q_candidate_seed)
-        q_candidate_rows, q_candidate_summary = compute_q_candidate_rows(
-            learner=learner,
-            encoder=encoder,
-            inputs=q_candidate_inputs,
-            noise_sigmas=parse_float_csv(str(args.q_candidate_noise_sigmas)),
-            random_n=int(args.q_candidate_random_n),
-            single_dim_sigma=float(args.q_candidate_single_dim_sigma),
-            single_dim_n=int(args.q_candidate_single_dim_n),
-            seed=q_candidate_seed,
-            action_low=float(args.q_candidate_action_low),
-            action_high=float(args.q_candidate_action_high),
-            batch_size=max(1, int(args.batch_size)),
-            device=device,
-        )
-        write_q_candidate_rows(q_candidate_csv_path, q_candidate_rows)
-        q_candidate_plot_paths = plot_q_candidate_diagnostics(bon_dir, q_candidate_rows)
-        q_candidate_summary["outputs"] = {
-            "candidates_csv": str(q_candidate_csv_path),
-            "summary_json": str(q_candidate_summary_path),
-            "rank_hist_png": str(q_candidate_plot_paths["rank_hist"]),
-            "delta_by_type_png": str(q_candidate_plot_paths["delta_by_type"]),
-            "timeseries_png": str(q_candidate_plot_paths["timeseries"]),
-        }
-        q_candidate_summary_path.write_text(
-            json.dumps(q_candidate_summary, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        bon_outputs = {
-            "output_dir": str(bon_dir),
-            "candidates_csv": str(q_candidate_csv_path),
-            "summary": str(q_candidate_summary_path),
-            "rank_hist_png": str(q_candidate_plot_paths["rank_hist"]),
-            "delta_by_type_png": str(q_candidate_plot_paths["delta_by_type"]),
-            "timeseries_png": str(q_candidate_plot_paths["timeseries"]),
-        }
-    else:
-        if bool(args.no_bon):
-            print("[vis_qv] skipping Best-of-n Q diagnostics (--no-bon).")
-        else:
-            print(
-                f"[vis_qv] skipping Best-of-n Q diagnostics for split={args.split!r} "
-                "(only enabled for success-like splits)."
-            )
 
     disc_viz_outputs: dict[str, Any] | None = None
     if not bool(args.no_disc_viz):
@@ -1713,7 +1295,6 @@ def main() -> None:
         "state_feature_dim": int(encoder.state_feature_dim),
         "chunk_feature_dim": int(encoder.chunk_feature_dim),
         "split": str(args.split),
-        "bon_enabled": bool(run_bon_diagnostics),
         "selected_hdf5": selected_hdf5,
         "selected_demo_key": selected_demo_key,
         "selected_offline_buffer": selected_offline_buffer,
@@ -1723,6 +1304,7 @@ def main() -> None:
         "viz_end_exclusive": viz_end_exclusive,
         "num_transitions_viz": len(transitions),
         "num_windows": len(rows),
+        "gae_lambda": float(args.gae_lambda),
         "demo_load": {
             "img_height": int(load_cfg.img_height),
             "img_width": int(load_cfg.img_width),
@@ -1744,10 +1326,8 @@ def main() -> None:
             "plot_png": str(plot_paths["overlapping"]),
             "plot_png_nonoverlap": str(plot_paths["nonoverlap"]),
             "video": None if rollout_video is None else str(rollout_video),
-            "bon": bon_outputs,
             "discriminator": disc_viz_outputs,
         },
-        "q_candidate_summary": q_candidate_summary,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
@@ -1757,9 +1337,6 @@ def main() -> None:
     print(f"[vis_qv] plot_png_nonoverlap={plot_paths['nonoverlap']}")
     if rollout_video is not None:
         print(f"[vis_qv] rollout_video={rollout_video}")
-    if bon_outputs is not None:
-        print(f"[vis_qv] bon_dir={bon_outputs['output_dir']}")
-        print(f"[vis_qv] bon_candidates_csv={bon_outputs['candidates_csv']}")
     if disc_viz_outputs is not None:
         print(f"[vis_qv] disc_viz_dir={disc_viz_outputs['output_dir']}")
         print(f"[vis_qv] disc_viz_video={disc_viz_outputs['video']}")

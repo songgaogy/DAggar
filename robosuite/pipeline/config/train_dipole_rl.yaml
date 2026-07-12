@@ -22,29 +22,32 @@ algorithm:
   q_learning:
     enabled: true
     config:
-      reward_mode: "0/1"   # "0/1" | "-1/0"
+      reward_mode: "-1/0"   # "0/1" | "-1/0"
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
-      expectile_tau: 0.7
-      q_lr: 1.0e-4
+      # Optimism knob: each V head regresses onto the 1-step bootstrap target by
+      # an expectile loss (tau > 0.5 turns V^beta -> V*). See §4 of the design.
+      expectile_tau: 0.5    # mse loss
+      # V-ensemble soft-LCB guardrail: V_lcb = mean_k - beta*std_k over
+      # v_ensemble_size independent heads (diversified by a per-head Bernoulli
+      # bootstrap mask, keep-prob ensemble_bootstrap_prob). size=1 -> single head.
+      v_ensemble_size: 5
+      ensemble_lcb_beta: 0.5
+      ensemble_bootstrap_prob: 0.5
       v_lr: 1.0e-4
       target_polyak: 0.005
       n_step_aggregate: true
       # Head width AFTER the Token/Group projector (the projector — not the
       # head — is the anti-overfit lever), so smaller than the legacy 512x512.
       hidden_dims: [256, 256]
-      # Token/Group dim-reduction projectors before the Q/V heads. The frozen
-      # encoder feature is 16 patch-tokens; chunk_proj_dim / state_proj_dim must
-      # be divisible by that token count (asserted in the learner).
-      chunk_proj_dim: 128      # 14272 chunk feature -> compressed Q input
+      # Token/Group dim-reduction projector before the V head. The frozen
+      # encoder state feature is 16 patch-tokens; state_proj_dim must be
+      # divisible by that token count (asserted in the learner).
       state_proj_dim: 128      # 12288 state visual tokens -> compressed V input
       proprio_proj_dim: 32     # state proprio block -> appended to V input
-      action_proj_dim: 64     # raw action chunk -> re-injected into Q
       proj_activation: "mish"  # mish | gelu | relu | silu
-      q_ensemble_size: 10
-      v_subset_size: 2
       grad_clip_norm: 2.0
-      weight_decay: 1.0e-6
+      weight_decay: 2.0e-6
       device: "cuda:1"
       output_reward_coef: 1
       disc_reward_coef: 0
@@ -62,6 +65,14 @@ algorithm:
 
 # Used only by ``python -m ...q_learning.warmup`` (init_iql_qv.sh).
 warmup:
+  # Raw-HDF5 load acceleration. Rollout HDF5 stores pre-action `is_success`;
+  # warmup shifts it by one step to match post-action env success rewards and
+  # falls back to MuJoCo replay only for demos without the label.
+  prefer_hdf5_success_labels: true
+  # Read each selected demo/camera image array in one HDF5 call instead of
+  # per-frame dataset indexing. This keeps raw-HDF5 semantics but reduces gzip
+  # chunk access overhead.
+  bulk_read_hdf5_images: true
   # Pre-encode every valid chunk once and sample from cached latents during the
   # warmup loops (frozen encoder => results-neutral; pure speedup). Set false to
   # re-encode every step (old behavior).
