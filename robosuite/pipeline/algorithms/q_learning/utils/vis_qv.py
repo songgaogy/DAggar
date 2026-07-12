@@ -1,15 +1,17 @@
 """Visualize the nnPU-backed V-only IQL value on one recorded or offline trajectory.
 
 Outputs (per run, under ``<output-root>/<split>_seed<seed>_<ts>/``):
-  * ``steps.csv``                    — per-window V / TD-advantage / reward metrics.
+  * ``steps.csv``                    — per-window V / TD-advantage / GAE / reward metrics.
   * ``qv_timeseries.png``            — 4-subplot diagnostics over overlapping windows.
   * ``qv_timeseries_nonoverlap.png`` — same plot restricted to disjoint chunks (stride=H).
   * ``rollout_policy_obs.mp4``       — raw policy-camera rollout video.
   * ``discriminator/``               — per-frame nnPU failure scores: CSV + plot + HUD video.
   * ``summary.json``                 — run metadata and output paths.
 
-The value is V-only (no Q head); the per-step advantage is the TD residual
-``r + γ^H V(s') - V(s)``. The discriminator path uses the frozen nnPU head.
+The value is V-only (no Q head). The advantage subplot overlays two curves: the
+one-macro-step TD residual ``r + γ^H V(s') - V(s)`` and the GAE(λ) advantage on
+``V*`` (chunk-period recursion, evaluated densely at every window start). The
+discriminator path uses the frozen nnPU head.
 """
 
 from __future__ import annotations
@@ -122,6 +124,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-windows", type=int, default=None)
+    parser.add_argument(
+        "--gae-lambda",
+        type=float,
+        default=0.95,
+        help=(
+            "λ for the GAE(λ) advantage overlaid on the TD advantage subplot. "
+            "GAE recurs in chunk periods (γ_eff = γ^action_horizon). λ→1 approaches "
+            "the Monte-Carlo return; λ<1 keeps the bootstrap/stitching."
+        ),
+    )
     parser.add_argument("--output-root", default="outputs/DIPOLE_rl/iql_qv_cache-vis")
     parser.add_argument("--renderer", default=None)
     parser.add_argument("--control-freq", type=int, default=None)
@@ -660,6 +672,7 @@ def compute_metrics(
     batch_size: int,
     max_windows: int | None,
     use_disc_reward: bool,
+    gae_lambda: float,
 ) -> tuple[list[dict[str, float]], PerStepNNPUDisc]:
     """Compute per-window V/TD metrics and a per-frame nnPU failure series.
 
@@ -797,6 +810,40 @@ def compute_metrics(
                     "has_valid_next": float(has_valid_next),
                 }
             )
+    # ---- GAE(λ) advantage on V*, dense chunk-period recursion --------------
+    # Each row is one macro-step of the chunk-MDP the value was trained on
+    # (effective discount γ^H). Its one-macro-step TD residual is
+    #   δ_t = r_chunk(t) + γ^H·mask_t·V(s_{t+H}) − V(s_t),
+    # which equals ``advantage_td1`` when the bootstrap is valid; at a
+    # terminal/OOD window (``has_valid_next`` == 0) the bootstrap is dropped so
+    # the recursion never propagates through an off-support next_v.
+    # GAE walks forward in chunk periods (t, t+H, t+2H, …):
+    #   A_t = δ_t + (γ^H λ)·mask_t·A_{t+H}
+    # and is evaluated at every window start, giving a stride-1-dense curve
+    # aligned with the TD one. ``starts`` is contiguous from 0, so the list
+    # index equals the window start and the chunk successor is index t+H.
+    n_rows = len(rows)
+    gamma_h = float(cfg.discount) ** horizon
+    lam = float(gae_lambda)
+    mask = np.array(
+        [1.0 if float(r["has_valid_next"]) > 0.5 else 0.0 for r in rows], dtype=np.float32
+    )
+    delta = np.array(
+        [
+            float(r["total_reward_horizon"]) + gamma_h * mask[i] * float(r["next_v"]) - float(r["v"])
+            for i, r in enumerate(rows)
+        ],
+        dtype=np.float32,
+    )
+    adv_gae = np.zeros(n_rows, dtype=np.float32)
+    for i in range(n_rows - 1, -1, -1):
+        nxt = i + horizon
+        future = float(adv_gae[nxt]) if nxt < n_rows else 0.0
+        adv_gae[i] = delta[i] + gamma_h * lam * mask[i] * future
+    for i, r in enumerate(rows):
+        r["advantage_gae"] = float(adv_gae[i])
+    # ------------------------------------------------------------------------
+
     per_step_disc = _per_step_disc_from_windows(
         starts=starts,
         horizon=horizon,
@@ -858,6 +905,7 @@ def _save_qv_timeseries_png(
     *,
     action_horizon: int,
     per_step_disc: PerStepNNPUDisc | None = None,
+    gae_lambda: float | None = None,
 ) -> Path:
     """Render the 4-subplot Q/V diagnostics (layout from dipole-rl/v0-kingback)."""
     if not metrics:
@@ -867,6 +915,12 @@ def _save_qv_timeseries_png(
     next_v = np.asarray([row["next_v"] for row in metrics], dtype=np.float32)
     td_target = np.asarray([row["td_target"] for row in metrics], dtype=np.float32)
     advantage_td1 = np.asarray([row["advantage_td1"] for row in metrics], dtype=np.float32)
+    has_gae = any("advantage_gae" in row for row in metrics)
+    advantage_gae = (
+        np.asarray([row.get("advantage_gae", np.nan) for row in metrics], dtype=np.float32)
+        if has_gae
+        else None
+    )
     bootstrap_v = np.asarray([row["bootstrap_v"] for row in metrics], dtype=np.float32)
     env_rewards = np.asarray([row["env_reward_horizon"] for row in metrics], dtype=np.float32)
     total_rewards = np.asarray([row["total_reward_horizon"] for row in metrics], dtype=np.float32)
@@ -894,6 +948,9 @@ def _save_qv_timeseries_png(
         td_target[no_s_prime] = np.nan
         advantage_td1[no_s_prime] = np.nan
         bootstrap_v[no_s_prime] = np.nan
+        if advantage_gae is not None:
+            advantage_gae = advantage_gae.copy()
+            advantage_gae[no_s_prime] = np.nan
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
@@ -930,9 +987,22 @@ def _save_qv_timeseries_png(
         color="tab:red",
         alpha=0.85,
     )
+    if advantage_gae is not None:
+        gae_label = (
+            "advantage GAE(λ)"
+            if gae_lambda is None
+            else f"advantage GAE(λ={float(gae_lambda):g}, γ^H recursion)"
+        )
+        axes[2].plot(
+            steps,
+            advantage_gae,
+            label=gae_label,
+            color="tab:blue",
+            alpha=0.85,
+        )
     axes[2].axhline(0.0, color="black", linewidth=1)
     axes[2].set_ylabel("Advantage")
-    axes[2].legend(loc="best")
+    axes[2].legend(loc="best", fontsize=8)
     axes[2].grid(True, alpha=0.3)
 
     axes[3].step(steps, total_rewards, where="post", label="total chunk reward (Bellman r)", color="tab:gray")
@@ -982,6 +1052,7 @@ def plot_qv(
     *,
     action_horizon: int,
     per_step_disc: PerStepNNPUDisc | None = None,
+    gae_lambda: float | None = None,
 ) -> dict[str, Path]:
     """Write overlapping-window and non-overlapping-chunk Q/V plots (PNG)."""
     plot_paths: dict[str, Path] = {}
@@ -991,6 +1062,7 @@ def plot_qv(
         title,
         action_horizon=int(action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=gae_lambda,
     )
     nonoverlap_metrics = filter_nonoverlap_chunk_metrics(metrics, int(action_horizon))
     nonoverlap_base = path_base.parent / f"{path_base.name}_nonoverlap"
@@ -1000,6 +1072,7 @@ def plot_qv(
         f"{title} (non-overlapping chunks, stride={int(action_horizon)})",
         action_horizon=int(action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=gae_lambda,
     )
     return plot_paths
 
@@ -1131,6 +1204,7 @@ def main() -> None:
         batch_size=args.batch_size,
         max_windows=args.max_windows,
         use_disc_reward=not args.no_disc_reward,
+        gae_lambda=args.gae_lambda,
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = (
@@ -1155,6 +1229,7 @@ def main() -> None:
         ),
         action_horizon=int(cfg.action_horizon),
         per_step_disc=per_step_disc,
+        gae_lambda=float(args.gae_lambda),
     )
     rollout_video = write_rollout_video(
         output_dir / "rollout_policy_obs.mp4",
@@ -1210,6 +1285,7 @@ def main() -> None:
         "viz_end_exclusive": viz_end_exclusive,
         "num_transitions_viz": len(transitions),
         "num_windows": len(rows),
+        "gae_lambda": float(args.gae_lambda),
         "demo_load": {
             "img_height": int(load_cfg.img_height),
             "img_width": int(load_cfg.img_width),

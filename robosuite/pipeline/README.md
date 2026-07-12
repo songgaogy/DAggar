@@ -123,7 +123,7 @@ NNPU_CKPT=/abs/path/to/pu_bce_head.pth \
 bash robosuite/pipeline/scripts/utils/vis_iql_qv.sh
 ```
 
-This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and V (schema v4) checkpoint as training. It plots V / target-V, the TD-residual advantage, and the per-frame discriminator reward (no Q curves; the old best-of-n Q diagnostic has been removed).
+This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and V (schema v4) checkpoint as training. It produces a 4-subplot figure: V / target-V, the V differences, the **advantage subplot** (the one-macro-step TD residual overlaid with the GAE(λ) advantage on `V*`), and the per-frame discriminator reward (no Q curves; the old best-of-n Q diagnostic has been removed). GAE recurs in chunk periods (`γ_eff = γ^action_horizon`) and is evaluated densely at every window start; set `GAE_LAMBDA` (default `0.95`) to change λ.
 
 ## Human-in-the-loop runtime
 

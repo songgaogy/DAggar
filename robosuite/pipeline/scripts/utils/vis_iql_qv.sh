@@ -19,6 +19,7 @@
 #   DISC_VIZ_CAMERA   — camera to render for videos (default: agentview, else first policy cam).
 #   DISC_VIZ_IMAGE_SIZE — square resolution for discriminator HUD MP4 (default: 256).
 #   DISC_VIZ_BORDER   — red-border thickness on predicted-failure frames (default 10).
+#   GAE_LAMBDA        — λ for the GAE advantage overlaid on the TD advantage subplot (default 0.95).
 #   NO_FLIP_VERTICAL  — set to 1 to NOT flip rendered frames vertically.
 #   MAX_WINDOWS             — optional cap for quick smoke tests.
 
@@ -33,9 +34,9 @@ BRANCH_NAME="dipole_rl-iql"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-SEEDS=(1 2 3)               # demo-selection seeds; one run per seed
-SPLIT="fail"      # success or fail
-TARGET_PATH="offline_iql_qv-v2_explore-baseline"
+SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
+SPLIT="success"      # success or fail
+TARGET_PATH="offline_iql_qv-v2_explore-GAE"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
@@ -48,6 +49,7 @@ DEVICE="${DEVICE:-cuda}"
 VIDEO_FPS="${VIDEO_FPS:-${CONTROL_FREQ:-20}}"
 DISC_VIZ_BORDER="${DISC_VIZ_BORDER:-10}"
 DISC_VIZ_IMAGE_SIZE="${DISC_VIZ_IMAGE_SIZE:-256}"
+GAE_LAMBDA="${GAE_LAMBDA:-0.6}"   # λ for the GAE advantage overlaid on the TD advantage subplot
 
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
@@ -67,12 +69,14 @@ echo "[vis_iql_qv] offline_buffer=${OFFLINE_BUFFER}"
 echo "[vis_iql_qv] output_dir=${OUTPUT_DIR}"
 echo "[vis_iql_qv] nnpu_ckpt=${NNPU_CKPT}"
 echo "[vis_iql_qv] device=${DEVICE}"
+echo "[vis_iql_qv] gae_lambda=${GAE_LAMBDA}"
 
 EXTRA_ARGS=()
 EXTRA_ARGS+=(
   --video-fps "${VIDEO_FPS}"
   --disc-viz-image-size "${DISC_VIZ_IMAGE_SIZE}"
   --disc-viz-border-thickness "${DISC_VIZ_BORDER}"
+  --gae-lambda "${GAE_LAMBDA}"
 )
 for SEED in "${SEEDS[@]}"; do
   echo "[vis_iql_qv] === running seed=${SEED} ==="

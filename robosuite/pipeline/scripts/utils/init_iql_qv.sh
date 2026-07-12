@@ -37,7 +37,7 @@ BRANCH_NAME="dipole_rl-iql"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v2_explore-baseline"
+NAME="offline_iql_qv-v2_explore-GAE"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
