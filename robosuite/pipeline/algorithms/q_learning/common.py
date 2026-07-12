@@ -41,6 +41,16 @@ class IQLConfig:
     v_lr: float = 3e-4
     target_polyak: float = 0.005
 
+    # n-step (multi chunk-macro-step) return for the V value fit. The bootstrap
+    # target sums n discounted chunk rewards along the episode and bootstraps at
+    # the n-th chunk-successor state:
+    #   target = Σ_{k=0}^{n-1} γ^{kH}·R_k + γ^{nH}·(1-done)·V_target(s_{+n}).
+    # `n_eff` is truncated per-row at the episode boundary / genuine terminal
+    # (variable n-step). n=1 reduces *exactly* to the legacy 1-chunk-step TD
+    # target. Advantage read-out stays 1-step (compute_td_advantage) — only the
+    # value *training* target is n-step. See V_ONLY_ADVANTAGE_DESIGN.md.
+    value_n_step: int = 3
+
     n_step_aggregate: bool = True
     # Head width *after* the Token/Group projector (the projector — not the
     # head — is the anti-overfit lever, so this is now much smaller than the
@@ -71,6 +81,9 @@ class IQLConfig:
         for name in ("state_proj_dim", "proprio_proj_dim"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"IQLConfig.{name} must be >= 1, got {getattr(self, name)}.")
+        self.value_n_step = int(self.value_n_step)
+        if self.value_n_step < 1:
+            raise ValueError(f"IQLConfig.value_n_step must be >= 1, got {self.value_n_step}.")
 
 
 @dataclass
@@ -83,10 +96,23 @@ class IQLStepBatch:
         next_v_state_feature
                         (B, D_state) — action-free state latent for V(s')
         action_chunk    (B, H, D_a) — raw chunk retained for metadata/debug
-        rewards        (B, 1)       — n-step aggregated r_env + λ_disc·r_disc
+        rewards        (B, 1)       — single-chunk aggregated r_env + λ_disc·r_disc
         dones          (B, 1)       — 1 if any step in chunk terminated
         is_online      (B, 1)       — 1 if sampled from online buffer
         is_intervention(B, 1)       — 1 if first step is an intervention
+
+    n-step (multi chunk-macro-step) fields for the V *training* target. These
+    are computed alongside the 1-chunk fields above; the 1-chunk fields feed the
+    1-step advantage read-out (unchanged) while these feed the n-step bootstrap
+    target (see IQLConfig.value_n_step). With value_n_step=1 they equal their
+    1-chunk counterparts exactly (nstep_rewards==rewards,
+    nstep_bootstrap_feature==next_v_state_feature, nstep_discount==γ^H,
+    nstep_dones==dones):
+        nstep_rewards          (B, 1)       — Σ_{k=0}^{n_eff-1} γ^{kH}·R_k
+        nstep_bootstrap_feature(B, D_state) — state feature of s_{+n_eff}
+        nstep_dones            (B, 1)       — 1 if the chain ended at a terminal
+        nstep_discount         (B, 1)       — γ^{n_eff·H} (per-row; n_eff varies)
+
         metadata       dict         — debug fields (episode ids, sources)
     """
 
@@ -98,6 +124,10 @@ class IQLStepBatch:
     dones: torch.Tensor
     is_online: torch.Tensor
     is_intervention: torch.Tensor
+    nstep_rewards: torch.Tensor
+    nstep_bootstrap_feature: torch.Tensor
+    nstep_dones: torch.Tensor
+    nstep_discount: torch.Tensor
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to(self, device: str | torch.device) -> "IQLStepBatch":
@@ -110,6 +140,10 @@ class IQLStepBatch:
             dones=self.dones.to(device),
             is_online=self.is_online.to(device),
             is_intervention=self.is_intervention.to(device),
+            nstep_rewards=self.nstep_rewards.to(device),
+            nstep_bootstrap_feature=self.nstep_bootstrap_feature.to(device),
+            nstep_dones=self.nstep_dones.to(device),
+            nstep_discount=self.nstep_discount.to(device),
             metadata=self.metadata,
         )
 

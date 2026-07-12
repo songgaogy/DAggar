@@ -13,6 +13,9 @@
 #                        same machine/GPU => identical demo-load order and sampling.
 #   VALUE_STEPS       — V-only warmup loop length (default 20000).
 #   FULL_STEPS        — full IQL update loop length (default 10000).
+#   N_STEP            — n-step (chunk-macro-step) value target horizon
+#                        (default 3; 1 == legacy 1-step target). Advantage
+#                        read-out stays 1-step. See V_ONLY_ADVANTAGE_DESIGN.md.
 #   BATCH_SIZE        — minibatch size (default 128).
 #   DEVICE            — learner device (default cuda:1).
 #   OUTPUT_DIR        — per-task output dir (default outputs/DIPOLE_rl/iql_qv_cache/<ENVIRONMENT>).
@@ -37,13 +40,14 @@ BRANCH_NAME="dipole_rl-iql"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v2_explore-GAE"
+NAME="offline_iql_qv-v2_explore-n_step"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
 BATCH_SIZE=512
+N_STEP="${N_STEP:-3}"
 DEVICE="${DEVICE:-cuda:0}"
 # Where to hold the pre-encoded chunk cache: "cpu" (default; no VRAM growth) or
 # "learner"/"device" (cache on the IQL GPU — faster sampling but OOMs on large
@@ -74,6 +78,7 @@ HYDRA_OVERRIDES=(
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
   "algorithm.discriminator.checkpoint=${NNPU_CKPT}"
   "algorithm.q_learning.config.device=${DEVICE}"
+  "algorithm.q_learning.config.value_n_step=${N_STEP}"
   "+warmup.output_path=${OUTPUT_FILE}"
   "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
@@ -93,7 +98,7 @@ FREEZE_POST_SUCCESS="${FREEZE_POST_SUCCESS:-true}"
 HYDRA_OVERRIDES+=("warmup.freeze_post_success=${FREEZE_POST_SUCCESS}")
 HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
-echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
+echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED} n_step=${N_STEP}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"
 echo "[init_iql_qv] tensorboard=${TENSORBOARD_DIR}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"

@@ -20,23 +20,21 @@
 #   DISC_VIZ_IMAGE_SIZE — square resolution for discriminator HUD MP4 (default: 256).
 #   DISC_VIZ_BORDER   — red-border thickness on predicted-failure frames (default 10).
 #   GAE_LAMBDA        — λ for the GAE advantage overlaid on the TD advantage subplot (default 0.95).
-#   NO_FLIP_VERTICAL  — set to 1 to NOT flip rendered frames vertically.
-#   MAX_WINDOWS             — optional cap for quick smoke tests.
 
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 BRANCH_NAME="dipole_rl-iql"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
 SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
-SPLIT="success"      # success or fail
-TARGET_PATH="offline_iql_qv-v2_explore-GAE"
+SPLIT="fail"      # success or fail
+TARGET_PATH="offline_iql_qv-v2_explore-n_step"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 

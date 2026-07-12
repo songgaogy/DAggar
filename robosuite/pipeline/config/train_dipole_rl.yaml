@@ -30,6 +30,11 @@ algorithm:
       expectile_tau: 0.7
       v_lr: 1.0e-4
       target_polyak: 0.005
+      # n-step (multi chunk-macro-step) return horizon for the V training
+      # target: Σ_{k<n} γ^{kH}·R_k + γ^{nH}·(1-done)·V(s_{+n}), n_eff truncated
+      # per-row at the episode boundary / terminal. n=1 == legacy 1-step target.
+      # Advantage read-out stays 1-step. See V_ONLY_ADVANTAGE_DESIGN.md.
+      value_n_step: 3
       n_step_aggregate: true
       # Head width AFTER the Token/Group projector (the projector — not the
       # head — is the anti-overfit lever), so smaller than the legacy 512x512.

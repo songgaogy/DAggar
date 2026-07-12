@@ -164,11 +164,13 @@ def load_iql_payload(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"IQL checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     schema_version = int(payload.get("schema_version", -1))
-    if schema_version != 4:
+    if schema_version not in (4, 5):
         raise ValueError(
             f"Unsupported IQL checkpoint schema_version={schema_version}. "
-            "This visualizer expects the V-only schema (v4); legacy Q-containing "
-            "checkpoints (v2/v3) are incompatible — re-run offline V warmup."
+            "This visualizer expects the V-only schema (v4, or v5 with the "
+            "n-step value target — the V network is identical); legacy "
+            "Q-containing checkpoints (v2/v3) are incompatible — re-run offline "
+            "V warmup."
         )
     for key in ("iql_state", "cfg", "encoder_meta"):
         if key not in payload:

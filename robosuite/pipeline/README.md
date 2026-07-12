@@ -87,7 +87,7 @@ With `warmup.num_trajectories.save_data=true` (forced by `init_iql_qv.sh`), the 
 
 With `FREEZE_POST_SUCCESS=true` (default, via `warmup.freeze_post_success`), each success demo's post-success tail is collapsed into a single frozen absorbing anchor before the IQL value consumes it. Recorded `success_rollout` demos are fixed-length (e.g. 400 steps) but keep running the live policy after success, so the frames after the first success are real *drift* (moving state, non-zero actions). Fitting V on those many distinct, meaningless states is a burden, while their dense sampling is what anchors the terminal value `V≈0` and stabilizes TD. The warmup therefore overwrites every frame strictly after the first success frame `t_s` with a copy of that frame: `obs` (images + proprio), `next_obs`, and `action` all become the `t_s` values, and the frozen-tail reward is set to `0.0`. The first success frame keeps its real `(s, a)`; `fail_rollout` and demos without a success frame are untouched. The freeze is applied after the offline-data save, so the persisted `offline_data` keeps the raw drift frames; only the in-memory buffer the IQL warmup trains on is frozen. Set `FREEZE_POST_SUCCESS=false` to disable.
 
-Current IQL warmup uses schema version 4 (V-only; no Q head). It compresses the frozen encoder state feature with a Token/Group projector before the V head and defaults to a lighter head (`hidden_dims=[256,256]`, `state_proj_dim=128`). The value is learned V-only by a single MSE-TD loop over `warmup_value_steps + warmup_full_steps` steps (the former two-phase value-only → full-IQL split no longer applies). Reward composition (`reward_mode`, `output_reward_coef`, `disc_reward_coef`) is set in `train_dipole_rl.yaml`.
+Current IQL warmup uses schema version 5 (V-only; no Q head; adds the `value_n_step` n-step value target — the V network is byte-identical to v4, and `vis_qv` loads both). It compresses the frozen encoder state feature with a Token/Group projector before the V head and defaults to a lighter head (`hidden_dims=[256,256]`, `state_proj_dim=128`). The value is learned V-only by a single MSE-TD loop over `warmup_value_steps + warmup_full_steps` steps (the former two-phase value-only → full-IQL split no longer applies), regressing onto the n-step bootstrap target (`value_n_step`, default 3; see *DIPOLE-RL value* below). Reward composition (`reward_mode`, `output_reward_coef`, `disc_reward_coef`) is set in `train_dipole_rl.yaml`.
 
 This is an experiment-specific entrance: `ENVIRONMENT`, `INIT_CHECKPOINT`, and `NNPU_CKPT` are intentionally hardcoded near the top of the script. Edit those constants directly for another task, base policy, or nnPU artifact. `SEED`, `BATCH_SIZE`, `DEVICE`, `OUTPUT_DIR`, `OUTPUT_FILE`, `PREENCODE_CACHE_DEVICE`, and `FREEZE_POST_SUCCESS` retain environment-variable overrides.
 
@@ -123,7 +123,7 @@ NNPU_CKPT=/abs/path/to/pu_bce_head.pth \
 bash robosuite/pipeline/scripts/utils/vis_iql_qv.sh
 ```
 
-This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and V (schema v4) checkpoint as training. It produces a 4-subplot figure: V / target-V, the V differences, the **advantage subplot** (the one-macro-step TD residual overlaid with the GAE(λ) advantage on `V*`), and the per-frame discriminator reward (no Q curves; the old best-of-n Q diagnostic has been removed). GAE recurs in chunk periods (`γ_eff = γ^action_horizon`) and is evaluated densely at every window start; set `GAE_LAMBDA` (default `0.95`) to change λ.
+This utility is diagnostic only. Its task, split, seed, checkpoint layout, and nnPU path are intentionally hardcoded near the top of the script; edit them directly for a different experiment. It must use the same task, camera mapping, nnPU artifact, and V (schema v4 or v5) checkpoint as training. It produces a 4-subplot figure: V / target-V, the V differences, the **advantage subplot** (the one-macro-step TD residual overlaid with the GAE(λ) advantage on `V*`), and the per-frame discriminator reward (no Q curves; the old best-of-n Q diagnostic has been removed). GAE recurs in chunk periods (`γ_eff = γ^action_horizon`) and is evaluated densely at every window start; set `GAE_LAMBDA` (default `0.95`) to change λ.
 
 ## Human-in-the-loop runtime
 
@@ -191,15 +191,17 @@ The positive policy trains on the `w_pos`-weighted loss, the negative policy on 
 
 ### DIPOLE-RL value (V-only)
 
-There is no Q head. V and target-V consume the action-free state feature through their own Token/Group projector. For an H-step replay window, the learner regresses V directly onto the bootstrap target by MSE (V-only TD backup):
+There is no Q head. V and target-V consume the action-free state feature through their own Token/Group projector. The learner regresses V onto an **n-step** (multi chunk-macro-step) bootstrap target by MSE (V-only TD backup). With `value_n_step = n`, the target walks up to `n` chunks forward along the episode (per-chunk return `R_k = Σ_{i} gamma^i·r_total_{k,i}`, chunk period `gamma^H`):
 
 ```text
-R_H   = sum(i=0..H-1) gamma^i * r_total_i
-y     = R_H + gamma^H * (1 - done_H) * target_V(s_next)
+y     = sum(k=0..n_eff-1) gamma^(k*H) * R_k
+        + gamma^(n_eff*H) * (1 - done) * target_V(s_{+n_eff})
 L_V   = MSE(V(s), y)
 ```
 
-Only target-V receives a Polyak update. Each learner tick performs the V update before the flow-policy update; there is no discriminator update. The per-step advantage consumed by the flow branch weighting is the TD residual `A = y - V(s)` (`IQLLearner.compute_td_advantage`); the offline path precomputes the same residual by window start index (`offline/utils/advantage.py`). `expectile_tau` is a reserved config knob for a future expectile-TD fit and is not read by the current MSE-TD path.
+`n_eff` truncates per-row at the episode boundary / genuine `success` terminal (variable n-step); a fail rollout running off the recording boundary keeps bootstrapping. `value_n_step = 1` recovers the legacy 1-step target `R_H + gamma^H·(1-done)·target_V(s_next)`. Default is `3`; expose via `N_STEP` in `init_iql_qv.sh`.
+
+Only target-V receives a Polyak update. Each learner tick performs the V update before the flow-policy update; there is no discriminator update. The per-step advantage consumed by the flow branch weighting stays **1-step** (deliberately not n-step): `A = r + gamma^H·(1-done)·target_V(s_next) - V(s)` (`IQLLearner.compute_td_advantage`); the offline path precomputes the same 1-step residual by window start index (`offline/utils/advantage.py`), and `vis_qv` layers GAE(λ) on it. `expectile_tau` is a reserved config knob for a future expectile-TD fit and is not read by the current MSE-TD path.
 
 ## Configuration and repository layout
 
@@ -244,6 +246,7 @@ algorithm:
       hidden_dims: [256, 256]
       state_proj_dim: 128
       proprio_proj_dim: 32
+      value_n_step: 3      # n-step (chunk-macro-step) value target; 1 == 1-step
       expectile_tau: 0.7   # reserved (unused by the current MSE-TD path)
 ```
 

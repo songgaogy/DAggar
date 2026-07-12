@@ -979,14 +979,16 @@ def main(cfg: DictConfig) -> None:
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
-            # V-side Token/Group dim-reduction projector layout (schema v4, V-only).
+            # V-side Token/Group dim-reduction projector layout (schema v5, V-only).
             "n_tokens": int(n_tokens),
             "proprio_dim": int(proprio_dim),
             "state_proj_dim": int(iql_cfg.state_proj_dim),
             "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
             "proj_activation": str(iql_cfg.proj_activation),
+            # n-step (multi chunk-macro-step) value target horizon (schema v5).
+            "value_n_step": int(iql_cfg.value_n_step),
         },
-        "schema_version": 4,
+        "schema_version": 5,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")
