@@ -15,7 +15,7 @@ finetuned critics to ``<run_dir>/checkpoints/iql_state_finetuned.pt``.
 policy sections (advantage-weighted, ``route="advantage"``), human sections
 (``route="pos_only"`` → positive branch), and the policy action during
 intervention (``route="neg_only"`` → negative branch). Precompute the TD advantage
-``A = V(s) - gamma^H target_V(s') - r`` against the frozen finetuned critics and
+``A = r + gamma^H target_V(s') - V(s)`` against the frozen finetuned critics and
 train the two flow policies with a pluggable routed branch-weight policy.
 
 Run dir: ``./data/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorboard.
@@ -58,6 +58,7 @@ from robosuite.pipeline.offline.utils import (
     build_branch_weight_policy,
     build_iql_finetune_buffer,
     build_offline_transitions,
+    build_online_success_transitions,
     finalize_normalizers,
     finetune_iql,
     load_pretrain_transitions,
@@ -66,6 +67,7 @@ from robosuite.pipeline.offline.utils import (
     precompute_offline_advantage,
     save_finetuned_iql,
 )
+from robosuite.pipeline.offline.utils.episode_dataset import ROUTE_POS_ONLY
 from robosuite.pipeline.train_dipole_rl import _load_iql_warmup_state
 from robosuite.pipeline.utils import (
     checkpoint_path,
@@ -308,6 +310,38 @@ def main(cfg: DictConfig) -> None:
     print(f"[offline] episodes={episodes_path}")
     print(f"[offline] streams: {streams.stats}")
 
+    use_online_success = bool(OmegaConf.select(cfg, "offline.use_online_success", default=False))
+    next_ep_base = _next_episode_index(streams.policy_bc, streams.human_pos, streams.neg)
+    online_success_pos: list[Any] = []
+    online_success_stats: dict[str, Any] = {}
+    online_success_replaced_policy_bc = 0
+    policy_bc_for_policy = list(streams.policy_bc)
+    if use_online_success:
+        online_success_pos, next_ep_base, online_success_stats = build_online_success_transitions(
+            payload,
+            action_horizon=H,
+            episode_index_base=next_ep_base,
+            route=ROUTE_POS_ONLY,
+        )
+        source_episode_indices = {
+            int(idx)
+            for idx in online_success_stats.get("pure_success_source_episode_indices", [])
+        }
+        if source_episode_indices:
+            policy_bc_for_policy = [
+                transition
+                for transition in streams.policy_bc
+                if int((transition.info or {}).get("source_episode_index", -1))
+                not in source_episode_indices
+            ]
+            online_success_replaced_policy_bc = len(streams.policy_bc) - len(policy_bc_for_policy)
+        print(
+            f"[offline] online_success: {online_success_stats}; "
+            f"replaced_policy_bc={online_success_replaced_policy_bc}"
+        )
+    else:
+        print("[offline] online_success: disabled (offline.use_online_success=false)")
+
     pretrain_pos = []
     pretrain_data_path = None
     raw_pretrain = OmegaConf.select(cfg, "offline.pretrain_data_path", default=None)
@@ -324,11 +358,7 @@ def main(cfg: DictConfig) -> None:
                 "offline.max_pretrain_trajectories",
                 default=None,
             ),
-            episode_index_base=_next_episode_index(
-                streams.policy_bc,
-                streams.human_pos,
-                streams.neg,
-            ),
+            episode_index_base=next_ep_base,
         )
         print(f"[offline] pretrain_data={pretrain_data_path} transitions={len(pretrain_pos)}")
 
@@ -402,20 +432,25 @@ def main(cfg: DictConfig) -> None:
     # Phase B: weighted-BC policy update (frozen finetuned IQL).         #
     # ------------------------------------------------------------------ #
     all_transitions = (
-        list(streams.policy_bc) + list(streams.human_pos) + list(streams.neg) + list(pretrain_pos)
+        list(policy_bc_for_policy)
+        + list(streams.human_pos)
+        + list(streams.neg)
+        + list(online_success_pos)
+        + list(pretrain_pos)
     )
     n_valid = populate_replay_buffer(agent.online_buffer, all_transitions)
     print(
         f"[offline] policy-BC buffer: {len(agent.online_buffer)} transitions, {n_valid} valid windows "
-        f"(policy_bc={len(streams.policy_bc)}, human_pos={len(streams.human_pos)}, "
-        f"neg={len(streams.neg)}, pretrain_pos={len(pretrain_pos)})"
+        f"(policy_bc={len(policy_bc_for_policy)}, human_pos={len(streams.human_pos)}, "
+        f"neg={len(streams.neg)}, online_success_pos={len(online_success_pos)}, "
+        f"pretrain_pos={len(pretrain_pos)})"
     )
     batch_size = finalize_normalizers(
         agent,
         cfg,
-        list(streams.policy_bc) + list(pretrain_pos),
+        list(policy_bc_for_policy) + list(online_success_pos) + list(pretrain_pos),
         log_tag="offline",
-        norm_desc="policy sections + pretrain positive demos",
+        norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
     advantage_raw, failure_raw, start_to_row = precompute_offline_advantage(
@@ -479,6 +514,10 @@ def main(cfg: DictConfig) -> None:
             "episodes_path": episodes_path,
             "pretrain_data_path": pretrain_data_path,
             "pretrain_transitions": len(pretrain_pos),
+            "online_success_enabled": use_online_success,
+            "online_success_transitions": len(online_success_pos),
+            "online_success_replaced_policy_bc_transitions": online_success_replaced_policy_bc,
+            "online_success_stats": online_success_stats,
             "skip_rl": bool(skip_rl),
             "warmup_transitions_path": warmup_transitions_path,
             "algorithm_type": "dipole_offline_sequential",

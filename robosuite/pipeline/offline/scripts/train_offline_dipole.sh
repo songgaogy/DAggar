@@ -16,7 +16,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 TASK="PickPlaceCereal"
@@ -30,12 +30,13 @@ NUM_TRAIN_STEPS=15000
 IQL_FINETUNE_STEPS=20000
 BATCH_SIZE=256
 BRANCH_BETA=4
-RUN_SUBFIX="beta${BRANCH_BETA}"
+RUN_SUBFIX="beta${BRANCH_BETA}_wo-success"
 
 # SKIP_RL=1: skip Phase A IQL finetune; reuse IQL_FINETUNED and copy it into the
 # new run dir as checkpoints/iql_state_finetuned.pt (see train_offline_dipole.py).
 SKIP_RL=1
 IQL_FINETUNED="outputs/dipole-rl-offline/PickPlaceCereal_20260710_180410_beta4/checkpoints/iql_state_finetuned.pt"
+USE_ONLINE_SUCCESS=0
 # -------------------------------------
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
@@ -60,6 +61,7 @@ HYDRA_OVERRIDES=(
   "offline.iql_finetune.num_steps=${IQL_FINETUNE_STEPS}"
   "offline.iql_finetune.batch_size=${BATCH_SIZE}"
   "offline.branch_weight.beta=${BRANCH_BETA}"
+  "offline.use_online_success=${USE_ONLINE_SUCCESS}"  # always: pure success rollouts -> pos_only
   "offline.run_subfix=${RUN_SUBFIX}"
   "offline.skip_rl=${SKIP_RL}"
   "offline.iql_finetuned_path=${IQL_FINETUNED}"
@@ -74,5 +76,6 @@ echo "[train_offline_dipole] iql_ckpt=${IQL_CKPT}"
 echo "[train_offline_dipole] skip_rl=${SKIP_RL} iql_finetuned=${IQL_FINETUNED}"
 echo "[train_offline_dipole] episodes=${OFFLINE_EPISODES}"
 echo "[train_offline_dipole] pretrain_data=${PRETRAIN_DATA}"
+echo "[train_offline_dipole] use_online_success=${USE_ONLINE_SUCCESS}"
 
 "${PY}" -m robosuite.pipeline.offline.src.train_offline_dipole "${HYDRA_OVERRIDES[@]}"

@@ -142,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-disc-reward", action="store_true")
     parser.add_argument("--no-disc-viz", action="store_true")
+    parser.add_argument(
+        "--no-bon",
+        action="store_true",
+        help="Skip Best-of-n Q diagnostics even on success-like splits.",
+    )
     # Discriminator HUD / rollout video controls.
     parser.add_argument(
         "--disc-viz-image-size",
@@ -693,6 +698,15 @@ def compute_metrics(
         raise RuntimeError(f"Need at least {horizon} transitions, got {len(transitions)}")
     num_windows = len(starts)
     sequences = [transitions[start : start + horizon] for start in starts]
+    # First task-success frame (if any). Windows whose s' lands on/after this
+    # index have no continuing bootstrap state — V(s') is terminal/OOD.
+    success_flags = [
+        bool((item.info or {}).get("success", False)) for item in transitions
+    ]
+    first_success_idx = next(
+        (idx for idx, flag in enumerate(success_flags) if flag),
+        None,
+    )
     images_np = np.stack(
         [np.stack([_stack_views(item.obs, camera_names) for item in seq]) for seq in sequences]
     )
@@ -778,6 +792,21 @@ def compute_metrics(
             q_max = float(q_values[:, index].max().item())
             v_val = float(v[index].item())
             td_target_val = float(td_target[index].item())
+            done_flag = float(done[index].item()) > 0.5
+            next_idx = int(start) + horizon
+            # Valid continuing s' only when bootstrap is used and s' is still a
+            # pre-success in-buffer frame. Otherwise V(s') is terminal/OOD and
+            # must not be plotted (raw values still stored for CSV).
+            if done_flag:
+                has_valid_next = False
+            elif first_success_idx is not None and next_idx >= int(first_success_idx):
+                has_valid_next = False
+            elif next_idx >= len(transitions):
+                # Traj-end fallback next_obs: keep for fail (matches training
+                # truncation bootstrap); success path already rejected above.
+                has_valid_next = True
+            else:
+                has_valid_next = True
             rows.append(
                 {
                     "window_start": float(start),
@@ -798,6 +827,7 @@ def compute_metrics(
                     "disc_intrinsic_step0": float(disc_intrinsic_wh[offset + index, 0]),
                     "failure_score_start": float(disc_failure_wh[offset + index, 0]),
                     "done_chunk": float(done[index].item()),
+                    "has_valid_next": float(has_valid_next),
                 }
             )
     per_step_disc = _per_step_disc_from_windows(
@@ -886,17 +916,27 @@ def _save_qv_timeseries_png(
     disc_rewards = np.asarray([row["disc_reward_horizon"] for row in metrics], dtype=np.float32)
     disc_step0 = np.asarray([row["disc_intrinsic_step0"] for row in metrics], dtype=np.float32)
 
-    # At a trajectory's terminal chunk the bootstrap γ^H·V(s') is masked out
-    # (done=1), so td_target collapses to the chunk's immediate reward while V/Q
-    # still carry the bootstrapped tail. The resulting td_target / advantage_td1
-    # outlier would crush the y-axis, so hide just those points (gap in the
-    # curve); the raw values remain in steps.csv (see the done_chunk column).
-    terminal = np.asarray([row.get("done_chunk", 0.0) for row in metrics], dtype=np.float32) > 0.5
-    if bool(terminal.any()):
+    # No continuing s' (done=1 bootstrap mask, or s' on/after first success):
+    # hide every V(s')-dependent curve so terminal/OOD next_v ≈ 0 does not
+    # crush the y-axis. Raw values remain in steps.csv (has_valid_next).
+    if any("has_valid_next" in row for row in metrics):
+        no_s_prime = np.asarray(
+            [float(row.get("has_valid_next", 1.0)) for row in metrics], dtype=np.float32
+        ) < 0.5
+    else:
+        # Backward-compat for older steps.csv without has_valid_next.
+        no_s_prime = (
+            np.asarray([row.get("done_chunk", 0.0) for row in metrics], dtype=np.float32) > 0.5
+        )
+    if bool(no_s_prime.any()):
+        next_v = next_v.copy()
         td_target = td_target.copy()
         advantage_td1 = advantage_td1.copy()
-        td_target[terminal] = np.nan
-        advantage_td1[terminal] = np.nan
+        bootstrap_v = bootstrap_v.copy()
+        next_v[no_s_prime] = np.nan
+        td_target[no_s_prime] = np.nan
+        advantage_td1[no_s_prime] = np.nan
+        bootstrap_v[no_s_prime] = np.nan
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
@@ -909,11 +949,22 @@ def _save_qv_timeseries_png(
     axes[0].legend(loc="best")
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(steps, td_target, label="TD target (r + γ^H V')", color="tab:purple")
-    axes[1].plot(steps, q_min, label="Q min", color="tab:blue", alpha=0.75)
-    axes[1].plot(steps, bootstrap_v, label="γ^H · V(s')", color="tab:green", alpha=0.65, linestyle="--")
-    axes[1].plot(steps, total_rewards, label="chunk r_total", color="tab:gray", alpha=0.65, linestyle=":")
-    axes[1].set_ylabel("Target / Q")
+    # γ^H from valid-bootstrap windows only (nan next_v already excluded).
+    safe = (~no_s_prime) & np.isfinite(next_v) & (np.abs(next_v) > 1e-8)
+    gamma_h = (
+        float(np.median(bootstrap_v[safe] / next_v[safe])) if bool(safe.any()) else 1.0
+    )
+    g_next_v = gamma_h * next_v
+    axes[1].plot(steps, next_v - v, label="V(s') - V(s)", color="tab:purple")
+    axes[1].plot(
+        steps,
+        g_next_v - v,
+        label="γ^H V(s') - V(s)",
+        color="tab:green",
+        alpha=0.85,
+    )
+    axes[1].axhline(0.0, color="black", linewidth=1)
+    axes[1].set_ylabel("V diff")
     axes[1].legend(loc="best", fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
@@ -1421,7 +1472,7 @@ def plot_q_candidate_diagnostics(bon_dir: Path, rows: list[dict[str, Any]]) -> d
 
 def main() -> None:
     args = parse_args()
-    run_bon_diagnostics = is_success_related_split(str(args.split))
+    run_bon_diagnostics = is_success_related_split(str(args.split)) and not bool(args.no_bon)
     checkpoint = resolve_cli_path(args.iql_ckpt)
     payload = load_iql_payload(checkpoint)
     device = resolve_device(args.device, str(payload["cfg"].get("device", "cpu")))
@@ -1618,10 +1669,13 @@ def main() -> None:
             "timeseries_png": str(q_candidate_plot_paths["timeseries"]),
         }
     else:
-        print(
-            f"[vis_qv] skipping Best-of-n Q diagnostics for split={args.split!r} "
-            "(only enabled for success-like splits)."
-        )
+        if bool(args.no_bon):
+            print("[vis_qv] skipping Best-of-n Q diagnostics (--no-bon).")
+        else:
+            print(
+                f"[vis_qv] skipping Best-of-n Q diagnostics for split={args.split!r} "
+                "(only enabled for success-like splits)."
+            )
 
     disc_viz_outputs: dict[str, Any] | None = None
     if not bool(args.no_disc_viz):

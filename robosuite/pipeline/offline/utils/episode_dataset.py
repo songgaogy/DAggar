@@ -149,6 +149,7 @@ def _materialize_section(
     action_horizon: int,
     pad_to_h: bool,
     mark_success: bool,
+    source_episode_index: int | None = None,
 ) -> tuple[list[Transition], bool]:
     """Turn one section into a standalone-episode list of transitions.
 
@@ -185,7 +186,10 @@ def _materialize_section(
             "route": str(route),
             "buffer_role": "offline",
             "episode_namespace": f"offline_{route}",
+            "source_frame_index": int(src_i),
         }
+        if source_episode_index is not None:
+            info["source_episode_index"] = int(source_episode_index)
         if mark_success:
             info["success"] = bool(success_arr[src_i])
         grasp_penalty = None
@@ -242,7 +246,7 @@ def build_offline_transitions(
         "keep_reasons": {},
     }
 
-    for episode in episodes:
+    for source_episode_index, episode in enumerate(episodes):
         is_intervention = np.asarray(episode["is_intervention"], dtype=np.bool_)
         terminal_reason = str(episode.get("terminal_reason", ""))
         sections = _split_sections(is_intervention)
@@ -268,6 +272,7 @@ def build_offline_transitions(
                     action_horizon=H,
                     pad_to_h=False,
                     mark_success=is_success,
+                    source_episode_index=source_episode_index,
                 )
                 if not transitions:
                     # Kept by policy but too short for a single H window -> dropped.
@@ -292,6 +297,7 @@ def build_offline_transitions(
                     action_horizon=H,
                     pad_to_h=True,
                     mark_success=False,
+                    source_episode_index=source_episode_index,
                 )
                 if pos_tr:
                     streams.human_pos.extend(pos_tr)
@@ -311,6 +317,7 @@ def build_offline_transitions(
                         action_horizon=H,
                         pad_to_h=True,
                         mark_success=False,
+                        source_episode_index=source_episode_index,
                     )
                     if neg_tr:
                         streams.neg.extend(neg_tr)
@@ -339,6 +346,7 @@ def build_online_success_transitions(
     *,
     action_horizon: int,
     episode_index_base: int = 0,
+    route: str = ROUTE_ADVANTAGE,
 ) -> tuple[list[Transition], int, dict[str, Any]]:
     """Extract entire policy-success episodes that had **zero** human intervention.
 
@@ -347,8 +355,10 @@ def build_online_success_transitions(
     on every frame (a pure on-policy success rollout — no SpaceMouse corrections
     anywhere). Each qualifying episode becomes one standalone-episode list of
     positive BC transitions (``action = executed_action`` which, with no
-    intervention, equals ``policy_action``; ``route = advantage``;
-    ``is_intervention = False``), so its chunk windows never cross into other data.
+    intervention, equals ``policy_action``; ``route = advantage`` by default),
+    so its chunk windows never cross into other data. Callers can pass
+    ``route=pos_only`` when the same pure-success rollouts should force
+    ``w_pos=1, w_neg=0`` in routed DIPOLE policy training.
 
     Episodes shorter than ``action_horizon`` are dropped (cannot form a window;
     no padding — these are full rollouts, not stubs). Returns
@@ -366,8 +376,9 @@ def build_online_success_transitions(
         "dropped_has_intervention": 0,
         "dropped_short_lt_H": 0,
         "online_success_transitions": 0,
+        "pure_success_source_episode_indices": [],
     }
-    for episode in episodes:
+    for source_episode_index, episode in enumerate(episodes):
         if str(episode.get("terminal_reason", "")) != "success":
             continue
         stats["success_episodes_total"] += 1
@@ -381,12 +392,13 @@ def build_online_success_transitions(
             section=section,
             camera_names=camera_names,
             action_key="executed_action",
-            route=ROUTE_ADVANTAGE,
+            route=route,
             reward_value=0.0,
             episode_index=next_index,
             action_horizon=H,
             pad_to_h=False,
             mark_success=False,
+            source_episode_index=source_episode_index,
         )
         if not transitions:
             stats["dropped_short_lt_H"] += 1
@@ -394,6 +406,7 @@ def build_online_success_transitions(
         out.extend(transitions)
         stats["online_success_transitions"] += len(transitions)
         stats["pure_success_episodes_kept"] += 1
+        stats["pure_success_source_episode_indices"].append(int(source_episode_index))
         next_index += 1
 
     logger.info(

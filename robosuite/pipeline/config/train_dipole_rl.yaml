@@ -22,7 +22,7 @@ algorithm:
   q_learning:
     enabled: true
     config:
-      reward_mode: "-1/0"   # "0/1" | "-1/0"
+      reward_mode: "0/1"   # "0/1" | "-1/0"
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
       expectile_tau: 0.7
@@ -46,7 +46,7 @@ algorithm:
       grad_clip_norm: 2.0
       weight_decay: 1.0e-6
       device: "cuda:1"
-      output_reward_coef: 0.1
+      output_reward_coef: 1
       disc_reward_coef: 0
       update_freq: 1
     warmup_value_steps: 10000

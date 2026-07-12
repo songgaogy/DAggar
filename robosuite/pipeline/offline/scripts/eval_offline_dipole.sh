@@ -15,10 +15,11 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole-rl-offline/PickPlaceCereal_20260711_124405_dagger-with_success/checkpoints/step_00014999.pt"
+POLICY_CKPT="/home/dodo/Documents/DAggar/robosuite/outputs/dipole-rl-offline/PickPlaceCereal_20260711_214918_beta4_wo-success_rev-adv/checkpoints/latest.pt"
 # OMEGAS=(0 0.2 1)
 # OMEGAS=(0.1 0.5 2)
-OMEGAS=(0)
+OMEGAS=(0 0.1 0.2 0.5 1 2)
+# OMEGAS=(0)
 EVAL_EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 SAVE_VIDEO=true

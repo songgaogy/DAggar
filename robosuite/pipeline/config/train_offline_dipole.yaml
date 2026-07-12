@@ -14,9 +14,9 @@ offline:
   max_pretrain_trajectories: null
   # Warmup transitions dir under data/<task>/ (init_iql_qv save_dir).
   iql_warmup_transitions_dir: "offline_data-iql"
-  # Offline DAgger only (src/train_dagger.py): add entire pure on-policy success
-  # rollouts (terminal_reason==success AND zero human intervention) as positive
-  # BC demos, on top of human_pos + pretrain. Ignored by the main DIPOLE entry.
+  # Add entire pure on-policy success rollouts (terminal_reason==success AND zero
+  # human intervention) as positive BC demos. Offline DAgger appends them; main
+  # Offline DIPOLE replaces their advantage route with pos_only (w_pos=1).
   use_online_success: false
 
   # Per-frame section-outcome rewards for policy sections (config-overridable).
