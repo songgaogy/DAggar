@@ -75,28 +75,17 @@ def _make_step_batch(
     D_chunk: int = 16,
     D_a: int = 4,
     H: int = 2,
-    gamma: float = 0.9,
 ) -> IQLStepBatch:
     torch.manual_seed(0)
-    rewards = torch.randn(B, 1)
-    dones = torch.zeros(B, 1)
-    next_v_state_feature = torch.randn(B, D_state)
-    # Default synthetic n-step fields mirror the 1-step ones (as value_n_step=1
-    # would produce): the replay chain-walk is exercised separately in
-    # tests/test_nstep_return.py.
     return IQLStepBatch(
         q_chunk_feature=torch.randn(B, D_chunk),
         v_state_feature=torch.randn(B, D_state),
-        next_v_state_feature=next_v_state_feature,
+        next_v_state_feature=torch.randn(B, D_state),
         action_chunk=torch.randn(B, H, D_a),
-        rewards=rewards,
-        dones=dones,
+        rewards=torch.randn(B, 1),
+        dones=torch.zeros(B, 1),
         is_online=torch.zeros(B, 1),
         is_intervention=torch.zeros(B, 1),
-        nstep_rewards=rewards.clone(),
-        nstep_bootstrap_feature=next_v_state_feature.clone(),
-        nstep_dones=dones.clone(),
-        nstep_discount=torch.full((B, 1), float(gamma) ** H),
         metadata={},
     )
 
@@ -170,33 +159,6 @@ def test_compute_td_advantage_matches_formula() -> None:
     expected = (batch.rewards + gamma_h * (1.0 - batch.dones) * v_sp - v_s).reshape(-1)
     assert adv.shape == (6,)
     assert torch.allclose(adv, expected, atol=1e-6)
-
-
-def test_bootstrap_target_uses_nstep_fields() -> None:
-    """The training target reads the n-step ingredients:
-    ``nstep_rewards + nstep_discount·(1-nstep_dones)·target_v(nstep_bootstrap_feature)``.
-    """
-    cfg = _make_cfg(action_horizon=2)
-    iql = _make_learner(cfg)
-    batch = _make_step_batch(B=5, D_state=12, D_chunk=16, D_a=4, H=2)
-    # Give the n-step fields distinct values from the 1-step fields so a target
-    # that mistakenly read `rewards`/`next_v_state_feature`/`dones` would differ.
-    batch.nstep_rewards = torch.randn(5, 1)
-    batch.nstep_bootstrap_feature = torch.randn(5, 12)
-    batch.nstep_dones = torch.tensor([[0.0], [1.0], [0.0], [1.0], [0.0]])
-    batch.nstep_discount = torch.full((5, 1), 0.9 ** 6)  # a 3-chunk discount
-
-    target = iql._bootstrap_target(batch)
-    v_boot = iql.target_v(batch.nstep_bootstrap_feature)
-    expected = (
-        batch.nstep_rewards
-        + batch.nstep_discount * (1.0 - batch.nstep_dones) * v_boot
-    )
-    assert target.shape == (5, 1)
-    assert torch.allclose(target, expected, atol=1e-6)
-    # Rows flagged done bootstrap off -> target == nstep_rewards exactly.
-    done_rows = batch.nstep_dones.squeeze(-1) > 0.5
-    assert torch.allclose(target[done_rows], batch.nstep_rewards[done_rows], atol=1e-6)
 
 
 def test_iql_state_dict_roundtrip() -> None:

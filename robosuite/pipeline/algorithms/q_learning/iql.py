@@ -9,19 +9,11 @@ cancels out of the value fit and the value can be learned V-only by a TD
 backup. The per-step advantage is the TD residual on V. See
 ``pipeline/V_ONLY_ADVANTAGE_DESIGN.md``.
 
-V is trained with an **n-step** return target (``IQLConfig.value_n_step``,
-propagation along the episode). The advantage read-out
-(:meth:`compute_td_advantage`) is deliberately kept **1-step** — it consumes
-the single-chunk ``rewards``/``dones``/``next_v_state_feature`` and layers
-GAE(λ) on top downstream (vis_qv). So the training backup horizon (n-step) and
-the advantage horizon (1-step) intentionally differ; only the *value* is
-n-step. With ``value_n_step=1`` the two coincide.
-
 Per-tick step ordering (called by the integrated trainer):
-    1. iql.update(step_batch) — V regresses onto the n-step bootstrap target
+    1. iql.update(step_batch) — V regresses onto the bootstrap target
        (MSE-TD) + polyak target update.
     2. Trainer/AdvantageGProvider calls iql.compute_td_advantage(...) to
-       produce the 1-step TD-residual advantage consumed by DIPOLE.
+       produce the TD-residual advantage consumed by DIPOLE.
 """
 
 from __future__ import annotations
@@ -110,24 +102,11 @@ class IQLLearner:
     # ------------------------------------------------------------------ #
 
     def _bootstrap_target(self, step_batch: IQLStepBatch) -> torch.Tensor:
-        """n-step Bellman target
-        ``Σ_{k=0}^{n_eff-1} γ^{kH}·R_k + γ^{n_eff·H}·(1-done)·target_v(s_{+n_eff})``.
-
-        The replay buffer precomputes the n-step ingredients per row (variable
-        n_eff, truncated at the episode boundary / genuine terminal; see
-        ``IQLConfig.value_n_step``): ``nstep_rewards`` is the discounted reward
-        sum, ``nstep_discount`` is the per-row ``γ^{n_eff·H}`` bootstrap factor,
-        ``nstep_dones`` masks the bootstrap at a genuine terminal, and
-        ``nstep_bootstrap_feature`` is the state feature of ``s_{+n_eff}``. With
-        ``value_n_step=1`` these reduce exactly to the legacy 1-step target
-        (``rewards + γ^H·(1-done)·target_v(s')``).
-        """
+        """Bellman target r + γ^H · (1 - done) · target_v(s')."""
+        bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
         with torch.no_grad():
-            v_next = self.target_v(step_batch.nstep_bootstrap_feature)
-            target = (
-                step_batch.nstep_rewards
-                + step_batch.nstep_discount * (1.0 - step_batch.nstep_dones) * v_next
-            )
+            v_next = self.target_v(step_batch.next_v_state_feature)
+            target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
 
     @torch.no_grad()

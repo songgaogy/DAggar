@@ -128,122 +128,19 @@ class IQLReplayBuffer:
             sequences = [self._base._storage[s : s + H] for s in start_indices]  # noqa: SLF001
         return sequences, start_indices
 
-    @staticmethod
-    def _resolve_next_obs(storage: list[Any], start: int, H: int) -> tuple[Any, bool]:
-        """Resolve s' for the chunk starting at ``start`` (caller holds the lock).
-
-        Returns ``(next_obs, forced_done)``: the true next-chunk state
-        ``storage[start+H].obs`` when it stays in the same episode, else the
-        last recorded ``next_obs`` with ``forced_done=True`` (truncation).
-        """
-        n = len(storage)
-        first_episode = _episode_index_of(storage[start])
-        tail_idx = start + H
-        if tail_idx < n and _episode_index_of(storage[tail_idx]) == first_episode:
-            return storage[tail_idx].obs, False
-        return storage[start + H - 1].next_obs, True
-
     def _next_obs_for(self, start: int) -> tuple[Any, bool]:
         """Resolve s' for chunk starting at `start`. Returns (next_obs, forced_done)."""
         H = int(self.cfg.action_horizon)
         with self._base._lock:  # noqa: SLF001
-            return self._resolve_next_obs(self._base._storage, start, H)  # noqa: SLF001
-
-    @staticmethod
-    def _chunk_reward_done(
-        storage: list[Any],
-        chunk_start: int,
-        H: int,
-        discount: float,
-        output_reward_coef: float,
-        disc_reward_coef: float,
-    ) -> tuple[float, float]:
-        """Discounted chunk return ``Σ_{i} γ^i·r_i`` and genuine-done flag for
-        the chunk ``storage[chunk_start : chunk_start+H]`` (caller holds lock).
-
-        Mirrors the vectorized ``aggregate_chunk_reward`` / ``chunk_done_mask``
-        + per-step success done semantics used by :meth:`_build_step_batch`, so
-        the per-chunk terms of the n-step return are consistent with the single
-        chunk the 1-step path produces. The disc term reuses the *precomputed*
-        per-transition nnPU intrinsic (0.0 when unavailable); live head-scoring
-        of interior chunks is intentionally not done here (the n-step experiment
-        runs ``disc_reward_coef=0``).
-        """
-        r_total = 0.0
-        acc_disc = 1.0  # γ^i
-        any_done = False
-        first_info = getattr(storage[chunk_start], "info", None) or {}
-        success_annotated = "success" in first_info
-        for i in range(H):
-            item = storage[chunk_start + i]
-            r_env = float(item.reward) if item.reward is not None else 0.0
-            r_disc = 0.0
-            if disc_reward_coef != 0.0:
-                intrinsic = _nnpu_disc_intrinsic_for_transition(item)
-                r_disc = float(intrinsic) if intrinsic is not None else 0.0
-            r_total += acc_disc * (output_reward_coef * r_env + disc_reward_coef * r_disc)
-            acc_disc *= float(discount)
-            if success_annotated:
-                any_done = any_done or bool((getattr(item, "info", None) or {}).get("success", False))
-            else:
-                any_done = any_done or bool(item.done)
-        return r_total, (1.0 if any_done else 0.0)
-
-    def _nstep_chain(self, start: int) -> tuple[float, float, float, Any]:
-        """Walk ≤ ``value_n_step`` chunk-macro-steps forward from ``start`` along
-        its episode and return the n-step return ingredients.
-
-        Returns ``(partial_reward, nstep_discount, nstep_done, bootstrap_obs)``:
-            partial_reward  Σ_{k=1}^{n_eff-1} (γ^H)^k · R_k  — EXCLUDES the k=0
-                            term, which the caller adds back as the already
-                            computed 1-chunk ``rewards`` (guarantees value_n_step
-                            =1 reduces exactly to the legacy 1-step target).
-            nstep_discount  (γ^H)^{n_eff}   — per-row; n_eff truncates at the
-                            episode boundary / genuine terminal (variable n-step).
-            nstep_done      1.0 if the chain stopped at a genuine terminal
-                            (success) — bootstrap masked off; 0.0 on truncation
-                            (fail rollouts run off the recording boundary → keep
-                            bootstrapping, matching the 1-step path).
-            bootstrap_obs   state s_{+n_eff} to bootstrap V from (the next-obs of
-                            the last accumulated chunk).
-        """
-        n = int(self.cfg.value_n_step)
-        H = int(self.cfg.action_horizon)
-        gamma = float(self.cfg.discount)
-        gamma_h = gamma ** H
-        out_coef = float(self.cfg.output_reward_coef)
-        disc_coef = float(self.cfg.disc_reward_coef)
-        with self._base._lock:  # noqa: SLF001
             storage = self._base._storage  # noqa: SLF001
-            n_storage = len(storage)
+            n = len(storage)
             first_episode = _episode_index_of(storage[start])
-            partial_reward = 0.0
-            n_eff = 0
-            nstep_done = 0.0
-            last_chunk_start = start
-            for k in range(n):
-                c = start + k * H
-                if k > 0:
-                    # chunk c must be a full in-episode window to be accumulated.
-                    if c + H > n_storage:
-                        break
-                    if _episode_index_of(storage[c]) != first_episode:
-                        break
-                    if _episode_index_of(storage[c + H - 1]) != first_episode:
-                        break
-                r_k, done_k = self._chunk_reward_done(
-                    storage, c, H, gamma, out_coef, disc_coef
-                )
-                if k > 0:
-                    partial_reward += (gamma_h ** k) * r_k
-                n_eff = k + 1
-                last_chunk_start = c
-                if done_k > 0.5:
-                    nstep_done = 1.0
-                    break
-            bootstrap_obs, _ = self._resolve_next_obs(storage, last_chunk_start, H)
-            nstep_discount = gamma_h ** n_eff
-        return partial_reward, nstep_discount, nstep_done, bootstrap_obs
+            tail_idx = start + H
+            if tail_idx < n:
+                tail_episode = _episode_index_of(storage[tail_idx])
+                if tail_episode == first_episode:
+                    return storage[tail_idx].obs, False
+            return storage[start + H - 1].next_obs, True
 
     def sample_step_batch(
         self,
@@ -304,25 +201,11 @@ class IQLReplayBuffer:
         episode_ids: list[int] = []
         episode_steps: list[int] = []
         nnpu_disc_per_sequence: list[np.ndarray | None] = []
-        # n-step return ingredients (§ IQLConfig.value_n_step). `nstep_partial`
-        # EXCLUDES the k=0 chunk term — added back below as the 1-chunk `rewards`
-        # so value_n_step=1 reduces exactly to the legacy 1-step target.
-        nstep_boot_images: list[np.ndarray] = []
-        nstep_boot_proprio: list[np.ndarray] = []
-        nstep_partial: list[float] = []
-        nstep_discount_list: list[float] = []
-        nstep_done_list: list[float] = []
 
         for sequence, start in zip(sequences, start_indices):
             nnpu_disc_per_sequence.append(_nnpu_disc_steps_for_sequence(sequence, H))
             first = sequence[0]
             next_obs, forced_done = self._next_obs_for(start)
-            partial_reward, nstep_discount, nstep_done, boot_obs = self._nstep_chain(start)
-            nstep_boot_images.append(_stack_views_uint8(boot_obs, camera_names))
-            nstep_boot_proprio.append(np.asarray(boot_obs["state"], dtype=np.float32))
-            nstep_partial.append(float(partial_reward))
-            nstep_discount_list.append(float(nstep_discount))
-            nstep_done_list.append(float(nstep_done))
             chunk_images.append(
                 np.stack(
                     [_stack_views_uint8(item.obs, camera_names) for item in sequence],
@@ -396,12 +279,6 @@ class IQLReplayBuffer:
         sp_proprio_tensor = torch.from_numpy(
             np.ascontiguousarray(sp_proprio_np)
         ).float()
-        nstep_boot_image_tensor = _to_image_tensor(
-            np.stack(nstep_boot_images, axis=0), device
-        )                                                                       # (B, V, 3, Hi, Wi)
-        nstep_boot_proprio_tensor = torch.from_numpy(
-            np.ascontiguousarray(np.stack(nstep_boot_proprio, axis=0))
-        ).float()
         if _prof:
             _PROFILE_TIMES["assemble"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
@@ -449,10 +326,6 @@ class IQLReplayBuffer:
                 image_obs_raw=sp_image_tensor,
                 proprio_raw=sp_proprio_tensor,
             )
-            nstep_bootstrap_feature = encoder.encode_state(
-                image_obs_raw=nstep_boot_image_tensor,
-                proprio_raw=nstep_boot_proprio_tensor,
-            )
         if _prof:
             _sync_if_cuda(device)
             _PROFILE_TIMES["encode"] += time.perf_counter() - _t0
@@ -485,20 +358,6 @@ class IQLReplayBuffer:
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
         dones = chunk_done_mask(done_tensor)
 
-        # n-step return target ingredients. `rewards` is the k=0 chunk term R_0;
-        # `nstep_partial` carries Σ_{k>=1} (γ^H)^k·R_k, so the full n-step return
-        # is their sum. `nstep_dones`/`nstep_discount` come from the chain walk.
-        nstep_partial_tensor = torch.tensor(
-            nstep_partial, dtype=rewards.dtype
-        ).reshape_as(rewards).to(rewards.device)
-        nstep_rewards = rewards + nstep_partial_tensor
-        nstep_dones = torch.tensor(
-            nstep_done_list, dtype=dones.dtype
-        ).reshape_as(dones).to(dones.device)
-        nstep_discount = torch.tensor(
-            nstep_discount_list, dtype=rewards.dtype
-        ).reshape_as(rewards).to(rewards.device)
-
         disc_meta: dict[str, float] = {}
         if effective_disc_coef != 0.0 and (use_precomputed_disc or discriminator is not None):
             disc_meta["disc_reward_first_frame_mean"] = float(r_disc_per_step[:, 0].mean().item())
@@ -513,10 +372,6 @@ class IQLReplayBuffer:
             dones=dones,
             is_online=is_online_tensor,
             is_intervention=is_intervention_tensor,
-            nstep_rewards=nstep_rewards,
-            nstep_bootstrap_feature=nstep_bootstrap_feature,
-            nstep_dones=nstep_dones,
-            nstep_discount=nstep_discount,
             metadata={
                 "start_indices": start_indices,
                 "episode_ids": episode_ids,
@@ -647,10 +502,6 @@ class IQLReplayBuffer:
             "dones",
             "is_online",
             "is_intervention",
-            "nstep_rewards",
-            "nstep_bootstrap_feature",
-            "nstep_dones",
-            "nstep_discount",
         )
         parts: dict[str, list[torch.Tensor]] = {name: [] for name in field_names}
 
@@ -699,10 +550,6 @@ class IQLReplayBuffer:
             dones=torch.cat(parts["dones"], dim=0),
             is_online=torch.cat(parts["is_online"], dim=0),
             is_intervention=torch.cat(parts["is_intervention"], dim=0),
-            nstep_rewards=torch.cat(parts["nstep_rewards"], dim=0),
-            nstep_bootstrap_feature=torch.cat(parts["nstep_bootstrap_feature"], dim=0),
-            nstep_dones=torch.cat(parts["nstep_dones"], dim=0),
-            nstep_discount=torch.cat(parts["nstep_discount"], dim=0),
             source_size=len(valid_starts),
         )
 
@@ -733,10 +580,6 @@ class IQLPreencodedReplayCache:
         dones: torch.Tensor,
         is_online: torch.Tensor,
         is_intervention: torch.Tensor,
-        nstep_rewards: torch.Tensor,
-        nstep_bootstrap_feature: torch.Tensor,
-        nstep_dones: torch.Tensor,
-        nstep_discount: torch.Tensor,
         source_size: int,
     ) -> None:
         self.q_chunk_feature = q_chunk_feature.contiguous()
@@ -747,10 +590,6 @@ class IQLPreencodedReplayCache:
         self.dones = dones.contiguous()
         self.is_online = is_online.contiguous()
         self.is_intervention = is_intervention.contiguous()
-        self.nstep_rewards = nstep_rewards.contiguous()
-        self.nstep_bootstrap_feature = nstep_bootstrap_feature.contiguous()
-        self.nstep_dones = nstep_dones.contiguous()
-        self.nstep_discount = nstep_discount.contiguous()
         self.source_size = int(source_size)
 
         n = self.q_chunk_feature.shape[0]
@@ -762,10 +601,6 @@ class IQLPreencodedReplayCache:
             ("dones", self.dones),
             ("is_online", self.is_online),
             ("is_intervention", self.is_intervention),
-            ("nstep_rewards", self.nstep_rewards),
-            ("nstep_bootstrap_feature", self.nstep_bootstrap_feature),
-            ("nstep_dones", self.nstep_dones),
-            ("nstep_discount", self.nstep_discount),
         ):
             if tensor.shape[0] != n:
                 raise ValueError(
@@ -798,10 +633,6 @@ class IQLPreencodedReplayCache:
             dones=self.dones.index_select(0, idx),
             is_online=self.is_online.index_select(0, idx),
             is_intervention=self.is_intervention.index_select(0, idx),
-            nstep_rewards=self.nstep_rewards.index_select(0, idx),
-            nstep_bootstrap_feature=self.nstep_bootstrap_feature.index_select(0, idx),
-            nstep_dones=self.nstep_dones.index_select(0, idx),
-            nstep_discount=self.nstep_discount.index_select(0, idx),
             metadata={"source": "preencoded_cache"},
         )
         return batch.to(device)
