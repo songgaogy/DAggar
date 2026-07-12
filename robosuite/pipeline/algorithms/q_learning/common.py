@@ -33,10 +33,21 @@ class IQLConfig:
 
     action_horizon: int = 8
     discount: float = 0.99
-    # RESERVED optimism knob for the planned expectile-TD value fit
-    # (L_V = expectile_tau(target - V)); the current path trains V by plain
-    # MSE-TD and does not read this. See V_ONLY_ADVANTAGE_DESIGN.md.
-    expectile_tau: float = 0.7
+    # Optimism knob for the expectile-TD value fit (L_V = expectile_tau(target
+    # - V_k)). tau > 0.5 pulls V up toward the best locally-reachable
+    # continuation, turning V^beta -> V*. See V_ONLY_ADVANTAGE_DESIGN.md §4.
+    expectile_tau: float = 0.85
+
+    # V-ensemble soft-LCB (deadly-triad guardrail): V_lcb = mean_k V_k - beta *
+    # std_k V_k over ``v_ensemble_size`` independent heads. Soft LCB (not hard
+    # min) so the recoverable-state lift in the high-disagreement region is
+    # kept, not suppressed. Heads are diversified by a per-head Bernoulli
+    # bootstrap mask (keep-prob ``ensemble_bootstrap_prob``) so the std does not
+    # collapse. v_ensemble_size == 1 recovers the single-head V (std == 0, beta
+    # and bootstrap mask inert). See V_ONLY_ADVANTAGE_DESIGN.md §4/§6.
+    v_ensemble_size: int = 2
+    ensemble_lcb_beta: float = 0.5
+    ensemble_bootstrap_prob: float = 0.5
 
     v_lr: float = 3e-4
     target_polyak: float = 0.005
@@ -71,6 +82,27 @@ class IQLConfig:
         for name in ("state_proj_dim", "proprio_proj_dim"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"IQLConfig.{name} must be >= 1, got {getattr(self, name)}.")
+        self.v_ensemble_size = int(self.v_ensemble_size)
+        if self.v_ensemble_size < 1:
+            raise ValueError(
+                f"IQLConfig.v_ensemble_size must be >= 1, got {self.v_ensemble_size}."
+            )
+        self.ensemble_lcb_beta = float(self.ensemble_lcb_beta)
+        if self.ensemble_lcb_beta < 0.0:
+            raise ValueError(
+                f"IQLConfig.ensemble_lcb_beta must be >= 0, got {self.ensemble_lcb_beta}."
+            )
+        self.ensemble_bootstrap_prob = float(self.ensemble_bootstrap_prob)
+        if not 0.0 < self.ensemble_bootstrap_prob <= 1.0:
+            raise ValueError(
+                "IQLConfig.ensemble_bootstrap_prob must be in (0, 1], got "
+                f"{self.ensemble_bootstrap_prob}."
+            )
+        self.expectile_tau = float(self.expectile_tau)
+        if not 0.0 < self.expectile_tau < 1.0:
+            raise ValueError(
+                f"IQLConfig.expectile_tau must be in (0, 1), got {self.expectile_tau}."
+            )
 
 
 @dataclass

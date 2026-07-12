@@ -174,3 +174,57 @@ class VStateNetwork(nn.Module):
                 f"VNetwork expected (B, {self.state_feature_dim}); got {tuple(state_feature.shape)}"
             )
         return self.head(self.projector(state_feature))
+
+
+class VEnsemble(nn.Module):
+    """N independent :class:`VStateNetwork` heads -> (B, N).
+
+    The value is learned by an *optimistic* expectile-TD backup guarded by a
+    soft ensemble LCB (``mean_k − β·std_k``, see V_ONLY_ADVANTAGE_DESIGN.md §4).
+    The LCB needs the heads to *disagree* in the high-epistemic-uncertainty
+    (recoverable-state) region, so each head is a fully independent network with
+    its own Token/Group projector + head. Diversity comes from (1) independent
+    random init of the hidden Linears (Kaiming draws differ per head) and (2) a
+    per-head bootstrap mask on the loss (applied by ``IQLLearner.update``).
+
+    Note each head's final Linear is zero-init (calibrated V≡0 at startup), so
+    the ensemble std starts at 0 and grows as the heads diverge under training —
+    that is expected; the LCB is inert (== mean) only at initialization.
+
+    ``forward`` returns the stacked per-head scalar values ``(B, N)``; the
+    learner reduces them to the LCB. ``N == 1`` recovers a single head (std ≡ 0,
+    β inert) so the ensemble is a strict generalization of the old single V.
+    """
+
+    def __init__(
+        self,
+        *,
+        ensemble_size: int,
+        state_feature_dim: int,
+        n_tokens: int,
+        proprio_dim: int,
+        state_proj_dim: int,
+        proprio_proj_dim: int,
+        hidden_dims: tuple[int, ...] = (256, 256),
+        activation: str = "mish",
+    ) -> None:
+        super().__init__()
+        self.ensemble_size = int(ensemble_size)
+        if self.ensemble_size < 1:
+            raise ValueError(f"VEnsemble: ensemble_size must be >= 1, got {ensemble_size}.")
+        self.heads = nn.ModuleList(
+            VStateNetwork(
+                state_feature_dim=state_feature_dim,
+                n_tokens=n_tokens,
+                proprio_dim=proprio_dim,
+                state_proj_dim=state_proj_dim,
+                proprio_proj_dim=proprio_proj_dim,
+                hidden_dims=hidden_dims,
+                activation=activation,
+            )
+            for _ in range(self.ensemble_size)
+        )
+
+    def forward(self, state_feature: torch.Tensor) -> torch.Tensor:
+        # each head -> (B, 1); stack along a new last axis -> (B, N)
+        return torch.cat([head(state_feature) for head in self.heads], dim=-1)

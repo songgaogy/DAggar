@@ -164,11 +164,12 @@ def load_iql_payload(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"IQL checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     schema_version = int(payload.get("schema_version", -1))
-    if schema_version != 4:
+    if schema_version != 5:
         raise ValueError(
             f"Unsupported IQL checkpoint schema_version={schema_version}. "
-            "This visualizer expects the V-only schema (v4); legacy Q-containing "
-            "checkpoints (v2/v3) are incompatible — re-run offline V warmup."
+            "This visualizer expects the V-only ensemble schema (v5); the "
+            "single-head v4 and legacy Q-containing v2/v3 checkpoints are "
+            "incompatible — re-run offline V warmup."
         )
     for key in ("iql_state", "cfg", "encoder_meta"):
         if key not in payload:
@@ -770,8 +771,10 @@ def compute_metrics(
         total_steps = float(cfg.output_reward_coef) * rewards + float(cfg.disc_reward_coef) * disc_steps
         aggregated = aggregate_chunk_reward(total_steps, float(cfg.discount)).to(learner.cfg.device)
         done = chunk_done_mask(dones).to(learner.cfg.device)
-        v = learner.v(state_features[:, 0])
-        next_v = learner.target_v(next_state)
+        v_all = learner.v(state_features[:, 0])          # (B, N) per-head
+        v = learner._lcb(v_all)                          # (B, 1) soft-LCB value
+        v_std = v_all.std(dim=-1, unbiased=False, keepdim=True)  # ensemble band
+        next_v = learner.target_v_lcb(next_state)
         bootstrap_v = bootstrap_discount * (1.0 - done) * next_v
         td_target = aggregated + bootstrap_v
         for index, start in enumerate(batch_starts):
@@ -797,6 +800,7 @@ def compute_metrics(
                     "window_start": float(start),
                     "step": float(start),
                     "v": v_val,
+                    "v_std": float(v_std[index].item()),
                     "next_v": float(next_v[index].item()),
                     "bootstrap_v": float(bootstrap_v[index].item()),
                     "advantage_td1": td_target_val - v_val,
@@ -912,6 +916,12 @@ def _save_qv_timeseries_png(
         raise ValueError("Cannot plot Q/V timeseries with empty metrics.")
     steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
     v = np.asarray([row["v"] for row in metrics], dtype=np.float32)
+    has_v_std = any("v_std" in row for row in metrics)
+    v_std = (
+        np.asarray([row.get("v_std", 0.0) for row in metrics], dtype=np.float32)
+        if has_v_std
+        else None
+    )
     next_v = np.asarray([row["next_v"] for row in metrics], dtype=np.float32)
     td_target = np.asarray([row["td_target"] for row in metrics], dtype=np.float32)
     advantage_td1 = np.asarray([row["advantage_td1"] for row in metrics], dtype=np.float32)
@@ -955,7 +965,16 @@ def _save_qv_timeseries_png(
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
 
-    axes[0].plot(steps, v, label="V", color="tab:orange")
+    axes[0].plot(steps, v, label="V_lcb", color="tab:orange")
+    if v_std is not None:
+        axes[0].fill_between(
+            steps,
+            v - v_std,
+            v + v_std,
+            color="tab:orange",
+            alpha=0.2,
+            label="ensemble ±std",
+        )
     axes[0].plot(steps, next_v, label="target next V", color="tab:green", alpha=0.8)
     axes[0].set_ylabel("V")
     axes[0].legend(loc="best")

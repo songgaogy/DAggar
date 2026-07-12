@@ -25,9 +25,15 @@ algorithm:
       reward_mode: "-1/0"   # "0/1" | "-1/0"
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
-      # RESERVED optimism knob for a future expectile-TD value fit; the current
-      # path trains V by plain MSE-TD and does not read this.
-      expectile_tau: 0.7
+      # Optimism knob: each V head regresses onto the 1-step bootstrap target by
+      # an expectile loss (tau > 0.5 turns V^beta -> V*). See §4 of the design.
+      expectile_tau: 0.5    # mse loss
+      # V-ensemble soft-LCB guardrail: V_lcb = mean_k - beta*std_k over
+      # v_ensemble_size independent heads (diversified by a per-head Bernoulli
+      # bootstrap mask, keep-prob ensemble_bootstrap_prob). size=1 -> single head.
+      v_ensemble_size: 5
+      ensemble_lcb_beta: 0.5
+      ensemble_bootstrap_prob: 0.5
       v_lr: 1.0e-4
       target_polyak: 0.005
       n_step_aggregate: true

@@ -853,6 +853,9 @@ def main(cfg: DictConfig) -> None:
                 "data/freeze_post_success": float(freeze_post_success),
                 "iql/discount": float(iql_cfg.discount),
                 "iql/expectile_tau": float(iql_cfg.expectile_tau),
+                "iql/v_ensemble_size": float(iql_cfg.v_ensemble_size),
+                "iql/ensemble_lcb_beta": float(iql_cfg.ensemble_lcb_beta),
+                "iql/ensemble_bootstrap_prob": float(iql_cfg.ensemble_bootstrap_prob),
                 "iql/v_lr": float(iql_cfg.v_lr),
                 "iql/target_polyak": float(iql_cfg.target_polyak),
                 "iql/grad_clip_norm": float(iql_cfg.grad_clip_norm),
@@ -979,14 +982,18 @@ def main(cfg: DictConfig) -> None:
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
-            # V-side Token/Group dim-reduction projector layout (schema v4, V-only).
+            # V-side Token/Group dim-reduction projector layout (schema v5,
+            # V-only ensemble: expectile-TD + soft-LCB).
             "n_tokens": int(n_tokens),
             "proprio_dim": int(proprio_dim),
             "state_proj_dim": int(iql_cfg.state_proj_dim),
             "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
             "proj_activation": str(iql_cfg.proj_activation),
+            "v_ensemble_size": int(iql_cfg.v_ensemble_size),
+            "ensemble_lcb_beta": float(iql_cfg.ensemble_lcb_beta),
+            "expectile_tau": float(iql_cfg.expectile_tau),
         },
-        "schema_version": 4,
+        "schema_version": 5,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")

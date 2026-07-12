@@ -5,11 +5,12 @@ Online DIPOLE-RL weights the two flow branches with
 (:class:`AdvantageGProvider`). README step-4 requires the offline variant to use
 the **TD residual** instead::
 
-    A = r + gamma^H * target_V(s') - V(s)
+    A = r + gamma^H * V_lcb_target(s') - V_lcb(s)
 
-with ``V(s)=iql.v(s)``, ``target_V=iql.target_v``, ``gamma^H`` (H=action_horizon)
-and ``r`` the chunk-aggregated reward — a drop-in replacement for ``Q - V``
-with matching sign: larger A (better-than-V transition) raises ``w_pos``.
+with ``V_lcb`` the soft-LCB ensemble value (``iql.v_lcb`` / ``iql.target_v_lcb``,
+``mean_k − β·std_k``), ``gamma^H`` (H=action_horizon) and ``r`` the
+chunk-aggregated reward — a drop-in replacement for ``Q - V`` with matching
+sign: larger A (better-than-V transition) raises ``w_pos``.
 
 Because the encoder, IQL critics and nnPU head are all **frozen** in offline
 training, each valid chunk window's ``A`` and failure score are constant for the
@@ -92,8 +93,8 @@ def precompute_offline_advantage(
             discriminator=discriminator,
             device=device,
         )
-        v_s = iql_learner.v(step_batch.v_state_feature)
-        v_sp = iql_learner.target_v(step_batch.next_v_state_feature)
+        v_s = iql_learner.v_lcb(step_batch.v_state_feature)
+        v_sp = iql_learner.target_v_lcb(step_batch.next_v_state_feature)
         advantage = (step_batch.rewards + gamma_h * v_sp - v_s).reshape(-1)
         failure = discriminator.failure_score(
             chunk_feature=step_batch.q_chunk_feature

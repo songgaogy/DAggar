@@ -37,7 +37,7 @@ BRANCH_NAME="dipole_rl-iql"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v2_explore-GAE"
+NAME="offline_iql_qv-v2_explore-ensemble"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
@@ -51,6 +51,12 @@ DEVICE="${DEVICE:-cuda:0}"
 PREENCODE_CACHE_DEVICE="${PREENCODE_CACHE_DEVICE:-cpu}"
 PREFER_HDF5_SUCCESS_LABELS="${PREFER_HDF5_SUCCESS_LABELS:-true}"
 BULK_READ_HDF5_IMAGES="${BULK_READ_HDF5_IMAGES:-true}"
+# V-only value fit (V_ONLY_ADVANTAGE_DESIGN.md §4): expectile optimism +
+# N-head soft-LCB (mean-beta*std) with per-head Bernoulli bootstrap masks.
+EXPECTILE_TAU="${EXPECTILE_TAU:-0.5}"
+V_ENSEMBLE_SIZE="${V_ENSEMBLE_SIZE:-5}"
+LCB_BETA="${LCB_BETA:-0.5}"
+BOOTSTRAP_PROB="${BOOTSTRAP_PROB:-0.5}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
@@ -74,6 +80,10 @@ HYDRA_OVERRIDES=(
   "runtime.init_checkpoint=${INIT_CHECKPOINT}"
   "algorithm.discriminator.checkpoint=${NNPU_CKPT}"
   "algorithm.q_learning.config.device=${DEVICE}"
+  "algorithm.q_learning.config.expectile_tau=${EXPECTILE_TAU}"
+  "algorithm.q_learning.config.v_ensemble_size=${V_ENSEMBLE_SIZE}"
+  "algorithm.q_learning.config.ensemble_lcb_beta=${LCB_BETA}"
+  "algorithm.q_learning.config.ensemble_bootstrap_prob=${BOOTSTRAP_PROB}"
   "+warmup.output_path=${OUTPUT_FILE}"
   "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
@@ -94,6 +104,7 @@ HYDRA_OVERRIDES+=("warmup.freeze_post_success=${FREEZE_POST_SUCCESS}")
 HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[init_iql_qv] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
+echo "[init_iql_qv] value: expectile_tau=${EXPECTILE_TAU} v_ensemble_size=${V_ENSEMBLE_SIZE} lcb_beta=${LCB_BETA} bootstrap_prob=${BOOTSTRAP_PROB}"
 echo "[init_iql_qv] output=${OUTPUT_FILE}"
 echo "[init_iql_qv] tensorboard=${TENSORBOARD_DIR}"
 echo "[init_iql_qv] init_checkpoint=${INIT_CHECKPOINT}"

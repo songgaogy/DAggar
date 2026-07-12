@@ -1,7 +1,7 @@
 """V-only IQL learner (no Q head).
 
-Held by `DipoleTrainer` in RL mode. Owns V, target_V and a single V optimizer.
-The encoder is INJECTED — this class never instantiates it.
+Held by `DipoleTrainer` in RL mode. Owns a V ensemble, its target ensemble and
+a single optimizer. The encoder is INJECTED — this class never instantiates it.
 
 Under the deterministic dynamics + single-action-per-state coverage here, the
 Q step of IQL is redundant: ``Q(s,a) = r + γ^H V(s')`` holds exactly, so Q
@@ -9,11 +9,23 @@ cancels out of the value fit and the value can be learned V-only by a TD
 backup. The per-step advantage is the TD residual on V. See
 ``pipeline/V_ONLY_ADVANTAGE_DESIGN.md``.
 
+The value fit is the §4 finalized method (not plain MSE):
+    - **Optimism**: each head regresses onto the 1-step bootstrap target by an
+      *expectile* loss (``expectile_tau`` > 0.5), turning the behavior value
+      ``V^β`` into the optimistic ``V*``.
+    - **Soft-LCB pessimism guardrail**: the bootstrap target and the advantage
+      read-out both use ``V_lcb = mean_k V_k − β·std_k V_k`` over the N-head
+      ensemble (``ensemble_lcb_beta``). Heads are diversified by a per-head
+      Bernoulli bootstrap mask so the std does not collapse.
+The TD target stays **1-step** (n-step propagation was tried and reverted); λ
+survives only in the read-out GAE (vis_qv / offline advantage). ``N == 1``
+recovers the legacy single-head 1-step backup (std ≡ 0; expectile still active).
+
 Per-tick step ordering (called by the integrated trainer):
-    1. iql.update(step_batch) — V regresses onto the bootstrap target
-       (MSE-TD) + polyak target update.
+    1. iql.update(step_batch) — each V head regresses onto the shared LCB
+       bootstrap target (expectile-TD) + polyak target update.
     2. Trainer/AdvantageGProvider calls iql.compute_td_advantage(...) to
-       produce the TD-residual advantage consumed by DIPOLE.
+       produce the TD-residual advantage (on ``V_lcb``) consumed by DIPOLE.
 """
 
 from __future__ import annotations
@@ -25,7 +37,8 @@ import torch
 from torch import nn
 
 from .common import IQLConfig, IQLStepBatch
-from .networks import VStateNetwork
+from .losses import expectile_v_loss
+from .networks import VEnsemble
 
 
 class IQLLearner:
@@ -44,8 +57,10 @@ class IQLLearner:
         proprio_dim: width of the proprio block appended to the state feature.
             From ``encoder.proprio_emb_dim``.
 
-    V is a single :class:`VStateNetwork` that owns its own state projector (so
-    ``target_v`` Polyak-tracks the projector with the head).
+    V is a :class:`VEnsemble` of ``cfg.v_ensemble_size`` independent heads, each
+    owning its own state projector (so ``target_v`` Polyak-tracks the projectors
+    with the heads). The scalar value consumed everywhere is the soft-LCB
+    ``V_lcb = mean_k − β·std_k`` (:meth:`v_lcb` / :meth:`target_v_lcb`).
     """
 
     def __init__(
@@ -67,26 +82,24 @@ class IQLLearner:
 
         self.state_proj_dim = int(cfg.state_proj_dim)
         self.proprio_proj_dim = int(cfg.proprio_proj_dim)
+        self.ensemble_size = int(cfg.v_ensemble_size)
+        self.lcb_beta = float(cfg.ensemble_lcb_beta)
         activation = str(cfg.proj_activation)
 
-        self.v: nn.Module = VStateNetwork(
-            state_feature_dim=self.state_feature_dim,
-            n_tokens=self.n_tokens,
-            proprio_dim=self.proprio_dim,
-            state_proj_dim=self.state_proj_dim,
-            proprio_proj_dim=self.proprio_proj_dim,
-            hidden_dims=tuple(cfg.hidden_dims),
-            activation=activation,
-        ).to(device)
-        self.target_v: nn.Module = VStateNetwork(
-            state_feature_dim=self.state_feature_dim,
-            n_tokens=self.n_tokens,
-            proprio_dim=self.proprio_dim,
-            state_proj_dim=self.state_proj_dim,
-            proprio_proj_dim=self.proprio_proj_dim,
-            hidden_dims=tuple(cfg.hidden_dims),
-            activation=activation,
-        ).to(device)
+        def _build_ensemble() -> VEnsemble:
+            return VEnsemble(
+                ensemble_size=self.ensemble_size,
+                state_feature_dim=self.state_feature_dim,
+                n_tokens=self.n_tokens,
+                proprio_dim=self.proprio_dim,
+                state_proj_dim=self.state_proj_dim,
+                proprio_proj_dim=self.proprio_proj_dim,
+                hidden_dims=tuple(cfg.hidden_dims),
+                activation=activation,
+            ).to(device)
+
+        self.v: nn.Module = _build_ensemble()
+        self.target_v: nn.Module = _build_ensemble()
         self.target_v.load_state_dict(self.v.state_dict())
         for p in self.target_v.parameters():
             p.requires_grad_(False)
@@ -101,11 +114,32 @@ class IQLLearner:
     # Internals                                                            #
     # ------------------------------------------------------------------ #
 
+    def _lcb(self, per_head: torch.Tensor) -> torch.Tensor:
+        """Soft-LCB reduction ``mean_k − β·std_k`` over the head axis.
+
+        ``per_head`` is (B, N); returns (B, 1). Population std (unbiased=False)
+        so N==1 gives std==0 (β inert), matching the single-head V exactly.
+        """
+        mean = per_head.mean(dim=-1, keepdim=True)
+        std = per_head.std(dim=-1, unbiased=False, keepdim=True)
+        return mean - self.lcb_beta * std
+
+    def v_lcb(self, state_feature: torch.Tensor) -> torch.Tensor:
+        """Online-ensemble soft-LCB value ``V_lcb(s)`` -> (B, 1)."""
+        return self._lcb(self.v(state_feature))
+
+    def target_v_lcb(self, state_feature: torch.Tensor) -> torch.Tensor:
+        """Target-ensemble soft-LCB value -> (B, 1)."""
+        return self._lcb(self.target_v(state_feature))
+
     def _bootstrap_target(self, step_batch: IQLStepBatch) -> torch.Tensor:
-        """Bellman target r + γ^H · (1 - done) · target_v(s')."""
+        """Bellman target r + γ^H · (1 - done) · V_lcb_target(s')  -> (B, 1).
+
+        Shared across heads (each head regresses onto the same LCB target).
+        """
         bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
         with torch.no_grad():
-            v_next = self.target_v(step_batch.next_v_state_feature)
+            v_next = self.target_v_lcb(step_batch.next_v_state_feature)
             target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
 
@@ -120,15 +154,27 @@ class IQLLearner:
     # ------------------------------------------------------------------ #
 
     def update(self, step_batch: IQLStepBatch) -> dict[str, float]:
-        """One V-only MSE-TD optimization step + polyak target update.
+        """One V-only expectile-TD optimization step + polyak target update.
 
-        V regresses directly toward the bootstrap target
-        ``r + γ^H · (1 - done) · target_v(s')`` by plain MSE (no Q). Returns
-        metrics dict: v_loss, v_mean, target_mean, td_error_abs_mean.
+        Every head regresses onto the shared 1-step LCB bootstrap target
+        ``r + γ^H · (1 - done) · V_lcb_target(s')`` by an *expectile* loss
+        (τ=``expectile_tau``), each head weighted by an independent per-sample
+        Bernoulli bootstrap mask (keep-prob ``ensemble_bootstrap_prob``) so the
+        heads diverge and the LCB std stays non-degenerate. Returns metrics:
+        v_loss, v_mean (V_lcb), target_mean, td_error_abs_mean, v_std_mean
+        (mean per-sample head std — the LCB diversity monitor).
         """
-        target = self._bootstrap_target(step_batch)
-        v_pred = self.v(step_batch.v_state_feature)
-        v_loss = torch.nn.functional.mse_loss(v_pred, target)
+        target = self._bootstrap_target(step_batch)             # (B, 1) shared
+        v_all = self.v(step_batch.v_state_feature)              # (B, N)
+        diff = target - v_all                                   # (B, N) broadcast
+        mask = (
+            torch.rand_like(v_all) < float(self.cfg.ensemble_bootstrap_prob)
+        ).to(v_all.dtype)
+        # Guard the degenerate all-zero mask (rare, tiny batch): fall back to
+        # unmasked so the step is never a no-op / NaN.
+        if float(mask.sum().item()) == 0.0:
+            mask = torch.ones_like(v_all)
+        v_loss = expectile_v_loss(diff, float(self.cfg.expectile_tau), weights=mask)
         self.v_optim.zero_grad(set_to_none=True)
         v_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.v.parameters(), float(self.cfg.grad_clip_norm))
@@ -136,13 +182,16 @@ class IQLLearner:
         self._polyak_update()
 
         with torch.no_grad():
-            td_error = (v_pred.detach() - target.detach()).abs().mean()
+            v_lcb = self._lcb(v_all.detach())
+            td_error = (v_lcb - target.detach()).abs().mean()
+            v_std = v_all.detach().std(dim=-1, unbiased=False).mean()
 
         return {
             "v_loss": float(v_loss.detach().item()),
-            "v_mean": float(v_pred.detach().mean().item()),
+            "v_mean": float(v_lcb.mean().item()),
             "target_mean": float(target.detach().mean().item()),
             "td_error_abs_mean": float(td_error.item()),
+            "v_std_mean": float(v_std.item()),
         }
 
     # ------------------------------------------------------------------ #
@@ -157,15 +206,16 @@ class IQLLearner:
         rewards: torch.Tensor,
         dones: torch.Tensor,
     ) -> torch.Tensor:
-        """TD-residual advantage A = r + γ^H·(1-done)·target_v(s') - v(s).
+        """TD-residual advantage A = r + γ^H·(1-done)·V_lcb_target(s') - V_lcb(s).
 
         Shapes: features (B, D_state); rewards/dones (B, 1) or (B,). Returns
-        (B,). This is the same backup V is trained on (:meth:`update`), so the
-        residual measures how much better-than-baseline the transition is.
+        (B,). This is the same backup V is trained on (:meth:`update`), read out
+        on the soft-LCB value, so the residual measures how much
+        better-than-baseline the transition is.
         """
         bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
-        v_s = self.v(v_state_feature)
-        v_sp = self.target_v(next_v_state_feature)
+        v_s = self.v_lcb(v_state_feature)
+        v_sp = self.target_v_lcb(next_v_state_feature)
         rewards = rewards.reshape_as(v_s)
         dones = dones.reshape_as(v_s)
         advantage = rewards + bootstrap_discount * (1.0 - dones) * v_sp - v_s
@@ -188,6 +238,7 @@ class IQLLearner:
             "proprio_dim": self.proprio_dim,
             "state_proj_dim": self.state_proj_dim,
             "proprio_proj_dim": self.proprio_proj_dim,
+            "v_ensemble_size": self.ensemble_size,
         }
 
     def load_state_dict(self, sd: dict[str, Any], strict: bool = True) -> None:
@@ -209,6 +260,7 @@ class IQLLearner:
                 ("proprio_proj_dim", self.proprio_proj_dim),
                 ("n_tokens", self.n_tokens),
                 ("proprio_dim", self.proprio_dim),
+                ("v_ensemble_size", self.ensemble_size),
             ):
                 if int(sd.get(key, -1)) != int(runtime_val):
                     raise ValueError(
