@@ -1,9 +1,9 @@
 """Offline Q/V warmup entry point for IQL.
 
 Loads HDF5 expert (and optional success/failure) demos for a single task,
-encodes them with the SharedDynamicsEncoder, then runs `warmup_value_only`
-followed by full IQL `update` steps. Dumps `iql_state.pt` for the online
-phase to pick up via `algorithm.q_learning.warmup_ckpt`.
+encodes them with the SharedDynamicsEncoder, then runs a V-only MSE-TD loop
+(no Q head). Dumps `iql_state.pt` for the online phase to pick up via
+`algorithm.q_learning.warmup_ckpt`.
 
 Run as a Hydra module (CLI overrides land on `train_dipole_rl.yaml`):
     python -m robosuite.pipeline.algorithms.q_learning.warmup \
@@ -362,6 +362,8 @@ def _load_hdf5_worker(
     control_freq: int,
     flow_env_metadata: dict[str, Any] | None,
     reward_mode: str = "-1/0",
+    prefer_hdf5_success_labels: bool = False,
+    bulk_read_hdf5_images: bool = False,
 ) -> list[Any]:
     env = build_robosuite_env(runtime_cfg)
     try:
@@ -379,6 +381,8 @@ def _load_hdf5_worker(
             demo_names=list(demo_names),
             state_extractor=extractor,
             reward_mode=str(reward_mode),
+            prefer_hdf5_success_labels=bool(prefer_hdf5_success_labels),
+            bulk_read_hdf5_images=bool(bulk_read_hdf5_images),
         )
     finally:
         env.close()
@@ -406,6 +410,8 @@ def _load_split_into_buffer(
     load_worker_demo_chunk_size: int,
     flow_env_metadata: dict[str, Any] | None,
     reward_mode: str = "-1/0",
+    prefer_hdf5_success_labels: bool = False,
+    bulk_read_hdf5_images: bool = False,
 ) -> tuple[int, int]:
     """Load one split's HDF5 demos into `buffer`. Returns (n_transitions_added,
     new_episode_index_base)."""
@@ -458,6 +464,8 @@ def _load_split_into_buffer(
                     control_freq=int(control_freq),
                     flow_env_metadata=None if flow_env_metadata is None else dict(flow_env_metadata),
                     reward_mode=str(reward_mode),
+                    prefer_hdf5_success_labels=bool(prefer_hdf5_success_labels),
+                    bulk_read_hdf5_images=bool(bulk_read_hdf5_images),
                 ): (path, chunk_index, len(chunk_demo_names))
                 for path, chunk_index, chunk_demo_names in hdf5_chunks
             }
@@ -668,6 +676,16 @@ def main(cfg: DictConfig) -> None:
         print(f"[warmup] reward_mode={reward_mode}")
         if reward_mode == "0/1" and float(iql_cfg.disc_reward_coef) != 0.0:
             raise ValueError("disc_reward_coef must be 0.0 when reward_mode is 0/1")
+        prefer_hdf5_success_labels = bool(
+            OmegaConf.select(cfg, "warmup.prefer_hdf5_success_labels", default=True)
+        )
+        bulk_read_hdf5_images = bool(
+            OmegaConf.select(cfg, "warmup.bulk_read_hdf5_images", default=True)
+        )
+        print(
+            f"[warmup] hdf5 fast path: prefer_success_labels={prefer_hdf5_success_labels} "
+            f"bulk_read_images={bulk_read_hdf5_images}"
+        )
 
         def hdf5_loader(path, demo_names=None):
             return load_hdf5_demos_into_flow_transitions(
@@ -682,6 +700,8 @@ def main(cfg: DictConfig) -> None:
                 demo_names=demo_names,
                 state_extractor=extractor,
                 reward_mode=reward_mode,
+                prefer_hdf5_success_labels=prefer_hdf5_success_labels,
+                bulk_read_hdf5_images=bulk_read_hdf5_images,
             )
 
         demo_splits = _resolve_warmup_demo_splits(cfg)
@@ -734,6 +754,8 @@ def main(cfg: DictConfig) -> None:
                 load_worker_demo_chunk_size=load_worker_demo_chunk_size,
                 flow_env_metadata=flow_env_metadata,
                 reward_mode=reward_mode,
+                prefer_hdf5_success_labels=prefer_hdf5_success_labels,
+                bulk_read_hdf5_images=bulk_read_hdf5_images,
             )
             total_loaded += n_loaded
         if total_loaded == 0:
@@ -831,7 +853,6 @@ def main(cfg: DictConfig) -> None:
                 "data/freeze_post_success": float(freeze_post_success),
                 "iql/discount": float(iql_cfg.discount),
                 "iql/expectile_tau": float(iql_cfg.expectile_tau),
-                "iql/q_lr": float(iql_cfg.q_lr),
                 "iql/v_lr": float(iql_cfg.v_lr),
                 "iql/target_polyak": float(iql_cfg.target_polyak),
                 "iql/grad_clip_norm": float(iql_cfg.grad_clip_norm),
@@ -900,16 +921,20 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"[warmup] preencoded cache ready: {len(train_replay)} chunks")
 
-    # Action normalization is owned by the frozen dynamics encoder.
-    print(f"[warmup] starting value-only loop for {value_steps} steps (batch={batch_size})")
-    for step in range(value_steps):
+    # Action normalization is owned by the frozen dynamics encoder. There is no
+    # Q phase anymore (V-only): the previous value-only + full-IQL loops are a
+    # single V-only MSE-TD loop. `warmup_value_steps` + `warmup_full_steps` are
+    # summed so existing configs keep their total step budget.
+    total_steps = value_steps + full_steps
+    print(f"[warmup] starting V-only TD loop for {total_steps} steps (batch={batch_size})")
+    for step in range(total_steps):
         batch = train_replay.sample_step_batch(
             batch_size,
             encoder=encoder,
             discriminator=discriminator,
             device=device,
         )
-        metrics = iql.warmup_value_only(batch)
+        metrics = iql.update(batch)
         if tb_logger is not None:
             tb_logger.log(
                 {
@@ -918,38 +943,11 @@ def main(cfg: DictConfig) -> None:
                 },
                 step=step,
             )
-        if step % max(1, value_steps // 20) == 0 or step == value_steps - 1:
+        if step % max(1, total_steps // 20) == 0 or step == total_steps - 1:
             print(
                 f"[warmup][value]  step={step:6d} "
                 f"v_loss={metrics['v_loss']:.4f} v_mean={metrics['v_mean']:+.3f} "
-                f"target_mean={metrics['target_mean']:+.3f}"
-            )
-            if tb_logger is not None:
-                tb_logger.flush()
-
-    print(f"[warmup] starting full IQL update loop for {full_steps} steps")
-    for step in range(full_steps):
-        batch = train_replay.sample_step_batch(
-            batch_size,
-            encoder=encoder,
-            discriminator=discriminator,
-            device=device,
-        )
-        metrics = iql.update(batch)
-        global_step = value_steps + step
-        if tb_logger is not None:
-            tb_logger.log(
-                {
-                    **_prefixed_metrics(metrics, prefix="train/full"),
-                    **_iql_batch_debug_metrics(batch, prefix="train/full"),
-                },
-                step=global_step,
-            )
-        if step % max(1, full_steps // 20) == 0 or step == full_steps - 1:
-            print(
-                f"[warmup][full]   step={step:6d} "
-                f"q_loss={metrics['q_loss']:.4f} v_loss={metrics['v_loss']:.4f} "
-                f"q1={metrics['q1_mean']:+.3f} v={metrics['v_mean']:+.3f} "
+                f"target_mean={metrics['target_mean']:+.3f} "
                 f"td={metrics['td_error_abs_mean']:.4f}"
             )
             if tb_logger is not None:
@@ -981,16 +979,14 @@ def main(cfg: DictConfig) -> None:
             "disc_reward_coef": float(iql_cfg.disc_reward_coef),
             "output_reward_coef": float(iql_cfg.output_reward_coef),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
-            # Token/Group dim-reduction projector layout (schema v3).
+            # V-side Token/Group dim-reduction projector layout (schema v4, V-only).
             "n_tokens": int(n_tokens),
             "proprio_dim": int(proprio_dim),
-            "chunk_proj_dim": int(iql_cfg.chunk_proj_dim),
             "state_proj_dim": int(iql_cfg.state_proj_dim),
             "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
-            "action_proj_dim": int(iql_cfg.action_proj_dim),
             "proj_activation": str(iql_cfg.proj_activation),
         },
-        "schema_version": 3,
+        "schema_version": 4,
     }
     torch.save(payload, output_path)
     print(f"[warmup] wrote IQL state to {output_path}")

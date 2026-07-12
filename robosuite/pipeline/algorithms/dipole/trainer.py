@@ -152,16 +152,14 @@ class DipoleTrainer:
 
         metrics: dict[str, float] = {}
 
-        # 1. IQL Q + V (before flow so AdvantageG sees Q/V from this tick).
+        # 1. IQL V (before flow so AdvantageG sees V from this tick).
         if (
             self.iql_learner is not None
             and self.iql_replay is not None
             and self.shared_encoder is not None
             and self.iql_replay.ready(self.iql_batch_size)
         ):
-            from robosuite.pipeline.algorithms.q_learning.common import IQLActorBatch
-
-            # Each iteration resamples and updates Q/V. metrics keep the last
+            # Each iteration resamples and updates V. metrics keep the last
             # iteration only (WandB x-axis is env step, not inner critic step).
             for _ in range(self.iql_update_freq):
                 step_batch = self.iql_replay.sample_step_batch(
@@ -174,12 +172,11 @@ class DipoleTrainer:
                 for k, v in iql_metrics.items():
                     metrics[f"iql/{k}"] = float(v)
                 with torch.no_grad():
-                    adv = self.iql_learner.compute_advantage_for_batch(
-                        IQLActorBatch(
-                            q_chunk_feature=step_batch.q_chunk_feature,
-                            v_state_feature=step_batch.v_state_feature,
-                            action_chunk=step_batch.action_chunk,
-                        )
+                    adv = self.iql_learner.compute_td_advantage(
+                        step_batch.v_state_feature,
+                        step_batch.next_v_state_feature,
+                        step_batch.rewards,
+                        step_batch.dones,
                     )
                 metrics["advantage_mean"] = float(adv.mean().item())
                 if self.discriminator is not None:
@@ -224,13 +221,14 @@ class DipoleTrainer:
                 discriminator=self.discriminator,
                 device=self.learner_device,
             )
-            m = self.iql_learner.warmup_value_only(step_batch)
+            m = self.iql_learner.update(step_batch)
             out.append({f"iql_warmup_v/{k}": float(v) for k, v in m.items()})
         return out
 
     def pretrain_iql_full(self, num_steps: int) -> list[dict[str, float]]:
-        """Full IQL warmup (Q + V + target polyak). Disc is frozen here — see
-        `pretrain_iql_value` docstring."""
+        """V-only IQL warmup (identical to `pretrain_iql_value` now that Q is
+        removed; kept as a separate phase for call-site compatibility). Disc is
+        frozen here — see `pretrain_iql_value` docstring."""
         if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
             raise RuntimeError("pretrain_iql_full requires iql_learner / iql_replay / shared_encoder.")
         out: list[dict[str, float]] = []

@@ -10,7 +10,7 @@ Building blocks reused verbatim:
 - :class:`FlowDaggerReplayBuffer` (+ ``.load``) for the mixed transition store,
 - :class:`IQLReplayBuffer` + :meth:`preencode_step_cache` for a one-shot frozen-
   encoder feature cache (the finetune loop never re-runs the encoder),
-- :meth:`IQLLearner.update` / :meth:`warmup_value_only` for the optimization step.
+- :meth:`IQLLearner.update` for the V-only MSE-TD optimization step.
 """
 
 from __future__ import annotations
@@ -178,12 +178,10 @@ def finetune_iql(
         batch = train_replay.sample_step_batch(
             batch_size, encoder=encoder, discriminator=discriminator, device=device
         )
-        if step < int(value_only_steps):
-            metrics = iql_learner.warmup_value_only(batch)
-            phase = "value_only"
-        else:
-            metrics = iql_learner.update(batch)
-            phase = "full"
+        # V-only MSE-TD (no Q phase). value_only_steps + num_steps are summed
+        # into one loop; the phase label is kept only for logging continuity.
+        metrics = iql_learner.update(batch)
+        phase = "value_only" if step < int(value_only_steps) else "full"
         last_metrics = metrics
         is_log = (step % max(1, int(log_interval)) == 0) or (step == total - 1)
         if is_log:
@@ -194,10 +192,10 @@ def finetune_iql(
             )
             print(
                 f"[offline][iql][{phase} {step:6d}/{total}] "
-                f"q_loss={metrics.get('q_loss', 0.0):.4f} "
                 f"v_loss={metrics.get('v_loss', 0.0):.4f} "
                 f"v_mean={metrics.get('v_mean', 0.0):+.3f} "
-                f"target_q_mean={metrics.get('target_q_mean', 0.0):+.3f}"
+                f"target_mean={metrics.get('target_mean', 0.0):+.3f} "
+                f"td={metrics.get('td_error_abs_mean', 0.0):.4f}"
             )
     return last_metrics
 
@@ -227,10 +225,8 @@ def save_finetuned_iql(
         "policy_action_dim": int(iql_learner.action_dim),
         "n_tokens": int(iql_learner.n_tokens),
         "proprio_dim": int(iql_learner.proprio_dim),
-        "chunk_proj_dim": int(iql_cfg.chunk_proj_dim),
         "state_proj_dim": int(iql_cfg.state_proj_dim),
         "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
-        "action_proj_dim": int(iql_cfg.action_proj_dim),
         "proj_activation": str(iql_cfg.proj_activation),
         "disc_reward_coef": float(iql_cfg.disc_reward_coef),
         "output_reward_coef": float(iql_cfg.output_reward_coef),
@@ -245,7 +241,7 @@ def save_finetuned_iql(
         "iql_state": iql_learner.state_dict(),
         "cfg": asdict(iql_cfg),
         "encoder_meta": encoder_meta,
-        "schema_version": 3,
+        "schema_version": 4,
     }
     torch.save(payload, path)
     logger.info("[offline][iql] wrote finetuned IQL state to %s", path)

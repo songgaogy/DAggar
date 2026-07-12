@@ -1,28 +1,25 @@
-"""Q-chunk and V networks operating on frozen nnPU encoder features.
+"""V network operating on frozen nnPU encoder features.
 
 These modules never own the encoder. The encoder is held by / shared between
 DIPOLE flow training, IQL, and the frozen nnPU discriminator. Callers pass the
-action-conditioned chunk feature to Q and the action-free state feature to V.
+action-free state feature to V. (The Q head is intentionally absent: under the
+deterministic dynamics + single-action coverage here, Q is redundant and the
+value is learned V-only by a TD backup — see V_ONLY_ADVANTAGE_DESIGN.md.)
 
 Architecture (dim-reduced, anti-overfit):
-    The frozen encoder emits very high-dim features (chunk 14272-d, state
-    12288-d) that have a token structure (16 patch-tokens x per-token dim,
-    plus a 64-d proprio block on the state side). Feeding them straight into a
-    512x512 MLP at ~zero weight-decay overfits the few effective offline demos.
+    The frozen encoder emits a very high-dim state feature (12288-d) with a
+    token structure (16 patch-tokens x per-token dim, plus a 64-d proprio block
+    on the state side). Feeding it straight into a 512x512 MLP at ~zero
+    weight-decay overfits the few effective offline demos.
 
-    We therefore insert a light *Token/Group* projector BEFORE the Q/V head:
+    We therefore insert a light *Token/Group* projector BEFORE the V head:
     a single Linear is shared across the 16 tokens and compresses each token to
     a small width, the tokens are flattened, LayerNorm + Mish are applied, and
     only then does a small MLP head produce the scalar value.
 
-    Q additionally re-injects the action: token-projection of the 14272 chunk
-    feature dilutes the ~7% action signal it carries, so a separate learnable
-    ActionProjector embeds the raw action chunk and is concatenated with the
-    compressed chunk feature before the Q head.
-
     Each hidden block in the head is Linear -> LayerNorm -> activation. Hidden
     Linears use Kaiming-normal init; the final Linear is zero-init (weight +
-    bias) to keep Q/V calibrated at startup.
+    bias) to keep V calibrated at startup.
 """
 
 from __future__ import annotations
@@ -122,71 +119,6 @@ class TokenProjector(nn.Module):
             extra = self.extra_proj(feature[:, self.token_input_dim :])
             projected = torch.cat([projected, extra], dim=-1)
         return self.act(self.norm(projected))
-
-
-class ActionProjector(nn.Module):
-    """Embed the raw action chunk ``(B, H, D_a)`` -> ``(B, action_proj_dim)``.
-
-    Input LayerNorm makes the projector robust to the raw (unnormalized) policy
-    action scale; output ``LayerNorm -> activation`` matches the chunk path.
-    """
-
-    def __init__(
-        self,
-        *,
-        action_flat_dim: int,
-        action_proj_dim: int,
-        activation: str = "mish",
-    ) -> None:
-        super().__init__()
-        self.action_flat_dim = int(action_flat_dim)
-        self.output_dim = int(action_proj_dim)
-        self.in_norm = nn.LayerNorm(self.action_flat_dim)
-        self.proj = nn.Linear(self.action_flat_dim, self.output_dim)
-        self.out_norm = nn.LayerNorm(self.output_dim)
-        self.act = _make_activation(activation)
-
-    def forward(self, action_chunk: torch.Tensor) -> torch.Tensor:
-        if action_chunk.dim() == 3:
-            flat = action_chunk.reshape(action_chunk.shape[0], -1)
-        elif action_chunk.dim() == 2:
-            flat = action_chunk
-        else:
-            raise ValueError(
-                f"ActionProjector expected (B, H, D_a) or (B, F); got {tuple(action_chunk.shape)}"
-            )
-        if flat.shape[1] != self.action_flat_dim:
-            raise ValueError(
-                f"ActionProjector expected flat action dim {self.action_flat_dim}; "
-                f"got {flat.shape[1]} from {tuple(action_chunk.shape)}"
-            )
-        return self.act(self.out_norm(self.proj(self.in_norm(flat))))
-
-
-class QHead(nn.Module):
-    """Scalar Q head on ``concat(chunk_proj, action_proj)`` -> (B, 1).
-
-    The shared chunk/action projectors live on the IQL learner; this module is
-    only the per-ensemble-member MLP head.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dims: tuple[int, ...] = (256, 256),
-        activation: str = "mish",
-    ) -> None:
-        super().__init__()
-        self.input_dim = int(input_dim)
-        self.hidden_dims = tuple(int(h) for h in hidden_dims)
-        self.net = _build_mlp(self.input_dim, self.hidden_dims, 1, activation=activation)
-
-    def forward(self, projected: torch.Tensor) -> torch.Tensor:
-        if projected.dim() != 2 or projected.shape[1] != self.input_dim:
-            raise ValueError(
-                f"QHead expected (B, {self.input_dim}); got {tuple(projected.shape)}"
-            )
-        return self.net(projected)
 
 
 class VStateNetwork(nn.Module):

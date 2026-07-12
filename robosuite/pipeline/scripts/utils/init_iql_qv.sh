@@ -33,29 +33,33 @@ cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 export CUDA_VISIBLE_DEVICES=1
 
+BRANCH_NAME="dipole_rl-iql"
+
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="offline_iql_qv-v2-01"
-BRANCH_NAME="dipole_rl-iql"
+NAME="offline_iql_qv-v2_explore-baseline"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED=42
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE=512
 DEVICE="${DEVICE:-cuda:0}"
 # Where to hold the pre-encoded chunk cache: "cpu" (default; no VRAM growth) or
 # "learner"/"device" (cache on the IQL GPU — faster sampling but OOMs on large
 # datasets since it stores one ~14k-float feature row per valid chunk in VRAM).
 PREENCODE_CACHE_DEVICE="${PREENCODE_CACHE_DEVICE:-cpu}"
+PREFER_HDF5_SUCCESS_LABELS="${PREFER_HDF5_SUCCESS_LABELS:-true}"
+BULK_READ_HDF5_IMAGES="${BULK_READ_HDF5_IMAGES:-true}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/iql_state.pt}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 INIT_CHECKPOINT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 mkdir -p "${OUTPUT_DIR}"
 
-# IQL warmup is offline (HDF5 images + proprio); sparse r_env is replayed through
-# the robosuite env per step (actual task success), not HDF5 split/last-frame labels.
+# IQL warmup is offline (HDF5 images + proprio). By default, rollout HDF5
+# `is_success` labels are shifted to post-action rewards; set
+# PREFER_HDF5_SUCCESS_LABELS=false to replay sparse r_env through robosuite.
 # Env is built without offscreen rendering.
 # MUJOCO_GL is unused unless you override warmup to enable rendering.
 export MUJOCO_GL="egl"
@@ -74,6 +78,8 @@ HYDRA_OVERRIDES=(
   "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
   "warmup.preencode_cache_device=${PREENCODE_CACHE_DEVICE}"
+  "warmup.prefer_hdf5_success_labels=${PREFER_HDF5_SUCCESS_LABELS}"
+  "warmup.bulk_read_hdf5_images=${BULK_READ_HDF5_IMAGES}"
 )
 
 # Save assembled offline transitions for future reuse (offline DIPOLE etc.).
