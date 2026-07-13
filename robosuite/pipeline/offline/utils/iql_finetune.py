@@ -10,7 +10,7 @@ Building blocks reused verbatim:
 - :class:`FlowDaggerReplayBuffer` (+ ``.load``) for the mixed transition store,
 - :class:`IQLReplayBuffer` + :meth:`preencode_step_cache` for a one-shot frozen-
   encoder feature cache (the finetune loop never re-runs the encoder),
-- :meth:`IQLLearner.update` for the V-only MSE-TD optimization step.
+- :meth:`IQLLearner.update` for the V-only expectile-TD soft-LCB ensemble step.
 """
 
 from __future__ import annotations
@@ -178,8 +178,9 @@ def finetune_iql(
         batch = train_replay.sample_step_batch(
             batch_size, encoder=encoder, discriminator=discriminator, device=device
         )
-        # V-only MSE-TD (no Q phase). value_only_steps + num_steps are summed
-        # into one loop; the phase label is kept only for logging continuity.
+        # V-only expectile-TD soft-LCB ensemble step (no Q phase). value_only_steps
+        # + num_steps are summed into one loop; the phase label is kept only for
+        # logging continuity.
         metrics = iql_learner.update(batch)
         phase = "value_only" if step < int(value_only_steps) else "full"
         last_metrics = metrics
@@ -210,9 +211,10 @@ def save_finetuned_iql(
     nnpu_ckpt: str | None = None,
     extra_meta: dict[str, Any] | None = None,
 ) -> Path:
-    """Persist the finetuned IQL in the same schema-v3 payload as the warmup.
+    """Persist the finetuned IQL in the same schema-v5 payload as the warmup.
 
-    Reloadable by ``train_dipole_rl._load_iql_warmup_state``.
+    Reloadable by ``train_dipole_rl._load_iql_warmup_state`` and the vis_qv
+    diagnostic (both require ``schema_version == 5``).
     """
     import torch
 
@@ -228,6 +230,12 @@ def save_finetuned_iql(
         "state_proj_dim": int(iql_cfg.state_proj_dim),
         "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
         "proj_activation": str(iql_cfg.proj_activation),
+        # V-only ensemble / expectile-TD knobs (schema v5) so the reloaded value
+        # rebuilds the same N-head soft-LCB critic and the vis/consumers agree.
+        "v_ensemble_size": int(iql_cfg.v_ensemble_size),
+        "ensemble_lcb_beta": float(iql_cfg.ensemble_lcb_beta),
+        "ensemble_bootstrap_prob": float(iql_cfg.ensemble_bootstrap_prob),
+        "expectile_tau": float(iql_cfg.expectile_tau),
         "disc_reward_coef": float(iql_cfg.disc_reward_coef),
         "output_reward_coef": float(iql_cfg.output_reward_coef),
         "threshold": (
@@ -241,7 +249,7 @@ def save_finetuned_iql(
         "iql_state": iql_learner.state_dict(),
         "cfg": asdict(iql_cfg),
         "encoder_meta": encoder_meta,
-        "schema_version": 4,
+        "schema_version": 5,
     }
     torch.save(payload, path)
     logger.info("[offline][iql] wrote finetuned IQL state to %s", path)

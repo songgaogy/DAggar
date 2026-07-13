@@ -32,6 +32,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tqdm import tqdm
 
 from robosuite.pipeline.algorithms.dipole.advantage_g_provider import AdvantageGProvider
 
@@ -55,8 +56,23 @@ def precompute_offline_advantage(
     iql_cfg: "IQLConfig",
     device: str,
     encode_batch_size: int = 64,
+    estimator: str = "td1",
+    gae_lambda: float = 0.95,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[int, int]]:
-    """Encode every valid chunk window once and compute its TD advantage.
+    """Encode every valid chunk window once and compute its advantage.
+
+    Two ``estimator`` modes (both read the soft-LCB ensemble value via
+    :meth:`IQLLearner.compute_td_advantage`, which masks the bootstrap at
+    terminal windows with ``(1 - done)``):
+
+    - ``"td1"``: the 1-step (macro-step) TD residual
+      ``delta_t = r_chunk + gamma^H*(1-done)*V_lcb_target(s') - V_lcb(s)``.
+    - ``"gae"``: GAE(``gae_lambda``) accumulated backward over each episode's
+      chunk chain, ``A_t = delta_t + gamma^H*lambda*(1-done_t)*A_{t+H}``. This
+      mirrors the read-out in ``q_learning/utils/vis_qv.py`` exactly. Offline
+      policy sections are stored as standalone short episodes with ``done=True``
+      on the last frame, so the recursion stops at the section boundary (no
+      cross-section bootstrap).
 
     Returns ``(advantage_raw, failure_raw, start_to_row)``:
       - ``advantage_raw`` / ``failure_raw``: CPU float tensors of shape ``(N,)``
@@ -76,13 +92,38 @@ def precompute_offline_advantage(
             "precompute_offline_advantage: base buffer has no valid chunk windows."
         )
 
+    estimator = str(estimator).lower()
+    if estimator not in ("td1", "gae"):
+        raise ValueError(
+            f"precompute_offline_advantage: estimator must be 'td1' or 'gae', got {estimator!r}."
+        )
+
     H = int(iql_cfg.action_horizon)
     gamma_h = float(iql_cfg.discount) ** H
+    lam = float(gae_lambda)
     encode_bs = max(1, int(encode_batch_size))
 
-    adv_parts: list[torch.Tensor] = []
+    # episode index per valid window (aligned with valid_starts) so GAE chains
+    # only within an episode / policy section, never across a section boundary.
+    with base_buffer._lock:  # noqa: SLF001
+        episode_indices = [
+            int((base_buffer._storage[s].info or {}).get("episode_index", -1))  # noqa: SLF001
+            for s in valid_starts
+        ]
+
+    delta_parts: list[torch.Tensor] = []
+    done_parts: list[torch.Tensor] = []
     fail_parts: list[torch.Tensor] = []
-    for offset in range(0, len(valid_starts), encode_bs):
+    # Bottleneck is frozen-encoder encode + V/disc forward per window batch;
+    # the subsequent GAE pass is a cheap CPU O(N) recursion.
+    n_windows = len(valid_starts)
+    batch_offsets = range(0, n_windows, encode_bs)
+    for offset in tqdm(
+        batch_offsets,
+        total=(n_windows + encode_bs - 1) // encode_bs,
+        desc=f"[offline] precompute {estimator.upper()} advantage",
+        unit="batch",
+    ):
         batch_starts = valid_starts[offset : offset + encode_bs]
         with base_buffer._lock:  # noqa: SLF001
             sequences = [base_buffer._storage[s : s + H] for s in batch_starts]  # noqa: SLF001
@@ -93,28 +134,88 @@ def precompute_offline_advantage(
             discriminator=discriminator,
             device=device,
         )
-        v_s = iql_learner.v_lcb(step_batch.v_state_feature)
-        v_sp = iql_learner.target_v_lcb(step_batch.next_v_state_feature)
-        advantage = (step_batch.rewards + gamma_h * v_sp - v_s).reshape(-1)
+        # 1-step (macro-step) TD residual on the soft-LCB value, done-masked —
+        # identical definition to the online IQLLearner.compute_td_advantage and
+        # the vis_qv.py read-out delta.
+        delta = iql_learner.compute_td_advantage(
+            step_batch.v_state_feature,
+            step_batch.next_v_state_feature,
+            step_batch.rewards,
+            step_batch.dones,
+        ).reshape(-1)
         failure = discriminator.failure_score(
             chunk_feature=step_batch.q_chunk_feature
         ).reshape(-1)
-        adv_parts.append(advantage.detach().to("cpu"))
+        delta_parts.append(delta.detach().to("cpu"))
+        done_parts.append(step_batch.dones.detach().to("cpu").reshape(-1))
         fail_parts.append(failure.detach().to("cpu"))
 
-    advantage_raw = torch.cat(adv_parts, dim=0)
-    failure_raw = torch.cat(fail_parts, dim=0)
+    delta_raw = torch.cat(delta_parts, dim=0).reshape(-1)
+    done_raw = torch.cat(done_parts, dim=0).reshape(-1)
+    failure_raw = torch.cat(fail_parts, dim=0).reshape(-1)
     start_to_row = {int(start): row for row, start in enumerate(valid_starts)}
+
+    if estimator == "gae":
+        advantage_raw = _gae_over_episodes(
+            delta=delta_raw,
+            done=done_raw,
+            valid_starts=valid_starts,
+            episode_indices=episode_indices,
+            start_to_row=start_to_row,
+            horizon=H,
+            gamma_h=gamma_h,
+            lam=lam,
+        )
+    else:
+        advantage_raw = delta_raw.clone()
+
     logger.info(
-        "[offline] precomputed TD advantage for %d windows "
-        "(gamma^H=%.4f, adv_mean=%.4f adv_std=%.4f, fail_mean=%.4f)",
+        "[offline] precomputed %s advantage for %d windows "
+        "(gamma^H=%.4f, lambda=%.3f, adv_mean=%.4f adv_std=%.4f, fail_mean=%.4f)",
+        estimator.upper(),
         advantage_raw.numel(),
         gamma_h,
+        lam if estimator == "gae" else float("nan"),
         float(advantage_raw.mean().item()),
         float(advantage_raw.std().item()) if advantage_raw.numel() > 1 else 0.0,
         float(failure_raw.mean().item()),
     )
     return advantage_raw, failure_raw, start_to_row
+
+
+def _gae_over_episodes(
+    *,
+    delta: torch.Tensor,
+    done: torch.Tensor,
+    valid_starts: list[int],
+    episode_indices: list[int],
+    start_to_row: dict[int, int],
+    horizon: int,
+    gamma_h: float,
+    lam: float,
+) -> torch.Tensor:
+    """GAE(lambda) accumulated backward over each episode's H-strided chunk chain.
+
+    ``A_t = delta_t + gamma^H * lambda * (1 - done_t) * A_{t+H}``, where the
+    ``t+H`` successor is the window ``horizon`` storage steps ahead **iff it is a
+    valid window in the same episode** (else the chain terminates and ``A_t``
+    falls back to the 1-step ``delta_t`` — matching vis_qv's boundary ``0``).
+    Rows are processed in descending start order so each successor is finalized
+    before its predecessor.
+    """
+    delta_l = delta.tolist()
+    done_l = done.tolist()
+    adv = list(delta_l)
+    coef = float(gamma_h) * float(lam)
+    order = sorted(range(len(valid_starts)), key=lambda r: valid_starts[r], reverse=True)
+    for r in order:
+        if done_l[r] > 0.5:
+            continue  # terminal window: no bootstrap, no propagation
+        nb = start_to_row.get(int(valid_starts[r]) + int(horizon))
+        if nb is None or episode_indices[nb] != episode_indices[r]:
+            continue  # no in-episode successor window -> 1-step delta
+        adv[r] = delta_l[r] + coef * adv[nb]
+    return torch.tensor(adv, dtype=delta.dtype)
 
 
 class OfflineAdvantageGProvider(AdvantageGProvider):

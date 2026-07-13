@@ -1,16 +1,3 @@
-#!/usr/bin/env bash
-# Offline DIPOLE training entry (PROMPT.md [tbd] Offline DIPOLE). Sequential:
-#   Phase A  finetune the pretrained IQL critics (unfrozen) on collected policy
-#            sections mixed with the warmup transitions; save iql_state_finetuned.pt.
-#   Phase B  freeze IQL, precompute TD advantage, run routed weighted-BC on the two
-#            flow policies (policy sections advantage-weighted, human -> pos branch,
-#            policy_action-during-intervention -> neg branch).
-# Data source: data/<task>/offline_data/offline_episodes.pt (collect_data.sh).
-# Result dir : data/dipole-rl-offline/<task>_<timestamp>_<postfix>.
-#
-# Experiment constants below are intentionally hardcoded; edit for another task,
-# base policy, nnPU artifact, or IQL warmup state.
-
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
@@ -22,20 +9,24 @@ export CUDA_VISIBLE_DEVICES=1
 TASK="PickPlaceCereal"
 POLICY_CKPT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
-IQL_CKPT="outputs/dipole_rl-iql/offline_iql_qv-v2/PickPlaceCereal/iql_state.pt"   # Pretrained IQL to CONTINUE training from (init_iql_qv.sh output).
+IQL_CKPT="outputs/dipole_rl-iql/offline_iql_qv-v2_explore-ensemble/PickPlaceCereal/iql_state.pt"   # Pretrained IQL to CONTINUE training from (init_iql_qv.sh output).
 OFFLINE_EPISODES="data/${TASK}/offline_data/offline_episodes.pt"  # Collected offline episodes (collect_data.sh output).
 PRETRAIN_DATA="data/${TASK}/pretrain_data-20260615_174814"
 DEVICE="${DEVICE:-cuda:0}"
 NUM_TRAIN_STEPS=15000
-IQL_FINETUNE_STEPS=20000
-BATCH_SIZE=256
-BRANCH_BETA=4
-RUN_SUBFIX="beta${BRANCH_BETA}_wo-success"
+V_FINETUNE_STEPS=10000
+V_BATCH_SIZE=512
+POLICY_BATCH_SIZE=256
+
+# w_pos = sigmoid(beta * (G + k)); decision boundary at G=-k.
+BRANCH_BETA=1
+BRANCH_K=-2
+RUN_SUBFIX="beta${BRANCH_BETA}_k${BRANCH_K}_ensemble-GAE"
 
 # SKIP_RL=1: skip Phase A IQL finetune; reuse IQL_FINETUNED and copy it into the
 # new run dir as checkpoints/iql_state_finetuned.pt (see train_offline_dipole.py).
 SKIP_RL=1
-IQL_FINETUNED="outputs/dipole-rl-offline/PickPlaceCereal_20260710_180410_beta4/checkpoints/iql_state_finetuned.pt"
+IQL_FINETUNED="outputs/dipole-rl-offline/PickPlaceCereal_20260713_113548_beta1_k-2_ensemble-GAE/checkpoints/iql_state_finetuned.pt"
 USE_ONLINE_SUCCESS=0
 # -------------------------------------
 
@@ -54,22 +45,26 @@ HYDRA_OVERRIDES=(
   "algorithm.discriminator.learner_device=${DEVICE}"
   "algorithm.flow.device=${DEVICE}"
   "algorithm.flow.inference_device=${DEVICE}"
-  "algorithm.trainer.batch_size=${BATCH_SIZE}"
+  "algorithm.trainer.batch_size=${POLICY_BATCH_SIZE}"
   "offline.episodes_path=${OFFLINE_EPISODES}"
   "offline.pretrain_data_path=${PRETRAIN_DATA}"
   "offline.num_train_steps=${NUM_TRAIN_STEPS}"
-  "offline.iql_finetune.num_steps=${IQL_FINETUNE_STEPS}"
-  "offline.iql_finetune.batch_size=${BATCH_SIZE}"
+  "offline.iql_finetune.num_steps=${V_FINETUNE_STEPS}"
+  "offline.iql_finetune.batch_size=${V_BATCH_SIZE}"
   "offline.branch_weight.beta=${BRANCH_BETA}"
+  "offline.branch_weight.k=${BRANCH_K}"
   "offline.use_online_success=${USE_ONLINE_SUCCESS}"  # always: pure success rollouts -> pos_only
   "offline.run_subfix=${RUN_SUBFIX}"
   "offline.skip_rl=${SKIP_RL}"
-  "offline.iql_finetuned_path=${IQL_FINETUNED}"
 )
+if [[ "${SKIP_RL}" == "1" || "${SKIP_RL}" == "true" ]]; then
+  HYDRA_OVERRIDES+=("offline.iql_finetuned_path=${IQL_FINETUNED}")
+fi
 HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
-echo "[train_offline_dipole] task=${TASK} device=${DEVICE} policy_steps=${NUM_TRAIN_STEPS} iql_steps=${IQL_FINETUNE_STEPS} batch_size=${BATCH_SIZE}"
-echo "[train_offline_dipole] run_subfix=${RUN_SUBFIX} branch_beta=${BRANCH_BETA}"
+echo "[train_offline_dipole] task=${TASK} device=${DEVICE} policy_steps=${NUM_TRAIN_STEPS} v_steps=${V_FINETUNE_STEPS}"
+echo "[train_offline_dipole] v_batch=${V_BATCH_SIZE} policy_batch=${POLICY_BATCH_SIZE}"
+echo "[train_offline_dipole] run_subfix=${RUN_SUBFIX} branch_beta=${BRANCH_BETA} branch_k=${BRANCH_K}"
 echo "[train_offline_dipole] policy_ckpt=${POLICY_CKPT}"
 echo "[train_offline_dipole] nnpu_ckpt=${NNPU_CKPT}"
 echo "[train_offline_dipole] iql_ckpt=${IQL_CKPT}"

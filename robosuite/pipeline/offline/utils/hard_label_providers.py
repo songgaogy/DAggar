@@ -7,7 +7,7 @@ branch weights by fixed labels instead of a learned advantage:
   expert + ``success_rollout`` frames ``is_intervention=True`` (policy forces
   ``w_pos=1, w_neg=0``); ``fail_rollout`` frames are the only provider-scored rows.
   A large constant *negative* G drives exactly those to the negative branch
-  (``w_pos = sigmoid(beta * (-BIG) + k) ~= 0`` -> ``w_neg ~= 1``; see
+  (``w_pos = sigmoid(beta * (-BIG + k)) ~= 0`` -> ``w_neg ~= 1``; see
   ``DipoleFlowPolicy._g_weights_from_raw`` / ``_compute_branch_weights``).
 
 - ``offline.mode == "neg_all"`` -> :class:`NegAllGProvider`. The negative branch
@@ -35,7 +35,7 @@ from robosuite.pipeline.offline.utils.buffer import _trajectory_kind
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
 
-# Large enough that sigmoid(beta * G + k) saturates to ~0 for any sane
+# Large enough that sigmoid(beta * (G + k)) saturates to ~0 for any sane
 # (positive) beta/k, i.e. fail frames get w_neg ~= 1.
 _NEG_G: float = -1.0e6
 

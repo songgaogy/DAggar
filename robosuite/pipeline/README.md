@@ -180,12 +180,12 @@ v_guided = (1 + omega) * v_pos - omega * v_neg
 `omega` is therefore an eval-only knob (`algorithm.dipole.guidance_omega`). Human-intervention samples explicitly force the positive branch weight to one. For non-intervention samples, the two flow-matching losses are weighted by:
 
 ```text
-w_pos = sigmoid(clamp(beta_dipole * normalize(G) + k, -g_clip, g_clip))
+w_pos = sigmoid(beta * (G + k))
 w_neg = 1 - w_pos
 L     = w_pos * L_pos + w_neg * L_neg     # per-policy weighted mean
 ```
 
-The positive policy trains on the `w_pos`-weighted loss, the negative policy on the `w_neg`-weighted loss — two independent forward/backward passes and two optimizer steps per update. The soft-weight scheme above (`offline.mode == "normal"`) and the hard-split schemes (`naive`/`neg_all`, where `w_pos`/`w_neg` become ~{0,1} membership) both reduce to this same two-policy weighted update. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*normalize(A)-beta*normalize(failure_score)` where the advantage is the V-only TD residual `A = r + γ^H·target_V(s') - V(s)`. The advantage and failure channels have independent normalization state.
+`k` offsets `G` before scaling (`w_pos=0.5` at `G=-k`); `beta` is the post-offset slope. There is no `normalize(G)` / `g_clip` on this path (`DipoleFlowPolicy._g_weights_from_raw`). The positive policy trains on the `w_pos`-weighted loss, the negative policy on the `w_neg`-weighted loss — two independent forward/backward passes and two optimizer steps per update. The soft-weight scheme above (`offline.mode == "normal"`) and the hard-split schemes (`naive`/`neg_all`, where `w_pos`/`w_neg` become ~{0,1} membership) both reduce to this same two-policy weighted update. The G provider returns the preference `G` directly (larger `G` -> more positive branch): discriminator-only DIPOLE uses `G=-failure_score`, and DIPOLE-RL uses `G=alpha*A-beta*failure_score` where the advantage is the V-only TD residual `A = r + γ^H·target_V(s') - V(s)` (offline path; online advantage provider is still a stub).
 
 > Note: this two-policy scheme is a clean break from the earlier dual-LoRA-on-frozen-backbone design — old dual-LoRA checkpoints do not load. Training two full policies is ~2x the compute/VRAM of the LoRA scheme; online rollout stays positive-only so the negative policy's inference copies sit idle during rollout.
 
@@ -204,7 +204,7 @@ The per-head Bernoulli **bootstrap mask** (keep-prob `ensemble_bootstrap_prob`, 
 
 > **Empirical update (`V_ONLY_ADVANTAGE_DESIGN.md` §4/§7-6):** the expectile *optimism* was tested and **rejected** — it gave no gain and degraded results. Runs therefore set `expectile_tau=0.5`, at which `expectile_tau(y - V_k)` reduces to `0.5·MSE` (asymmetry inert) → the value fit is plain **MSE-TD**. The **ensemble soft-LCB is the axis that works**, run with `v_ensemble_size=5`. Both are applied via `init_iql_qv.sh` env overrides (`EXPECTILE_TAU=0.5`, `V_ENSEMBLE_SIZE=5`); the in-code defaults (0.85 / 2) still hold the original hypothesis.
 
-Only target heads receive a Polyak update. Each learner tick performs the V update before the flow-policy update; there is no discriminator update. The per-step advantage consumed by the flow branch weighting is the TD residual on the LCB value `A = r + gamma^H·(1-done)·V_lcb_target(s') - V_lcb(s)` (`IQLLearner.compute_td_advantage`); the offline path precomputes the same residual by window start index (`offline/utils/advantage.py`).
+Only target heads receive a Polyak update. Each learner tick performs the V update before the flow-policy update; there is no discriminator update. The per-step advantage consumed by the flow branch weighting is the TD residual on the LCB value `A = r + gamma^H·(1-done)·V_lcb_target(s') - V_lcb(s)` (`IQLLearner.compute_td_advantage`). The **offline** pipeline precomputes this by window start index (`offline/utils/advantage.py`) and additionally offers a **GAE(λ) read-out** (`offline.advantage.estimator: gae`, default, `gae_lambda=0.6`) that accumulates the residual backward over each policy-section episode — the same recursion as the `vis_qv.py` diagnostic. See [offline/README.md](./offline/README.md).
 
 ## Configuration and repository layout
 
@@ -276,8 +276,8 @@ TensorBoard is enabled by the training scripts unless overridden. To use WandB, 
 
 - Existing flow policy checkpoints remain compatible because the actor architecture and state-dict keys are unchanged.
 - Old LPB v2 BCE or online-BCE discriminator artifacts are not valid `NNPU_CKPT` inputs.
-- Any warmup checkpoint that contains a Q head (`q_ensemble`/`q1`) — i.e. every pre-V-only schema (v2/v3) — is rejected by the V-only learner. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder to produce a schema-v4 V-only checkpoint.
-- A V checkpoint is tied to the nnPU encoder, task, camera views, horizon, token count, proprio width, and V-projector dimensions recorded in its metadata.
+- Any warmup checkpoint that contains a Q head (`q_ensemble`/`q1`) — i.e. every pre-V-only schema (v2/v3) — is rejected by the V-only learner. Re-run `scripts/utils/init_iql_qv.sh` with the nnPU encoder to produce a schema-v5 V-only checkpoint. The offline Phase-A finetune also writes schema v5 (`offline/utils/iql_finetune.save_finetuned_iql`).
+- A V checkpoint is tied to the nnPU encoder, task, camera views, horizon, token count, proprio width, the V-projector dimensions, and the V-ensemble size (`v_ensemble_size`) recorded in its metadata; `load_state_dict` rejects a mismatch.
 
 ## Troubleshooting
 

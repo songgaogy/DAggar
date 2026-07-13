@@ -45,11 +45,25 @@ offline:
     batch_size: 256
     preencode_cache: true
 
+  # Phase-B advantage read-out fed into G (offline/utils/advantage.py).
+  advantage:
+    # gae -> GAE(gae_lambda) accumulated backward per policy-section episode on
+    #        the soft-LCB value (matches q_learning/utils/vis_qv.py read-out).
+    # td1 -> the plain 1-step (macro-step) TD residual.
+    estimator: "gae"          # gae | td1
+    gae_lambda: 0.6
+
   # Pluggable branch-weight policy (offline/utils/branch_weights.py).
   branch_weight:
     type: "routed_sigmoid"    # routed_sigmoid | disc_scaled
-    beta: 4.0                 # sigmoid slope  w_pos = sigmoid(beta*G + k)
-    k: 0.0
+    # w_pos = sigmoid(beta * (G + k)). NOTE: G is NOT normalized, so beta is the
+    # post-offset slope (tracks advantage scale). k shifts the decision threshold
+    # in G-space (w_pos=0.5 at G=-k). GAE(lambda=0.6) advantages run ~2x the
+    # 1-step residual, so beta~2.0 here vs ~4.0 for estimator=td1. Tune against
+    # the branch-weight histogram (diagnostic_plots.py) so w_pos does not
+    # collapse to {0,1}.
+    beta: 1.0
+    k: -2.0
 
 algorithm:
   type: "dipole_rl"
@@ -58,7 +72,7 @@ algorithm:
     capacity: 5000000
   dipole:
     g_mode: "advantage"
-    beta: 4.0
+    beta: 2.0        # overridden at runtime by offline.branch_weight.beta; kept in sync
     k: 0.0
   q_learning:
     enabled: true

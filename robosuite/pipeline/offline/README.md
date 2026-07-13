@@ -38,8 +38,8 @@ Offline training **continues** from a warmed-up IQL. Produce it once with `../sc
 
 **Sequential two phases:**
 
-- **Phase A — IQL finetune (unfrozen).** Load the pretrained IQL, continue training it on the collected policy sections **mixed with** the warmup transitions, save `<run_dir>/checkpoints/iql_state_finetuned.pt`. A one-shot frozen-encoder feature cache (`preencode_step_cache`) keeps the loop encoder-free.
-- **Phase B — weighted-BC policy update (IQL frozen).** Precompute the TD advantage `A = V(s) − γ^H·target_V(s') − r` against the frozen finetuned critics, then update the two flow policies with a pluggable routed branch-weight policy.
+- **Phase A — IQL finetune (unfrozen).** Load the pretrained IQL (V-only N-head soft-LCB ensemble, expectile-TD), continue training it (`IQLLearner.update`) on the collected policy sections **mixed with** the warmup transitions, save `<run_dir>/checkpoints/iql_state_finetuned.pt` (schema v5). A one-shot frozen-encoder feature cache (`preencode_step_cache`) keeps the loop encoder-free. The value-semantics config (`expectile_tau`, `ensemble_lcb_beta`, `ensemble_bootstrap_prob`, `discount`, reward coefs) is aligned from the loaded checkpoint so finetuning continues in the warmup regime; structural fields (`v_ensemble_size`, projector dims) are asserted by `load_state_dict`.
+- **Phase B — weighted-BC policy update (IQL frozen).** Precompute the per-window advantage against the frozen finetuned critics on the **soft-LCB value** `V_lcb`, then update the two flow policies with a pluggable routed branch-weight policy. The 1-step (macro-step) TD residual is `A = r + γ^H·(1−done)·V_lcb_target(s') − V_lcb(s)`. `offline.advantage.estimator` selects the read-out: `gae` (default) accumulates GAE(`gae_lambda`, default 0.6) backward over each policy-section episode (`A_t = δ_t + γ^H·λ·(1−done_t)·A_{t+H}`, matching `q_learning/utils/vis_qv.py`); `td1` uses the bare residual. Sections are standalone short episodes with `done=True` on the last frame, so GAE never bootstraps across a section boundary.
 
 ### Data usage — split each episode on `is_intervention`
 
@@ -58,7 +58,7 @@ Rules:
 
 ### Branch weights (modular)
 
-`utils/branch_weights.RoutedSigmoidBranchWeightPolicy` (default) reads `batch.metadata["route"]`: `advantage → w_pos=σ(β·G+k), w_neg=1−w_pos`; `pos_only → (1,0)`; `neg_only → (0,1)`. Swap the format via `offline.branch_weight.type` (e.g. `disc_scaled`, an example extension) — the policy is attached with `DipoleFlowPolicy.set_branch_weight_policy`, which short-circuits the built-in weighting.
+`utils/branch_weights.RoutedSigmoidBranchWeightPolicy` (default) reads `batch.metadata["route"]`: `advantage → w_pos=σ(β·(G+k)), w_neg=1−w_pos`; `pos_only → (1,0)`; `neg_only → (0,1)`. Swap the format via `offline.branch_weight.type` (e.g. `disc_scaled`, an example extension) — the policy is attached with `DipoleFlowPolicy.set_branch_weight_policy`, which short-circuits the built-in weighting. `k` offsets `G` before scaling (`w_pos=0.5` at `G=-k`); `beta` is the post-offset slope (`DipoleFlowPolicy._g_weights_from_raw`).
 
 ### Run
 
@@ -91,8 +91,9 @@ bash robosuite/pipeline/offline/scripts/eval_offline_dipole.sh   # set POLICY_CK
 | `offline.include_policy_action_neg` | `true` | route `policy_action` → neg branch |
 | `offline.iql_finetune.{num_steps,value_only_steps,batch_size,preencode_cache}` | `20000,0,256,true` | Phase A |
 | `offline.num_train_steps` | `15000` | Phase B policy steps |
-| `offline.branch_weight.{type,beta,k}` | `routed_sigmoid,4.0,0.0` | weight scheme + sigmoid slope/offset |
-| `algorithm.advantage_g_provider.{alpha,beta}` | `1.0,0.0` | `G = alpha·A − beta·failure` (β=0 → pure TD) |
+| `offline.advantage.{estimator,gae_lambda}` | `gae,0.6` | Phase-B read-out: `gae` (GAE over section) or `td1` (1-step residual) |
+| `offline.branch_weight.{type,beta,k}` | `routed_sigmoid,2.0,0.0` | `w_pos=σ(β·(G+k))`. `G` is **not** normalized: `beta` is post-offset slope (`~2.0` for `gae` λ=0.6 ≈ 2× 1-step scale, `~4.0` for `td1`); `k` shifts the threshold in G-space. Tune against the branch-weight histogram. |
+| `algorithm.advantage_g_provider.{alpha,beta}` | `1.0,0.0` | `G = alpha·A − beta·failure` (β=0 → pure advantage) |
 
 ## File map
 
@@ -104,8 +105,8 @@ offline/
     ├── collect_data.py        Stage-1 collector (fixed policy, no updates)
     ├── episode_dataset.py     split on is_intervention → 3 routed Transition streams
     ├── branch_weights.py      pluggable RoutedSigmoid / DiscriminatorScaled branch weights
-    ├── iql_finetune.py        Phase-A mixed buffer + unfrozen IQL update + save
-    ├── advantage.py           precompute_offline_advantage + OfflineAdvantageGProvider (TD)
+    ├── iql_finetune.py        Phase-A mixed buffer + unfrozen IQL update + save (schema v5)
+    ├── advantage.py           precompute_offline_advantage (td1 | gae read-out) + OfflineAdvantageGProvider
     └── setup.py               build_agent_env / finalize_normalizers / make_hdf5_loader
 ```
 `route` is threaded through `algorithms/dipole/{common.py, models/flow.py, replay_buffer.py}`.

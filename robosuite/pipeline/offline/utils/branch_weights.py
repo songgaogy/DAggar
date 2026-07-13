@@ -18,7 +18,7 @@ The default :class:`RoutedSigmoidBranchWeightPolicy` reads the per-frame
 - ``pos_only`` (human intervention → positive branch): ``w_pos=1, w_neg=0``.
 - ``neg_only`` (policy action during intervention → negative branch): ``w_pos=0,
   w_neg=1``.
-- ``advantage`` (policy rollout sections): ``w_pos=σ(β·G+k)``, ``w_neg=1-w_pos``,
+- ``advantage`` (policy rollout sections): ``w_pos=σ(β·(G+k))``, ``w_neg=1-w_pos``,
   computed by reusing the policy's own ``sigmoid_fn`` on the attached G provider's
   advantage — identical math to the online coupled path.
 

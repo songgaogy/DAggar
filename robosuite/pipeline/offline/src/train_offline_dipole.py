@@ -249,13 +249,29 @@ def main(cfg: DictConfig) -> None:
         initial_iql_ckpt = warmup_ckpt
     warmup_payload = torch.load(initial_iql_ckpt, map_location="cpu", weights_only=False)
     warmup_meta = warmup_payload.get("encoder_meta", {}) if isinstance(warmup_payload, dict) else {}
-    for coef in ("output_reward_coef", "disc_reward_coef"):
-        if coef in warmup_meta:
-            old = getattr(iql_cfg, coef)
-            new = float(warmup_meta[coef])
-            if float(old) != new:
-                print(f"[offline][iql] aligning {coef}: {old} -> {new} (from warmup ckpt)")
-            setattr(iql_cfg, coef, new)
+    warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
+    # Align the value-semantics config with the loaded checkpoint so Phase-A
+    # finetune continues in the exact regime the warmup established, and the
+    # frozen-critic advantage read-out uses the same soft-LCB beta the value was
+    # trained with (ensemble_lcb_beta directly scales V_lcb, hence the advantage).
+    # Structural fields (v_ensemble_size, projector dims) are asserted separately
+    # by IQLLearner.load_state_dict, which raises loudly on any mismatch.
+    for field in (
+        "output_reward_coef",
+        "disc_reward_coef",
+        "expectile_tau",
+        "ensemble_lcb_beta",
+        "ensemble_bootstrap_prob",
+        "discount",
+    ):
+        src = warmup_cfg if field in warmup_cfg else (warmup_meta if field in warmup_meta else None)
+        if src is None:
+            continue
+        old = getattr(iql_cfg, field)
+        new = type(old)(src[field])
+        if old != new:
+            print(f"[offline][iql] aligning {field}: {old} -> {new} (from warmup ckpt)")
+        setattr(iql_cfg, field, new)
 
     H = int(iql_cfg.action_horizon)
     if int(agent.flow_config.action_horizon) != H:
@@ -450,6 +466,8 @@ def main(cfg: DictConfig) -> None:
         norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
+    adv_estimator = str(OmegaConf.select(cfg, "offline.advantage.estimator", default="gae"))
+    adv_gae_lambda = float(OmegaConf.select(cfg, "offline.advantage.gae_lambda", default=0.6))
     advantage_raw, failure_raw, start_to_row = precompute_offline_advantage(
         base_buffer=agent.online_buffer,
         iql_learner=iql_learner,
@@ -458,6 +476,12 @@ def main(cfg: DictConfig) -> None:
         iql_cfg=iql_cfg,
         device=rl_device,
         encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
+        estimator=adv_estimator,
+        gae_lambda=adv_gae_lambda,
+    )
+    print(
+        f"[offline] advantage estimator={adv_estimator}"
+        + (f" (lambda={adv_gae_lambda})" if adv_estimator == "gae" else "")
     )
     provider = OfflineAdvantageGProvider(
         iql_learner=iql_learner,
@@ -474,7 +498,7 @@ def main(cfg: DictConfig) -> None:
     agent.attach_discriminator(discriminator)
     agent.attach_g_provider(provider)
 
-    # Pluggable branch-weight policy (sigmoid slope/offset from config).
+    # Pluggable branch-weight policy: w_pos = sigmoid(beta * (G + k)).
     agent.core.config.beta = float(OmegaConf.select(cfg, "offline.branch_weight.beta", default=agent.core.config.beta))
     agent.core.config.k = float(OmegaConf.select(cfg, "offline.branch_weight.k", default=agent.core.config.k))
     branch_policy = build_branch_weight_policy(

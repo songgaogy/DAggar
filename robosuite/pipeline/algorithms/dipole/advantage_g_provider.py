@@ -7,7 +7,7 @@ Intended math (V-only, no Q head):
     failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
     G              = alpha * A - beta * failure
 
-The flow policy then maps G -> w_pos = sigmoid(beta_policy * G + k), so a
+The flow policy then maps G -> w_pos = sigmoid(beta_policy * (G + k)), so a
 larger advantage raises the positive-branch weight.
 
 STATUS: the online ``compute_g_for_batch`` is a stub. Computing the TD residual
