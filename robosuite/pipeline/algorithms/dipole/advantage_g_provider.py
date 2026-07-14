@@ -1,8 +1,8 @@
-"""G provider that mixes a V-only TD advantage with frozen nnPU failure scores.
+"""G provider that mixes the VAST TD1 fallback with frozen nnPU failure scores.
 
 Replaces `NNPUGProvider` when DipoleConfig.g_mode == "advantage".
 
-Intended math (V-only, no Q head):
+Online fallback math (no Q head):
     A(s, a)        = r + gamma^H * target_V(s') - V(s)      # TD residual
     failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
     G              = alpha * A - beta * failure
@@ -17,7 +17,7 @@ offline path precomputes the residual by start index instead — see
 ``offline/utils/advantage.py``). Wiring next-state/reward through the online
 sampler is deferred; until then this provider raises ``NotImplementedError``.
 
-This object owns nothing it doesn't construct: the IQL learner, the
+This object owns nothing it doesn't construct: the VAST learner, the
 discriminator, and the encoder are all injected.
 """
 
@@ -30,14 +30,14 @@ import torch
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
     from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
-    from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
+    from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 
 
 class AdvantageGProvider:
     """Mix advantage and discriminator logit into a single G tensor.
 
     Args:
-        iql_learner:           the IQL learner; provides advantage.
+        vast_learner:           the VAST learner; provides advantage.
         discriminator:         frozen nnPU head; provides failure score.
         encoder:               shared frozen encoder; used to build features
                                from `DipoleBatch.image_obs_raw` + `proprio_raw`.
@@ -47,13 +47,13 @@ class AdvantageGProvider:
     def __init__(
         self,
         *,
-        iql_learner: "IQLLearner",
+        vast_learner: "VASTLearner",
         discriminator: "FrozenNNPUDiscriminator",
         encoder: "SharedDynamicsEncoder",
         alpha: float,
         beta: float,
     ) -> None:
-        self.iql_learner = iql_learner
+        self.vast_learner = vast_learner
         self.discriminator = discriminator
         self.encoder = encoder
         self.alpha = float(alpha)
@@ -67,7 +67,7 @@ class AdvantageGProvider:
     def compute_g_for_batch(self, batch: Any) -> torch.Tensor:
         """Online TD-advantage G — NOT YET WIRED.
 
-        The V-only advantage is the TD residual
+        The online fallback advantage is the TD1 residual
         ``r + gamma^H * target_V(s') - V(s)``, which needs the next state
         ``s'`` and chunk reward ``r`` for each window. The online
         :class:`DipoleBatch` does not carry those (only ``s`` and the action
@@ -77,7 +77,7 @@ class AdvantageGProvider:
         """
         raise NotImplementedError(
             "Online AdvantageGProvider.compute_g_for_batch is not implemented for "
-            "the V-only TD residual: the online DipoleBatch carries no next state "
+            "the VAST TD1 fallback: the online DipoleBatch carries no next state "
             "or chunk reward. Use the offline OfflineAdvantageGProvider (precomputed "
             "TD advantage), or thread next_obs/reward through the online sampler "
             "before enabling g_mode='advantage' online."

@@ -1,18 +1,17 @@
-"""Offline Q/V warmup entry point for IQL.
+"""Offline VAST warmup entry point.
 
 Loads HDF5 expert (and optional success/failure) demos for a single task,
-encodes them with the SharedDynamicsEncoder, then runs a V-only MSE-TD loop
-(no Q head). Dumps `iql_state.pt` for the online phase to pick up via
-`algorithm.q_learning.warmup_ckpt`.
+encodes them with the SharedDynamicsEncoder, then runs the joint G/V loop
+(no Q head). Dumps `vast_state.pt` for the online phase to pick up via
+`algorithm.vast.warmup_ckpt`.
 
 Run as a Hydra module (CLI overrides land on `train_dipole_rl.yaml`):
-    python -m robosuite.pipeline.algorithms.q_learning.warmup \
+    python -m robosuite.pipeline.algorithms.vast.warmup \
         env.environment=PickPlaceBread \
         runtime.init_checkpoint=checkpoints/.../flow.pt \
-        algorithm.q_learning.warmup_value_steps=20000 \
-        algorithm.q_learning.warmup_full_steps=5000 \
-        algorithm.q_learning.config.device=cuda:1 \
-        +warmup.output_path=outputs/DIPOLE_RL/iql_qv_cache/PickPlaceBread/iql_state.pt
+        algorithm.vast.warmup_joint_steps=30000 \
+        algorithm.vast.config.device=cuda:1 \
+        +warmup.output_path=outputs/dipole_rl-vast/baseline/PickPlaceBread/vast_state.pt
 
 `+warmup.output_path` is required (use `+` to add the key — it lives only
 in the warmup namespace).
@@ -47,9 +46,9 @@ from robosuite.pipeline.algorithms.flow_dagger.common import (
     ReplayBufferConfig,
 )
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
-from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
-from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
-from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
+from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.vast import VASTLearner
+from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
 from robosuite.pipeline.envs import build_robosuite_env
 from robosuite.pipeline.envs.robosuite import RobosuiteRuntimeConfig
 from robosuite.pipeline.train_dipole import (
@@ -98,13 +97,16 @@ def _build_warmup_tensorboard(
     logger = TensorBoardMetricLogger(SummaryWriter(log_dir=str(log_dir)), log_dir)
     resolved_cfg = OmegaConf.to_yaml(cfg, resolve=True)
     logger.log_text("run/config_resolved", f"```\n{resolved_cfg}\n```", step=0)
-    logger.log_text("run/iql_output_path", str(output_path), step=0)
+    logger.log_text("run/vast_output_path", str(output_path), step=0)
+    logger.log_text(
+        "run/vast_algorithm", "vast_value_stitching_adaptation", step=0
+    )
     print(f"[warmup][tensorboard] log_dir={log_dir}")
     return logger
 
 
 @torch.no_grad()
-def _iql_batch_debug_metrics(batch: Any, *, prefix: str) -> dict[str, float]:
+def _vast_batch_debug_metrics(batch: Any, *, prefix: str) -> dict[str, float]:
     rewards = batch.rewards.detach()
     dones = batch.dones.detach()
     actions = batch.action_chunk.detach()
@@ -143,7 +145,7 @@ def _resolve_warmup_demo_chunk_size(cfg: DictConfig) -> int:
 
 
 def _resolve_warmup_demo_splits(cfg: DictConfig) -> tuple[str, ...]:
-    """HDF5 subdirs under ``data/<task_name>/`` to load for offline IQL warmup."""
+    """HDF5 subdirs under ``data/<task_name>/`` to load for offline VAST warmup."""
     raw = OmegaConf.select(cfg, "warmup.demo_splits", default=None)
     if raw is None:
         return DEFAULT_WARMUP_DEMO_SPLITS
@@ -266,9 +268,9 @@ def _freeze_post_success_tail(transitions: list[Any]) -> int:
 
     Rationale: the recorded success rollouts keep running the live policy after
     success, so the post-success tail is real *drift* (moving state, non-zero
-    actions). Fitting Q/V on those many distinct meaningless states is the
+    actions). Fitting VAST on those many distinct meaningless states is the
     "task burden" we want to drop, while the terminal-value anchor (V≈0 at
-    success) is what stabilizes offline IQL TD. Freezing the tail to a single
+    success) is what stabilizes offline VAST TD. Freezing the tail to a single
     ``(s_{t_s}, a_{t_s})`` keeps every frozen frame a valid chunk start (so the
     anchor *sampling density* is preserved) but makes all those chunks encode to
     one identical latent — a clean, dense, unbiased absorbing anchor.
@@ -542,6 +544,10 @@ def _resolve_policy_action_dim(init_payload: dict[str, Any] | None, env) -> int:
 
 @hydra.main(version_base="1.2", config_path="../../config", config_name="train_dipole_rl")
 def main(cfg: DictConfig) -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "VAST/VAST warmup requires CUDA; torch.cuda.is_available() is False."
+        )
     torch.set_float32_matmul_precision("high")
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -565,16 +571,25 @@ def main(cfg: DictConfig) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tb_logger = _build_warmup_tensorboard(cfg, output_path=output_path)
 
-    q_cfg_block = cfg.algorithm.q_learning
-    value_steps = int(getattr(q_cfg_block, "warmup_value_steps", 20000))
-    full_steps = int(getattr(q_cfg_block, "warmup_full_steps", 5000))
+    vast_cfg_block = cfg.algorithm.vast
+    configured_joint_steps = OmegaConf.select(
+        cfg, "algorithm.vast.warmup_joint_steps", default=None
+    )
+    if configured_joint_steps is None:
+        raise ValueError(
+            "algorithm.vast.warmup_joint_steps must be set; the legacy "
+            "warmup_value_steps/warmup_full_steps parameters were removed."
+        )
+    total_steps = int(configured_joint_steps)
+    if total_steps < 1:
+        raise ValueError("algorithm.vast.warmup_joint_steps must be >= 1.")
     batch_size = int(getattr(cfg.algorithm.trainer, "batch_size", 64)) if "trainer" in cfg.algorithm else 64
     batch_size = int(getattr(warmup_cfg, "batch_size", batch_size))
 
     init_checkpoint, init_payload = load_init_checkpoint_payload(cfg)
     if init_checkpoint is None:
         raise FileNotFoundError(
-            "IQL warmup requires runtime.init_checkpoint to be set (used to resolve "
+            "VAST warmup requires runtime.init_checkpoint to be set (used to resolve "
             "policy action_dim and camera layout)."
         )
     print(f"[warmup] init_checkpoint={init_checkpoint}")
@@ -629,7 +644,7 @@ def main(cfg: DictConfig) -> None:
         encoder_ckpt = (
             to_absolute_path(str(encoder_ckpt_raw)) if encoder_ckpt_raw else None
         )
-        requested_device = str(q_cfg_block.config.device)
+        requested_device = str(vast_cfg_block.config.device)
         default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
         device = resolve_requested_device(requested_device, fallback=default_device)
         if str(requested_device).startswith("cuda") and device == "cpu":
@@ -656,25 +671,25 @@ def main(cfg: DictConfig) -> None:
             encoder=encoder,
         )
 
-        iql_cfg_dict = OmegaConf.to_container(q_cfg_block.config, resolve=True)
-        iql_cfg_dict["device"] = device
-        iql_cfg = IQLConfig(**iql_cfg_dict)
+        vast_cfg_dict = OmegaConf.to_container(vast_cfg_block.config, resolve=True)
+        vast_cfg_dict["device"] = device
+        vast_cfg = VASTConfig(**vast_cfg_dict)
 
         capacity = int(getattr(cfg.runtime, "demo_buffer_capacity", 200_000))
         buffer = FlowDaggerReplayBuffer(
             config=ReplayBufferConfig(capacity=capacity, batch_size=batch_size),
-            name="iql_warmup_offline",
+            name="vast_warmup_offline",
             camera_names=policy_camera_names,
-            action_horizon=int(iql_cfg.action_horizon),
+            action_horizon=int(vast_cfg.action_horizon),
             image_size=int(cfg.env.img_height),
             augmentation_config=FlowAugmentationConfig(),
         )
 
-        reward_mode = str(iql_cfg.reward_mode)
+        reward_mode = str(vast_cfg.reward_mode)
         if reward_mode not in {"0/1", "-1/0"}:
             raise ValueError(f"Invalid reward_mode={reward_mode!r}; expected '0/1' or '-1/0'.")
         print(f"[warmup] reward_mode={reward_mode}")
-        if reward_mode == "0/1" and float(iql_cfg.disc_reward_coef) != 0.0:
+        if reward_mode == "0/1" and float(vast_cfg.disc_reward_coef) != 0.0:
             raise ValueError("disc_reward_coef must be 0.0 when reward_mode is 0/1")
         prefer_hdf5_success_labels = bool(
             OmegaConf.select(cfg, "warmup.prefer_hdf5_success_labels", default=True)
@@ -760,7 +775,7 @@ def main(cfg: DictConfig) -> None:
             total_loaded += n_loaded
         if total_loaded == 0:
             raise RuntimeError(
-                f"IQL warmup loaded zero transitions for task={task_data_name} under {data_root}. "
+                f"VAST warmup loaded zero transitions for task={task_data_name} under {data_root}. "
                 "Check data.demo_root and that at least the 'expert' split exists."
             )
         print(f"[warmup] buffer ready: {len(buffer)} transitions, valid_starts={buffer.num_valid_sequences()}")
@@ -776,7 +791,7 @@ def main(cfg: DictConfig) -> None:
     if save_data:
         save_dir = str(OmegaConf.select(cfg, "warmup.num_trajectories.save_dir", default="offline_data"))
         offline_dir = Path(data_root) / task_data_name / save_dir
-        offline_path = offline_dir / "iql_offline_transitions.pt"
+        offline_path = offline_dir / "vast_offline_transitions.pt"
         buffer.save(offline_path)
         meta = {
             "task": task_data_name,
@@ -786,7 +801,7 @@ def main(cfg: DictConfig) -> None:
             "split_caps": {str(k): split_caps[k] for k in demo_splits},
             "n_transitions": int(len(buffer)),
             "num_valid_sequences": int(buffer.num_valid_sequences()),
-            "action_horizon": int(iql_cfg.action_horizon),
+            "action_horizon": int(vast_cfg.action_horizon),
             "camera_names": list(policy_camera_names),
             "image_size": int(cfg.env.img_height),
             "img_height": int(cfg.env.img_height),
@@ -796,7 +811,7 @@ def main(cfg: DictConfig) -> None:
             "control_freq": int(cfg.env.control_freq),
             "reward_mode": reward_mode,
             **_summarize_gt_fail_labels(buffer._storage),  # noqa: SLF001
-            "source": "q_learning.warmup",
+            "source": "vast.warmup",
         }
         meta_path = offline_path.with_suffix(".meta.json")
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -806,10 +821,10 @@ def main(cfg: DictConfig) -> None:
         )
 
     # Collapse each success demo's post-success drift into one frozen absorbing
-    # (s, a) anchor for the IQL critics. Applied AFTER the offline-data save so
+    # (s, a) anchor for the VAST critics. Applied AFTER the offline-data save so
     # the persisted `offline_data` keeps the raw drift frames (offline DIPOLE's
     # policy BC must not over-imitate a single repeated success-moment action);
-    # only the in-memory buffer the IQL warmup consumes is frozen. done/episode
+    # only the in-memory buffer the VAST warmup consumes is frozen. done/episode
     # structure is unchanged, so valid-start windows (and thus anchor sampling
     # density) are preserved while every post-success chunk now encodes to one
     # identical latent. No-op for fail/no-success demos.
@@ -821,24 +836,24 @@ def main(cfg: DictConfig) -> None:
             f"frames into absorbing anchors (offline_data save kept raw)"
         )
 
-    # Build IQL learner and replay sampler. The Token/Group projectors need the
+    # Build VAST learner and replay sampler. The Token/Group projectors need the
     # encoder's patch-token layout (chunk feature = n_tokens x chunk_token_dim;
     # state visual block = n_tokens x state_visual_token_dim; proprio_dim is the
     # trailing block on the state feature).
     n_tokens = int(encoder.inner_encoder.num_patches)
     proprio_dim = int(encoder.inner_encoder.proprio_emb_dim)
-    iql = IQLLearner(
-        cfg=iql_cfg,
+    vast = VASTLearner(
+        cfg=vast_cfg,
         state_feature_dim=encoder.state_feature_dim,
         chunk_feature_dim=encoder.chunk_feature_dim,
         action_dim=policy_action_dim,
         n_tokens=n_tokens,
         proprio_dim=proprio_dim,
     )
-    replay = IQLReplayBuffer(base_buffer=buffer, cfg=iql_cfg)
+    replay = VASTReplayBuffer(base_buffer=buffer, cfg=vast_cfg)
     if not replay.ready(batch_size):
         raise RuntimeError(
-            f"IQL warmup buffer has too few valid chunks ({buffer.num_valid_sequences()}) "
+            f"VAST warmup buffer has too few valid chunks ({buffer.num_valid_sequences()}) "
             f"to fill batch_size={batch_size}."
         )
     if tb_logger is not None:
@@ -846,21 +861,20 @@ def main(cfg: DictConfig) -> None:
             {
                 "run/seed": float(seed),
                 "run/batch_size": float(batch_size),
-                "run/value_steps": float(value_steps),
-                "run/full_steps": float(full_steps),
+                "run/joint_steps": float(total_steps),
                 "data/transitions": float(len(buffer)),
                 "data/valid_starts": float(buffer.num_valid_sequences()),
                 "data/freeze_post_success": float(freeze_post_success),
-                "iql/discount": float(iql_cfg.discount),
-                "iql/expectile_tau": float(iql_cfg.expectile_tau),
-                "iql/v_ensemble_size": float(iql_cfg.v_ensemble_size),
-                "iql/ensemble_lcb_beta": float(iql_cfg.ensemble_lcb_beta),
-                "iql/ensemble_bootstrap_prob": float(iql_cfg.ensemble_bootstrap_prob),
-                "iql/v_lr": float(iql_cfg.v_lr),
-                "iql/target_polyak": float(iql_cfg.target_polyak),
-                "iql/grad_clip_norm": float(iql_cfg.grad_clip_norm),
-                "reward/output_reward_coef": float(iql_cfg.output_reward_coef),
-                "reward/disc_reward_coef": float(iql_cfg.disc_reward_coef),
+                "vast/discount": float(vast_cfg.discount),
+                "vast/expectile_tau": float(vast_cfg.expectile_tau),
+                "vast/v_ensemble_size": float(vast_cfg.v_ensemble_size),
+                "vast/ensemble_lcb_beta": float(vast_cfg.ensemble_lcb_beta),
+                "vast/ensemble_bootstrap_prob": float(vast_cfg.ensemble_bootstrap_prob),
+                "vast/v_lr": float(vast_cfg.v_lr),
+                "vast/target_polyak": float(vast_cfg.target_polyak),
+                "vast/grad_clip_norm": float(vast_cfg.grad_clip_norm),
+                "reward/output_reward_coef": float(vast_cfg.output_reward_coef),
+                "reward/disc_reward_coef": float(vast_cfg.disc_reward_coef),
                 "reward/nnpu_threshold": float(
                     discriminator.threshold if discriminator is not None else float("nan")
                 ),
@@ -891,8 +905,8 @@ def main(cfg: DictConfig) -> None:
 
     print(
         f"[warmup] disc_reward: frozen nnPU scores on chunk features "
-        f"(coef={float(iql_cfg.disc_reward_coef)} "
-        f"output_reward_coef={float(iql_cfg.output_reward_coef)} "
+        f"(coef={float(vast_cfg.disc_reward_coef)} "
+        f"output_reward_coef={float(vast_cfg.output_reward_coef)} "
         f"threshold={getattr(discriminator, 'threshold', None)} source=checkpoint)"
     )
 
@@ -902,7 +916,7 @@ def main(cfg: DictConfig) -> None:
     # rewards + identical RNG-driven sampling); a pure warmup speedup.
     train_replay: Any = replay
     preencode_cache = bool(OmegaConf.select(cfg, "warmup.preencode_cache", default=True))
-    if preencode_cache and (value_steps + full_steps) > 0:
+    if preencode_cache and total_steps > 0:
         preencode_batch_size = max(
             1,
             int(OmegaConf.select(cfg, "warmup.preencode_batch_size", default=batch_size)),
@@ -911,7 +925,7 @@ def main(cfg: DictConfig) -> None:
         if cache_device.lower() in {"learner", "device"}:
             cache_device = str(device)
         print(
-            f"[warmup] preencoding IQL replay cache: valid_starts={buffer.num_valid_sequences()} "
+            f"[warmup] preencoding VAST replay cache: valid_starts={buffer.num_valid_sequences()} "
             f"encode_batch={preencode_batch_size} cache_device={cache_device}"
         )
         train_replay = replay.preencode_step_cache(
@@ -920,16 +934,14 @@ def main(cfg: DictConfig) -> None:
             device=device,
             encode_batch_size=preencode_batch_size,
             cache_device=cache_device,
-            progress_desc="[warmup] preencode IQL",
+            progress_desc="[warmup] preencode VAST",
         )
         print(f"[warmup] preencoded cache ready: {len(train_replay)} chunks")
 
     # Action normalization is owned by the frozen dynamics encoder. There is no
-    # Q phase anymore (V-only): the previous value-only + full-IQL loops are a
-    # single V-only MSE-TD loop. `warmup_value_steps` + `warmup_full_steps` are
-    # summed so existing configs keep their total step budget.
-    total_steps = value_steps + full_steps
-    print(f"[warmup] starting V-only TD loop for {total_steps} steps (batch={batch_size})")
+    # There is one joint G+V loop; no legacy value/full phases remain.
+    loop_name = "VAST joint G+V"
+    print(f"[warmup] starting {loop_name} loop for {total_steps} steps (batch={batch_size})")
     for step in range(total_steps):
         batch = train_replay.sample_step_batch(
             batch_size,
@@ -937,18 +949,18 @@ def main(cfg: DictConfig) -> None:
             discriminator=discriminator,
             device=device,
         )
-        metrics = iql.update(batch)
+        metrics = vast.update(batch)
         if tb_logger is not None:
             tb_logger.log(
                 {
-                    **_prefixed_metrics(metrics, prefix="train/value"),
-                    **_iql_batch_debug_metrics(batch, prefix="train/value"),
+                    **_prefixed_metrics(metrics, prefix="train/vast"),
+                    **_vast_batch_debug_metrics(batch, prefix="train/vast"),
                 },
                 step=step,
             )
         if step % max(1, total_steps // 20) == 0 or step == total_steps - 1:
             print(
-                f"[warmup][value]  step={step:6d} "
+                f"[warmup][joint]  step={step:6d} "
                 f"v_loss={metrics['v_loss']:.4f} v_mean={metrics['v_mean']:+.3f} "
                 f"target_mean={metrics['target_mean']:+.3f} "
                 f"td={metrics['td_error_abs_mean']:.4f}"
@@ -957,8 +969,8 @@ def main(cfg: DictConfig) -> None:
                 tb_logger.flush()
 
     payload = {
-        "iql_state": iql.state_dict(),
-        "cfg": asdict(iql_cfg),
+        "vast_state": vast.state_dict(),
+        "cfg": asdict(vast_cfg),
         "encoder_meta": {
             "nnpu_checkpoint": nnpu_ckpt,
             "state_feature_dim": int(encoder.state_feature_dim),
@@ -979,24 +991,30 @@ def main(cfg: DictConfig) -> None:
                 float(discriminator.threshold) if discriminator is not None else float("nan")
             ),
             "threshold_source": "checkpoint",
-            "disc_reward_coef": float(iql_cfg.disc_reward_coef),
-            "output_reward_coef": float(iql_cfg.output_reward_coef),
+            "disc_reward_coef": float(vast_cfg.disc_reward_coef),
+            "output_reward_coef": float(vast_cfg.output_reward_coef),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
-            # V-side Token/Group dim-reduction projector layout (schema v5,
-            # V-only ensemble: expectile-TD + soft-LCB).
+            # V-side Token/Group dim-reduction projector layout.
             "n_tokens": int(n_tokens),
             "proprio_dim": int(proprio_dim),
-            "state_proj_dim": int(iql_cfg.state_proj_dim),
-            "proprio_proj_dim": int(iql_cfg.proprio_proj_dim),
-            "proj_activation": str(iql_cfg.proj_activation),
-            "v_ensemble_size": int(iql_cfg.v_ensemble_size),
-            "ensemble_lcb_beta": float(iql_cfg.ensemble_lcb_beta),
-            "expectile_tau": float(iql_cfg.expectile_tau),
+            "state_proj_dim": int(vast_cfg.state_proj_dim),
+            "proprio_proj_dim": int(vast_cfg.proprio_proj_dim),
+            "proj_activation": str(vast_cfg.proj_activation),
+            "v_ensemble_size": int(vast_cfg.v_ensemble_size),
+            "ensemble_lcb_beta": float(vast_cfg.ensemble_lcb_beta),
+            "expectile_tau": float(vast_cfg.expectile_tau),
+            "algorithm": "vast_value_stitching_adaptation",
+            "vast_v_mode": str(vast_cfg.vast_v_mode),
+            "vast_max_k": int(vast_cfg.vast_max_k),
+            "vast_comp_coef": float(vast_cfg.vast_comp_coef),
+            "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
+            "action_horizon": int(vast_cfg.action_horizon),
         },
-        "schema_version": 5,
+        "schema_version": 7,
+        "algorithm": "vast_value_stitching_adaptation",
     }
     torch.save(payload, output_path)
-    print(f"[warmup] wrote IQL state to {output_path}")
+    print(f"[warmup] wrote VAST state to {output_path}")
     if tb_logger is not None:
         tb_logger.flush()
         tb_logger.close()

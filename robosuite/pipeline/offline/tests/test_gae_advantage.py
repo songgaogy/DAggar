@@ -1,8 +1,8 @@
 """Unit tests for the offline GAE(lambda) advantage recursion.
 
-CPU-only, dependency-free: exercises ``_gae_over_episodes`` (the pure backward
+CUDA-only: exercises ``_gae_over_episodes`` (the pure backward
 recursion that turns per-window 1-step TD residuals into a GAE advantage) in
-isolation — no encoder, discriminator, buffer, or IQL learner. Covers:
+isolation — no encoder, discriminator, buffer, or VAST learner. Covers:
     - a hand-computed closed-form chain (multi-hop accumulation),
     - the ``done`` terminal window stopping propagation,
     - the episode-boundary guard: a numeric ``start + H`` successor that belongs
@@ -14,8 +14,15 @@ isolation — no encoder, discriminator, buffer, or IQL learner. Covers:
 from __future__ import annotations
 
 import torch
+import pytest
 
 from robosuite.pipeline.offline.utils.advantage import _gae_over_episodes
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Offline tensor tests require CUDA and never fall back to CPU.",
+)
+DEVICE = torch.device("cuda")
 
 
 def _brute_gae(delta, done, starts, ep, horizon, coef):
@@ -49,8 +56,8 @@ def test_gae_closed_form_terminal_and_episode_boundary():
     # must exclude it (14 has no valid in-episode successor).
     starts = [10, 12, 14, 16, 18]
     ep = [0, 0, 0, 1, 1]
-    delta = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
-    done = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0])
+    delta = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0], device=DEVICE)
+    done = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0], device=DEVICE)
     start_to_row = {s: i for i, s in enumerate(starts)}
     gamma_h, lam = 0.5, 0.6
     coef = gamma_h * lam  # 0.3
@@ -68,7 +75,7 @@ def test_gae_closed_form_terminal_and_episode_boundary():
 
     # A[18]=5 ; A[16]=4+0.3*5=5.5 ; A[14]=3 (successor 16 is ep1 -> excluded)
     # A[12]=2+0.3*3=2.9 ; A[10]=1+0.3*2.9=1.87
-    expected = torch.tensor([1.87, 2.9, 3.0, 5.5, 5.0])
+    expected = torch.tensor([1.87, 2.9, 3.0, 5.5, 5.0], device=DEVICE)
     assert torch.allclose(adv, expected, atol=1e-6), adv
 
 
@@ -91,8 +98,8 @@ def test_gae_matches_brute_force_random_scenario():
             done_list.append(1.0 if j == length - 1 else 0.0)
             cursor += 1
         cursor += 5  # gap so episodes are not storage-adjacent
-    delta = torch.randn(len(starts))
-    done = torch.tensor(done_list)
+    delta = torch.randn(len(starts), device=DEVICE)
+    done = torch.tensor(done_list, device=DEVICE)
     start_to_row = {s: i for i, s in enumerate(starts)}
 
     adv = _gae_over_episodes(
@@ -105,15 +112,17 @@ def test_gae_matches_brute_force_random_scenario():
         gamma_h=gamma_h,
         lam=lam,
     )
-    ref = torch.tensor(_brute_gae(delta, done, starts, ep, horizon, coef))
+    ref = torch.tensor(
+        _brute_gae(delta, done, starts, ep, horizon, coef), device=DEVICE
+    )
     assert torch.allclose(adv, ref, atol=1e-5), (adv - ref).abs().max()
 
 
 def test_gae_lambda_zero_recovers_one_step_delta():
     starts = [0, 1, 2]
     ep = [0, 0, 0]
-    delta = torch.tensor([1.0, -2.0, 3.0])
-    done = torch.tensor([0.0, 0.0, 0.0])
+    delta = torch.tensor([1.0, -2.0, 3.0], device=DEVICE)
+    done = torch.tensor([0.0, 0.0, 0.0], device=DEVICE)
     adv = _gae_over_episodes(
         delta=delta,
         done=done,

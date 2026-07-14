@@ -79,7 +79,7 @@ def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
     advantage_raw = torch.arange(len(valid_starts), dtype=torch.float32)
     failure_raw = torch.zeros(len(valid_starts), dtype=torch.float32)
     provider = OfflineAdvantageGProvider(
-        iql_learner=None,
+        vast_learner=None,
         discriminator=None,
         encoder=None,
         alpha=2.0,

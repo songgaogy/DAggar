@@ -1,14 +1,9 @@
-"""Loss helpers for the V-only IQL value backup.
+"""Loss helpers for VAST value stitching.
 
 Implementation notes:
-- The value is learned V-only by a TD backup; there is no Q head (Q is
-  redundant under deterministic dynamics + single-action coverage — see
-  V_ONLY_ADVANTAGE_DESIGN.md). V currently regresses onto the bootstrap target
-  by plain MSE (see `IQLLearner.update`).
+- V regresses onto the detached stitched target with expectile regression.
 - `expectile_v_loss` mirrors baseline awr/models/flow.py:37-39: asymmetric
-  L2 weighted by tau if diff > 0 else (1 - tau). It is RESERVED for the
-  planned optimism knob (`L_V = expectile_tau(target - V)`), not called by the
-  current MSE-TD training path.
+  L2 weighted by tau if diff > 0 else (1 - tau).
 """
 
 from __future__ import annotations
@@ -24,8 +19,8 @@ def expectile_v_loss(
     """Asymmetric expectile regression loss.
 
     Args:
-        diff: (B, 1) = q_min.detach() - v_pred, where v_pred requires grad.
-        tau:  expectile in (0, 1); 0.7 is the IQL default.
+        diff: (B, 1) = stitched_target.detach() - v_pred.
+        tau:  expectile in (0, 1); 0.9 is the VAST default.
         weights: optional (B, 1) per-sample loss weights.
     Returns:
         scalar mean loss.

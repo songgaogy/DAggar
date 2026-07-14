@@ -1,10 +1,8 @@
-"""V network operating on frozen nnPU encoder features.
+"""VAST G/V networks operating on frozen nnPU encoder features.
 
 These modules never own the encoder. The encoder is held by / shared between
-DIPOLE flow training, IQL, and the frozen nnPU discriminator. Callers pass the
-action-free state feature to V. (The Q head is intentionally absent: under the
-deterministic dynamics + single-action coverage here, Q is redundant and the
-value is learned V-only by a TD backup — see V_ONLY_ADVANTAGE_DESIGN.md.)
+DIPOLE flow training, VAST, and the frozen nnPU discriminator. Callers pass the
+action-free state feature to the value and goal-conditioned return networks.
 
 Architecture (dim-reduced, anti-overfit):
     The frozen encoder emits a very high-dim state feature (12288-d) with a
@@ -176,16 +174,95 @@ class VStateNetwork(nn.Module):
         return self.head(self.projector(state_feature))
 
 
+class GoalConditionedValueNetwork(nn.Module):
+    """Single-head ``G(s, s_k, k)`` used by VAST value stitching.
+
+    The frozen dynamics encoder remains external. Current and future state
+    features pass through one shared token projector, matching their common
+    encoder feature space, then the two projected states and the raw scalar
+    macro horizon ``k`` are concatenated for a LayerNorm MLP scalar head.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_feature_dim: int,
+        n_tokens: int,
+        proprio_dim: int,
+        state_proj_dim: int,
+        proprio_proj_dim: int,
+        hidden_dims: tuple[int, ...] = (256, 256),
+        activation: str = "mish",
+    ) -> None:
+        super().__init__()
+        self.state_feature_dim = int(state_feature_dim)
+        self.n_tokens = int(n_tokens)
+        self.proprio_dim = int(proprio_dim)
+        visual_dim = self.state_feature_dim - self.proprio_dim
+        if visual_dim <= 0 or visual_dim % self.n_tokens != 0:
+            raise ValueError(
+                f"GoalConditionedValueNetwork: state visual dim {visual_dim} "
+                f"not divisible by n_tokens {self.n_tokens}."
+            )
+        if int(state_proj_dim) % self.n_tokens != 0:
+            raise ValueError(
+                "GoalConditionedValueNetwork: state_proj_dim "
+                f"{state_proj_dim} not divisible by n_tokens {self.n_tokens}."
+            )
+        self.projector = TokenProjector(
+            n_tokens=self.n_tokens,
+            token_dim=visual_dim // self.n_tokens,
+            out_per_token=int(state_proj_dim) // self.n_tokens,
+            extra_in=self.proprio_dim,
+            extra_out=int(proprio_proj_dim),
+            activation=activation,
+        )
+        self.hidden_dims = tuple(int(h) for h in hidden_dims)
+        self.head = _build_mlp(
+            2 * self.projector.output_dim + 1,
+            self.hidden_dims,
+            1,
+            activation=activation,
+        )
+
+    def forward(
+        self,
+        state_feature: torch.Tensor,
+        future_state_feature: torch.Tensor,
+        k: torch.Tensor,
+    ) -> torch.Tensor:
+        if state_feature.shape != future_state_feature.shape:
+            raise ValueError(
+                "GoalConditionedValueNetwork requires matching current/future "
+                f"feature shapes, got {tuple(state_feature.shape)} and "
+                f"{tuple(future_state_feature.shape)}."
+            )
+        if state_feature.dim() != 2 or state_feature.shape[1] != self.state_feature_dim:
+            raise ValueError(
+                "GoalConditionedValueNetwork expected state features "
+                f"(B, {self.state_feature_dim}); got {tuple(state_feature.shape)}."
+            )
+        k = k.to(device=state_feature.device, dtype=state_feature.dtype).reshape(-1, 1)
+        if k.shape[0] != state_feature.shape[0]:
+            raise ValueError(
+                "GoalConditionedValueNetwork k batch size mismatch: "
+                f"features={state_feature.shape[0]} k={k.shape[0]}."
+            )
+        current = self.projector(state_feature)
+        future = self.projector(future_state_feature)
+        return self.head(torch.cat([current, future, k], dim=-1))
+
+
 class VEnsemble(nn.Module):
     """N independent :class:`VStateNetwork` heads -> (B, N).
 
     The value is learned by an *optimistic* expectile-TD backup guarded by a
-    soft ensemble LCB (``mean_k − β·std_k``, see V_ONLY_ADVANTAGE_DESIGN.md §4).
+    soft ensemble LCB (``mean_k − β·std_k``).
     The LCB needs the heads to *disagree* in the high-epistemic-uncertainty
     (recoverable-state) region, so each head is a fully independent network with
     its own Token/Group projector + head. Diversity comes from (1) independent
     random init of the hidden Linears (Kaiming draws differ per head) and (2) a
-    per-head bootstrap mask on the loss (applied by ``IQLLearner.update``).
+    per-head bootstrap mask on the loss (applied by ``VASTLearner.update``).
 
     Note each head's final Linear is zero-init (calibrated V≡0 at startup), so
     the ensemble std starts at 0 and grows as the heads diverge under training —

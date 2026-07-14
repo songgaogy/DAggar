@@ -1,5 +1,5 @@
 # Offline DIPOLE training (README step-4).
-# Inherits the full DIPOLE-RL stack (env / flow / dipole / q_learning /
+# Inherits the full DIPOLE-RL stack (env / flow / dipole / VAST /
 # advantage_g_provider / discriminator) from train_dipole_rl and overrides the
 # pieces that differ for the offline, rollout-free setting.
 defaults:
@@ -10,7 +10,7 @@ defaults:
 offline:
   data_root: "/home/dodo/Documents/DAggar/robosuite/data"
   pretrain_dir: "pretrain_data-20260615_174814"   # <data_root>/<task>/<pretrain_dir>, expert HDF5, all frames
-  offline_data_dir: "offline_data"                 # <data_root>/<task>/<offline_data_dir>/iql_offline_transitions.pt
+  offline_data_dir: "offline_data"                 # <data_root>/<task>/<offline_data_dir>/vast_offline_transitions.pt
   num_train_steps: 15000
   run_subfix: ""                                   # run dir = "<timestamp>" or "<timestamp>_<run_subfix>"
   log_interval: 200
@@ -34,9 +34,9 @@ algorithm:
     capacity: 5000000            # offline data is static; never wrap (would break the precompute index map)
   dipole:
     g_mode: "advantage"          # offline uses the TD-advantage provider
-  q_learning:
+  vast:
     enabled: true
-    warmup_ckpt: null            # set via IQL_CKPT / algorithm.q_learning.warmup_ckpt
+    warmup_ckpt: null            # set via VAST_CKPT / algorithm.vast.warmup_ckpt
     config:
       device: "cuda:0"           # single-GPU offline default
   discriminator:

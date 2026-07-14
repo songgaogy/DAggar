@@ -1,4 +1,4 @@
-"""DIPOLE-RL training entry: DIPOLE flow + IQL Q-chunking + frozen nnPU.
+"""DIPOLE-RL training entry: DIPOLE flow + VAST Q-chunking + frozen nnPU.
 
 This module is a sibling of ``train_dipole.py`` (not a replacement). The rollout
 loop body is a near-verbatim copy from ``train_dipole.main()``; RL additions are
@@ -32,9 +32,10 @@ from robosuite.pipeline.algorithms.discriminator.runtime import (
     build_nnpu_runtime,
     render_nnpu_hud,
 )
-from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
-from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
-from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
+from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.checkpoint import load_vast_payload
+from robosuite.pipeline.algorithms.vast.vast import VASTLearner
+from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.envs import (
     RobosuiteInterventionRuntime,
@@ -100,7 +101,7 @@ def _annotate_offline_demos(
 ) -> list[Transition]:
     """Stamp episode_index / episode_step / buffer_role onto ``info``.
 
-    The IQL replay's chunk-window valid-start cache reads
+    The VAST replay's chunk-window valid-start cache reads
     ``info['episode_index']`` and ``info['buffer_role']``. We pre-annotate the
     demonstrations so offline and online windows remain separate.
     """
@@ -134,37 +135,37 @@ def _annotate_offline_demos(
     return out
 
 
-def _load_iql_warmup_state(
-    learner: IQLLearner,
+def _load_vast_warmup_state(
+    learner: VASTLearner,
     warmup_ckpt: str,
     *,
     expected_state_feature_dim: int,
     expected_chunk_feature_dim: int,
     expected_action_dim: int,
 ) -> None:
-    """Load an IQL state-dict ckpt produced by ``algorithms/q_learning/warmup.py``."""
+    """Load an VAST state-dict ckpt produced by ``algorithms/vast/warmup.py``."""
     path = Path(to_absolute_path(str(warmup_ckpt)))
     if not path.exists():
-        raise FileNotFoundError(f"IQL warmup ckpt not found: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    learner.load_state_dict(payload["iql_state"], strict=True)
+        raise FileNotFoundError(f"VAST warmup ckpt not found: {path}")
+    payload = load_vast_payload(path)
+    learner.load_state_dict(payload["vast_state"], strict=True)
     meta = payload.get("encoder_meta", {})
     if int(meta.get("state_feature_dim", -1)) != int(expected_state_feature_dim):
         raise ValueError(
-            f"IQL warmup ckpt state_feature_dim={meta.get('state_feature_dim')} != "
+            f"VAST warmup ckpt state_feature_dim={meta.get('state_feature_dim')} != "
             f"shared_encoder.state_feature_dim={expected_state_feature_dim}."
         )
     if int(meta.get("chunk_feature_dim", -1)) != int(expected_chunk_feature_dim):
         raise ValueError(
-            f"IQL warmup ckpt chunk_feature_dim={meta.get('chunk_feature_dim')} != "
+            f"VAST warmup ckpt chunk_feature_dim={meta.get('chunk_feature_dim')} != "
             f"shared_encoder.chunk_feature_dim={expected_chunk_feature_dim}."
         )
     if int(meta.get("policy_action_dim", -1)) != int(expected_action_dim):
         raise ValueError(
-            f"IQL warmup ckpt policy_action_dim={meta.get('policy_action_dim')} != "
+            f"VAST warmup ckpt policy_action_dim={meta.get('policy_action_dim')} != "
             f"agent action_dim={expected_action_dim}."
         )
-    print(f"[iql_warmup] loaded {path}")
+    print(f"[vast_warmup] loaded {path}")
 
 
 @hydra.main(version_base="1.2", config_path="./config", config_name="train_dipole_rl")
@@ -219,6 +220,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             "run_elapsed_sec": 0.0,
             "training_elapsed_sec": 0.0,
             "algorithm_type": "dipole_rl",
+            "vast_algorithm": "vast_value_stitching_adaptation",
         }
     )
     buffer_save_interval = max(1, int(getattr(cfg.runtime, "buffer_save_interval", 200)))
@@ -337,7 +339,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
     if not Path(nnpu_ckpt).exists():
         raise FileNotFoundError(f"nnPU checkpoint not found: {nnpu_ckpt}")
     disc_node.checkpoint = nnpu_ckpt
-    rl_learner_device = str(cfg.algorithm.q_learning.config.device)
+    rl_learner_device = str(cfg.algorithm.vast.config.device)
     camera_to_view = {
         str(k): str(v) for k, v in dict(disc_node.camera_to_view or {}).items()
     }
@@ -372,47 +374,47 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         discriminator=discriminator,
     )
 
-    # IQL learner + replay. The frozen nnPU path can run without IQL updates.
+    # VAST learner + replay. The frozen nnPU path can run without VAST updates.
     policy_action_dim = int(agent.flow_config.action_dim)
-    iql_cfg_dict = OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True)
-    iql_cfg = IQLConfig(**iql_cfg_dict)
-    q_learning_enabled = bool(getattr(cfg.algorithm.q_learning, "enabled", True))
+    vast_cfg_dict = OmegaConf.to_container(cfg.algorithm.vast.config, resolve=True)
+    vast_cfg = VASTConfig(**vast_cfg_dict)
+    vast_enabled = bool(getattr(cfg.algorithm.vast, "enabled", True))
 
-    if q_learning_enabled:
-        iql_learner = IQLLearner(
-            iql_cfg,
+    if vast_enabled:
+        vast_learner = VASTLearner(
+            vast_cfg,
             state_feature_dim=int(shared_encoder.state_feature_dim),
             chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
             action_dim=policy_action_dim,
             n_tokens=int(shared_encoder.inner_encoder.num_patches),
             proprio_dim=int(shared_encoder.inner_encoder.proprio_emb_dim),
         )
-        iql_replay = IQLReplayBuffer(agent.online_buffer, iql_cfg)
+        vast_replay = VASTReplayBuffer(agent.online_buffer, vast_cfg)
     else:
-        iql_learner = None
-        iql_replay = None
-        print("[rl] algorithm.q_learning.enabled=false — IQL learner / replay skipped")
+        vast_learner = None
+        vast_replay = None
+        print("[rl] algorithm.vast.enabled=false — VAST learner / replay skipped")
 
-    if not (str(iql_cfg.device) == str(shared_encoder.device) == rl_learner_device):
+    if not (str(vast_cfg.device) == str(shared_encoder.device) == rl_learner_device):
         raise RuntimeError(
             "DIPOLE-RL device mismatch: "
-            f"iql_cfg.device={iql_cfg.device} "
+            f"vast_cfg.device={vast_cfg.device} "
             f"encoder.device={shared_encoder.device} expected={rl_learner_device}"
         )
 
     # Trainer constructed AFTER all RL modules so it can hold their references.
     trainer = DipoleTrainer(
         agent,
-        iql_learner=iql_learner,
+        vast_learner=vast_learner,
         discriminator=discriminator,
-        iql_replay=iql_replay,
+        vast_replay=vast_replay,
         shared_encoder=shared_encoder,
         learner_device=rl_learner_device,
-        iql_batch_size=int(cfg.algorithm.trainer.batch_size),
-        iql_update_freq=int(iql_cfg.update_freq),
+        vast_batch_size=int(cfg.algorithm.trainer.batch_size),
+        vast_update_freq=int(vast_cfg.update_freq),
     )
-    if iql_learner is not None:
-        agent.attach_iql_learner(iql_learner)
+    if vast_learner is not None:
+        agent.attach_vast_learner(vast_learner)
     agent.attach_discriminator(discriminator)
 
     # Until warmup completes the flow loss can use discriminator-only G.
@@ -583,6 +585,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             "online_chunk_dir": str(checkpoint_dir / "buffers" / "online_chunks"),
             "demo_chunk_dir": str(checkpoint_dir / "buffers" / "demo_chunks"),
             "algorithm_type": "dipole_rl",
+            "vast_algorithm": "vast_value_stitching_adaptation",
             "g_mode": str(cfg.algorithm.dipole.g_mode),
         },
     )
@@ -641,19 +644,19 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         print("[INFO] Reusing normalizers from checkpoint.")
 
     # ------------------------------------------------------------------ #
-    # RL-ADD: seed the IQL replay from offline demonstrations.           #
+    # RL-ADD: seed the VAST replay from offline demonstrations.           #
     # ------------------------------------------------------------------ #
 
     # load offline demos into online buffer
-    if iql_replay is not None and len(agent.online_buffer) == 0:
+    if vast_replay is not None and len(agent.online_buffer) == 0:
         annotated_demos = _annotate_offline_demos(transitions, namespace="offline_demo")
         for transition in annotated_demos:
             agent.online_buffer.add(transition)
-        print(f"[rl] iql online buffer seeded with {len(annotated_demos)} offline demo transitions")
+        print(f"[rl] vast online buffer seeded with {len(annotated_demos)} offline demo transitions")
     elif len(agent.online_buffer) > 0:
         print(
             f"[rl] reusing checkpoint online buffer with {len(agent.online_buffer)} transitions; "
-            "offline/online windows will be indexed lazily on the next IQL sample"
+            "offline/online windows will be indexed lazily on the next VAST sample"
         )
 
     if bool(cfg.runtime.load_buffers):
@@ -874,38 +877,40 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
         )
         print(f"[ckpt] step={step} pending={pending_updates} queued={step_checkpoint.name}")
 
-    # RL-ADD: IQL warmup (load ckpt or run pretrain_iql_value/full).
-    warmup_ckpt_raw = cfg.algorithm.q_learning.warmup_ckpt
-    if iql_learner is None:
-        print("[iql_warmup] skipped (algorithm.q_learning.enabled=false)")
+    # RL-ADD: VAST warmup (load checkpoint or run the joint G/V loop).
+    warmup_ckpt_raw = cfg.algorithm.vast.warmup_ckpt
+    if vast_learner is None:
+        print("[vast_warmup] skipped (algorithm.vast.enabled=false)")
     elif warmup_ckpt_raw is not None and str(warmup_ckpt_raw).strip().lower() not in ("", "null"):
-        _load_iql_warmup_state(
-            iql_learner,
+        _load_vast_warmup_state(
+            vast_learner,
             str(warmup_ckpt_raw),
             expected_state_feature_dim=int(shared_encoder.state_feature_dim),
             expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
             expected_action_dim=policy_action_dim,
         )
     else:
-        warmup_v_steps = int(cfg.algorithm.q_learning.warmup_value_steps)
-        warmup_full_steps = int(cfg.algorithm.q_learning.warmup_full_steps)
-        print(f"[iql_warmup] in-process value={warmup_v_steps} full={warmup_full_steps}")
-        v_log = trainer.pretrain_iql_value(warmup_v_steps)
-        if v_log:
-            print(f"[iql_warmup] value tail metrics: {v_log[-1]}")
-        full_log = trainer.pretrain_iql_full(warmup_full_steps)
-        if full_log:
-            print(f"[iql_warmup] full tail metrics: {full_log[-1]}")
+        joint_steps_raw = getattr(cfg.algorithm.vast, "warmup_joint_steps", None)
+        if joint_steps_raw is None:
+            raise ValueError(
+                "algorithm.vast.warmup_joint_steps must be set; legacy "
+                "value/full warmup parameters were removed."
+            )
+        joint_steps = int(joint_steps_raw)
+        print(f"[vast_warmup] in-process joint_steps={joint_steps}")
+        vast_log = trainer.pretrain_vast_joint(joint_steps)
+        if vast_log:
+            print(f"[vast_warmup] joint tail metrics: {vast_log[-1]}")
 
     # RL-ADD: flip g_mode → advantage if requested.
     g_mode = str(cfg.algorithm.dipole.g_mode)
     if g_mode == "advantage":
-        if iql_learner is None:
+        if vast_learner is None:
             raise RuntimeError(
-                "g_mode='advantage' requires algorithm.q_learning.enabled=true."
+                "g_mode='advantage' requires algorithm.vast.enabled=true."
             )
         advantage_g = AdvantageGProvider(
-            iql_learner=iql_learner,
+            vast_learner=vast_learner,
             discriminator=discriminator,
             encoder=shared_encoder,
             alpha=float(cfg.algorithm.advantage_g_provider.alpha),
@@ -1088,7 +1093,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             if frozen_eval_mode and (episode_length + 1) >= eval_episode_max_steps:
                 done = True
             done = bool(done or success)
-            # RL-EDIT: tag `buffer_role="online"` so IQL replay can distinguish
+            # RL-EDIT: tag `buffer_role="online"` so VAST replay can distinguish
             # online transitions from offline-bootstrap ones.
             info_payload = dict(info) if isinstance(info, dict) else {"raw_info": info}
             info_payload.setdefault("buffer_role", "online")
@@ -1336,6 +1341,7 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
                 "latest_checkpoint": str(checkpoint_path(checkpoint_dir, "latest")),
                 "trainer_state": trainer.state_dict(),
                 "algorithm_type": "dipole_rl",
+                "vast_algorithm": "vast_value_stitching_adaptation",
                 "g_mode": str(cfg.algorithm.dipole.g_mode),
             },
         )

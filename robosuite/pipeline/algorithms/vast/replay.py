@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .common import IQLActorBatch, IQLConfig, IQLStepBatch
+from .common import VASTActorBatch, VASTConfig, VASTStepBatch
 from .data_util import aggregate_chunk_reward, chunk_done_mask
 
 # Opt-in timing instrumentation for the offline warmup preencode sweep. Enable
@@ -76,19 +76,23 @@ def _stack_views_uint8(obs: Any, camera_names: list[str]) -> np.ndarray:
     images = []
     for camera_name in camera_names:
         if camera_name not in obs:
-            raise KeyError(f"IQL replay sample is missing camera '{camera_name}'")
+            raise KeyError(f"VAST replay sample is missing camera '{camera_name}'")
         image = np.asarray(obs[camera_name], dtype=np.uint8)
         images.append(np.transpose(image, (2, 0, 1)))  # (3, H, W)
     return np.stack(images, axis=0)  # (V, 3, H, W)
 
 
 def _to_image_tensor(stacked: np.ndarray, device: str) -> torch.Tensor:
-    """(B, V, 3, H, W) uint8 -> float32 in [0, 1] on cpu (encoder moves to its own device)."""
-    tensor = torch.from_numpy(np.ascontiguousarray(stacked)).to(dtype=torch.float32)
+    """(B, V, 3, H, W) uint8 -> CUDA float32 in [0, 1]."""
+    if not str(device).startswith("cuda"):
+        raise ValueError(f"VAST replay tensor computation requires CUDA, got {device!r}.")
+    tensor = torch.from_numpy(np.ascontiguousarray(stacked)).to(
+        device=device, dtype=torch.float32
+    )
     return tensor.div_(255.0)
 
 
-class IQLReplayBuffer:
+class VASTReplayBuffer:
     """Chunk-centric replay buffer wrapping a `FlowDaggerReplayBuffer`-style store.
 
     Args:
@@ -96,15 +100,16 @@ class IQLReplayBuffer:
             online buffer; passed by reference, not copied). Must expose
             `_storage`, `_lock`, `_get_valid_start_indices_locked()`,
             `camera_names`, `image_size`, `action_horizon`.
-        cfg: IQLConfig
+        cfg: VASTConfig
     """
 
-    def __init__(self, base_buffer: Any, cfg: IQLConfig) -> None:
+    def __init__(self, base_buffer: Any, cfg: VASTConfig) -> None:
         self._base = base_buffer
         self.cfg = cfg
+        self._vast_rng = np.random.default_rng(int(cfg.vast_sampling_seed))
         if int(getattr(base_buffer, "action_horizon", -1)) != int(cfg.action_horizon):
             raise ValueError(
-                "IQLReplayBuffer: base_buffer.action_horizon "
+                "VASTReplayBuffer: base_buffer.action_horizon "
                 f"({getattr(base_buffer, 'action_horizon', None)}) must equal "
                 f"cfg.action_horizon ({cfg.action_horizon}); chunk-window cache "
                 "would otherwise be inconsistent."
@@ -121,7 +126,7 @@ class IQLReplayBuffer:
         with self._base._lock:  # noqa: SLF001 — intentional access to base cache
             valid_starts = self._base._get_valid_start_indices_locked()  # noqa: SLF001
             if len(valid_starts) == 0:
-                raise ValueError("IQLReplayBuffer: base buffer has no valid sequences.")
+                raise ValueError("VASTReplayBuffer: base buffer has no valid sequences.")
             sampled = np.random.randint(0, len(valid_starts), size=int(batch_size))
             start_indices = [valid_starts[int(i)] for i in sampled]
             H = int(self.cfg.action_horizon)
@@ -149,21 +154,138 @@ class IQLReplayBuffer:
         encoder: "SharedDynamicsEncoder",
         discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
-    ) -> IQLStepBatch:
+    ) -> VASTStepBatch:
         """Sample `batch_size` chunk windows, encode every frame under no_grad,
         and synthesize total rewards (env + optional disc intrinsic).
 
         Optional precomputed nnPU rewards are read from transition metadata;
         otherwise the frozen nnPU head scores the per-frame chunk features.
         """
-        sequences, start_indices = self._gather_chunks(batch_size)
-        return self._build_step_batch(
-            sequences,
-            start_indices,
+        return self._sample_vast_step_batch(
+            batch_size,
             encoder=encoder,
             discriminator=discriminator,
             device=device,
         )
+
+    def _raw_chunk_done_locked(self, start: int) -> bool:
+        """Absorbing-terminal semantics matching ``_build_step_batch``."""
+        storage = self._base._storage  # noqa: SLF001
+        H = int(self.cfg.action_horizon)
+        sequence = storage[start : start + H]
+        first_info = sequence[0].info or {}
+        if "success" in first_info:
+            return any(bool((item.info or {}).get("success", False)) for item in sequence)
+        if any(bool(item.done) for item in sequence):
+            return True
+        tail = start + H
+        if tail >= len(storage):
+            return True
+        return _episode_index_of(storage[tail]) != _episode_index_of(storage[start])
+
+    def _sample_vast_step_batch(
+        self,
+        batch_size: int,
+        *,
+        encoder: "SharedDynamicsEncoder",
+        discriminator: "FrozenNNPUDiscriminator | None",
+        device: str,
+    ) -> VASTStepBatch:
+        """Sample same-trajectory macro paths and encode all selected chunks."""
+        H = int(self.cfg.action_horizon)
+        with self._base._lock:  # noqa: SLF001
+            storage = self._base._storage  # noqa: SLF001
+            valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
+            if not valid_starts:
+                raise ValueError("VASTReplayBuffer: base buffer has no valid sequences.")
+            valid_set = set(valid_starts)
+            sampled_rows = np.random.randint(0, len(valid_starts), size=int(batch_size))
+            anchors = [valid_starts[int(row)] for row in sampled_rows]
+            path_starts: list[list[int]] = []
+            ks: list[int] = []
+            js: list[int] = []
+            for start in anchors:
+                episode = _episode_index_of(storage[start])
+                candidates: list[int] = []
+                for macro_idx in range(int(self.cfg.vast_max_k)):
+                    macro_start = start + macro_idx * H
+                    if macro_start not in valid_set:
+                        break
+                    if _episode_index_of(storage[macro_start]) != episode:
+                        break
+                    candidates.append(macro_start)
+                    if self._raw_chunk_done_locked(macro_start):
+                        break
+                if not candidates:
+                    raise RuntimeError(f"VAST anchor {start} has no legal macro chunk.")
+                k = int(self._vast_rng.integers(1, len(candidates) + 1))
+                j = int(self._vast_rng.integers(1, k)) if k >= 2 else 1
+                path_starts.append(candidates[:k])
+                ks.append(k)
+                js.append(j)
+            flat_starts = [start for path in path_starts for start in path]
+            sequences = [storage[start : start + H] for start in flat_starts]
+
+        flat = self._build_step_batch(
+            sequences,
+            flat_starts,
+            encoder=encoder,
+            discriminator=discriminator,
+            device=device,
+        )
+        current_rows: list[int] = []
+        future_rows: list[int] = []
+        intermediate_rows: list[int] = []
+        returns: list[torch.Tensor] = []
+        path_dones: list[torch.Tensor] = []
+        offset = 0
+        gamma_h = float(self.cfg.discount) ** H
+        for k, j in zip(ks, js):
+            rows = list(range(offset, offset + k))
+            current_rows.append(rows[0])
+            future_rows.append(rows[-1])
+            intermediate_rows.append(rows[j] if k >= 2 else rows[0])
+            discounts = torch.tensor(
+                [gamma_h**m for m in range(k)],
+                device=flat.rewards.device,
+                dtype=flat.rewards.dtype,
+            ).reshape(-1, 1)
+            returns.append((flat.rewards[rows] * discounts).sum(dim=0))
+            path_dones.append(flat.dones[rows].amax(dim=0))
+            offset += k
+
+        current_idx = torch.tensor(current_rows, device=flat.rewards.device, dtype=torch.long)
+        future_idx = torch.tensor(future_rows, device=flat.rewards.device, dtype=torch.long)
+        intermediate_idx = torch.tensor(
+            intermediate_rows, device=flat.rewards.device, dtype=torch.long
+        )
+        k_tensor = torch.tensor(ks, device=flat.rewards.device, dtype=flat.rewards.dtype).view(-1, 1)
+        j_tensor = torch.tensor(js, device=flat.rewards.device, dtype=flat.rewards.dtype).view(-1, 1)
+        return VASTStepBatch(
+            chunk_feature=flat.chunk_feature.index_select(0, current_idx),
+            v_state_feature=flat.v_state_feature.index_select(0, current_idx),
+            next_v_state_feature=flat.next_v_state_feature.index_select(0, current_idx),
+            action_chunk=flat.action_chunk.index_select(0, current_idx),
+            rewards=flat.rewards.index_select(0, current_idx),
+            dones=flat.dones.index_select(0, current_idx),
+            is_online=flat.is_online.index_select(0, current_idx),
+            is_intervention=flat.is_intervention.index_select(0, current_idx),
+            metadata={
+                "start_indices": anchors,
+                "future_start_indices": [path[-1] + H for path in path_starts],
+                "sampled_k": ks,
+                "sampled_j": js,
+            },
+            future_v_state_feature=flat.next_v_state_feature.index_select(0, future_idx),
+            intermediate_v_state_feature=flat.v_state_feature.index_select(
+                0, intermediate_idx
+            ),
+            k=k_tensor,
+            j=j_tensor,
+            k_step_returns=torch.stack(returns, dim=0),
+            mc_mask=(k_tensor >= 2).to(flat.rewards.dtype),
+            future_dones=torch.stack(path_dones, dim=0),
+        ).to(device)
 
     def _build_step_batch(
         self,
@@ -173,9 +295,9 @@ class IQLReplayBuffer:
         encoder: "SharedDynamicsEncoder",
         discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
-    ) -> IQLStepBatch:
+    ) -> VASTStepBatch:
         """Encode the given chunk ``sequences`` (with their ``start_indices``)
-        and build an :class:`IQLStepBatch`.
+        and build an :class:`VASTStepBatch`.
 
         Shared by :meth:`sample_step_batch` (random draw) and
         :meth:`preencode_step_cache` (deterministic full sweep). Under the
@@ -268,23 +390,35 @@ class IQLReplayBuffer:
             np.ascontiguousarray(chunk_images_np.reshape(B * H, V, C, Hi, Wi)),
             device,
         ).view(B, H, V, C, Hi, Wi)
-        chunk_proprio_tensor = torch.from_numpy(np.ascontiguousarray(chunk_proprio_np)).float()
-        action_tensor = torch.from_numpy(np.ascontiguousarray(action_np)).float()
-        reward_tensor = torch.from_numpy(np.ascontiguousarray(rewards_np)).float()
-        done_tensor = torch.from_numpy(np.ascontiguousarray(dones_np)).float()
-        is_online_tensor = torch.tensor(is_online, dtype=torch.float32).unsqueeze(-1)
-        is_intervention_tensor = torch.tensor(is_intervention, dtype=torch.float32).unsqueeze(-1)
+        chunk_proprio_tensor = torch.from_numpy(np.ascontiguousarray(chunk_proprio_np)).to(
+            device=device, dtype=torch.float32
+        )
+        action_tensor = torch.from_numpy(np.ascontiguousarray(action_np)).to(
+            device=device, dtype=torch.float32
+        )
+        reward_tensor = torch.from_numpy(np.ascontiguousarray(rewards_np)).to(
+            device=device, dtype=torch.float32
+        )
+        done_tensor = torch.from_numpy(np.ascontiguousarray(dones_np)).to(
+            device=device, dtype=torch.float32
+        )
+        is_online_tensor = torch.tensor(
+            is_online, device=device, dtype=torch.float32
+        ).unsqueeze(-1)
+        is_intervention_tensor = torch.tensor(
+            is_intervention, device=device, dtype=torch.float32
+        ).unsqueeze(-1)
 
         sp_image_tensor = _to_image_tensor(sp_images_np, device)                # (B, V, 3, Hi, Wi)
-        sp_proprio_tensor = torch.from_numpy(
-            np.ascontiguousarray(sp_proprio_np)
-        ).float()
+        sp_proprio_tensor = torch.from_numpy(np.ascontiguousarray(sp_proprio_np)).to(
+            device=device, dtype=torch.float32
+        )
         if _prof:
             _PROFILE_TIMES["assemble"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
 
-        # Only the *first* chunk frame's Q/V features (plus the s' state feature)
-        # feed the IQL batch (`q_chunk_feature`/`v_state_feature` index [:, 0, :]).
+        # Only the *first* chunk frame's VAST features (plus the s' state feature)
+        # feed the VAST batch (`chunk_feature`/`v_state_feature` index [:, 0, :]).
         # The frozen encoder's per-frame disc reward is the sole consumer of the
         # remaining H-1 chunk frames, so when no live disc scoring is needed we
         # encode just frame 0 of the chunk instead of all H. Each frame is encoded
@@ -312,12 +446,12 @@ class IQLReplayBuffer:
                     chunk_proprio=chunk_proprio_tensor,
                     chunk_actions=action_tensor,
                 )
-                q_chunk_feature = chunk_features[:, 0, :]
+                chunk_feature = chunk_features[:, 0, :]
                 v_state_feature = state_features[:, 0, :]
             else:
                 # frame-0-only fast path: encode obs_0 once, fused with the full
                 # H-step action window (identical to encode_features step 0).
-                v_state_feature, q_chunk_feature = encoder.encode_state_and_chunk(
+                v_state_feature, chunk_feature = encoder.encode_state_and_chunk(
                     image_obs_raw=chunk_images_tensor[:, 0],
                     proprio_raw=chunk_proprio_tensor[:, 0],
                     action_chunk=action_tensor,
@@ -363,8 +497,8 @@ class IQLReplayBuffer:
             disc_meta["disc_reward_first_frame_mean"] = float(r_disc_per_step[:, 0].mean().item())
             disc_meta["disc_reward_chunk_mean"] = float(r_disc_per_step.mean().item())
 
-        batch = IQLStepBatch(
-            q_chunk_feature=q_chunk_feature,
+        batch = VASTStepBatch(
+            chunk_feature=chunk_feature,
             v_state_feature=v_state_feature,
             next_v_state_feature=next_v_state_feature,
             action_chunk=action_tensor,
@@ -391,7 +525,7 @@ class IQLReplayBuffer:
         *,
         encoder: "SharedDynamicsEncoder",
         device: str = "cuda:1",
-    ) -> IQLActorBatch:
+    ) -> VASTActorBatch:
         """Sample chunks for actor-side advantage scoring (no rewards needed)."""
         sequences, start_indices = self._gather_chunks(batch_size)
         camera_names = list(self._base.camera_names)
@@ -423,8 +557,10 @@ class IQLReplayBuffer:
         ).view(B, H, V, C, Hi, Wi)
         proprio_tensor = torch.from_numpy(
             np.ascontiguousarray(np.stack(chunk_proprio, axis=0))
-        ).float()
-        action_tensor_raw = torch.from_numpy(np.ascontiguousarray(np.stack(actions, axis=0))).float()
+        ).to(device=device, dtype=torch.float32)
+        action_tensor_raw = torch.from_numpy(
+            np.ascontiguousarray(np.stack(actions, axis=0))
+        ).to(device=device, dtype=torch.float32)
 
         with torch.no_grad():
             state_features, chunk_features = encoder.encode_features(
@@ -433,8 +569,8 @@ class IQLReplayBuffer:
                 chunk_actions=action_tensor_raw,
             )
 
-        batch = IQLActorBatch(
-            q_chunk_feature=chunk_features[:, 0, :],
+        batch = VASTActorBatch(
+            chunk_feature=chunk_features[:, 0, :],
             v_state_feature=state_features[:, 0, :],
             action_chunk=action_tensor_raw,
             metadata={
@@ -471,7 +607,7 @@ class IQLReplayBuffer:
         encode_batch_size: int = 64,
         cache_device: str = "cpu",
         progress_desc: str | None = None,
-    ) -> "IQLPreencodedReplayCache":
+    ) -> "VASTPreencodedReplayCache":
         """Encode *every* valid chunk once and return an in-memory cache.
 
         This is a pure training-speed optimization for the offline warmup
@@ -481,20 +617,20 @@ class IQLReplayBuffer:
         produce for the same start index. The cache is built in
         ``_get_valid_start_indices_locked()`` order, so cache row ``i``
         corresponds to ``valid_starts[i]`` — letting
-        :class:`IQLPreencodedReplayCache` reproduce the same uniform sampling
+        :class:`VASTPreencodedReplayCache` reproduce the same uniform sampling
         (and hence the same RNG stream and the same training result).
         """
         with self._base._lock:  # noqa: SLF001
             valid_starts = list(self._base._get_valid_start_indices_locked())  # noqa: SLF001
         if not valid_starts:
             raise ValueError(
-                "IQLReplayBuffer: base buffer has no valid sequences to preencode."
+                "VASTReplayBuffer: base buffer has no valid sequences to preencode."
             )
         H = int(self.cfg.action_horizon)
         encode_bs = max(1, int(encode_batch_size))
 
         field_names = (
-            "q_chunk_feature",
+            "chunk_feature",
             "v_state_feature",
             "next_v_state_feature",
             "action_chunk",
@@ -529,8 +665,13 @@ class IQLReplayBuffer:
                 device=device,
             )
             _t = time.perf_counter() if _WARMUP_PROFILE else 0.0
+            # Assemble the cache on CPU even when its final home is CUDA.  The
+            # old CUDA path retained every per-batch tensor and then allocated
+            # a second full-sized torch.cat output, briefly doubling the cache
+            # VRAM footprint.  A CPU assembly followed by one exact device copy
+            # keeps peak VRAM close to the final cache size.
             for name in field_names:
-                parts[name].append(getattr(batch, name).detach().to(cache_device))
+                parts[name].append(getattr(batch, name).detach().to("cpu"))
             if _WARMUP_PROFILE:
                 _PROFILE_TIMES["to_cache"] += time.perf_counter() - _t
 
@@ -541,30 +682,46 @@ class IQLReplayBuffer:
                 print(f"  {key:10s} {value:8.2f}s ({100.0 * value / total:5.1f}%)")
             print(f"  {'TOTAL':10s} {total:8.2f}s")
 
-        return IQLPreencodedReplayCache(
-            q_chunk_feature=torch.cat(parts["q_chunk_feature"], dim=0),
-            v_state_feature=torch.cat(parts["v_state_feature"], dim=0),
-            next_v_state_feature=torch.cat(parts["next_v_state_feature"], dim=0),
-            action_chunk=torch.cat(parts["action_chunk"], dim=0),
-            rewards=torch.cat(parts["rewards"], dim=0),
-            dones=torch.cat(parts["dones"], dim=0),
-            is_online=torch.cat(parts["is_online"], dim=0),
-            is_intervention=torch.cat(parts["is_intervention"], dim=0),
+        assembled = {
+            name: torch.cat(parts[name], dim=0) for name in field_names
+        }
+        target_cache_device = torch.device(cache_device)
+        if target_cache_device.type != "cpu":
+            assembled = {
+                name: tensor.to(target_cache_device)
+                for name, tensor in assembled.items()
+            }
+
+        return VASTPreencodedReplayCache(
+            chunk_feature=assembled["chunk_feature"],
+            v_state_feature=assembled["v_state_feature"],
+            next_v_state_feature=assembled["next_v_state_feature"],
+            action_chunk=assembled["action_chunk"],
+            rewards=assembled["rewards"],
+            dones=assembled["dones"],
+            is_online=assembled["is_online"],
+            is_intervention=assembled["is_intervention"],
             source_size=len(valid_starts),
+            cfg=self.cfg,
+            valid_starts=valid_starts,
+            episode_ids=[
+                _episode_index_of(self._base._storage[start])  # noqa: SLF001
+                for start in valid_starts
+            ],
         )
 
 
-class IQLPreencodedReplayCache:
-    """In-memory cache of pre-encoded :class:`IQLStepBatch` tensors.
+class VASTPreencodedReplayCache:
+    """In-memory cache of pre-encoded :class:`VASTStepBatch` tensors.
 
-    Built by :meth:`IQLReplayBuffer.preencode_step_cache`. Exposes a
-    ``sample_step_batch`` interface compatible with :class:`IQLReplayBuffer`
+    Built by :meth:`VASTReplayBuffer.preencode_step_cache`. Exposes a
+    ``sample_step_batch`` interface compatible with :class:`VASTReplayBuffer`
     (it accepts and ignores ``encoder`` / ``discriminator`` so call sites need
     no change), but samples by indexing into the cached tensors instead of
     re-running the frozen encoder every step.
 
     Sampling uses the same ``np.random.randint(0, N, batch_size)`` draw as
-    :meth:`IQLReplayBuffer._gather_chunks`, so against an identical RNG state it
+    :meth:`VASTReplayBuffer._gather_chunks`, so against an identical RNG state it
     selects the same chunks — making cached warmup byte-for-byte equivalent to
     the live path.
     """
@@ -572,7 +729,7 @@ class IQLPreencodedReplayCache:
     def __init__(
         self,
         *,
-        q_chunk_feature: torch.Tensor,
+        chunk_feature: torch.Tensor,
         v_state_feature: torch.Tensor,
         next_v_state_feature: torch.Tensor,
         action_chunk: torch.Tensor,
@@ -581,8 +738,13 @@ class IQLPreencodedReplayCache:
         is_online: torch.Tensor,
         is_intervention: torch.Tensor,
         source_size: int,
+        cfg: VASTConfig,
+        valid_starts: list[int],
+        episode_ids: list[int],
     ) -> None:
-        self.q_chunk_feature = q_chunk_feature.contiguous()
+        self.cfg = cfg
+        self._vast_rng = np.random.default_rng(int(cfg.vast_sampling_seed))
+        self.chunk_feature = chunk_feature.contiguous()
         self.v_state_feature = v_state_feature.contiguous()
         self.next_v_state_feature = next_v_state_feature.contiguous()
         self.action_chunk = action_chunk.contiguous()
@@ -591,8 +753,20 @@ class IQLPreencodedReplayCache:
         self.is_online = is_online.contiguous()
         self.is_intervention = is_intervention.contiguous()
         self.source_size = int(source_size)
+        self.valid_starts = tuple(int(v) for v in valid_starts)
+        self.episode_ids = tuple(int(v) for v in episode_ids)
+        self._start_to_row = {start: row for row, start in enumerate(self.valid_starts)}
 
-        n = self.q_chunk_feature.shape[0]
+        # VAST path legality depends only on the static cache metadata.  Build
+        # the row table once instead of repeating dict lookups, episode checks,
+        # and scalar Tensor.item() calls for every sample in every update.
+        # Keeping k/j draws in the sampling loop below preserves the exact
+        # Generator call order (and therefore the sampled sequence) unchanged.
+        self._vast_path_rows: np.ndarray | None = None
+        self._vast_path_lengths: np.ndarray | None = None
+        self._build_vast_path_table()
+
+        n = self.chunk_feature.shape[0]
         for name, tensor in (
             ("v_state_feature", self.v_state_feature),
             ("next_v_state_feature", self.next_v_state_feature),
@@ -604,9 +778,35 @@ class IQLPreencodedReplayCache:
         ):
             if tensor.shape[0] != n:
                 raise ValueError(
-                    f"IQLPreencodedReplayCache {name} batch dim {tensor.shape[0]} "
-                    f"!= q_chunk_feature batch dim {n}."
+                    f"VASTPreencodedReplayCache {name} batch dim {tensor.shape[0]} "
+                    f"!= chunk_feature batch dim {n}."
                 )
+
+    def _build_vast_path_table(self) -> None:
+        """Precompute legal same-episode macro paths for every cache row."""
+        H = int(self.cfg.action_horizon)
+        max_k = int(self.cfg.vast_max_k)
+        n = len(self.valid_starts)
+        path_rows = np.full((n, max_k), -1, dtype=np.int64)
+        path_lengths = np.zeros(n, dtype=np.int64)
+        done_rows = (
+            self.dones.detach().amax(dim=1).to(device="cpu").numpy().astype(bool, copy=False)
+        )
+        for row, (start, episode) in enumerate(
+            zip(self.valid_starts, self.episode_ids)
+        ):
+            for macro_idx in range(max_k):
+                candidate = self._start_to_row.get(start + macro_idx * H)
+                if candidate is None or self.episode_ids[candidate] != episode:
+                    break
+                path_rows[row, macro_idx] = candidate
+                path_lengths[row] += 1
+                if done_rows[candidate]:
+                    break
+            if path_lengths[row] == 0:
+                raise RuntimeError(f"VAST cache row {row} has no legal macro chunk.")
+        self._vast_path_rows = path_rows
+        self._vast_path_lengths = path_lengths
 
     def sample_step_batch(
         self,
@@ -615,30 +815,107 @@ class IQLPreencodedReplayCache:
         encoder: "SharedDynamicsEncoder | None" = None,
         discriminator: "FrozenNNPUDiscriminator | None" = None,
         device: str = "cuda:1",
-    ) -> IQLStepBatch:
+    ) -> VASTStepBatch:
         # `encoder` / `discriminator` are accepted for call-site compatibility
         # and intentionally unused (everything is already encoded).
         del encoder, discriminator
-        n = self.q_chunk_feature.shape[0]
+        n = self.chunk_feature.shape[0]
         if n == 0:
-            raise ValueError("IQLPreencodedReplayCache is empty.")
+            raise ValueError("VASTPreencodedReplayCache is empty.")
         sampled = np.random.randint(0, n, size=int(batch_size))
-        idx = torch.from_numpy(sampled).to(device=self.q_chunk_feature.device, dtype=torch.long)
-        batch = IQLStepBatch(
-            q_chunk_feature=self.q_chunk_feature.index_select(0, idx),
-            v_state_feature=self.v_state_feature.index_select(0, idx),
-            next_v_state_feature=self.next_v_state_feature.index_select(0, idx),
-            action_chunk=self.action_chunk.index_select(0, idx),
-            rewards=self.rewards.index_select(0, idx),
-            dones=self.dones.index_select(0, idx),
-            is_online=self.is_online.index_select(0, idx),
-            is_intervention=self.is_intervention.index_select(0, idx),
-            metadata={"source": "preencoded_cache"},
+        return self._sample_vast_step_batch(sampled, device=device)
+
+    def _sample_vast_step_batch(
+        self, sampled_rows: np.ndarray, *, device: str
+    ) -> VASTStepBatch:
+        H = int(self.cfg.action_horizon)
+        if self._vast_path_rows is None or self._vast_path_lengths is None:
+            raise RuntimeError("VAST path table was not initialized.")
+        sampled_rows = np.asarray(sampled_rows, dtype=np.int64)
+        path_lengths = self._vast_path_lengths[sampled_rows]
+        ks = np.empty(sampled_rows.shape[0], dtype=np.int64)
+        js = np.empty(sampled_rows.shape[0], dtype=np.int64)
+        # Do not vectorize these RNG calls: the conditional j draw is part of
+        # the established reproducibility contract.
+        for index, path_length in enumerate(path_lengths):
+            k = int(self._vast_rng.integers(1, int(path_length) + 1))
+            j = int(self._vast_rng.integers(1, k)) if k >= 2 else 1
+            ks[index] = k
+            js[index] = j
+
+        all_path_rows = self._vast_path_rows[sampled_rows]
+        batch_rows = np.arange(sampled_rows.shape[0], dtype=np.int64)
+        last_rows = all_path_rows[batch_rows, ks - 1]
+        middle_offsets = np.where(ks >= 2, js, 0)
+        middle_rows = all_path_rows[batch_rows, middle_offsets]
+
+        cache_device = self.chunk_feature.device
+        current = torch.from_numpy(sampled_rows).to(device=cache_device)
+        last = torch.from_numpy(last_rows).to(device=cache_device)
+        middle = torch.from_numpy(middle_rows).to(device=cache_device)
+        path_index = torch.from_numpy(all_path_rows).to(device=cache_device)
+        safe_path_index = path_index.clamp_min(0)
+        flat_path_index = safe_path_index.reshape(-1)
+        path_rewards = self.rewards.index_select(0, flat_path_index).view(
+            sampled_rows.shape[0], int(self.cfg.vast_max_k), -1
+        )
+        path_dones = self.dones.index_select(0, flat_path_index).view(
+            sampled_rows.shape[0], int(self.cfg.vast_max_k), -1
+        )
+        gamma_h = float(self.cfg.discount) ** H
+        returns = torch.zeros_like(path_rewards[:, 0])
+        # Preserve the legacy left-to-right floating-point accumulation order,
+        # but perform each horizon position for the whole batch at once.
+        for macro_idx in range(int(self.cfg.vast_max_k)):
+            active = (ks > macro_idx)
+            if not bool(active.any()):
+                break
+            active_tensor = torch.from_numpy(active).to(
+                device=cache_device, dtype=self.rewards.dtype
+            ).view(-1, 1)
+            returns = returns + (
+                path_rewards[:, macro_idx] * (gamma_h**macro_idx) * active_tensor
+            )
+        sampled_path_mask = torch.arange(
+            int(self.cfg.vast_max_k), device=cache_device
+        ).view(1, -1) < torch.from_numpy(ks).to(device=cache_device).view(-1, 1)
+        future_dones = path_dones.masked_fill(
+            ~sampled_path_mask.unsqueeze(-1), 0
+        ).amax(dim=1)
+        k_tensor = torch.from_numpy(ks).to(
+            device=cache_device, dtype=self.rewards.dtype
+        ).view(-1, 1)
+        j_tensor = torch.from_numpy(js).to(
+            device=cache_device, dtype=self.rewards.dtype
+        ).view(-1, 1)
+        batch = VASTStepBatch(
+            chunk_feature=self.chunk_feature.index_select(0, current),
+            v_state_feature=self.v_state_feature.index_select(0, current),
+            next_v_state_feature=self.next_v_state_feature.index_select(0, current),
+            action_chunk=self.action_chunk.index_select(0, current),
+            rewards=self.rewards.index_select(0, current),
+            dones=self.dones.index_select(0, current),
+            is_online=self.is_online.index_select(0, current),
+            is_intervention=self.is_intervention.index_select(0, current),
+            metadata={
+                "source": "preencoded_cache",
+                "start_indices": [self.valid_starts[int(row)] for row in sampled_rows],
+                "future_start_indices": [self.valid_starts[int(row)] + H for row in last_rows],
+                "sampled_k": ks.tolist(),
+                "sampled_j": js.tolist(),
+            },
+            future_v_state_feature=self.next_v_state_feature.index_select(0, last),
+            intermediate_v_state_feature=self.v_state_feature.index_select(0, middle),
+            k=k_tensor,
+            j=j_tensor,
+            k_step_returns=returns,
+            mc_mask=(k_tensor >= 2).to(self.rewards.dtype),
+            future_dones=future_dones,
         )
         return batch.to(device)
 
     def ready(self, batch_size: int) -> bool:
-        return self.q_chunk_feature.shape[0] >= int(batch_size)
+        return self.chunk_feature.shape[0] >= int(batch_size)
 
     def __len__(self) -> int:
-        return int(self.q_chunk_feature.shape[0])
+        return int(self.chunk_feature.shape[0])

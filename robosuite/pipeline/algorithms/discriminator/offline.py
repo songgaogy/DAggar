@@ -1,4 +1,4 @@
-"""Offline nnPU scoring helpers shared by IQL warmup and visualization."""
+"""Offline nnPU scoring helpers shared by VAST warmup and visualization."""
 
 from __future__ import annotations
 

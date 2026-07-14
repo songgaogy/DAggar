@@ -1,4 +1,4 @@
-"""DIPOLE / IQL algorithm exports (lazy to avoid eager dipole → benchmark imports)."""
+"""DIPOLE / VAST algorithm exports (lazy to avoid eager dipole → benchmark imports)."""
 
 from __future__ import annotations
 

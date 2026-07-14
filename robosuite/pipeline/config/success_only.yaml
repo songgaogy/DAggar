@@ -1,6 +1,6 @@
 # Success-only SFT for the DIPOLE flow policy (positive-branch only).
 # Inherits the full offline stack but the trainer
-# (offline/train_success_only.py) ignores the IQL / nnPU / discriminator /
+# (offline/train_success_only.py) ignores the VAST / nnPU / discriminator /
 # advantage pieces: it loads ONLY the success_rollout split, marks every frame
 # is_intervention=True (w_pos=1), and trains just the positive LoRA branch.
 # LoRA / flow / dipole config is inherited unchanged from

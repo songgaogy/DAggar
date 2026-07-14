@@ -1,4 +1,4 @@
-"""Frozen nnPU discriminator used by DIPOLE and IQL."""
+"""Frozen nnPU discriminator used by DIPOLE and VAST."""
 
 from __future__ import annotations
 

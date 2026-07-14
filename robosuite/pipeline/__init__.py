@@ -1,4 +1,4 @@
-"""Robosuite DIPOLE / IQL pipeline (lazy public API)."""
+"""Robosuite DIPOLE / VAST pipeline (lazy public API)."""
 
 from __future__ import annotations
 

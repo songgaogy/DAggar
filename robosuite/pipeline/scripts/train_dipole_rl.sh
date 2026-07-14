@@ -7,7 +7,8 @@
 #                      (passed to runtime.init_checkpoint)
 # Optional env vars:
 #   NNPU_CKPT        — task-calibrated pu_bce_head.pth
-#   IQL_WARMUP_CKPT  — overrides algorithm.q_learning.warmup_ckpt
+#   VAST_WARMUP_CKPT — overrides algorithm.vast.warmup_ckpt
+#   IQL_WARMUP_CKPT  — deprecated read-only alias for VAST_WARMUP_CKPT
 #   ALPHA, BETA      — overrides algorithm.advantage_g_provider.{alpha,beta}
 #   G_MODE           — "advantage" | "nnpu_frozen"
 #   LOGGING_USE_TENSORBOARD / LOGGING_USE_WANDB          — logging backends
@@ -50,8 +51,16 @@ HYDRA_ARGS=(
   "logging.use_tensorboard=${LOGGING_USE_TENSORBOARD}"
   "logging.use_wandb=${LOGGING_USE_WANDB}"
 )
+if [[ -n "${VAST_WARMUP_CKPT:-}" && -n "${IQL_WARMUP_CKPT:-}" ]]; then
+  echo "ERROR: Set only VAST_WARMUP_CKPT; IQL_WARMUP_CKPT is a deprecated alias." >&2
+  exit 1
+fi
+if [[ -n "${IQL_WARMUP_CKPT:-}" ]]; then
+  echo "WARNING: IQL_WARMUP_CKPT is deprecated; use VAST_WARMUP_CKPT." >&2
+  VAST_WARMUP_CKPT="${IQL_WARMUP_CKPT}"
+fi
 [[ -n "${NNPU_ENCODER_CKPT:-}" ]]     && HYDRA_ARGS+=("algorithm.discriminator.encoder_ckpt=${NNPU_ENCODER_CKPT}")
-[[ -n "${IQL_WARMUP_CKPT:-}" ]]       && HYDRA_ARGS+=("algorithm.q_learning.warmup_ckpt=${IQL_WARMUP_CKPT}")
+[[ -n "${VAST_WARMUP_CKPT:-}" ]]      && HYDRA_ARGS+=("algorithm.vast.warmup_ckpt=${VAST_WARMUP_CKPT}")
 [[ -n "${ALPHA:-}" ]]                 && HYDRA_ARGS+=("algorithm.advantage_g_provider.alpha=${ALPHA}")
 [[ -n "${BETA:-}" ]]                  && HYDRA_ARGS+=("algorithm.advantage_g_provider.beta=${BETA}")
 [[ -n "${G_MODE:-}" ]]                && HYDRA_ARGS+=("algorithm.dipole.g_mode=${G_MODE}")

@@ -1,6 +1,6 @@
-# Offline DIPOLE (sequential IQL-finetune -> weighted-BC) — PROMPT.md [tbd].
+# Offline DIPOLE (VAST value-stitching finetune -> weighted-BC).
 # Consumes data/<task>/offline_data/offline_episodes.pt (collect_data.sh) and the
-# warmup IQL state (init_iql_qv.sh). Inherits the full RL stack from train_dipole_rl.
+# warmup VAST state (init_vast.sh). Inherits the full RL stack from train_dipole_rl.
 defaults:
   - train_dipole_rl
   - _self_
@@ -12,8 +12,8 @@ offline:
   # Expert pretrain HDF5 dir/file; null -> do not add pretrain data to Phase B.
   pretrain_data_path: null
   max_pretrain_trajectories: null
-  # Warmup transitions dir under data/<task>/ (init_iql_qv save_dir).
-  iql_warmup_transitions_dir: "offline_data-iql"
+  # Warmup transitions dir under data/<task>/ (init_vast.sh SAVE_DIR).
+  vast_warmup_transitions_dir: "offline_data-vast"
   # Add entire pure on-policy success rollouts (terminal_reason==success AND zero
   # human intervention) as positive BC demos. Offline DAgger appends them; main
   # Offline DIPOLE replaces their advantage route with pos_only (w_pos=1).
@@ -36,21 +36,18 @@ offline:
   run_root: "./outputs/dipole-rl-offline"
   run_subfix: ""
 
-  # Phase A IQL finetune (unfrozen, continues from warmup_ckpt).
+  # Phase A joint VAST G+V finetune (continues from warmup_ckpt).
   skip_rl: false
-  iql_finetuned_path: null
-  iql_finetune:
+  vast_finetuned_path: null
+  vast_finetune:
     num_steps: 20000
-    value_only_steps: 0
     batch_size: 256
     preencode_cache: true
 
-  # Phase-B advantage read-out fed into G (offline/utils/advantage.py).
+  # TD1/GAE remain diagnostics. Phase B uses stitched advantage and falls back
+  # to TD1 only when fewer than two future macro chunks remain.
   advantage:
-    # gae -> GAE(gae_lambda) accumulated backward per policy-section episode on
-    #        the soft-LCB value (matches q_learning/utils/vis_qv.py read-out).
-    # td1 -> the plain 1-step (macro-step) TD residual.
-    estimator: "gae"          # gae | td1
+    estimator: "vast_stitched"  # vast_stitched
     gae_lambda: 0.6
 
   # Pluggable branch-weight policy (offline/utils/branch_weights.py).
@@ -74,10 +71,15 @@ algorithm:
     g_mode: "advantage"
     beta: 2.0        # overridden at runtime by offline.branch_weight.beta; kept in sync
     k: 0.0
-  q_learning:
+  vast:
     enabled: true
     warmup_ckpt: null
     config:
+      vast_v_mode: "single_vast"
+      vast_max_k: 10
+      vast_comp_coef: 0.5
+      vast_sampling_seed: ${seed}
+      expectile_tau: 0.9
       device: "cuda:0"
   discriminator:
     checkpoint: null

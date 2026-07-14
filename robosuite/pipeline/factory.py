@@ -33,7 +33,7 @@ def _build_dipole_algorithm(
     """Builder for both `dipole` and `dipole_rl` algorithm types.
 
     The same `DipoleAgent` is used in both modes — the RL additions
-    (IQL learner, frozen nnPU discriminator, AdvantageGProvider) are owned by the
+    (VAST learner, frozen nnPU discriminator, AdvantageGProvider) are owned by the
     trainer in `train_dipole_rl.py`, not the agent. `agent.from_config`
     reads `algorithm.dipole.g_mode` to decide whether to expect an
     AdvantageGProvider attachment later.

@@ -47,7 +47,7 @@ source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 HYDRA_OVERRIDES=(
   "env.environment=${TASK}"
   "runtime.init_checkpoint=${POLICY_CKPT}"
-  "algorithm.q_learning.config.device=${DEVICE}"
+  "algorithm.vast.config.device=${DEVICE}"
   "algorithm.flow.device=${DEVICE}"
   "algorithm.flow.inference_device=${DEVICE}"
   "algorithm.trainer.batch_size=${BATCH_SIZE}"

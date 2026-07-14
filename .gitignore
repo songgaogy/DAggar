@@ -137,6 +137,7 @@ video/
 checkpoints/
 error.txt
 /tmp
+robosuite/pipeline/docs/*
 
 # ------------------------------------------------------------
 # allow tracking lpb_v2 config/data (overrides env/ and data/ above)

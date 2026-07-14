@@ -1,7 +1,7 @@
-# DIPOLE-RL training config (DIPOLE flow + IQL Q-chunking + frozen nnPU disc).
+# DIPOLE-RL training config (DIPOLE flow + VAST value stitching + frozen nnPU disc).
 #
 # Inherits the existing DIPOLE schema and adds three new sections:
-#   - algorithm.q_learning      (IQLConfig + warmup schedule)
+#   - algorithm.vast            (VASTConfig + warmup schedule)
 #   - algorithm.discriminator   (inherited frozen nnPU configuration)
 #   - algorithm.advantage_g_provider  (alpha, beta)
 #
@@ -19,27 +19,28 @@ algorithm:
   dipole:
     g_mode: "advantage"   # advantage | nnpu_frozen
 
-  q_learning:
+  vast:
     enabled: true
     config:
+      vast_v_mode: "single_vast"  # single_vast | ensemble_lcb
+      vast_max_k: 10               # macro chunks; one chunk is action_horizon steps
+      vast_comp_coef: 0.5
+      vast_sampling_seed: ${seed}
       reward_mode: "-1/0"   # "0/1" | "-1/0"
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
-      # Optimism knob: each V head regresses onto the 1-step bootstrap target by
-      # an expectile loss (tau > 0.5 turns V^beta -> V*). See §4 of the design.
-      expectile_tau: 0.5    # mse loss
-      # V-ensemble soft-LCB guardrail: V_lcb = mean_k - beta*std_k over
-      # v_ensemble_size independent heads (diversified by a per-head Bernoulli
-      # bootstrap mask, keep-prob ensemble_bootstrap_prob). size=1 -> single head.
+      expectile_tau: 0.9
+      # The ensemble fields are used only when vast_v_mode=ensemble_lcb.
       v_ensemble_size: 5
       ensemble_lcb_beta: 0.5
       ensemble_bootstrap_prob: 0.5
+      g_lr: 1.0e-4
       v_lr: 1.0e-4
       target_polyak: 0.005
       n_step_aggregate: true
       # Head width AFTER the Token/Group projector (the projector — not the
       # head — is the anti-overfit lever), so smaller than the legacy 512x512.
-      hidden_dims: [256, 256]
+      hidden_dims: [512, 512, 256]
       # Token/Group dim-reduction projector before the V head. The frozen
       # encoder state feature is 16 patch-tokens; state_proj_dim must be
       # divisible by that token count (asserted in the learner).
@@ -52,18 +53,18 @@ algorithm:
       output_reward_coef: 1
       disc_reward_coef: 0
       update_freq: 1
-    warmup_value_steps: 10000
-    warmup_full_steps: 5000
+    # Preserve the previous total warmup budget as one joint G+V schedule.
+    warmup_joint_steps: 20000
     warmup_ckpt: null
 
   discriminator:
-    learner_device: ${algorithm.q_learning.config.device}
+    learner_device: ${algorithm.vast.config.device}
 
   advantage_g_provider:
     alpha: 1.0
     beta: 0
 
-# Used only by ``python -m ...q_learning.warmup`` (init_iql_qv.sh).
+# Used only by ``python -m ...algorithms.vast.warmup`` (init_vast.sh).
 warmup:
   # Raw-HDF5 load acceleration. Rollout HDF5 stores pre-action `is_success`;
   # warmup shifts it by one step to match post-action env success rewards and
@@ -79,17 +80,17 @@ warmup:
   preencode_cache: true
   preencode_batch_size: 32
   # Where to hold the full pre-encoded chunk cache. "cpu" is the safe default:
-  # the cache holds one encoded-feature row per valid chunk (q_chunk_feature
+  # the cache holds one encoded-feature row per valid chunk (the chunk feature
   # alone is ~14k floats), so on a 100k+ chunk dataset "learner"/"device" (cache
-  # on the IQL GPU) accumulates tens of GB of VRAM during preencode and OOMs.
+  # on the VAST GPU) accumulates tens of GB of VRAM during preencode and OOMs.
   # CPU cache costs only a per-step batch H2D copy in the warmup loops.
-  preencode_cache_device: "cpu"        # "cpu" | "learner"/"device" (cache on the IQL GPU; OOM risk)
+  preencode_cache_device: "cpu"        # "cpu" | "learner"/"device" (cache on the VAST GPU; OOM risk)
   # Collapse each success demo's post-success drift into one frozen absorbing
   # anchor: every frame strictly after the first success frame is overwritten
   # with a copy of that first-success frame (obs images + proprio + action), so
   # all post-success chunks encode to one identical (s, a) latent. Keeps the
   # terminal-anchor sampling density (still valid chunk starts) but drops the
-  # burden/bias of fitting Q/V on many distinct meaningless drift states.
+  # burden/bias of fitting G/V on many distinct meaningless drift states.
   # No-op for demos without a success frame (e.g. fail_rollout truncations).
   freeze_post_success: true
   demo_splits:
@@ -102,8 +103,8 @@ warmup:
     success_rollout: 50
     fail_rollout: 50
     fail_rollout-labeled: 50
-    save_data: true           # save the iql training data for future use
-    save_dir: "offline_data"  # <data_root>/<task_name>/<save_dir>
+    save_data: true           # save the VAST training data for future use
+    save_dir: "offline_data-vast"  # <data_root>/<task_name>/<save_dir>
 
 runtime:
   init_checkpoint: null               # MUST be set: flow-dagger base ckpt.

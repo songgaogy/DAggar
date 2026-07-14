@@ -1,4 +1,4 @@
-"""Frozen nnPU discriminator integration shared by DIPOLE and IQL."""
+"""Frozen nnPU discriminator integration shared by DIPOLE and VAST."""
 
 from .base import DiscriminatorOutput
 from .encoder import SharedDynamicsEncoder, SharedFrozenEncoder

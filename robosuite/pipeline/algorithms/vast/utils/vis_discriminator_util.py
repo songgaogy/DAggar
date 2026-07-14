@@ -5,7 +5,7 @@ Two layers live here:
     dump used by the standalone ``main`` CLI.
   * ``visualize_selected_trajectory_discriminator_nnpu`` — per-frame failure
     timeseries (CSV + plot) and a HUD/red-border MP4 for one rollout, consumed
-    by ``vis_qv``. This mirrors the ``dipole-rl/v0-kingback`` discriminator
+    by ``vis_vast``. This mirrors the ``dipole-rl/v0-kingback`` discriminator
     visualization, adapted to nnPU per-frame failure scores.
 """
 

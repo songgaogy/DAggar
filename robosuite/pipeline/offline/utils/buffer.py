@@ -8,8 +8,8 @@ and are advantage-weighted. See README step-4:
 
 1. ``pretrain_data`` — clean expert HDF5 demos under
    ``<data_root>/<task>/<pretrain_dir>``. Every frame is kept.
-2. ``offline_data`` — the assembled transitions exported by the IQL warmup
-   (``<data_root>/<task>/<offline_data_dir>/iql_offline_transitions.pt``,
+2. ``offline_data`` — the assembled transitions exported by the VAST warmup
+   (``<data_root>/<task>/<offline_data_dir>/vast_offline_transitions.pt``,
    reloaded verbatim with :meth:`FlowDaggerReplayBuffer.load`). These are the
    ``success_rollout`` / ``fail_rollout`` / ``expert`` splits the warmup saw.
    We filter them per README step-4:
@@ -260,10 +260,10 @@ def load_offline_data_transitions(
     (``True`` forces the policy's ``w_pos=1`` positive-branch-only update).
     """
     offline_dir = Path(data_root) / str(task_name) / str(offline_data_dir)
-    offline_path = offline_dir / "iql_offline_transitions.pt"
+    offline_path = offline_dir / "vast_offline_transitions.pt"
     if not offline_path.exists():
         raise FileNotFoundError(
-            f"offline_data not found: {offline_path}. Run init_iql_qv.sh with "
+            f"offline_data not found: {offline_path}. Run init_vast.sh with "
             "warmup.num_trajectories.save_data=true first."
         )
 

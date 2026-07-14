@@ -16,8 +16,8 @@ from .agent import DipoleAgent
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
     from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
-    from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
-    from robosuite.pipeline.algorithms.q_learning.replay import IQLReplayBuffer
+    from robosuite.pipeline.algorithms.vast.vast import VASTLearner
+    from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
 
 
 logger = logging.getLogger(__name__)
@@ -29,13 +29,13 @@ class DipoleTrainer:
         agent: DipoleAgent,
         config=None,
         *,
-        iql_learner: "IQLLearner | None" = None,
+        vast_learner: "VASTLearner | None" = None,
         discriminator: "FrozenNNPUDiscriminator | None" = None,
-        iql_replay: "IQLReplayBuffer | None" = None,
+        vast_replay: "VASTReplayBuffer | None" = None,
         shared_encoder: "SharedDynamicsEncoder | None" = None,
         learner_device: str = "cuda:1",
-        iql_batch_size: int = 64,
-        iql_update_freq: int = 1,
+        vast_batch_size: int = 64,
+        vast_update_freq: int = 1,
     ) -> None:
         self.agent = agent
         self.config = config or agent.trainer_config
@@ -54,13 +54,13 @@ class DipoleTrainer:
         self._async_busy = False
         self._async_error: BaseException | None = None
         # DIPOLE-RL hooks (None == disabled, trainer degenerates to legacy DIPOLE)
-        self.iql_learner = iql_learner
+        self.vast_learner = vast_learner
         self.discriminator = discriminator
-        self.iql_replay = iql_replay
+        self.vast_replay = vast_replay
         self.shared_encoder = shared_encoder
         self.learner_device = str(learner_device)
-        self.iql_batch_size = int(iql_batch_size)
-        self.iql_update_freq = int(iql_update_freq)
+        self.vast_batch_size = int(vast_batch_size)
+        self.vast_update_freq = int(vast_update_freq)
 
     def bootstrap_demo_buffer(
         self,
@@ -133,7 +133,7 @@ class DipoleTrainer:
             demo_source=demo_source or ("intervention" if is_intervention else None),
         )
         self.agent.store_transition(transition)
-        # IQL replay shares the agent online buffer by reference; no add needed.
+        # VAST replay shares the agent online buffer by reference; no add needed.
         self.total_env_steps += 1
         return transition
 
@@ -152,27 +152,27 @@ class DipoleTrainer:
 
         metrics: dict[str, float] = {}
 
-        # 1. IQL V (before flow so AdvantageG sees V from this tick).
+        # 1. VAST G/V update (before flow so AdvantageG sees V from this tick).
         if (
-            self.iql_learner is not None
-            and self.iql_replay is not None
+            self.vast_learner is not None
+            and self.vast_replay is not None
             and self.shared_encoder is not None
-            and self.iql_replay.ready(self.iql_batch_size)
+            and self.vast_replay.ready(self.vast_batch_size)
         ):
             # Each iteration resamples and updates V. metrics keep the last
-            # iteration only (WandB x-axis is env step, not inner critic step).
-            for _ in range(self.iql_update_freq):
-                step_batch = self.iql_replay.sample_step_batch(
-                    self.iql_batch_size,
+            # iteration only (TensorBoard x-axis is env step, not inner learner step).
+            for _ in range(self.vast_update_freq):
+                step_batch = self.vast_replay.sample_step_batch(
+                    self.vast_batch_size,
                     encoder=self.shared_encoder,
                     discriminator=self.discriminator,
                     device=self.learner_device,
                 )
-                iql_metrics = self.iql_learner.update(step_batch)
-                for k, v in iql_metrics.items():
-                    metrics[f"iql/{k}"] = float(v)
+                vast_metrics = self.vast_learner.update(step_batch)
+                for k, v in vast_metrics.items():
+                    metrics[f"vast/{k}"] = float(v)
                 with torch.no_grad():
-                    adv = self.iql_learner.compute_td_advantage(
+                    adv = self.vast_learner.compute_td_advantage(
                         step_batch.v_state_feature,
                         step_batch.next_v_state_feature,
                         step_batch.rewards,
@@ -196,54 +196,35 @@ class DipoleTrainer:
         flow_metrics = dict(self.agent.update(batch=batch))
         metrics.update(flow_metrics)
 
-        metrics["iql_update_freq"] = float(self.iql_update_freq)
+        metrics["vast_update_freq"] = float(self.vast_update_freq)
         self.total_updates += 1
         return metrics
 
     # ------------------------------------------------------------------ #
-    # IQL warmup helpers (called by train_dipole_rl.py before rollout)   #
+    # VAST warmup helper (called by train_dipole_rl.py before rollout)    #
     # ------------------------------------------------------------------ #
 
-    def pretrain_iql_value(self, num_steps: int) -> list[dict[str, float]]:
-        """V-only IQL warmup. Disc is treated as frozen here (no `.update()` is
-        ever invoked during this loop); we pass it through so r_disc enters the
+    def pretrain_vast_joint(self, num_steps: int) -> list[dict[str, float]]:
+        """Joint G/V VAST warmup. The discriminator remains frozen (no update is
+        invoked during this loop); we pass it through so r_disc enters the
         reward composition consistently with the online phase."""
-        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
-            raise RuntimeError("pretrain_iql_value requires iql_learner / iql_replay / shared_encoder.")
+        if self.vast_learner is None or self.vast_replay is None or self.shared_encoder is None:
+            raise RuntimeError(
+                "pretrain_vast_joint requires vast_learner / vast_replay / shared_encoder."
+            )
         out: list[dict[str, float]] = []
         for _ in range(int(num_steps)):
-            if not self.iql_replay.ready(self.iql_batch_size):
-                logger.warning("IQL warmup_value: replay not ready; stopping early.")
+            if not self.vast_replay.ready(self.vast_batch_size):
+                logger.warning("VAST warmup: replay not ready; stopping early.")
                 break
-            step_batch = self.iql_replay.sample_step_batch(
-                self.iql_batch_size,
+            step_batch = self.vast_replay.sample_step_batch(
+                self.vast_batch_size,
                 encoder=self.shared_encoder,
                 discriminator=self.discriminator,
                 device=self.learner_device,
             )
-            m = self.iql_learner.update(step_batch)
-            out.append({f"iql_warmup_v/{k}": float(v) for k, v in m.items()})
-        return out
-
-    def pretrain_iql_full(self, num_steps: int) -> list[dict[str, float]]:
-        """V-only IQL warmup (identical to `pretrain_iql_value` now that Q is
-        removed; kept as a separate phase for call-site compatibility). Disc is
-        frozen here — see `pretrain_iql_value` docstring."""
-        if self.iql_learner is None or self.iql_replay is None or self.shared_encoder is None:
-            raise RuntimeError("pretrain_iql_full requires iql_learner / iql_replay / shared_encoder.")
-        out: list[dict[str, float]] = []
-        for _ in range(int(num_steps)):
-            if not self.iql_replay.ready(self.iql_batch_size):
-                logger.warning("IQL warmup_full: replay not ready; stopping early.")
-                break
-            step_batch = self.iql_replay.sample_step_batch(
-                self.iql_batch_size,
-                encoder=self.shared_encoder,
-                discriminator=self.discriminator,
-                device=self.learner_device,
-            )
-            m = self.iql_learner.update(step_batch)
-            out.append({f"iql_warmup_full/{k}": float(v) for k, v in m.items()})
+            m = self.vast_learner.update(step_batch)
+            out.append({f"vast_warmup/{k}": float(v) for k, v in m.items()})
         return out
 
     def maybe_update(self, *, env_step: int | None = None, batch_size: int | None = None) -> list[dict[str, float]]:

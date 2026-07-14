@@ -32,8 +32,8 @@ class _FakeEncoder:
         self.bind_calls.append(list(cams))
 
 
-class _FakeIQL:
-    """Placeholder IQL learner (the stub provider never calls into it)."""
+class _FakeVAST:
+    """Placeholder VAST learner (the stub provider never calls into it)."""
 
 
 class _FakeDisc:
@@ -50,7 +50,7 @@ def _make_batch(B: int = 4, H: int = 3, D_a: int = 2, D_s: int = 5):
 
 def _make_provider() -> AdvantageGProvider:
     return AdvantageGProvider(
-        iql_learner=_FakeIQL(),
+        vast_learner=_FakeVAST(),
         discriminator=_FakeDisc(),
         encoder=_FakeEncoder(context_dim=4),
         alpha=1.0,
@@ -73,7 +73,7 @@ def test_compute_g_for_observation_raises() -> None:
 def test_bind_policy_cameras_proxies_to_encoder() -> None:
     encoder = _FakeEncoder(context_dim=4)
     provider = AdvantageGProvider(
-        iql_learner=_FakeIQL(),
+        vast_learner=_FakeVAST(),
         discriminator=_FakeDisc(),
         encoder=encoder,
         alpha=1.0,

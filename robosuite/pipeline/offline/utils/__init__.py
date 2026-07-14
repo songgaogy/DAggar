@@ -1,6 +1,12 @@
 """Tool functions for offline DIPOLE training."""
 
-from .advantage import OfflineAdvantageGProvider, precompute_offline_advantage
+from .advantage import (
+    OfflineAdvantageGProvider,
+    VASTAdvantageDiagnostics,
+    precompute_offline_advantage,
+    precompute_vast_offline_advantage,
+    sample_vast_macro_horizons,
+)
 from .branch_weights import (
     BranchWeightPolicy,
     DiscriminatorScaledBranchWeightPolicy,
@@ -22,10 +28,11 @@ from .hard_label_providers import (
     NegAllGProvider,
     precompute_neg_all_membership,
 )
-from .iql_finetune import (
-    build_iql_finetune_buffer,
-    finetune_iql,
-    save_finetuned_iql,
+from .vast_finetune import (
+    build_vast_finetune_buffer,
+    finetune_vast,
+    save_finetuned_vast,
+    validate_vast_checkpoint_payload,
 )
 from .setup import (
     AgentEnvContext,
@@ -43,20 +50,24 @@ __all__ = [
     "NegAllGProvider",
     "OfflineAdvantageGProvider",
     "OfflineStreams",
+    "VASTAdvantageDiagnostics",
     "RoutedSigmoidBranchWeightPolicy",
     "build_agent_env",
     "build_branch_weight_policy",
-    "build_iql_finetune_buffer",
+    "build_vast_finetune_buffer",
     "build_offline_transitions",
     "build_online_success_transitions",
     "finalize_normalizers",
-    "finetune_iql",
+    "finetune_vast",
     "load_offline_data_transitions",
     "load_pretrain_transitions",
     "make_hdf5_loader",
     "populate_replay_buffer",
     "precompute_neg_all_membership",
     "precompute_offline_advantage",
+    "precompute_vast_offline_advantage",
+    "sample_vast_macro_horizons",
     "print_policy_param_summary",
-    "save_finetuned_iql",
+    "save_finetuned_vast",
+    "validate_vast_checkpoint_payload",
 ]

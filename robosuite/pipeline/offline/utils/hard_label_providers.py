@@ -1,6 +1,6 @@
 """Hard-label G providers for the offline DIPOLE baselines.
 
-Two baselines skip the whole IQL / nnPU / advantage stack and decide the flow
+Two baselines skip the whole VAST / nnPU / advantage stack and decide the flow
 branch weights by fixed labels instead of a learned advantage:
 
 - ``offline.mode == "naive"`` -> :class:`NaiveNegativeGProvider`. The buffer marks

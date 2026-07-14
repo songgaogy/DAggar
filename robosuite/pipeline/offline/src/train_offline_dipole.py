@@ -4,19 +4,20 @@ Mimics a single online ``policy -> interaction -> policy update`` loop from a
 dataset collected by ``offline/utils/collect_data.py``
 (``data/<task>/offline_data/offline_episodes.pt``). Sequential two phases:
 
-**Phase A — IQL finetune (unfrozen).** Load the pretrained IQL critics
-(``init_iql_qv.sh`` output, via ``algorithm.q_learning.warmup_ckpt``) and continue
+**Phase A — VAST finetune (unfrozen).** Load the pretrained VAST G/V modules
+(``init_vast.sh`` output, via ``algorithm.vast.warmup_ckpt``) and continue
 training them on the collected policy-rollout sections mixed with the transitions
-the warmup consumed (``offline_data-iql/iql_offline_transitions.pt``). Save the
-finetuned critics to ``<run_dir>/checkpoints/iql_state_finetuned.pt``.
+the warmup consumed (``offline_data-vast/vast_offline_transitions.pt``). Save the
+finetuned critics to ``<run_dir>/checkpoints/vast_state_finetuned.pt``.
 
-**Phase B — weighted-BC policy update (IQL frozen).** Split each episode on
+**Phase B — weighted-BC policy update (G/V frozen).** Split each episode on
 ``is_intervention`` into three routed streams (see ``offline/utils/episode_dataset``):
 policy sections (advantage-weighted, ``route="advantage"``), human sections
 (``route="pos_only"`` → positive branch), and the policy action during
-intervention (``route="neg_only"`` → negative branch). Precompute the TD advantage
-``A = r + gamma^H target_V(s') - V(s)`` against the frozen finetuned critics and
-train the two flow policies with a pluggable routed branch-weight policy.
+intervention (``route="neg_only"`` → negative branch). Precompute one fixed-seed
+stitched advantage ``A = G(s,s_k,k) + gamma^(kH)V_target(s_k) - V(s)`` per policy
+window, with TD1 fallback at short trajectory tails, then train the two flow
+policies with the existing routed branch-weight policy.
 
 Run dir: ``./data/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorboard.
 
@@ -24,7 +25,7 @@ Run dir: ``./data/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorbo
         env.environment=PickPlaceCereal \\
         runtime.init_checkpoint=checkpoints/.../flow.pt \\
         algorithm.discriminator.checkpoint=.../pu_bce_head.pth \\
-        algorithm.q_learning.warmup_ckpt=.../iql_state.pt \\
+        algorithm.vast.warmup_ckpt=.../vast_state.pt \\
         offline.episodes_path=data/PickPlaceCereal/offline_data/offline_episodes.pt
 """
 
@@ -33,8 +34,8 @@ from __future__ import annotations
 import datetime
 import logging
 import queue
-import shutil
 import threading
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,8 +46,8 @@ from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
-from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
-from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
+from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 from robosuite.pipeline.offline.src.diagnostic_plots import (
     plot_branch_weight_distribution,
     plot_raw_g_distribution,
@@ -56,19 +57,20 @@ from robosuite.pipeline.offline.utils import (
     OfflineAdvantageGProvider,
     build_agent_env,
     build_branch_weight_policy,
-    build_iql_finetune_buffer,
+    build_vast_finetune_buffer,
     build_offline_transitions,
     build_online_success_transitions,
     finalize_normalizers,
-    finetune_iql,
+    finetune_vast,
     load_pretrain_transitions,
     make_hdf5_loader,
     populate_replay_buffer,
-    precompute_offline_advantage,
-    save_finetuned_iql,
+    precompute_vast_offline_advantage,
+    save_finetuned_vast,
+    validate_vast_checkpoint_payload,
 )
 from robosuite.pipeline.offline.utils.episode_dataset import ROUTE_POS_ONLY
-from robosuite.pipeline.train_dipole_rl import _load_iql_warmup_state
+from robosuite.pipeline.train_dipole_rl import _load_vast_warmup_state
 from robosuite.pipeline.utils import (
     checkpoint_path,
     maybe_build_metric_logger,
@@ -125,12 +127,12 @@ class _BatchPrefetcher:
         self._thread.join(timeout=2.0)
 
 
-def _freeze_iql(iql: IQLLearner) -> None:
-    """Disable grads on the IQL value modules so Phase B never updates them."""
-    for module in (
-        iql.v,
-        iql.target_v,
-    ):
+def _freeze_vast(vast: VASTLearner) -> None:
+    """Disable grads on all value-stitching modules for Phase B."""
+    modules = [vast.v, vast.target_v]
+    if getattr(vast, "g", None) is not None:
+        modules.append(vast.g)
+    for module in modules:
         for param in module.parameters():
             param.requires_grad_(False)
 
@@ -160,8 +162,25 @@ def _resolve_episodes_path(cfg: DictConfig, task_name: str) -> str:
 
 def _warmup_transitions_path(cfg: DictConfig, task_name: str) -> str:
     data_root = str(cfg.offline.data_root)
-    sub = str(OmegaConf.select(cfg, "offline.iql_warmup_transitions_dir", default="offline_data-iql"))
-    return str(Path(data_root) / task_name / sub / "iql_offline_transitions.pt")
+    sub = str(OmegaConf.select(cfg, "offline.vast_warmup_transitions_dir", default="offline_data-vast"))
+    base = Path(data_root) / task_name
+    canonical = base / sub / "vast_offline_transitions.pt"
+    if canonical.exists():
+        return str(canonical)
+    legacy_candidates = (
+        base / sub / "iql_offline_transitions.pt",
+        base / "offline_data-iql" / "iql_offline_transitions.pt",
+        base / "offline_data" / "iql_offline_transitions.pt",
+    )
+    for legacy in legacy_candidates:
+        if legacy.exists():
+            warnings.warn(
+                f"Loading deprecated warmup buffer {legacy}; use {canonical}.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            return str(legacy)
+    return str(canonical)
 
 
 def _next_episode_index(*transition_groups: list[Any]) -> int:
@@ -195,7 +214,12 @@ def main(cfg: DictConfig) -> None:
     img_height = ctx.img_height
     camera_names = list(agent.camera_names)
 
-    rl_device = str(cfg.algorithm.q_learning.config.device)
+    rl_device = str(cfg.algorithm.vast.config.device)
+    if not rl_device.startswith("cuda") or not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Offline VAST requires CUDA tensor execution; requested device={rl_device!r}, "
+            f"torch.cuda.is_available()={torch.cuda.is_available()}."
+        )
     nnpu_ckpt = _resolve_required_path(
         cfg.algorithm.discriminator.checkpoint,
         what="algorithm.discriminator.checkpoint (NNPU_CKPT)",
@@ -228,26 +252,34 @@ def main(cfg: DictConfig) -> None:
         f"state_dim={shared_encoder.state_feature_dim} chunk_dim={shared_encoder.chunk_feature_dim}"
     )
 
-    # IQL config + reward-coefficient alignment with the loaded checkpoint so the
+    # VAST config + reward-coefficient alignment with the loaded checkpoint so the
     # value scale stays consistent through finetuning or skipped-rl reuse.
     policy_action_dim = int(agent.flow_config.action_dim)
-    iql_cfg = IQLConfig(**OmegaConf.to_container(cfg.algorithm.q_learning.config, resolve=True))
+    vast_cfg_dict = OmegaConf.to_container(cfg.algorithm.vast.config, resolve=True)
+    if not isinstance(vast_cfg_dict, dict):
+        raise TypeError("algorithm.vast.config must resolve to a mapping.")
+    vast_cfg = VASTConfig(**vast_cfg_dict)
     skip_rl = _as_bool(OmegaConf.select(cfg, "offline.skip_rl", default=False))
     warmup_ckpt: str | None = None
-    iql_finetuned_override: str | None = None
+    vast_finetuned_override: str | None = None
     if skip_rl:
-        iql_finetuned_override = _resolve_required_path(
-            OmegaConf.select(cfg, "offline.iql_finetuned_path", default=None),
-            what="offline.iql_finetuned_path (finetuned IQL state)",
+        vast_finetuned_override = _resolve_required_path(
+            OmegaConf.select(cfg, "offline.vast_finetuned_path", default=None),
+            what="offline.vast_finetuned_path (finetuned VAST state)",
         )
-        initial_iql_ckpt = iql_finetuned_override
+        initial_vast_ckpt = vast_finetuned_override
     else:
         warmup_ckpt = _resolve_required_path(
-            cfg.algorithm.q_learning.warmup_ckpt,
-            what="algorithm.q_learning.warmup_ckpt (pretrained IQL state)",
+            cfg.algorithm.vast.warmup_ckpt,
+            what="algorithm.vast.warmup_ckpt (pretrained VAST state)",
         )
-        initial_iql_ckpt = warmup_ckpt
-    warmup_payload = torch.load(initial_iql_ckpt, map_location="cpu", weights_only=False)
+        initial_vast_ckpt = warmup_ckpt
+    warmup_payload = torch.load(initial_vast_ckpt, map_location="cpu", weights_only=False)
+    validate_vast_checkpoint_payload(
+        warmup_payload,
+        vast_cfg,
+        require_finetuned=bool(skip_rl),
+    )
     warmup_meta = warmup_payload.get("encoder_meta", {}) if isinstance(warmup_payload, dict) else {}
     warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
     # Align the value-semantics config with the loaded checkpoint so Phase-A
@@ -255,7 +287,7 @@ def main(cfg: DictConfig) -> None:
     # frozen-critic advantage read-out uses the same soft-LCB beta the value was
     # trained with (ensemble_lcb_beta directly scales V_lcb, hence the advantage).
     # Structural fields (v_ensemble_size, projector dims) are asserted separately
-    # by IQLLearner.load_state_dict, which raises loudly on any mismatch.
+    # by VASTLearner.load_state_dict, which raises loudly on any mismatch.
     for field in (
         "output_reward_coef",
         "disc_reward_coef",
@@ -267,34 +299,34 @@ def main(cfg: DictConfig) -> None:
         src = warmup_cfg if field in warmup_cfg else (warmup_meta if field in warmup_meta else None)
         if src is None:
             continue
-        old = getattr(iql_cfg, field)
+        old = getattr(vast_cfg, field)
         new = type(old)(src[field])
         if old != new:
-            print(f"[offline][iql] aligning {field}: {old} -> {new} (from warmup ckpt)")
-        setattr(iql_cfg, field, new)
+            print(f"[offline][vast] aligning {field}: {old} -> {new} (from warmup ckpt)")
+        setattr(vast_cfg, field, new)
 
-    H = int(iql_cfg.action_horizon)
+    H = int(vast_cfg.action_horizon)
     if int(agent.flow_config.action_horizon) != H:
         raise RuntimeError(
-            f"action_horizon mismatch: policy={agent.flow_config.action_horizon} vs IQL={H}."
+            f"action_horizon mismatch: policy={agent.flow_config.action_horizon} vs VAST={H}."
         )
 
-    iql_learner = IQLLearner(
-        iql_cfg,
+    vast_learner = VASTLearner(
+        vast_cfg,
         state_feature_dim=int(shared_encoder.state_feature_dim),
         chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
         action_dim=policy_action_dim,
         n_tokens=int(shared_encoder.inner_encoder.num_patches),
         proprio_dim=int(shared_encoder.inner_encoder.proprio_emb_dim),
     )
-    _load_iql_warmup_state(
-        iql_learner,
-        initial_iql_ckpt,
+    _load_vast_warmup_state(
+        vast_learner,
+        initial_vast_ckpt,
         expected_state_feature_dim=int(shared_encoder.state_feature_dim),
         expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
         expected_action_dim=policy_action_dim,
     )
-    print(f"[offline][iql] loaded IQL critics from {initial_iql_ckpt}")
+    print(f"[offline][vast] loaded VAST critics from {initial_vast_ckpt}")
 
     # ------------------------------------------------------------------ #
     # Load + split collected episodes into the three routed streams.     #
@@ -318,7 +350,7 @@ def main(cfg: DictConfig) -> None:
     )
     if not streams.policy_bc:
         raise RuntimeError(
-            "No policy sections survived filtering; cannot finetune IQL or precompute advantage."
+            "No policy sections survived filtering; cannot finetune VAST or precompute advantage."
         )
     print(f"[offline] episodes={episodes_path}")
     print(f"[offline] streams: {streams.stats}")
@@ -396,53 +428,62 @@ def main(cfg: DictConfig) -> None:
     write_resolved_config(cfg, run_dir)
 
     # ------------------------------------------------------------------ #
-    # Phase A: IQL finetune (unfrozen).                                  #
+    # Phase A: VAST finetune (unfrozen).                                  #
     # ------------------------------------------------------------------ #
     warmup_transitions_path = _warmup_transitions_path(cfg, task_name)
-    iql_buffer_stats: dict[str, int] = {}
+    vast_buffer_stats: dict[str, int] = {}
     if skip_rl:
-        src_iql = Path(str(iql_finetuned_override))
-        iql_ckpt_path = run_dir / "checkpoints" / "iql_state_finetuned.pt"
-        shutil.copy2(src_iql, iql_ckpt_path)
-        print(f"[offline][iql] skip_rl=true; copied finetuned IQL {src_iql} -> {iql_ckpt_path}")
+        vast_ckpt_path = run_dir / "checkpoints" / "vast_state_finetuned.pt"
+        save_finetuned_vast(
+            vast_learner,
+            vast_ckpt_path,
+            encoder=shared_encoder,
+            discriminator=discriminator,
+            vast_cfg=vast_cfg,
+            nnpu_ckpt=nnpu_ckpt,
+            extra_meta={"migrated_from_checkpoint": str(vast_finetuned_override)},
+        )
+        print(
+            "[offline][vast] skip_rl=true; normalized finetuned VAST checkpoint "
+            f"to schema v7 at {vast_ckpt_path}"
+        )
     else:
-        iql_buffer, iql_buffer_stats = build_iql_finetune_buffer(
+        vast_buffer, vast_buffer_stats = build_vast_finetune_buffer(
             streams.policy_bc,
             camera_names=camera_names,
             image_size=img_height,
             action_horizon=H,
             warmup_transitions_path=warmup_transitions_path,
         )
-        finetune_iql(
-            iql_learner,
-            iql_buffer,
-            iql_cfg,
+        finetune_vast(
+            vast_learner,
+            vast_buffer,
+            vast_cfg,
             encoder=shared_encoder,
             discriminator=discriminator,
-            num_steps=int(OmegaConf.select(cfg, "offline.iql_finetune.num_steps", default=20000)),
-            batch_size=int(OmegaConf.select(cfg, "offline.iql_finetune.batch_size", default=256)),
-            value_only_steps=int(OmegaConf.select(cfg, "offline.iql_finetune.value_only_steps", default=0)),
-            preencode=bool(OmegaConf.select(cfg, "offline.iql_finetune.preencode_cache", default=True)),
+            num_steps=int(OmegaConf.select(cfg, "offline.vast_finetune.num_steps", default=20000)),
+            batch_size=int(OmegaConf.select(cfg, "offline.vast_finetune.batch_size", default=256)),
+            preencode=bool(OmegaConf.select(cfg, "offline.vast_finetune.preencode_cache", default=True)),
             device=rl_device,
             encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
             metric_logger=metric_logger,
             log_interval=int(cfg.offline.log_interval),
         )
-        iql_ckpt_path = save_finetuned_iql(
-            iql_learner,
-            run_dir / "checkpoints" / "iql_state_finetuned.pt",
+        vast_ckpt_path = save_finetuned_vast(
+            vast_learner,
+            run_dir / "checkpoints" / "vast_state_finetuned.pt",
             encoder=shared_encoder,
             discriminator=discriminator,
-            iql_cfg=iql_cfg,
+            vast_cfg=vast_cfg,
             nnpu_ckpt=nnpu_ckpt,
         )
-        print(f"[offline][iql] finetuned IQL -> {iql_ckpt_path}")
+        print(f"[offline][vast] finetuned VAST -> {vast_ckpt_path}")
 
     # Phase A.5: freeze the finetuned critics for the policy update.
-    _freeze_iql(iql_learner)
+    _freeze_vast(vast_learner)
 
     # ------------------------------------------------------------------ #
-    # Phase B: weighted-BC policy update (frozen finetuned IQL).         #
+    # Phase B: weighted-BC policy update (frozen finetuned VAST).         #
     # ------------------------------------------------------------------ #
     all_transitions = (
         list(policy_bc_for_policy)
@@ -466,25 +507,25 @@ def main(cfg: DictConfig) -> None:
         norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
-    adv_estimator = str(OmegaConf.select(cfg, "offline.advantage.estimator", default="gae"))
     adv_gae_lambda = float(OmegaConf.select(cfg, "offline.advantage.gae_lambda", default=0.6))
-    advantage_raw, failure_raw, start_to_row = precompute_offline_advantage(
+    advantage_raw, failure_raw, start_to_row, vast_diagnostics = precompute_vast_offline_advantage(
         base_buffer=agent.online_buffer,
-        iql_learner=iql_learner,
+        vast_learner=vast_learner,
         encoder=shared_encoder,
         discriminator=discriminator,
-        iql_cfg=iql_cfg,
+        vast_cfg=vast_cfg,
         device=rl_device,
         encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
-        estimator=adv_estimator,
         gae_lambda=adv_gae_lambda,
     )
     print(
-        f"[offline] advantage estimator={adv_estimator}"
-        + (f" (lambda={adv_gae_lambda})" if adv_estimator == "gae" else "")
+        "[offline] advantage estimator=vast_stitched "
+        f"(K={vast_cfg.vast_max_k}, seed={vast_cfg.vast_sampling_seed}, "
+        f"td1_fallback={100.0 * vast_diagnostics.fallback_fraction:.2f}%, "
+        f"diagnostic_gae_lambda={adv_gae_lambda})"
     )
     provider = OfflineAdvantageGProvider(
-        iql_learner=iql_learner,
+        vast_learner=vast_learner,
         discriminator=discriminator,
         encoder=shared_encoder,
         alpha=float(cfg.algorithm.advantage_g_provider.alpha),
@@ -494,7 +535,7 @@ def main(cfg: DictConfig) -> None:
         start_to_row=start_to_row,
     )
     provider.bind_policy_cameras(camera_names)
-    agent.attach_iql_learner(iql_learner)
+    agent.attach_vast_learner(vast_learner)
     agent.attach_discriminator(discriminator)
     agent.attach_g_provider(provider)
 
@@ -530,8 +571,8 @@ def main(cfg: DictConfig) -> None:
             "policy_camera_names": camera_names,
             "initialized_checkpoint": str(ctx.init_checkpoint),
             "nnpu_checkpoint": nnpu_ckpt,
-            "iql_warmup_checkpoint": warmup_ckpt,
-            "iql_finetuned_checkpoint": str(iql_ckpt_path),
+            "vast_warmup_checkpoint": warmup_ckpt,
+            "vast_finetuned_checkpoint": str(vast_ckpt_path),
             "episodes_path": episodes_path,
             "pretrain_data_path": pretrain_data_path,
             "pretrain_transitions": len(pretrain_pos),
@@ -541,10 +582,16 @@ def main(cfg: DictConfig) -> None:
             "online_success_stats": online_success_stats,
             "skip_rl": bool(skip_rl),
             "warmup_transitions_path": warmup_transitions_path,
-            "algorithm_type": "dipole_offline_sequential",
-            "g_mode": "advantage_offline_td",
+            "algorithm": "vast_value_stitching_adaptation",
+            "g_mode": "advantage_offline_vast_stitched",
+            "vast_v_mode": str(vast_cfg.vast_v_mode),
+            "vast_max_k": int(vast_cfg.vast_max_k),
+            "vast_macro_horizon": int(H),
+            "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
+            "vast_comp_coef": float(vast_cfg.vast_comp_coef),
+            "vast_td1_fallback_fraction": vast_diagnostics.fallback_fraction,
             "stream_stats": streams.stats,
-            "iql_buffer_stats": iql_buffer_stats,
+            "vast_buffer_stats": vast_buffer_stats,
             "replay_valid_windows": int(n_valid),
         },
     )

@@ -194,7 +194,7 @@ class SharedDynamicsEncoder:
         proprio_raw: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return Q/V features with one visual/proprio encoder forward."""
+        """Return state and action-conditioned chunk features in one forward."""
         state, conditioned = self.inner_encoder.encode_state_and_chunk_batch(
             self._prepare_images(image_obs_raw),
             proprio_raw.to(self.device, dtype=torch.float32, non_blocking=True),

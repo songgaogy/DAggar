@@ -16,7 +16,7 @@ emit three streams of :class:`~robosuite.pipeline.common.types.Transition`, each
 frame tagged with ``info["route"] in {"advantage", "pos_only", "neg_only"}``:
 
 - **policy_bc** (kept policy sections): ``action = executed_action``, per-frame
-  reward by section outcome, ``route="advantage"``. Fed to BOTH the IQL buffer and
+  reward by section outcome, ``route="advantage"``. Fed to BOTH the VAST buffer and
   the policy-BC buffer.
 - **human_pos** (every human section): ``action = executed_action`` (== human),
   ``route="pos_only"`` (forces ``w_pos=1, w_neg=0``). Policy-BC only.
@@ -28,18 +28,18 @@ Chunk-boundary handling (confirmed with the user):
   so ``FlowDaggerReplayBuffer._is_valid_sequence_start_locked`` never lets a chunk
   window cross a section boundary.
 - Human / neg sections shorter than ``H`` are **padded to ``H``** (repeat the last
-  frame) — they are BC-only, so a fabricated tail never reaches IQL.
+  frame) — they are BC-only, so a fabricated tail never reaches VAST.
 - Policy sections shorter than ``H`` are **dropped** (avoid fabricating ``s'`` for
-  IQL).
+  VAST).
 
 Reward / done semantics (config-overridable ``reward_success`` / ``reward_fail``):
 - **success** policy section (episode ended in ``terminal_reason=="success"``):
   every frame gets ``reward_success`` (default 0) and carries per-frame
-  ``info["success"]``, so ``IQLReplayBuffer._build_step_batch`` takes the absorbing
+  ``info["success"]``, so ``VASTReplayBuffer._build_step_batch`` takes the absorbing
   branch at the success frame and keeps bootstrapping elsewhere.
 - any other kept policy section (ended in human-intervention / ``manual_reset``):
   every frame gets ``reward_fail`` (default -1), no ``info["success"]`` key, and
-  ``done=True`` on the section's last frame → the IQL else-branch treats the
+  ``done=True`` on the section's last frame → the VAST else-branch treats the
   section boundary as a truncation-terminal (no bootstrap past ``-1``).
 """
 

@@ -1,17 +1,19 @@
-"""Visualize the nnPU-backed V-only IQL value on one recorded or offline trajectory.
+"""Visualize VAST value stitching on one recorded trajectory.
 
 Outputs (per run, under ``<output-root>/<split>_seed<seed>_<ts>/``):
-  * ``steps.csv``                    — per-window V / TD-advantage / GAE / reward metrics.
-  * ``qv_timeseries.png``            — 4-subplot diagnostics over overlapping windows.
-  * ``qv_timeseries_nonoverlap.png`` — same plot restricted to disjoint chunks (stride=H).
+  * ``steps.csv``                    — V, TD/GAE, and VAST stitching metrics.
+  * ``vast_timeseries.png``            — 4-subplot diagnostics over overlapping windows.
+  * ``vast_timeseries_nonoverlap.png`` — same plot restricted to disjoint chunks (stride=H).
   * ``rollout_policy_obs.mp4``       — raw policy-camera rollout video.
+  * ``vast_current_future.mp4``      — current/future frame pairs selected by VAST.
   * ``discriminator/``               — per-frame nnPU failure scores: CSV + plot + HUD video.
   * ``summary.json``                 — run metadata and output paths.
 
-The value is V-only (no Q head). The advantage subplot overlays two curves: the
-one-macro-step TD residual ``r + γ^H V(s') - V(s)`` and the GAE(λ) advantage on
-``V*`` (chunk-period recursion, evaluated densely at every window start). The
-discriminator path uses the frozen nnPU head.
+The diagnostic plot keeps the one-macro-step TD residual and GAE overlays while
+also reporting ``G(s,s_k,k)``, the stitched target and advantage,
+MC/composition residuals, sampled horizons, and TD1 fallback flags. Schema-v7
+is canonical; schema-v6 VAST checkpoints are supported read-only. The
+discriminator path remains the frozen nnPU head.
 """
 
 from __future__ import annotations
@@ -26,22 +28,26 @@ from pathlib import Path
 from typing import Any
 
 import h5py
+import imageio.v2 as imageio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+from robosuite.pipeline.algorithms.vast.checkpoint import load_vast_payload as load_checkpoint_payload
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
-from robosuite.pipeline.algorithms.q_learning.common import IQLConfig
-from robosuite.pipeline.algorithms.q_learning.data_util import (
+from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.data_util import (
     aggregate_chunk_reward,
     chunk_done_mask,
 )
-from robosuite.pipeline.algorithms.q_learning.iql import IQLLearner
-from robosuite.pipeline.algorithms.q_learning.utils.vis_discriminator_util import (
+from robosuite.pipeline.algorithms.vast.vast import VASTLearner
+from robosuite.pipeline.algorithms.vast.utils.vis_discriminator_util import (
     visualize_selected_trajectory_discriminator_nnpu,
     write_rollout_video,
 )
@@ -106,7 +112,13 @@ class PerStepNNPUDisc:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--iql-ckpt", required=True)
+    parser.add_argument("--vast-ckpt", default=None)
+    parser.add_argument(
+        "--iql-ckpt",
+        dest="legacy_iql_ckpt",
+        default=None,
+        help="Deprecated schema-v6 checkpoint alias; use --vast-ckpt.",
+    )
     parser.add_argument("--disc-ckpt", default=None)
     parser.add_argument("--demo-root", default=DEFAULT_DEMO_ROOT)
     parser.add_argument("--task-data-name", default=None)
@@ -125,6 +137,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument(
+        "--vast-sampling-seed",
+        type=int,
+        default=None,
+        help="Override checkpoint VAST sampling seed for diagnostic k selection.",
+    )
+    parser.add_argument(
         "--gae-lambda",
         type=float,
         default=0.95,
@@ -134,14 +152,14 @@ def parse_args() -> argparse.Namespace:
             "the Monte-Carlo return; λ<1 keeps the bootstrap/stitching."
         ),
     )
-    parser.add_argument("--output-root", default="outputs/DIPOLE_rl/iql_qv_cache-vis")
+    parser.add_argument("--output-root", default="outputs/dipole_rl-vast/vast_cache-vis")
     parser.add_argument("--renderer", default=None)
     parser.add_argument("--control-freq", type=int, default=None)
     parser.add_argument(
         "--image-size",
         type=int,
         default=None,
-        help="Override HDF5 resize (H=W). Default: read from IQL checkpoint encoder_meta.",
+        help="Override HDF5 resize (H=W). Default: read from VAST checkpoint encoder_meta.",
     )
     parser.add_argument("--no-disc-reward", action="store_true")
     parser.add_argument("--no-disc-viz", action="store_true")
@@ -156,24 +174,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disc-viz-camera", default=None)
     parser.add_argument("--disc-viz-border-thickness", type=int, default=10)
     parser.add_argument("--no-flip-vertical", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.vast_ckpt and args.legacy_iql_ckpt:
+        parser.error("set only one of --vast-ckpt and deprecated --iql-ckpt")
+    if args.legacy_iql_ckpt:
+        import warnings
 
-
-def load_iql_payload(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"IQL checkpoint does not exist: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    schema_version = int(payload.get("schema_version", -1))
-    if schema_version != 5:
-        raise ValueError(
-            f"Unsupported IQL checkpoint schema_version={schema_version}. "
-            "This visualizer expects the V-only ensemble schema (v5); the "
-            "single-head v4 and legacy Q-containing v2/v3 checkpoints are "
-            "incompatible — re-run offline V warmup."
+        warnings.warn(
+            "--iql-ckpt is deprecated; use --vast-ckpt.",
+            FutureWarning,
+            stacklevel=2,
         )
-    for key in ("iql_state", "cfg", "encoder_meta"):
+        args.vast_ckpt = args.legacy_iql_ckpt
+    if not args.vast_ckpt:
+        parser.error("--vast-ckpt is required")
+    return args
+
+
+def load_vast_payload(path: Path) -> dict[str, Any]:
+    payload = load_checkpoint_payload(path)
+    for key in ("vast_state", "cfg", "encoder_meta"):
         if key not in payload:
-            raise KeyError(f"IQL checkpoint is missing required key {key!r}")
+            raise KeyError(f"VAST checkpoint is missing required key {key!r}")
     return payload
 
 
@@ -186,7 +208,7 @@ def resolve_device(requested: str | None, checkpoint_device: str) -> str:
 
 @dataclass(frozen=True)
 class DemoLoadConfig:
-    """HDF5 demo loading settings aligned with IQL warmup / training."""
+    """HDF5 demo loading settings aligned with VAST warmup / training."""
 
     img_height: int
     img_width: int
@@ -198,13 +220,13 @@ class DemoLoadConfig:
 
 def resolve_demo_load_config(
     meta: dict[str, Any],
-    cfg: IQLConfig,
+    cfg: VASTConfig,
     *,
     image_size_override: int | None = None,
     renderer_override: str | None = None,
     control_freq_override: int | None = None,
 ) -> DemoLoadConfig:
-    """Resolve demo-loading kwargs to mirror q_learning.warmup data flow."""
+    """Resolve demo-loading kwargs to mirror vast.warmup data flow."""
     if image_size_override is not None:
         img_height = int(image_size_override)
         img_width = int(image_size_override)
@@ -218,7 +240,7 @@ def resolve_demo_load_config(
     control_freq = int(control_freq_override or meta.get("control_freq", 20))
     if "image_size" not in meta and "img_height" not in meta and image_size_override is None:
         print(
-            f"[vis_qv] warning: checkpoint encoder_meta lacks image_size; "
+            f"[vis_vast] warning: checkpoint encoder_meta lacks image_size; "
             f"using default img={img_height}x{img_width} (re-run warmup to persist)."
         )
     return DemoLoadConfig(
@@ -253,7 +275,7 @@ def align_disc_viz_transitions(
     *,
     viz_end_exclusive: int | None,
 ) -> list[Transition]:
-    """Match Q/V pre-success truncation on the high-res video trajectory."""
+    """Match VAST pre-success truncation on the high-res video trajectory."""
     if viz_end_exclusive is None:
         return disc_transitions
     return disc_transitions[: int(viz_end_exclusive)]
@@ -337,7 +359,7 @@ def load_offline_disc_viz_transitions(
                 )
             except KeyError as exc:
                 print(
-                    f"[vis_qv] disc_viz: source HDF5 reload failed ({hdf5_path}: {exc}); "
+                    f"[vis_vast] disc_viz: source HDF5 reload failed ({hdf5_path}: {exc}); "
                     f"upscaling buffer frames to {disc_viz_load_cfg.img_height}x"
                     f"{disc_viz_load_cfg.img_width}"
                 )
@@ -351,13 +373,13 @@ def load_offline_disc_viz_transitions(
                 return disc_transitions
         else:
             print(
-                f"[vis_qv] disc_viz: source HDF5 missing ({hdf5_path}); "
+                f"[vis_vast] disc_viz: source HDF5 missing ({hdf5_path}); "
                 f"upscaling buffer frames to {disc_viz_load_cfg.img_height}x"
                 f"{disc_viz_load_cfg.img_width}"
             )
     else:
         print(
-            f"[vis_qv] disc_viz: offline episode lacks source_hdf5_path/demo_name; "
+            f"[vis_vast] disc_viz: offline episode lacks source_hdf5_path/demo_name; "
             f"upscaling buffer frames to {disc_viz_load_cfg.img_height}x"
             f"{disc_viz_load_cfg.img_width}"
         )
@@ -434,10 +456,10 @@ def truncate_transitions_for_success_viz(
         raise RuntimeError(
             f"Rounded pre-success segment has {viz_end} frames "
             f"(raw pre_success_end={pre_success_end}), but action_horizon={action_horizon} "
-            f"requires at least {action_horizon} frames for Q/V windows."
+            f"requires at least {action_horizon} frames for VAST windows."
         )
     print(
-        f"[vis_qv] success split: truncate viz to chunk-rounded pre-success frames "
+        f"[vis_vast] success split: truncate viz to chunk-rounded pre-success frames "
         f"[0, {viz_end}) / {len(transitions)} (raw pre_success_end={pre_success_end})"
     )
     return transitions[:viz_end], int(viz_end)
@@ -468,10 +490,10 @@ def truncate_offline_transitions_for_success_viz(
         raise RuntimeError(
             f"Rounded pre-success segment has {viz_end} frames "
             f"(raw pre_success_end={pre_success_end}), but action_horizon={action_horizon} "
-            f"requires at least {action_horizon} frames for Q/V windows."
+            f"requires at least {action_horizon} frames for VAST windows."
         )
     print(
-        f"[vis_qv] offline success split: truncate viz to chunk-rounded pre-success frames "
+        f"[vis_vast] offline success split: truncate viz to chunk-rounded pre-success frames "
         f"[0, {viz_end}) / {len(transitions)} (raw pre_success_end={pre_success_end})"
     )
     return transitions[:viz_end], int(viz_end)
@@ -629,7 +651,7 @@ def _image_tensor(array: np.ndarray) -> torch.Tensor:
 
 def build_models(
     payload: dict[str, Any], *, device: str, disc_override: str | None
-) -> tuple[IQLLearner, SharedDynamicsEncoder, FrozenNNPUDiscriminator, IQLConfig, dict[str, Any]]:
+) -> tuple[VASTLearner, SharedDynamicsEncoder, FrozenNNPUDiscriminator, VASTConfig, dict[str, Any]]:
     meta = dict(payload["encoder_meta"])
     nnpu_path = disc_override or meta.get("nnpu_checkpoint")
     if not nnpu_path:
@@ -644,10 +666,11 @@ def build_models(
         nnpu_ckpt_path=nnpu_path, task_name=task_name, device=device, encoder=encoder
     )
     cfg_dict = dict(payload["cfg"])
+    cfg_dict.pop("method", None)
     cfg_dict["device"] = device
-    cfg = IQLConfig(**cfg_dict)
-    action_dim = int(meta.get("policy_action_dim", payload["iql_state"].get("action_dim", 0)))
-    learner = IQLLearner(
+    cfg = VASTConfig(**cfg_dict)
+    action_dim = int(meta.get("policy_action_dim", payload["vast_state"].get("action_dim", 0)))
+    learner = VASTLearner(
         cfg,
         state_feature_dim=encoder.state_feature_dim,
         chunk_feature_dim=encoder.chunk_feature_dim,
@@ -655,9 +678,11 @@ def build_models(
         n_tokens=int(encoder.inner_encoder.num_patches),
         proprio_dim=int(encoder.inner_encoder.proprio_emb_dim),
     )
-    learner.load_state_dict(payload["iql_state"], strict=True)
+    learner.load_state_dict(payload["vast_state"], strict=True)
     learner.v.eval()
     learner.target_v.eval()
+    if getattr(learner, "g", None) is not None:
+        learner.g.eval()
     return learner, encoder, discriminator, cfg, meta
 
 
@@ -665,15 +690,16 @@ def build_models(
 def compute_metrics(
     transitions: list[Transition],
     *,
-    learner: IQLLearner,
+    learner: VASTLearner,
     encoder: SharedDynamicsEncoder,
     discriminator: FrozenNNPUDiscriminator,
-    cfg: IQLConfig,
+    cfg: VASTConfig,
     camera_names: list[str],
     batch_size: int,
     max_windows: int | None,
     use_disc_reward: bool,
     gae_lambda: float,
+    vast_sampling_seed: int | None = None,
 ) -> tuple[list[dict[str, float]], PerStepNNPUDisc]:
     """Compute per-window V/TD metrics and a per-frame nnPU failure series.
 
@@ -724,7 +750,7 @@ def compute_metrics(
     batch_offsets = range(0, len(starts), batch_step)
     for offset in tqdm(
         batch_offsets,
-        desc="[vis_qv] Q/V metrics",
+        desc="[vis_vast] VAST metrics",
         unit="batch",
         total=(len(starts) + batch_step - 1) // batch_step,
     ):
@@ -733,7 +759,7 @@ def compute_metrics(
         proprio = proprio_cpu[offset : offset + len(batch_starts)]
         actions = actions_cpu[offset : offset + len(batch_starts)]
         rewards = rewards_cpu[offset : offset + len(batch_starts)]
-        # Bootstrap terminal mask, mirroring IQL training (replay._build_step_batch):
+        # Bootstrap terminal mask, mirroring VAST training (replay._build_step_batch):
         # only a task-success frame is a true terminal. A truncated (e.g.
         # fail_rollout) trajectory end keeps the γ^H·V(s') bootstrap, so the tail
         # chunks' TD target stays on the same scale as the interior windows.
@@ -856,6 +882,123 @@ def compute_metrics(
         disc_intrinsic_wh=disc_intrinsic_wh,
         threshold=threshold,
     )
+    if getattr(learner, "g", None) is None:
+        raise RuntimeError("VAST checkpoint loaded without a G network.")
+    sampling_seed = int(
+        getattr(cfg, "vast_sampling_seed", 0)
+        if vast_sampling_seed is None
+        else vast_sampling_seed
+    )
+    rng = np.random.default_rng(sampling_seed)
+    max_k_cfg = int(getattr(cfg, "vast_max_k", 10))
+    selections: list[tuple[int, int, int, bool]] = []
+    for start in starts:
+        max_k = 1
+        for candidate_k in range(2, max_k_cfg + 1):
+            previous_start = int(start) + (candidate_k - 2) * horizon
+            previous_done = any(
+                bool((transitions[idx].info or {}).get("success", False))
+                for idx in range(previous_start, min(previous_start + horizon, len(transitions)))
+            )
+            last_macro_start = int(start) + (candidate_k - 1) * horizon
+            if previous_done or last_macro_start > len(transitions) - horizon:
+                break
+            max_k = candidate_k
+        fallback = max_k < 2
+        k = 1 if fallback else int(rng.integers(2, max_k + 1))
+        future_idx = int(start) + k * horizon
+        j = 0 if fallback else k // 2
+        selections.append((k, j, future_idx, fallback))
+
+    def encode_indices(indices: list[int]) -> torch.Tensor:
+        observations = [
+            transitions[index].obs if index < len(transitions) else transitions[-1].next_obs
+            for index in indices
+        ]
+        return encoder.encode_state(
+            image_obs_raw=_image_tensor(
+                np.stack([_stack_views(obs, camera_names) for obs in observations])
+            ),
+            proprio_raw=torch.from_numpy(
+                np.stack([np.asarray(obs["state"], np.float32) for obs in observations])
+            ).float(),
+        )
+
+    for offset in range(0, len(starts), batch_step):
+        batch_starts = starts[offset : offset + batch_step]
+        batch_select = selections[offset : offset + len(batch_starts)]
+        current_state = encode_indices([int(start) for start in batch_starts])
+        future_state = encode_indices([item[2] for item in batch_select])
+        k_tensor = torch.tensor(
+            [item[0] for item in batch_select],
+            dtype=torch.float32,
+            device=learner.cfg.device,
+        ).unsqueeze(-1)
+        current_v = learner.v_lcb(current_state)
+        future_v = learner.target_v_lcb(future_state)
+        g_value = learner.g_value(current_state, future_state, k_tensor)
+        for local, start in enumerate(batch_starts):
+            row = rows[offset + local]
+            k, j, future_idx, fallback = batch_select[local]
+            done_span = any(
+                bool((transitions[idx].info or {}).get("success", False))
+                for idx in range(int(start), min(future_idx, len(transitions)))
+            )
+            gamma_kh = float(cfg.discount) ** (k * horizon)
+            bootstrap = gamma_kh * (0.0 if done_span else 1.0) * float(future_v[local].item())
+            g_val = float(g_value[local].item())
+            stitched_target = g_val + bootstrap
+            stitched_advantage = stitched_target - float(current_v[local].item())
+
+            raw_return = 0.0
+            for step_offset, transition_idx in enumerate(
+                range(int(start), min(future_idx, len(transitions)))
+            ):
+                env_reward = float(transitions[transition_idx].reward or 0.0)
+                disc_reward = (
+                    float(per_step_disc.intrinsic_reward[transition_idx])
+                    if use_disc_reward and transition_idx < per_step_disc.num_frames
+                    else 0.0
+                )
+                total_reward = (
+                    float(cfg.output_reward_coef) * env_reward
+                    + float(cfg.disc_reward_coef) * disc_reward
+                )
+                raw_return += (float(cfg.discount) ** step_offset) * total_reward
+
+            composition_residual = float("nan")
+            if not fallback:
+                intermediate_idx = int(start) + j * horizon
+                intermediate_state = encode_indices([intermediate_idx])
+                j_tensor = torch.tensor([[float(j)]], device=learner.cfg.device)
+                rest_tensor = torch.tensor([[float(k - j)]], device=learner.cfg.device)
+                g_left = learner.g_value(
+                    current_state[local : local + 1], intermediate_state, j_tensor
+                )
+                g_right = learner.g_value(
+                    intermediate_state, future_state[local : local + 1], rest_tensor
+                )
+                composition = float(
+                    (g_left + (float(cfg.discount) ** (j * horizon)) * g_right).item()
+                )
+                composition_residual = g_val - composition
+            row.update(
+                {
+                    "sampled_k": float(k),
+                    "sampled_j": float(j),
+                    "future_frame_index": float(future_idx),
+                    "g_value": g_val,
+                    "future_v": float(future_v[local].item()),
+                    "vast_bootstrap_value": bootstrap,
+                    "stitched_target": stitched_target,
+                    "advantage_stitched": (
+                        float(row["advantage_td1"]) if fallback else stitched_advantage
+                    ),
+                    "g_mc_error": g_val - raw_return,
+                    "composition_residual": composition_residual,
+                    "td1_fallback": float(fallback),
+                }
+            )
     return rows, per_step_disc
 
 
@@ -902,7 +1045,7 @@ def filter_nonoverlap_chunk_metrics(
     return [row for row in metrics if int(row["step"]) % stride == 0]
 
 
-def _save_qv_timeseries_png(
+def _save_value_diagnostics_png(
     path_base: Path,
     metrics: list[dict[str, float]],
     title: str,
@@ -911,9 +1054,9 @@ def _save_qv_timeseries_png(
     per_step_disc: PerStepNNPUDisc | None = None,
     gae_lambda: float | None = None,
 ) -> Path:
-    """Render the 4-subplot Q/V diagnostics (layout from dipole-rl/v0-kingback)."""
+    """Render the 4-subplot VAST diagnostics (layout from dipole-rl/v0-kingback)."""
     if not metrics:
-        raise ValueError("Cannot plot Q/V timeseries with empty metrics.")
+        raise ValueError("Cannot plot VAST timeseries with empty metrics.")
     steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
     v = np.asarray([row["v"] for row in metrics], dtype=np.float32)
     has_v_std = any("v_std" in row for row in metrics)
@@ -1064,7 +1207,95 @@ def _save_qv_timeseries_png(
     return out_path
 
 
-def plot_qv(
+def _save_vast_stitching_png(
+    path_base: Path,
+    metrics: list[dict[str, float]],
+    title: str,
+) -> Path:
+    """Render VAST G/target/advantage, residual, and horizon diagnostics."""
+    steps = np.asarray([row["step"] for row in metrics], dtype=np.float32)
+    values = {
+        key: np.asarray([row.get(key, np.nan) for row in metrics], dtype=np.float32)
+        for key in (
+            "g_value",
+            "future_v",
+            "vast_bootstrap_value",
+            "stitched_target",
+            "advantage_stitched",
+            "advantage_td1",
+            "advantage_gae",
+            "g_mc_error",
+            "composition_residual",
+            "sampled_k",
+            "future_frame_index",
+            "td1_fallback",
+        )
+    }
+    fig, axes = plt.subplots(4, 1, figsize=(12, 13), sharex=True)
+    fig.suptitle(f"{title} — VAST value-stitching adaptation")
+    axes[0].plot(steps, values["g_value"], label="G(s,s_k,k)", color="tab:purple")
+    axes[0].plot(steps, values["future_v"], label="target V(s_k)", color="tab:green", alpha=0.5)
+    axes[0].plot(
+        steps,
+        values["vast_bootstrap_value"],
+        label="γ^(kH) target V(s_k)",
+        color="tab:olive",
+    )
+    axes[0].plot(steps, values["stitched_target"], label="stitched target", color="tab:orange")
+    axes[0].set_ylabel("Stitched value")
+
+    axes[1].plot(
+        steps,
+        values["advantage_stitched"],
+        label="stitched advantage (Phase B)",
+        color="tab:blue",
+    )
+    axes[1].plot(steps, values["advantage_td1"], label="legacy TD1 / fallback", color="tab:red", alpha=0.7)
+    axes[1].plot(steps, values["advantage_gae"], label="legacy GAE diagnostic", color="tab:cyan", alpha=0.65)
+    axes[1].axhline(0.0, color="black", linewidth=1)
+    axes[1].set_ylabel("Advantage")
+
+    axes[2].plot(steps, values["g_mc_error"], label="G MC error", color="tab:pink")
+    axes[2].plot(
+        steps,
+        values["composition_residual"],
+        label="G composition residual",
+        color="tab:brown",
+    )
+    axes[2].axhline(0.0, color="black", linewidth=1)
+    axes[2].set_ylabel("Residual")
+
+    axes[3].step(steps, values["sampled_k"], where="mid", label="sampled k", color="tab:olive")
+    axes[3].plot(
+        steps,
+        values["future_frame_index"],
+        label="future frame index",
+        color="tab:gray",
+        alpha=0.65,
+    )
+    axes[3].fill_between(
+        steps,
+        0.0,
+        values["td1_fallback"],
+        step="mid",
+        alpha=0.25,
+        color="tab:red",
+        label="TD1 fallback",
+    )
+    axes[3].set_ylabel("Horizon / index")
+    axes[3].set_xlabel("step (window start)")
+    for axis in axes:
+        axis.legend(loc="best", fontsize=8)
+        axis.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_path = path_base.with_suffix(".png")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def plot_vast(
     path_base: Path,
     metrics: list[dict[str, float]],
     title: str,
@@ -1073,9 +1304,9 @@ def plot_qv(
     per_step_disc: PerStepNNPUDisc | None = None,
     gae_lambda: float | None = None,
 ) -> dict[str, Path]:
-    """Write overlapping-window and non-overlapping-chunk Q/V plots (PNG)."""
+    """Write overlapping-window and non-overlapping-chunk VAST plots (PNG)."""
     plot_paths: dict[str, Path] = {}
-    plot_paths["overlapping"] = _save_qv_timeseries_png(
+    plot_paths["overlapping"] = _save_value_diagnostics_png(
         path_base,
         metrics,
         title,
@@ -1085,7 +1316,7 @@ def plot_qv(
     )
     nonoverlap_metrics = filter_nonoverlap_chunk_metrics(metrics, int(action_horizon))
     nonoverlap_base = path_base.parent / f"{path_base.name}_nonoverlap"
-    plot_paths["nonoverlap"] = _save_qv_timeseries_png(
+    plot_paths["nonoverlap"] = _save_value_diagnostics_png(
         nonoverlap_base,
         nonoverlap_metrics,
         f"{title} (non-overlapping chunks, stride={int(action_horizon)})",
@@ -1093,6 +1324,12 @@ def plot_qv(
         per_step_disc=per_step_disc,
         gae_lambda=gae_lambda,
     )
+    if any("advantage_stitched" in row for row in metrics):
+        plot_paths["vast"] = _save_vast_stitching_png(
+            path_base.parent / "vast_stitching_timeseries",
+            metrics,
+            title,
+        )
     return plot_paths
 
 
@@ -1104,10 +1341,65 @@ def write_metrics_csv(csv_path: Path, rows: list[dict[str, float]]) -> None:
         writer.writerows(rows)
 
 
+def write_vast_current_future_video(
+    path: Path,
+    transitions: list[Transition],
+    rows: list[dict[str, float]],
+    *,
+    camera_names: list[str],
+    camera_name: str | None,
+    fps: int,
+    flip_vertical: bool,
+) -> Path | None:
+    """Write side-by-side current and sampled future frames for VAST rows."""
+    if not rows or not any("future_frame_index" in row for row in rows):
+        return None
+    camera = str(camera_name or ("agentview" if "agentview" in camera_names else camera_names[0]))
+    if camera not in camera_names:
+        raise KeyError(f"camera {camera!r} not available; choices: {camera_names}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(
+        path,
+        format="FFMPEG",
+        mode="I",
+        fps=int(fps),
+        codec="libx264",
+        ffmpeg_params=["-movflags", "+faststart"],
+        macro_block_size=1,
+    ) as writer:
+        for row in rows:
+            current_idx = min(int(row["step"]), len(transitions) - 1)
+            future_idx = int(row["future_frame_index"])
+            current = np.asarray(transitions[current_idx].obs[camera], dtype=np.uint8)
+            future_obs = (
+                transitions[future_idx].obs
+                if future_idx < len(transitions)
+                else transitions[-1].next_obs
+            )
+            future = np.asarray(future_obs[camera], dtype=np.uint8)
+            if flip_vertical:
+                current = np.flipud(current)
+                future = np.flipud(future)
+            paired = np.concatenate([current, future], axis=1)
+            image = Image.fromarray(np.ascontiguousarray(paired))
+            draw = ImageDraw.Draw(image)
+            fallback = bool(float(row.get("td1_fallback", 0.0)) > 0.5)
+            draw.rectangle((0, 0, image.width, 18), fill=(0, 0, 0))
+            draw.text((4, 3), f"current t={current_idx}", fill=(255, 255, 255))
+            draw.text(
+                (current.shape[1] + 4, 3),
+                f"future t={future_idx} k={int(row['sampled_k'])}"
+                + (" TD1 fallback" if fallback else ""),
+                fill=(255, 100, 100) if fallback else (255, 255, 255),
+            )
+            writer.append_data(np.asarray(image, dtype=np.uint8))
+    return path
+
+
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_cli_path(args.iql_ckpt)
-    payload = load_iql_payload(checkpoint)
+    checkpoint = resolve_cli_path(args.vast_ckpt)
+    payload = load_vast_payload(checkpoint)
     device = resolve_device(args.device, str(payload["cfg"].get("device", "cpu")))
     learner, encoder, discriminator, cfg, meta = build_models(
         payload, device=device, disc_override=args.disc_ckpt
@@ -1122,7 +1414,7 @@ def main() -> None:
         control_freq_override=args.control_freq,
     )
     print(
-        f"[vis_qv] demo_load img={load_cfg.img_height}x{load_cfg.img_width} "
+        f"[vis_vast] demo_load img={load_cfg.img_height}x{load_cfg.img_width} "
         f"reward_mode={load_cfg.reward_mode} renderer={load_cfg.renderer} "
         f"control_freq={load_cfg.control_freq} camera_aliases={load_cfg.camera_aliases or '{}'}"
     )
@@ -1169,12 +1461,12 @@ def main() -> None:
         selected_demo_source = selected_offline.demo_source
         selected_namespace = selected_offline.namespace
         print(
-            f"[vis_qv] offline_buffer={selected_offline.buffer_path} "
+            f"[vis_vast] offline_buffer={selected_offline.buffer_path} "
             f"episode_index={selected_offline.episode_index} length={selected_offline.length} "
             f"namespace={selected_offline.namespace!r} demo_source={selected_offline.demo_source or '<unknown>'}"
         )
         print(
-            f"[vis_qv] disc_viz_frames img={disc_viz_img_height}x"
+            f"[vis_vast] disc_viz_frames img={disc_viz_img_height}x"
             f"{disc_viz_img_width} num_frames={len(disc_viz_transitions)}"
         )
     else:
@@ -1209,7 +1501,7 @@ def main() -> None:
         selected_demo_key = selected.demo_key
         selected_namespace = str(args.split)
         print(
-            f"[vis_qv] disc_viz_frames img={disc_viz_load_cfg.img_height}x"
+            f"[vis_vast] disc_viz_frames img={disc_viz_load_cfg.img_height}x"
             f"{disc_viz_load_cfg.img_width} num_frames={len(disc_viz_transitions)}"
         )
 
@@ -1224,6 +1516,7 @@ def main() -> None:
         max_windows=args.max_windows,
         use_disc_reward=not args.no_disc_reward,
         gae_lambda=args.gae_lambda,
+        vast_sampling_seed=args.vast_sampling_seed,
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = (
@@ -1238,8 +1531,8 @@ def main() -> None:
     flip_vertical = not bool(args.no_flip_vertical)
 
     write_metrics_csv(output_dir / "steps.csv", rows)
-    plot_paths = plot_qv(
-        output_dir / "qv_timeseries",
+    plot_paths = plot_vast(
+        output_dir / "vast_timeseries",
         rows,
         title=(
             f"{task} {args.split} offline episode {selected_episode_index}"
@@ -1253,6 +1546,15 @@ def main() -> None:
     rollout_video = write_rollout_video(
         output_dir / "rollout_policy_obs.mp4",
         transitions,
+        camera_names=camera_names,
+        camera_name=args.disc_viz_camera,
+        fps=video_fps,
+        flip_vertical=flip_vertical,
+    )
+    vast_pair_video = write_vast_current_future_video(
+        output_dir / "vast_current_future.mp4",
+        transitions,
+        rows,
         camera_names=camera_names,
         camera_name=args.disc_viz_camera,
         fps=video_fps,
@@ -1286,9 +1588,45 @@ def main() -> None:
         }
 
     first_pred = np.where(per_step_disc.pred_failure.astype(bool))[0]
+    fallback_fraction = float(
+        np.mean([row.get("td1_fallback", 0.0) for row in rows])
+    ) if any("td1_fallback" in row for row in rows) else None
+    vast_diagnostics: dict[str, dict[str, float | int]] = {}
+    for key in (
+        "sampled_k",
+        "g_value",
+        "stitched_target",
+        "advantage_stitched",
+        "g_mc_error",
+        "composition_residual",
+        "td1_fallback",
+    ):
+        values = np.asarray(
+            [float(row[key]) for row in rows if key in row], dtype=np.float64
+        )
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            vast_diagnostics[key] = {
+                "count": int(finite.size),
+                "mean": float(finite.mean()),
+                "std": float(finite.std()),
+                "min": float(finite.min()),
+                "max": float(finite.max()),
+            }
     summary = {
-        "schema_version": 2,
-        "iql_checkpoint": str(checkpoint),
+        "schema_version": 3,
+        "algorithm": "vast_value_stitching_adaptation",
+        "vast_v_mode": str(getattr(cfg, "vast_v_mode", "legacy")),
+        "vast_max_k": int(getattr(cfg, "vast_max_k", 0)),
+        "vast_sampling_seed": int(
+            getattr(cfg, "vast_sampling_seed", args.seed)
+            if args.vast_sampling_seed is None
+            else args.vast_sampling_seed
+        ),
+        "td1_fallback_fraction": fallback_fraction,
+        "selection_seed": int(args.seed),
+        "vast_diagnostics": vast_diagnostics,
+        "vast_checkpoint": str(checkpoint),
         "nnpu_checkpoint": discriminator.ckpt_path,
         "threshold": float(discriminator.threshold),
         "threshold_source": "checkpoint",
@@ -1325,21 +1663,27 @@ def main() -> None:
             "steps_csv": str(output_dir / "steps.csv"),
             "plot_png": str(plot_paths["overlapping"]),
             "plot_png_nonoverlap": str(plot_paths["nonoverlap"]),
+            "vast_plot_png": None if "vast" not in plot_paths else str(plot_paths["vast"]),
             "video": None if rollout_video is None else str(rollout_video),
+            "vast_current_future_video": None if vast_pair_video is None else str(vast_pair_video),
             "discriminator": disc_viz_outputs,
         },
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
     )
-    print(f"[vis_qv] wrote {output_dir}")
-    print(f"[vis_qv] plot_png={plot_paths['overlapping']}")
-    print(f"[vis_qv] plot_png_nonoverlap={plot_paths['nonoverlap']}")
+    print(f"[vis_vast] wrote {output_dir}")
+    print(f"[vis_vast] plot_png={plot_paths['overlapping']}")
+    print(f"[vis_vast] plot_png_nonoverlap={plot_paths['nonoverlap']}")
     if rollout_video is not None:
-        print(f"[vis_qv] rollout_video={rollout_video}")
+        print(f"[vis_vast] rollout_video={rollout_video}")
+    if "vast" in plot_paths:
+        print(f"[vis_vast] vast_plot_png={plot_paths['vast']}")
+    if vast_pair_video is not None:
+        print(f"[vis_vast] vast_current_future_video={vast_pair_video}")
     if disc_viz_outputs is not None:
-        print(f"[vis_qv] disc_viz_dir={disc_viz_outputs['output_dir']}")
-        print(f"[vis_qv] disc_viz_video={disc_viz_outputs['video']}")
+        print(f"[vis_vast] disc_viz_dir={disc_viz_outputs['output_dir']}")
+        print(f"[vis_vast] disc_viz_video={disc_viz_outputs['video']}")
 
 
 if __name__ == "__main__":
