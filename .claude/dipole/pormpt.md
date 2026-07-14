@@ -1,6 +1,6 @@
 # Coding Agent Prompt: Integrate DIPOLE into `robosuite.pipeline`
 
-You are working in `/home/dodo/Documents/DAggar/robosuite`.
+You are working in `/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3`.
 
 Your task is to integrate the DIPOLE algorithm into the existing `robosuite/pipeline` training stack, using LPB v2 from `robosuite/discriminator/lpb_v2` to provide the scalar `G` used by DIPOLE weighted behavior cloning(usage will be described in detail later in [how to get G](#lpb-v2-g-requirement)
 

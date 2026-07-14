@@ -4,7 +4,7 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0
 export MUJOCO_GL=egl
 
-ROOT="/home/dodo/Documents/DAggar/robosuite"
+ROOT="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 cd "${ROOT}"

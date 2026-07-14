@@ -42,10 +42,10 @@ _wandb:
         started_at: '2026-04-19T17:13:06.327217Z'
         args:
         - seed=42
-        - hydra.run.dir=/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v5/lpb_dipole_dsm_20260420_011232
+        - hydra.run.dir=/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/multitask_6/lpb_dipole-new-v5/lpb_dipole_dsm_20260420_011232
         - save_name=lpb_dipole_dsm_20260420_011232.pt
-        - save_dir=/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/lpb_dipole-new-v5/lpb_dipole_dsm_20260420_011232
-        - policy.ckpt=/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt
+        - save_dir=/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/multitask_6/lpb_dipole-new-v5/lpb_dipole_dsm_20260420_011232
+        - policy.ckpt=/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt
         - policy.encoder_batch_size=64
         - policy.trainable_encoder=false
         - policy.lora.enabled=false
@@ -76,13 +76,13 @@ _wandb:
         - training.aux_contrastive_weight=0.1
         - training.normalization_warmup_max_samples=2000
         - training.normalization_warmup_max_batches=32
-        program: /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/lpb_score/train.py
+        program: /home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/robosuite/discriminator/lpb_score/train.py
         code_path: robosuite/discriminator/lpb_score/train.py
         code_path_local: robosuite/discriminator/lpb_score/train.py
         git:
           remote_url: https://github.com/songgaogy/robosuite.git
           commit: 45bb4241699dba58a5aa503215af14b6ac0d25de
-        root: /home/dodo/Documents/DAggar/robosuite
+        root: /home/dodo/Documents/DAggar/robosuite_dipole-rl_v3
         host: dodo-System-Product-Name
         executable: /home/dodo/miniconda3/envs/dagger/bin/python3.10
         cpu_count: 16

@@ -7,12 +7,12 @@ seed: 42
 data:
   data_dir: null
   data_dirs:
-    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceBread/expert"
-    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceCereal/expert"
-    - "/home/dodo/Documents/DAggar/robosuite/data/PickPlaceMilk/expert"
-    - "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert"
-    - "/home/dodo/Documents/DAggar/robosuite/data/PandaStack/expert"
-    - "/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PickPlaceBread/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PickPlaceCereal/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PickPlaceMilk/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaPickPlaceCan/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaStack/expert"
+    - "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaLift/expert"
   camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
   image_size: 128
   action_horizon: 8
@@ -55,5 +55,5 @@ logging:
   log_every: 100
 
 checkpoint:
-  save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask_6tasks"
+  save_dir: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/flow_multi/multitask_6tasks"
   save_freq: 50

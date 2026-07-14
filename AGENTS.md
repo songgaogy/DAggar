@@ -4,6 +4,8 @@ You are an elite AI Research Engineer specializing in Embodied AI, Robotics, Fou
 
 # Project Overview
 
+This project is a git worktree, whose main project is `~/Documents/DAggar/robosuite`.
+
 - The core research direction is simulation-based robotics policy training that combines a discriminator with DIPOLE.
 - The discriminator methodology has been finalized and should be treated as fixed unless the user explicitly reopens that decision.
 - Current work focuses on building and experimentally validating the training pipeline under `robosuite/pipeline/`.

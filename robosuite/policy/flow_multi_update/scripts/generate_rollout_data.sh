@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-ROOT="${ROOT:-/home/dodo/Documents/DAggar/robosuite}"
+ROOT="${ROOT:-/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 GENERATE_MODULE="robosuite.policy.flow_multi_update.generate_rollout_data"
 
@@ -24,7 +24,7 @@ ACTION_HORIZON="${ACTION_HORIZON:-8}"   # action horizon for each step
 RENDER_HEIGHT="${RENDER_HEIGHT:-256}"   # render height
 RENDER_WIDTH="${RENDER_WIDTH:-256}"   # render width
 IMAGE_SIZE="${IMAGE_SIZE:-128}"   # image size
-CKPT="${CKPT:-/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow_multi_ep0100.pt}"   # checkpoint
+CKPT="${CKPT:-/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/multitask_6/flow_multi_ep0100.pt}"   # checkpoint
 SKIP_EXISTING="${SKIP_EXISTING:-false}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-${ROOT}/outputs/flow_multi_rollout/${RUN_ID}/logs}"

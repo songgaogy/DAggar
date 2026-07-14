@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 offline:
-  data_root: "/home/dodo/Documents/DAggar/robosuite/data"
+  data_root: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data"
   # Collected episodes; null -> data/<task>/offline_data/offline_episodes.pt.
   episodes_path: null
   # Expert pretrain HDF5 dir/file; null -> do not add pretrain data to Phase B.

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
+ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite_dipole-rl_v3}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 export CUDA_VISIBLE_DEVICES=1

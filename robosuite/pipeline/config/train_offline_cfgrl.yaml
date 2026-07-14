@@ -1,0 +1,9 @@
+# Offline CFGRL: DAgger positive data plus an independently trained negative policy.
+defaults:
+  - train_offline_dipole
+  - _self_
+
+offline:
+  cfg_mode: "all"             # all | neg-weighted
+  # Match the current train_dagger.sh positive-data default.
+  use_online_success: true

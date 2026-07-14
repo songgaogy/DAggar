@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
+ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite_dipole-rl_v3}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 ENVIRONMENT="${ENVIRONMENT:-PickPlaceBread}"

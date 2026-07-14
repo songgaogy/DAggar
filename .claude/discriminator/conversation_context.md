@@ -15,7 +15,7 @@
 
 ## 2. Repository context
 
-- Repo root: `/home/dodo/Documents/DAggar/robosuite`.
+- Repo root: `/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3`.
 - Current branch at conversation time: `discriminator-baseline`.
 - The user stated (D10) that they will create a new branch themselves; the implementer should just modify code in-place.
 - Relevant directories:

@@ -6,7 +6,7 @@ seed: 42
 
 data:
   data_dir: null
-  data_root: "/home/dodo/Documents/DAggar/robosuite/data"
+  data_root: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data"
   # data split to dir: data_root/<task_name>/<data_splits>/
   data_splits: "expert"
   tasks: ["PickPlaceBread", "PickPlaceCereal", "PickPlaceMilk", "PickPlaceCan", "Stack", "Lift", "NutAssemblyRound", "NutAssemblySquare"]
@@ -61,5 +61,5 @@ logging:
   log_every: 100
 
 checkpoint:
-  save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_multi/multitask_6tasks"
+  save_dir: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/flow_multi/multitask_6tasks"
   save_freq: 50

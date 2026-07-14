@@ -8,7 +8,7 @@ defaults:
 
 # Offline-specific knobs (read by offline/src/train_offline_dipole.py).
 offline:
-  data_root: "/home/dodo/Documents/DAggar/robosuite/data"
+  data_root: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data"
   pretrain_dir: "pretrain_data-20260615_174814"   # <data_root>/<task>/<pretrain_dir>, expert HDF5, all frames
   offline_data_dir: "offline_data"                 # <data_root>/<task>/<offline_data_dir>/iql_offline_transitions.pt
   num_train_steps: 15000

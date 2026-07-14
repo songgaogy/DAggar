@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-ROOT="/home/dodo/Documents/DAggar/robosuite"
-SAVE_DIR="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/policy/flow-update"
+ROOT="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3"
+SAVE_DIR="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/multitask_6/policy/flow-update"
 SAVE_TRAIN_DATA=true
 
 export CUDA_VISIBLE_DEVICES=0

@@ -1,12 +1,12 @@
 export CUDA_VISIBLE_DEVICES=0
 
 python -m robosuite.discriminator.eval_discriminator \
-  data.expert_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert" \
-  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout" \
+  data.expert_dir="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaLift/expert" \
+  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaLift/fail_rollout" \
   data.success_rollout_dir="" \
   data.obs_key="states" \
   data.camera_name="agentview" \
-  policy.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
+  policy.ckpt="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
   policy.device="cuda" \
   policy.image_size=128 \
   split.val_ratio=0.2 \

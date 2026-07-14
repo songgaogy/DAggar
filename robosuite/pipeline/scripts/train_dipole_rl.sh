@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
+ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite_dipole-rl_v3}"
 cd "$ROOT_DIR"
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"

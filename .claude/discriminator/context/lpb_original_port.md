@@ -2,7 +2,7 @@
 
 Date: 2026-04-25
 Branch: `discriminator-baseline`
-Working dir: `/home/dodo/Documents/DAggar/robosuite`
+Working dir: `/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3`
 
 ## Goal
 

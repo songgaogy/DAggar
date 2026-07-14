@@ -8,14 +8,14 @@
 
 set -euo pipefail
 
-ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
+ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite_dipole-rl_v3}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="/home/dodo/Documents/DAggar/robosuite/outputs/dipole-rl-offline/PickPlaceCereal_20260713_125043_beta1_k-1_ensemble-GAE/checkpoints/latest.pt"
+POLICY_CKPT="outputs/dipole-rl-offline/PickPlaceCereal_20260714_204356_beta1_k-2_cfg-all/checkpoints/latest.pt"
 # OMEGAS=(0 0.2 1)
 # OMEGAS=(0.1 0.5 2)
 OMEGAS=(0 0.1 0.2 0.5 1 2)

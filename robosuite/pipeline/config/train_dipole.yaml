@@ -51,7 +51,7 @@ algorithm:
       image_encoder:
         type: "shared_resnet18_spatial_softmax"
         feature_dim: 256
-        pretrained_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"
+        pretrained_path: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/robosuite/RL/models/resnet18-f37072fd.pth"
         freeze_backbone: true
         trainable_stages: ["layer3", "layer4"]
         train_token_projections: true
@@ -66,7 +66,7 @@ algorithm:
 
       language_encoder:
         type: "clip_text"
-        pretrained_name: "/home/dodo/Documents/DAggar/robosuite/data/pretrained/clip-vit-base-patch32"
+        pretrained_name: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/pretrained/clip-vit-base-patch32"
         max_length: 77
         freeze_backbone: true
         local_files_only: true

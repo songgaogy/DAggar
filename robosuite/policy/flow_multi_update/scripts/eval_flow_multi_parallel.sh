@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/dodo/Documents/DAggar/robosuite"
+ROOT="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 EVAL_MODULE="robosuite.policy.flow_multi_update.eval_flow"
 

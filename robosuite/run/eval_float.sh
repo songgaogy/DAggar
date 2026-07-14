@@ -1,10 +1,10 @@
-python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/eval_discriminator.py \
-  data.expert_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/expert" \
-  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite/data/PandaLift/fail_rollout" \
+python /home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/robosuite/discriminator/eval_discriminator.py \
+  data.expert_dir="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaLift/expert" \
+  data.fail_rollout_dir="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaLift/fail_rollout" \
   data.success_rollout_dir="" \
   data.obs_key="states" \
   data.camera_name="agentview" \
-  policy.ckpt="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
+  policy.ckpt="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/PandaLift/flow/BC_warmup/flow_policy_ep0040_20260303_135632.pt" \
   policy.device="cuda" \
   policy.image_size=128 \
   data.max_expert_trajectories=100 \
@@ -18,4 +18,4 @@ python /home/dodo/Documents/DAggar/robosuite/robosuite/discriminator/eval_discri
   float.to=2 \
   float.num_expert_candidates=20 \
   online.adaptive_delta=false \
-  output.save_json_path="/home/dodo/Documents/DAggar/robosuite/checkpoints/PandaLift/discriminator/float/eval/summary_quick.json"
+  output.save_json_path="/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/PandaLift/discriminator/float/eval/summary_quick.json"

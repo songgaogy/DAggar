@@ -5,7 +5,7 @@ defaults:
 seed: 42
 
 data:
-  data_dir: "/home/dodo/Documents/DAggar/robosuite/data/PandaPickPlaceCan/expert_recover"
+  data_dir: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/data/PandaPickPlaceCan/expert_recover"
   camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
   image_size: 128
   action_horizon: 8
@@ -45,5 +45,5 @@ logging:
   log_every: 20
 
 checkpoint:
-  save_dir: "/home/dodo/Documents/DAggar/robosuite/checkpoints/flow_unet/pickplace_can"
+  save_dir: "/home/dodo/Documents/DAggar/robosuite_dipole-rl_v3/checkpoints/flow_unet/pickplace_can"
   save_freq: 10
