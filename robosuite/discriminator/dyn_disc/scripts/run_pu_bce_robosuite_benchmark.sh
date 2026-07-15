@@ -35,7 +35,7 @@ FAIL_SPLIT="fail_rollout-val-labeled"       # benchmark eval failures
 SUCCESS_SPLIT="success_rollout-val"         # benchmark eval success
 SUCCESS_TRAIN_SPLIT="success_rollout"       # nnPU positives + calibration
 FAIL_TRAIN_SPLIT="fail_rollout"             # unlabeled failure pool
-TASKS="NutAssemblyRound"
+TASKS="PickPlaceCereal"
 TRAIN_MAX_SUCCESS_PER_TASK=50                    # train: success_rollout (per task)
 TRAIN_MAX_FAIL_PER_TASK=50                       # train: fail_rollout (per task)
 MAX_FAIL_PER_TASK=50                             # eval: fail_rollout-val-labeled
@@ -54,10 +54,11 @@ EPOCHS="${EPOCHS:-20}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
+USE_CHUNK="${USE_CHUNK:-True}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
@@ -110,6 +111,7 @@ fi
     --lr                    "${LR}" \
     --weight-decay          "${WEIGHT_DECAY}" \
     --batch-size            "${BATCH_SIZE}" \
+    --use-chunk             "${USE_CHUNK}" \
     "${EXTRA_ARGS[@]}" \
     "$@"
 

@@ -187,6 +187,9 @@ class DynEncoder:
             if p.exists():
                 norm_path = p
                 break
+        self.normalizer_checkpoint = (
+            None if norm_path is None else str(norm_path.expanduser().resolve())
+        )
 
         self.model = load_model(ckpt_path, self.cfg, device=self.device)
         self.model.eval()

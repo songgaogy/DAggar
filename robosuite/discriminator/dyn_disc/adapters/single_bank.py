@@ -65,6 +65,7 @@ class DynBenchmarkDiscriminator:
         knn_chunk_size: int = 2048,
         feature_source: str = "encoder",
         transformer_layer: int = -1,
+        use_chunk: bool = False,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
@@ -84,6 +85,7 @@ class DynBenchmarkDiscriminator:
         self.knn_chunk_size = int(knn_chunk_size)
         self.feature_source = str(feature_source)
         self.transformer_layer = int(transformer_layer)
+        self.use_chunk = bool(use_chunk)
         self.calib_fraction = float(calib_fraction)
         self.seed = int(seed)
         self.verbose_fit = bool(verbose_fit)
@@ -116,7 +118,7 @@ class DynBenchmarkDiscriminator:
     # Encoding helpers                                                   #
     # ------------------------------------------------------------------ #
 
-    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str, str, str]:
+    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str, str, str, bool]:
         group_key = getattr(trajectory, "demo_path", None)
         if group_key is None:
             group_key = getattr(trajectory, "episode_path", "")
@@ -126,6 +128,7 @@ class DynBenchmarkDiscriminator:
             str(cache_key or group_key),
             self.feature_source,
             str(self.transformer_layer),
+            self.use_chunk,
         )
 
     def _resolve_camera(self, view: str) -> str:
@@ -171,6 +174,18 @@ class DynBenchmarkDiscriminator:
         pad = np.zeros((actions.shape[0], target_dim - d), dtype=np.float32)
         return np.concatenate([actions.astype(np.float32, copy=False), pad], axis=1)
 
+    def _prepare_actions(self, actions: np.ndarray, t_len: int) -> np.ndarray:
+        """Prepare trajectory actions according to the configured feature contract."""
+        if self.feature_source == "encoder" or self.use_chunk:
+            return self.encoder.prepare_actions(actions[:t_len], t_len=t_len)
+
+        target_action_dim = None
+        try:
+            target_action_dim = int(self.encoder.model.action_encoder.in_chans)
+        except Exception:
+            target_action_dim = None
+        return self._slice_action(actions[:t_len], target_dim=target_action_dim)
+
     def _prepare_trajectory_tensors(self, trajectory: BenchmarkTrajectory) -> Dict[str, Any]:
         view_names = self.encoder.view_names
         cameras_needed = [self._resolve_camera(v) for v in view_names]
@@ -194,15 +209,7 @@ class DynBenchmarkDiscriminator:
             target_dim=target_proprio_dim,
             task_name=str(trajectory.task_name),
         )
-        if self.feature_source == "encoder":
-            act = self.encoder.prepare_actions(actions[:t_len], t_len=t_len)
-        else:
-            target_action_dim = None
-            try:
-                target_action_dim = int(self.encoder.model.action_encoder.in_chans)
-            except Exception:
-                target_action_dim = None
-            act = self._slice_action(actions[:t_len], target_dim=target_action_dim)
+        act = self._prepare_actions(actions, t_len=t_len)
 
         h = self.encoder.original_img_size
         per_view_chw: Dict[str, np.ndarray] = {}

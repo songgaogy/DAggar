@@ -1,0 +1,32 @@
+# Standalone warm-start finetuning for the frozen-encoder nnPU discriminator.
+# This config is intentionally independent from train_offline_dipole.yaml.
+seed: 0
+
+env:
+  environment: "PickPlaceCereal"
+
+algorithm:
+  discriminator:
+    checkpoint: null
+    encoder_ckpt: null
+    learner_device: "cuda:0"
+    camera_to_view: {}
+
+offline:
+  discriminator_finetune:
+    episodes_path: "data/${env.environment}/offline_data/offline_episodes.pt"
+    pretrain_dir: "data/${env.environment}/discriminator-pretrain"
+    epochs: 10
+    lr: 3.0e-5
+    weight_decay: 1.0e-4
+    batch_size: 512
+    encode_batch_size: 32
+    log_interval: 10
+    use_only_offline: false
+    run_root: "./outputs/discriminator-finetune"
+    run_subfix: ""
+
+logging:
+  use_tensorboard: true
+  tensorboard_dir: "tensorboard"
+  use_wandb: false

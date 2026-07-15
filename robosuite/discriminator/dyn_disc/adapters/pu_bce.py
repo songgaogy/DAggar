@@ -27,6 +27,7 @@ Hard invariants:
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -40,6 +41,15 @@ from robosuite.discriminator.dyn_disc.adapters.single_bank import (
     _pad_to_length,
 )
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
+
+
+def _sha256_file(path_value: str | Path) -> str:
+    path = Path(path_value).expanduser().resolve()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _pad_to_length_with_fill(
@@ -78,6 +88,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
+        use_chunk: bool = False,
         loss_surrogate: str = "sigmoid",
         nn_correction: bool = True,
         beta: float = 0.0,
@@ -111,6 +122,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             knn_chunk_size=knn_chunk_size,
             feature_source=feature_source,
             transformer_layer=transformer_layer,
+            use_chunk=use_chunk,
             calib_fraction=calib_fraction,
             seed=seed,
             verbose_fit=verbose_fit,
@@ -137,6 +149,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self._detectors_per_task: Dict[str, PUBCEDiscriminator] = {}
         self._calibration_stats: Dict[str, dict] = {}
         self._global_stats: Dict[str, Any] = {}
+        self._success_train_video_ids: Dict[str, List[str]] = {}
+        self._success_calib_video_ids: Dict[str, List[str]] = {}
 
     # ------------------------------------------------------------------ #
     # Helpers                                                            #
@@ -248,11 +262,37 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "pu_bce_detector": self._shared_detector.state_dict(),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
+            "use_chunk": bool(self.use_chunk),
             "model_ckpt": str(self.model_ckpt),
+            "model_ckpt_sha256": _sha256_file(self.model_ckpt),
+            "normalizer_ckpt": self.encoder.normalizer_checkpoint,
+            "normalizer_ckpt_sha256": (
+                None
+                if self.encoder.normalizer_checkpoint is None
+                else _sha256_file(self.encoder.normalizer_checkpoint)
+            ),
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
+            "seed": int(self.seed),
+            "calib_fraction": float(self.calib_fraction),
+            "delta": float(self.delta),
+            "camera_to_view": dict(self.camera_to_view),
+            "proprio_indices": (
+                None
+                if self.proprio_indices is None
+                else [int(v) for v in self.proprio_indices.tolist()]
+            ),
+            "encode_batch_size": int(self.encode_batch_size),
+            "success_train_video_ids": {
+                task: list(video_ids)
+                for task, video_ids in sorted(self._success_train_video_ids.items())
+            },
+            "success_calib_video_ids": {
+                task: list(video_ids)
+                for task, video_ids in sorted(self._success_calib_video_ids.items())
+            },
             "unlabeled_fail_video_ids": sorted(
                 str(t.video_id) for t in self.unlabeled_fail_trajectories
             ),
@@ -337,6 +377,15 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             train_success_per_task[task] = [t for i, t in enumerate(succ_list) if i not in calib_idx]
             calib_success_per_task[task] = [t for i, t in enumerate(succ_list) if i in calib_idx]
 
+        self._success_train_video_ids = {
+            task: [str(t.video_id) for t in trajs]
+            for task, trajs in train_success_per_task.items()
+        }
+        self._success_calib_video_ids = {
+            task: [str(t.video_id) for t in trajs]
+            for task, trajs in calib_success_per_task.items()
+        }
+
         # ------ encode positives via the parent's _encode cache ------
         if self.verbose_fit:
             n_train = sum(len(v) for v in train_success_per_task.values())
@@ -413,6 +462,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 f"Np(success train)={n_p} Nu(unlabeled fail whole)={n_u} N_calib={n_c} "
                 f"pi_p={self.pi_p} surrogate={self.loss_surrogate} "
                 f"nn_correction={self.nn_correction} "
+                f"use_chunk={self.use_chunk} "
                 f"feature_source={self.feature_source} layer={self.transformer_layer}",
                 flush=True,
             )
@@ -465,6 +515,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
+            "use_chunk": bool(self.use_chunk),
             "num_unlabeled_fail_trajectories": int(len(self.unlabeled_fail_trajectories)),
             "train_history": list(self._shared_detector._train_history),
         }
@@ -547,6 +598,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "feature_len": int(feat.shape[0]),
             "feature_source": self.feature_source,
             "transformer_layer": int(self.transformer_layer),
+            "use_chunk": bool(self.use_chunk),
             "view_names": list(self.encoder.view_names),
         }
         if not bool(trajectory.is_failure):
@@ -563,6 +615,13 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "per_task": dict(self._calibration_stats),
             "global": dict(self._global_stats),
             "model_ckpt": self.model_ckpt,
+            "model_ckpt_sha256": _sha256_file(self.model_ckpt),
+            "normalizer_ckpt": self.encoder.normalizer_checkpoint,
+            "normalizer_ckpt_sha256": (
+                None
+                if self.encoder.normalizer_checkpoint is None
+                else _sha256_file(self.encoder.normalizer_checkpoint)
+            ),
             "view_names": list(self.encoder.view_names),
             "camera_to_view": dict(self.camera_to_view),
             "delta": float(self.delta),
@@ -573,5 +632,17 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "encode_batch_size": int(self.encode_batch_size),
             "feature_source": self.feature_source,
             "transformer_layer": int(self.transformer_layer),
+            "use_chunk": bool(self.use_chunk),
+            "success_train_video_ids": {
+                task: list(video_ids)
+                for task, video_ids in sorted(self._success_train_video_ids.items())
+            },
+            "success_calib_video_ids": {
+                task: list(video_ids)
+                for task, video_ids in sorted(self._success_calib_video_ids.items())
+            },
+            "unlabeled_fail_video_ids": sorted(
+                str(t.video_id) for t in self.unlabeled_fail_trajectories
+            ),
             "save_ckpt_dir": self.save_ckpt_dir,
         }

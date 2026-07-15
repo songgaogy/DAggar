@@ -3,7 +3,9 @@
 Offline DIPOLE has three stages: collect fixed-policy episodes, finetune the VAST
 G/V learner, then train the existing dual-branch DIPOLE policy with GAE computed
 from the finetuned VAST V / target-V pair. The nnPU discriminator and shared
-dynamics encoder remain frozen.
+dynamics encoder remain frozen inside Offline DIPOLE. A separate, optional nnPU
+warm-start workflow updates the discriminator before it is supplied to another
+run; it is not invoked by `train_offline_dipole.sh`.
 
 ## Prerequisite: VAST warmup
 
@@ -19,6 +21,99 @@ reward coefficients, and sampling semantics.
 human intervention. It does not update the policy, VAST learner, encoder, or
 discriminator. The output is `offline_episodes.pt` under the configured task data
 directory.
+
+## Independent nnPU discriminator update
+
+The discriminator update is a standalone CUDA-only workflow. It freezes the
+dynamics encoder, uses the checkpoint-selected transformer layer and action
+chunk contract, and continues optimizing the existing nnPU head weights. It
+never initializes a replacement head.
+
+### Extract the original pretrain pools
+
+`discriminator/dyn_disc/scripts/extract_pretrain_data.sh` reconstructs the
+original success split from the parent checkpoint metadata. For the canonical
+PickPlaceCereal run, `seed=0`, `calib_fraction=0.2`, and a 50-trajectory cap
+produce 40 `positive_train` and 10 `positive_calib` trajectories. Whole failure
+rollouts form `unlabeled_train`.
+
+```bash
+NNPU_CKPT=/path/to/pu_bce_head.pth \
+TASK=PickPlaceCereal \
+bash robosuite/discriminator/dyn_disc/scripts/extract_pretrain_data.sh
+```
+
+The default output is
+`data/<task>/discriminator-pretrain/{manifest.json,positive_train/,positive_calib/,unlabeled_train/}`.
+Each atomic `.pt` shard stores float32 latents, frame indices, and provenance;
+the manifest pins both the dynamics model and saved normalizer by SHA-256.
+Existing output is rejected unless overwrite is explicitly requested.
+
+### Warm-start finetuning
+
+`offline/scripts/finetune_disc.sh` combines the extracted and collected pools.
+Collected episodes are split at intervention boundaries and episode ends. Only
+non-intervention `executed_action` rows are encoded, after checking equality with
+`policy_action`; human actions and counterfactual actions are excluded.
+
+A policy section enters the positive pool only when its final executed action
+directly causes task success. Success completed by a human section produces no
+positive section. Every other policy section enters the unlabeled pool,
+including intervention-ending, reset, max-step, environment-done, and
+interrupted sections. Short sections are retained, and action chunks repeat-pad
+within their section without crossing a boundary.
+
+```bash
+NNPU_CKPT=/path/to/pu_bce_head.pth \
+OFFLINE_EPISODES=data/PickPlaceCereal/offline_data/offline_episodes.pt \
+PRETRAIN_DIR=data/PickPlaceCereal/discriminator-pretrain \
+TASK=PickPlaceCereal \
+bash robosuite/pipeline/offline/scripts/finetune_disc.sh
+```
+
+The standalone Hydra config is `pipeline/config/finetune_disc.yaml`. Launcher
+environment variables expose the parent checkpoint and optional encoder
+override, CUDA device, input paths, schedule, seed, run root/suffix, and logging
+interval. Defaults are AdamW with cosine decay for 10 epochs, learning rate
+`3e-5`, weight decay `1e-4`, batch size `512`, and seed `0`. TensorBoard is the
+only experiment logger.
+
+Pretrain and online trajectories are merged within their respective P/U pools,
+sampled uniformly by frame within each group, and trained with the inherited
+50/50 P/U batch composition and checkpoint nnPU settings. Threshold calibration
+uses only the held-out original `positive_calib` split. The standalone command
+accepts a single-task parent checkpoint; a multi-task shared head is rejected
+because every task threshold would need its own held-out recalibration pool.
+
+Each run writes
+`outputs/discriminator-finetune/<task>_<timestamp>[_suffix]/` with:
+
+- `checkpoints/pu_bce_head_finetuned.pth`, compatible with
+  `FrozenNNPUDiscriminator`
+- `run_info.json` and `config_resolved.yaml`
+- TensorBoard events under `tensorboard/`
+
+The checkpoint preserves the original top-level nnPU schema and adds provenance,
+training history, pool statistics, and recalibration metadata.
+
+### Visualize the finetuned head
+
+The visualization launcher loads only the finetuned checkpoint and runs the
+pipeline-owned finetuned visualizer on deterministic samples from
+`fail_rollout-val-labeled`, `success_rollout-val`, and the collected offline
+episodes:
+
+```bash
+FINETUNED_CKPT=/path/to/pu_bce_head_finetuned.pth \
+MODEL_CKPT=/path/to/model_10.pth \
+TASK=PickPlaceCereal \
+bash robosuite/pipeline/offline/scripts/vis_disc_finetuned.sh
+```
+
+It writes one MP4 per trajectory plus `finetuned_scores.pdf` and
+`finetuned_scores_offline.pdf` under the finetune run's
+`visualization/val-seed<seed>/` directory by default. This command does not fit
+a head or run benchmark evaluation.
 
 ## Stage 2: offline training
 
@@ -98,18 +193,38 @@ Visualization is CUDA-only and accepts schema-v7/v8 checkpoints. Existing
 schema-v6 artifacts with legacy payload naming may be read through the explicit
 compatibility path, but all new outputs use VAST names.
 
+Use `offline/scripts/vis_disc_finetuned.sh` for the independent nnPU output, as
+described above. Both visualization launchers reject non-CUDA devices.
+
 ## File map
 
 ```text
 offline/
 ├── scripts/
 │   ├── collect_data.sh
+│   ├── finetune_disc.sh
 │   ├── train_offline_dipole.sh
+│   ├── vis_disc_finetuned.sh
 │   └── vis_vast_finetuned.sh
 ├── src/
+│   ├── finetune_disc.py
+│   ├── visualize_disc_finetuned.py
 │   ├── train_offline_dipole.py
 │   ├── eval_offline_dipole.py
 │   └── diagnostic_plots.py
+├── discriminator/
+│   ├── episodes.py
+│   ├── features.py
+│   ├── pools.py
+│   ├── encoder.py
+│   ├── contracts.py
+│   ├── trainer.py
+│   └── checkpoint.py
+├── visualization/
+│   ├── disc_adapter.py
+│   ├── disc_contract.py
+│   ├── disc_episodes.py
+│   └── disc_renderer.py
 └── utils/
     ├── vast_finetune.py
     ├── advantage.py

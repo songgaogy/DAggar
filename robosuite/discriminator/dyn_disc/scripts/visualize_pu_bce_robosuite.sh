@@ -19,16 +19,16 @@ DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 
-LOAD_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_203140_NutAssemblySquare/checkpoints/pu_bce_head.pth"
+LOAD_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk/run_20260715_121551_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 MODEL_CKPT="checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
-TASK="NutAssemblySquare"
-NUM_TRAJS=5     # per split for each
+TASK="PickPlaceCereal"
+NUM_TRAJS=10     # per split for each
 FAIL_SPLIT="fail_rollout-val-labeled"
 SUCCESS_SPLIT="success_rollout-val"
 
 
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_viz_robosuite/${TASK}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_viz_robosuite-chunk/${TASK}-${TIMESTAMP}}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"

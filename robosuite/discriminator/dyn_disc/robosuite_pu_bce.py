@@ -31,6 +31,17 @@ from robosuite.discriminator.utils.robosuite_benchmark import (
 from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value, got {value!r}. Use True or False."
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-ckpt", required=True)
@@ -101,6 +112,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--use-chunk",
+        type=_parse_bool,
+        default=False,
+        help="Use forward action chunks instead of zero-padding a single action.",
+    )
 
     # Unlabeled failure-pool selection.
     parser.add_argument("--unlabeled-per-task", type=int, default=25,
@@ -307,6 +324,7 @@ def main() -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         batch_size=int(args.batch_size),
+        use_chunk=bool(args.use_chunk),
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
@@ -353,6 +371,8 @@ def main() -> None:
                 "nn_correction": not bool(args.no_nn_correction),
                 "beta": float(args.beta),
                 "pi_p": float(args.pi_p),
+                "model_ckpt": str(args.model_ckpt),
+                "model_ckpt_sha256": calib_summary.get("model_ckpt_sha256"),
                 "data_root": str(args.data_root),
                 "fail_train_split": str(args.fail_train_split),
                 "fail_eval_split": str(args.fail_split),
@@ -360,7 +380,16 @@ def main() -> None:
                 "success_train_split": str(args.success_train_split),
                 "train_max_success_per_task": train_max_success_per_task,
                 "train_max_fail_per_task": train_max_fail_per_task,
+                "seed": int(args.seed),
+                "calib_fraction": float(args.calib_fraction),
+                "success_train_video_ids": calib_summary.get(
+                    "success_train_video_ids", {}
+                ),
+                "success_calib_video_ids": calib_summary.get(
+                    "success_calib_video_ids", {}
+                ),
                 "unlabeled_pool": unlabeled_by_task,
+                "unlabeled_fail_video_ids": sorted(unlabeled_keys),
                 "unlabeled_per_task": int(unlabeled_per_task),
                 "eval_fail_video_ids": sorted(eval_fail_keys),
                 "delta": float(args.delta),
@@ -370,6 +399,7 @@ def main() -> None:
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
+                "use_chunk": bool(args.use_chunk),
                 "knn_feature_source": str(args.knn_feature_source),
                 "knn_transformer_layer": int(args.knn_transformer_layer),
             }

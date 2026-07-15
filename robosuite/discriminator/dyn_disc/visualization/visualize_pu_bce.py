@@ -626,6 +626,7 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
 
 def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    disc.use_chunk = bool(payload.get("use_chunk", False))
     state = payload["pu_bce_detector"]
     detector = PUBCEDiscriminator(
         in_dim=int(payload["in_dim"]),
@@ -648,6 +649,7 @@ def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> N
         "head_layers": int(payload["num_layers"]),
         "feature_source": str(payload.get("feature_source", disc.feature_source)),
         "transformer_layer": int(payload.get("transformer_layer", disc.transformer_layer)),
+        "use_chunk": bool(disc.use_chunk),
         "pi_p": payload.get("pi_p"),
         "loss_surrogate": payload.get("loss_surrogate"),
         "nn_correction": payload.get("nn_correction"),
