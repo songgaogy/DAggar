@@ -20,7 +20,7 @@
 #   DISC_VIZ_CAMERA   — camera to render for videos (default: agentview, else first policy cam).
 #   DISC_VIZ_IMAGE_SIZE — square resolution for discriminator HUD MP4 (default: 256).
 #   DISC_VIZ_BORDER   — red-border thickness on predicted-failure frames (default 10).
-#   GAE_LAMBDA        — λ for the GAE advantage overlaid on the TD advantage subplot (default 0.95).
+#   GAE_LAMBDA        — λ for the GAE advantage overlaid on the TD advantage subplot (default 0.6).
 #   VAST_SAMPLING_SEED — optional diagnostic k-sampling seed override.
 #   NO_FLIP_VERTICAL  — set to 1 to NOT flip rendered frames vertically.
 #   MAX_WINDOWS             — optional cap for quick smoke tests.
@@ -37,8 +37,8 @@ BRANCH_NAME="dipole_rl-vast"
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
 SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
-SPLIT="success"      # success or fail
-TARGET_PATH="tau0p7"
+SPLIT="fail"      # success or fail
+TARGET_PATH="tau0p7_en5"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
@@ -115,7 +115,8 @@ if [[ -n "${VAST_SAMPLING_SEED}" ]]; then
   EXTRA_ARGS+=(--vast-sampling-seed "${VAST_SAMPLING_SEED}")
 fi
 for SEED in "${SEEDS[@]}"; do
-  echo "\n[vis_vast] === running seed=${SEED} ==="
+  echo
+  echo "[vis_vast] === running seed=${SEED} ==="
   "${PY}" -m robosuite.pipeline.algorithms.vast.utils.vis_vast \
     --vast-ckpt "${VAST_CKPT}" \
     --output-root "${OUTPUT_DIR}" \

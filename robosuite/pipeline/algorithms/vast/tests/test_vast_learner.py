@@ -2,11 +2,10 @@
 
 No encoder or environment is constructed. Exercises:
     - `expectile_v_loss` at tau=0.5 reducing to 0.5·MSE.
-    - `VEnsemble` forward shape and the `V_lcb = mean - beta*std` reduction
-      (N=1 ⇒ std=0 ⇒ lcb==mean; N=2 ⇒ lcb below mean by beta*std).
+    - Independent V-ensemble mean readout and head-wise targets / optimizers.
     - One `VASTLearner.update` joint G/V step runs forward+backward
       without NaNs, moves V, and diversifies the heads (v_std_mean > 0).
-    - `_bootstrap_target` / `compute_td_advantage` use the soft-LCB value.
+    - `_bootstrap_target` / `compute_td_advantage` use paired heads and mean V.
     - `state_dict / load_state_dict` round-trip on a fresh learner.
     - `load_state_dict` rejects legacy Q-containing checkpoints and
       `v_ensemble_size` mismatches (old single-head v4).
@@ -50,14 +49,12 @@ def _make_cfg(
         vast_v_mode=(
             vast_v_mode
             if vast_v_mode is not None
-            else ("single_vast" if v_ensemble_size == 1 else "ensemble_lcb")
+            else ("single_vast" if v_ensemble_size == 1 else "indep_ensemble")
         ),
         action_horizon=action_horizon,
         discount=0.9,
         expectile_tau=0.7,
         v_ensemble_size=v_ensemble_size,
-        ensemble_lcb_beta=0.5,
-        ensemble_bootstrap_prob=0.5,
         v_lr=1e-3,
         target_polyak=0.1,
         n_step_aggregate=True,
@@ -196,11 +193,43 @@ def test_compute_td_advantage_matches_formula() -> None:
         batch.v_state_feature, batch.next_v_state_feature, batch.rewards, batch.dones
     )
     gamma_h = float(cfg.discount) ** int(cfg.action_horizon)
-    v_s = vast.v_lcb(batch.v_state_feature)
-    v_sp = vast.target_v_lcb(batch.next_v_state_feature)
+    v_s = vast.v_value(batch.v_state_feature)
+    v_sp = vast.target_v_value(batch.next_v_state_feature)
     expected = (batch.rewards + gamma_h * (1.0 - batch.dones) * v_sp - v_s).reshape(-1)
     assert adv.shape == (6,)
     assert torch.allclose(adv, expected, atol=1e-6)
+
+
+def test_independent_td_advantage_equals_mean_head_advantage() -> None:
+    cfg = _make_cfg(action_horizon=2, v_ensemble_size=3)
+    vast = _make_learner(cfg)
+    batch = _make_step_batch(B=6, H=2)
+    vast.update(batch)
+    gamma_h = float(cfg.discount) ** int(cfg.action_horizon)
+    current_heads = vast.v(batch.v_state_feature)
+    next_heads = vast.target_v(batch.next_v_state_feature)
+    expected_heads = (
+        batch.rewards
+        + gamma_h * (1.0 - batch.dones) * next_heads
+        - current_heads
+    )
+    actual = vast.compute_td_advantage(
+        batch.v_state_feature,
+        batch.next_v_state_feature,
+        batch.rewards,
+        batch.dones,
+    )
+    torch.testing.assert_close(actual, expected_heads.mean(dim=-1))
+
+
+def test_independent_update_does_not_sample_bootstrap_mask(monkeypatch) -> None:
+    vast = _make_learner(_make_cfg(v_ensemble_size=2))
+
+    def _unexpected_rand_like(*args, **kwargs):
+        raise AssertionError("indep_ensemble must use the full batch for every head")
+
+    monkeypatch.setattr(torch, "rand_like", _unexpected_rand_like)
+    vast.update(_make_step_batch(B=8))
 
 
 def test_vast_state_dict_roundtrip() -> None:
@@ -251,7 +280,7 @@ def test_vast_legacy_checkpoint_requires_new_warmup() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# V-ensemble + soft-LCB (§4 finalized method)                                 #
+# Independent V ensemble                                                      #
 # --------------------------------------------------------------------------- #
 
 
@@ -260,52 +289,74 @@ def test_v_ensemble_forward_shape() -> None:
     vast = _make_learner(cfg)
     out = vast.v(torch.randn(5, 12, device=DEVICE))
     assert out.shape == (5, 3), "VEnsemble.forward must return (B, N)"
-    assert vast.v_lcb(torch.randn(5, 12, device=DEVICE)).shape == (5, 1)
+    assert vast.v_value(torch.randn(5, 12, device=DEVICE)).shape == (5, 1)
+    assert len(vast.v_optims) == 3
+    assert vast.v_optim is None
 
 
-def test_v_lcb_single_head_reduces_to_mean() -> None:
-    # N=1 -> population std == 0 -> V_lcb == the single head (beta inert).
+def test_single_head_value_readout_is_unchanged() -> None:
     cfg = _make_cfg(v_ensemble_size=1)
     vast = _make_learner(cfg)
     vast.update(_make_step_batch(B=8))  # move off zero-init
     feat = torch.randn(6, 12, device=DEVICE)
-    assert torch.allclose(vast.v_lcb(feat), vast.v(feat), atol=1e-6)
+    assert torch.allclose(vast.v_value(feat), vast.v(feat), atol=1e-6)
+    assert vast.v_optim is not None
+    assert vast.v_optims == []
 
 
-def test_v_lcb_is_mean_minus_beta_std() -> None:
+def test_independent_ensemble_readout_is_head_mean() -> None:
     cfg = _make_cfg(v_ensemble_size=2)
     vast = _make_learner(cfg)
     vast.update(_make_step_batch(B=8))  # diverge the heads
     feat = torch.randn(7, 12, device=DEVICE)
     per_head = vast.v(feat)  # (B, 2)
     mean = per_head.mean(dim=-1, keepdim=True)
-    std = per_head.std(dim=-1, unbiased=False, keepdim=True)
-    expected = mean - float(cfg.ensemble_lcb_beta) * std
-    assert torch.allclose(vast.v_lcb(feat), expected, atol=1e-6)
+    assert torch.allclose(vast.v_value(feat), mean, atol=1e-6)
 
 
-def test_bootstrap_target_uses_lcb() -> None:
+def test_bootstrap_target_is_headwise() -> None:
     cfg = _make_cfg(v_ensemble_size=2)
     vast = _make_learner(cfg)
     batch = _make_step_batch(B=5)
     vast.update(batch)  # move target heads off zero-init
     target = vast._bootstrap_target(batch)
     gamma_h = float(cfg.discount) ** int(cfg.action_horizon)
-    v_next = vast.target_v_lcb(batch.next_v_state_feature)
+    v_next = vast.target_v(batch.next_v_state_feature)
     expected = batch.rewards + gamma_h * (1.0 - batch.dones) * v_next
-    assert target.shape == (5, 1)
+    assert target.shape == (5, 2)
     assert torch.allclose(target, expected, atol=1e-6)
 
 
 def test_update_diversifies_heads() -> None:
-    # Independent init + per-head bootstrap mask must drive the ensemble std
-    # away from 0 so the soft-LCB is not inert.
+    # Independent initialization and optimization must preserve disagreement.
     cfg = _make_cfg(v_ensemble_size=2)
     vast = _make_learner(cfg)
     last = 0.0
     for _ in range(40):
         last = vast.update(_make_step_batch(B=16))["v_std_mean"]
-    assert last > 0.0, "ensemble heads did not diverge (LCB std collapsed)"
+    assert last > 0.0, "independent ensemble heads did not diverge"
+
+
+def test_independent_heads_have_separate_optimizer_state() -> None:
+    vast = _make_learner(_make_cfg(v_ensemble_size=3))
+    assert len({id(optim) for optim in vast.v_optims}) == 3
+    parameter_ids = [
+        {id(parameter) for group in optim.param_groups for parameter in group["params"]}
+        for optim in vast.v_optims
+    ]
+    assert all(parameter_ids[i].isdisjoint(parameter_ids[j]) for i in range(3) for j in range(i))
+    vast.update(_make_step_batch(B=8))
+    assert all(optim.state for optim in vast.v_optims)
+
+
+def test_independent_ensemble_g_initialization_matches_single() -> None:
+    torch.manual_seed(1234)
+    single = _make_learner(_make_cfg(v_ensemble_size=1, vast_v_mode="single_vast"))
+    single_g = {key: value.detach().clone() for key, value in single.g.state_dict().items()}
+    torch.manual_seed(1234)
+    ensemble = _make_learner(_make_cfg(v_ensemble_size=3, vast_v_mode="indep_ensemble"))
+    for key, value in ensemble.g.state_dict().items():
+        torch.testing.assert_close(value, single_g[key], rtol=0.0, atol=0.0)
 
 
 def test_state_dict_records_ensemble_size_and_rejects_mismatch() -> None:
@@ -313,7 +364,18 @@ def test_state_dict_records_ensemble_size_and_rejects_mismatch() -> None:
     vast2 = _make_learner(cfg2)
     sd = vast2.state_dict()
     assert sd["v_ensemble_size"] == 2
+    assert sd["learner_schema_version"] == 8
+    assert len(sd["v_optims"]) == 2
     # A single-head learner must refuse an N=2 checkpoint before shape errors.
     vast1 = _make_learner(_make_cfg(v_ensemble_size=1))
     with pytest.raises(ValueError, match="v_ensemble_size mismatch"):
         vast1.load_state_dict(sd, strict=True)
+
+
+def test_legacy_ensemble_lcb_checkpoint_is_rejected() -> None:
+    vast = _make_learner(_make_cfg(v_ensemble_size=2))
+    legacy = dict(vast.state_dict())
+    legacy["learner_schema_version"] = 7
+    legacy["vast_v_mode"] = "ensemble_lcb"
+    with pytest.raises(ValueError, match="legacy ensemble_lcb"):
+        vast.load_state_dict(legacy, strict=True)

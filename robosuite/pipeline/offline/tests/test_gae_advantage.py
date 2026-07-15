@@ -13,10 +13,15 @@ isolation — no encoder, discriminator, buffer, or VAST learner. Covers:
 
 from __future__ import annotations
 
-import torch
-import pytest
+from types import SimpleNamespace
 
-from robosuite.pipeline.offline.utils.advantage import _gae_over_episodes
+import pytest
+import torch
+
+from robosuite.pipeline.offline.utils.advantage import (
+    OfflineAdvantageGProvider,
+    _gae_over_episodes,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -34,12 +39,12 @@ def _brute_gae(delta, done, starts, ep, horizon, coef):
     row = {int(s): i for i, s in enumerate(starts)}
     out = []
     for i in range(len(starts)):
-        acc = 0.0
+        acc = torch.zeros((), dtype=delta.dtype, device=delta.device)
         c = 1.0
         cur = i
         while True:
-            acc += c * float(delta[cur])
-            if float(done[cur]) > 0.5:
+            acc = acc + c * delta[cur]
+            if done[cur] > 0.5:
                 break
             nb = row.get(int(starts[cur]) + int(horizon))
             if nb is None or ep[nb] != ep[cur]:
@@ -47,7 +52,7 @@ def _brute_gae(delta, done, starts, ep, horizon, coef):
             c *= coef
             cur = nb
         out.append(acc)
-    return out
+    return torch.stack(out)
 
 
 def test_gae_closed_form_terminal_and_episode_boundary():
@@ -76,7 +81,32 @@ def test_gae_closed_form_terminal_and_episode_boundary():
     # A[18]=5 ; A[16]=4+0.3*5=5.5 ; A[14]=3 (successor 16 is ep1 -> excluded)
     # A[12]=2+0.3*3=2.9 ; A[10]=1+0.3*2.9=1.87
     expected = torch.tensor([1.87, 2.9, 3.0, 5.5, 5.0], device=DEVICE)
+    assert adv.device.type == "cuda"
     assert torch.allclose(adv, expected, atol=1e-6), adv
+
+
+def test_gae_missing_horizon_successor_does_not_recurse():
+    # With H=2, start=0 would recurse only through a start=2 row. A later row at
+    # start=3 must not be treated as a successor even though it is in the same
+    # episode.
+    starts = [0, 1, 3]
+    delta = torch.tensor([1.0, 2.0, 100.0], device=DEVICE)
+    done = torch.zeros(3, device=DEVICE)
+
+    adv = _gae_over_episodes(
+        delta=delta,
+        done=done,
+        valid_starts=starts,
+        episode_indices=[0, 0, 0],
+        start_to_row={s: i for i, s in enumerate(starts)},
+        horizon=2,
+        gamma_h=0.9,
+        lam=0.8,
+    )
+
+    assert adv.device.type == "cuda"
+    expected = torch.tensor([1.0, 74.0, 100.0], device=DEVICE)
+    assert torch.allclose(adv, expected, atol=1e-7), adv
 
 
 def test_gae_matches_brute_force_random_scenario():
@@ -112,9 +142,7 @@ def test_gae_matches_brute_force_random_scenario():
         gamma_h=gamma_h,
         lam=lam,
     )
-    ref = torch.tensor(
-        _brute_gae(delta, done, starts, ep, horizon, coef), device=DEVICE
-    )
+    ref = _brute_gae(delta, done_list, starts, ep, horizon, coef)
     assert torch.allclose(adv, ref, atol=1e-5), (adv - ref).abs().max()
 
 
@@ -134,3 +162,28 @@ def test_gae_lambda_zero_recovers_one_step_delta():
         lam=0.0,
     )
     assert torch.allclose(adv, delta, atol=1e-7), adv
+
+
+def test_offline_advantage_provider_cuda_cache_lookup_stays_on_cuda():
+    provider = OfflineAdvantageGProvider(
+        vast_learner=None,
+        discriminator=None,
+        encoder=None,
+        alpha=2.0,
+        beta=0.25,
+        advantage_raw=torch.tensor([1.0, -2.0, 3.0], device=DEVICE),
+        failure_raw=torch.tensor([0.5, 4.0, 1.0], device=DEVICE),
+        start_to_row={10: 0, 20: 1, 30: 2},
+    )
+    batch = SimpleNamespace(
+        metadata={"start_indices": [30, 10]},
+        action_sequences_raw=torch.empty(2, 1, 1, device=DEVICE),
+    )
+
+    g = provider.compute_g_for_batch(batch)
+
+    assert provider._advantage_raw.device.type == "cuda"
+    assert provider._failure_raw.device.type == "cuda"
+    assert g.device.type == "cuda"
+    expected = torch.tensor([5.75, 1.875], device=DEVICE)
+    assert torch.allclose(g, expected, atol=1e-7), g

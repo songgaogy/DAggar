@@ -42,22 +42,16 @@ class VASTConfig:
     # spans ``action_horizon`` environment transitions and discounts by
     # gamma ** action_horizon. The sampling seed owns only k/j sampling; the
     # replay start-index RNG remains unchanged for reproducibility.
-    vast_v_mode: str = "single_vast"  # single_vast | ensemble_lcb
+    vast_v_mode: str = "single_vast"  # single_vast | indep_ensemble
     vast_max_k: int = 10
     vast_comp_coef: float = 0.5
     vast_sampling_seed: int = 0
     g_lr: float = 3e-4
 
-    # V-ensemble soft-LCB (deadly-triad guardrail): V_lcb = mean_k V_k - beta *
-    # std_k V_k over ``v_ensemble_size`` independent heads. Soft LCB (not hard
-    # min) so the recoverable-state lift in the high-disagreement region is
-    # kept, not suppressed. Heads are diversified by a per-head Bernoulli
-    # bootstrap mask (keep-prob ``ensemble_bootstrap_prob``) so the std does not
-    # collapse. v_ensemble_size == 1 recovers the single-head V (std == 0, beta
-    # and bootstrap mask inert).
+    # Independent V ensemble. Each head uses the full batch, its own target
+    # head, optimizer, and gradient clipping. Scalar V reads use the head mean;
+    # disagreement is diagnostic only.
     v_ensemble_size: int = 2
-    ensemble_lcb_beta: float = 0.5
-    ensemble_bootstrap_prob: float = 0.5
 
     v_lr: float = 3e-4
     target_polyak: float = 0.005
@@ -87,9 +81,14 @@ class VASTConfig:
 
     def __post_init__(self) -> None:
         self.vast_v_mode = str(self.vast_v_mode).strip().lower()
-        if self.vast_v_mode not in {"single_vast", "ensemble_lcb"}:
+        if self.vast_v_mode == "ensemble_lcb":
             raise ValueError(
-                "VASTConfig.vast_v_mode must be 'single_vast' or 'ensemble_lcb', "
+                "VASTConfig.vast_v_mode='ensemble_lcb' was removed; use "
+                "'indep_ensemble' and re-run VAST warmup."
+            )
+        if self.vast_v_mode not in {"single_vast", "indep_ensemble"}:
+            raise ValueError(
+                "VASTConfig.vast_v_mode must be 'single_vast' or 'indep_ensemble', "
                 f"got {self.vast_v_mode!r}."
             )
         self.action_horizon = int(self.action_horizon)
@@ -119,17 +118,6 @@ class VASTConfig:
         if self.v_ensemble_size < 1:
             raise ValueError(
                 f"VASTConfig.v_ensemble_size must be >= 1, got {self.v_ensemble_size}."
-            )
-        self.ensemble_lcb_beta = float(self.ensemble_lcb_beta)
-        if self.ensemble_lcb_beta < 0.0:
-            raise ValueError(
-                f"VASTConfig.ensemble_lcb_beta must be >= 0, got {self.ensemble_lcb_beta}."
-            )
-        self.ensemble_bootstrap_prob = float(self.ensemble_bootstrap_prob)
-        if not 0.0 < self.ensemble_bootstrap_prob <= 1.0:
-            raise ValueError(
-                "VASTConfig.ensemble_bootstrap_prob must be in (0, 1], got "
-                f"{self.ensemble_bootstrap_prob}."
             )
         self.expectile_tau = float(self.expectile_tau)
         if not 0.0 < self.expectile_tau < 1.0:

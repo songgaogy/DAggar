@@ -14,7 +14,8 @@ STATUS: the online ``compute_g_for_batch`` is a stub. Computing the TD residual
 requires the next state ``s'`` and the chunk reward ``r`` for each sampled
 window, which the online :class:`DipoleBatch` does not currently carry (the
 offline path precomputes the residual by start index instead — see
-``offline/utils/advantage.py``). Wiring next-state/reward through the online
+``offline/utils/advantage.py``, which can accumulate GAE from those residuals).
+Wiring next-state/reward through the online
 sampler is deferred; until then this provider raises ``NotImplementedError``.
 
 This object owns nothing it doesn't construct: the VAST learner, the
@@ -79,7 +80,7 @@ class AdvantageGProvider:
             "Online AdvantageGProvider.compute_g_for_batch is not implemented for "
             "the VAST TD1 fallback: the online DipoleBatch carries no next state "
             "or chunk reward. Use the offline OfflineAdvantageGProvider (precomputed "
-            "TD advantage), or thread next_obs/reward through the online sampler "
+            "TD1/GAE advantage), or thread next_obs/reward through the online sampler "
             "before enabling g_mode='advantage' online."
         )
 

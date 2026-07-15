@@ -14,12 +14,11 @@ finetuned critics to ``<run_dir>/checkpoints/vast_state_finetuned.pt``.
 ``is_intervention`` into three routed streams (see ``offline/utils/episode_dataset``):
 policy sections (advantage-weighted, ``route="advantage"``), human sections
 (``route="pos_only"`` → positive branch), and the policy action during
-intervention (``route="neg_only"`` → negative branch). Precompute one fixed-seed
-stitched advantage ``A = G(s,s_k,k) + gamma^(kH)V_target(s_k) - V(s)`` per policy
-window, with TD1 fallback at short trajectory tails, then train the two flow
-policies with the existing routed branch-weight policy.
+intervention (``route="neg_only"`` → negative branch). Precompute chunk-MDP
+GAE from the frozen VAST ``V/target_V`` values, then train the two flow policies
+with the existing routed branch-weight policy. TD1 remains an explicit ablation.
 
-Run dir: ``./data/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorboard.
+Run dir: ``./outputs/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorboard.
 
     python -m robosuite.pipeline.offline.src.train_offline_dipole \\
         env.environment=PickPlaceCereal \\
@@ -65,7 +64,7 @@ from robosuite.pipeline.offline.utils import (
     load_pretrain_transitions,
     make_hdf5_loader,
     populate_replay_buffer,
-    precompute_vast_offline_advantage,
+    precompute_offline_advantage,
     save_finetuned_vast,
     validate_vast_checkpoint_payload,
 )
@@ -201,9 +200,51 @@ def _as_bool(value: Any) -> bool:
     return text in ("1", "true", "yes", "y", "on")
 
 
+def _resolve_advantage_config(cfg: DictConfig) -> tuple[str, float]:
+    estimator = str(
+        OmegaConf.select(cfg, "offline.advantage.estimator", default="gae")
+    ).lower()
+    if estimator not in {"gae", "td1"}:
+        raise ValueError(
+            "offline.advantage.estimator must be 'gae' or 'td1', "
+            f"got {estimator!r}."
+        )
+    gae_lambda = float(
+        OmegaConf.select(cfg, "offline.advantage.gae_lambda", default=0.6)
+    )
+    return estimator, gae_lambda
+
+
+def _precompute_phase_b_advantage(
+    *,
+    base_buffer: Any,
+    vast_learner: VASTLearner,
+    encoder: SharedDynamicsEncoder,
+    discriminator: FrozenNNPUDiscriminator,
+    vast_cfg: VASTConfig,
+    device: str,
+    encode_batch_size: int,
+    estimator: str,
+    gae_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[int, int]]:
+    """Dispatch Phase B to VAST-value TD1/GAE, never stitched advantage."""
+    return precompute_offline_advantage(
+        base_buffer=base_buffer,
+        vast_learner=vast_learner,
+        encoder=encoder,
+        discriminator=discriminator,
+        vast_cfg=vast_cfg,
+        device=device,
+        encode_batch_size=encode_batch_size,
+        estimator=estimator,
+        gae_lambda=gae_lambda,
+    )
+
+
 @hydra.main(version_base="1.2", config_path="../../config", config_name="train_offline_dipole")
 def main(cfg: DictConfig) -> None:
     torch.set_float32_matmul_precision("high")
+    adv_estimator, adv_gae_lambda = _resolve_advantage_config(cfg)
 
     # ------------------------------------------------------------------ #
     # Shared setup: env (headless) + DIPOLE agent + frozen encoder/disc. #
@@ -284,16 +325,13 @@ def main(cfg: DictConfig) -> None:
     warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
     # Align the value-semantics config with the loaded checkpoint so Phase-A
     # finetune continues in the exact regime the warmup established, and the
-    # frozen-critic advantage read-out uses the same soft-LCB beta the value was
-    # trained with (ensemble_lcb_beta directly scales V_lcb, hence the advantage).
+    # frozen-critic advantage read-out uses the same value semantics.
     # Structural fields (v_ensemble_size, projector dims) are asserted separately
     # by VASTLearner.load_state_dict, which raises loudly on any mismatch.
     for field in (
         "output_reward_coef",
         "disc_reward_coef",
         "expectile_tau",
-        "ensemble_lcb_beta",
-        "ensemble_bootstrap_prob",
         "discount",
     ):
         src = warmup_cfg if field in warmup_cfg else (warmup_meta if field in warmup_meta else None)
@@ -415,7 +453,11 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Run directory + logging.                                           #
     # ------------------------------------------------------------------ #
-    run_root = Path(to_absolute_path(str(OmegaConf.select(cfg, "offline.run_root", default="./data/dipole-rl-offline"))))
+    run_root = Path(
+        to_absolute_path(
+            str(OmegaConf.select(cfg, "offline.run_root", default="./outputs/dipole-rl-offline"))
+        )
+    )
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     postfix = str(OmegaConf.select(cfg, "offline.run_subfix", default="") or "").strip()
     dir_name = f"{task_name}_{timestamp}_{postfix}" if postfix else f"{task_name}_{timestamp}"
@@ -443,9 +485,10 @@ def main(cfg: DictConfig) -> None:
             nnpu_ckpt=nnpu_ckpt,
             extra_meta={"migrated_from_checkpoint": str(vast_finetuned_override)},
         )
+        normalized_schema = 8 if vast_cfg.vast_v_mode == "indep_ensemble" else 7
         print(
             "[offline][vast] skip_rl=true; normalized finetuned VAST checkpoint "
-            f"to schema v7 at {vast_ckpt_path}"
+            f"to schema v{normalized_schema} at {vast_ckpt_path}"
         )
     else:
         vast_buffer, vast_buffer_stats = build_vast_finetune_buffer(
@@ -507,8 +550,7 @@ def main(cfg: DictConfig) -> None:
         norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
-    adv_gae_lambda = float(OmegaConf.select(cfg, "offline.advantage.gae_lambda", default=0.6))
-    advantage_raw, failure_raw, start_to_row, vast_diagnostics = precompute_vast_offline_advantage(
+    advantage_raw, failure_raw, start_to_row = _precompute_phase_b_advantage(
         base_buffer=agent.online_buffer,
         vast_learner=vast_learner,
         encoder=shared_encoder,
@@ -516,13 +558,33 @@ def main(cfg: DictConfig) -> None:
         vast_cfg=vast_cfg,
         device=rl_device,
         encode_batch_size=int(OmegaConf.select(cfg, "offline.preencode_batch_size", default=64)),
+        estimator=adv_estimator,
         gae_lambda=adv_gae_lambda,
     )
+    gamma_h = float(vast_cfg.discount) ** H
+    advantage_mean = float(advantage_raw.mean().item())
+    advantage_std = (
+        float(advantage_raw.std().item()) if advantage_raw.numel() > 1 else 0.0
+    )
+    failure_mean = float(failure_raw.mean().item())
     print(
-        "[offline] advantage estimator=vast_stitched "
-        f"(K={vast_cfg.vast_max_k}, seed={vast_cfg.vast_sampling_seed}, "
-        f"td1_fallback={100.0 * vast_diagnostics.fallback_fraction:.2f}%, "
-        f"diagnostic_gae_lambda={adv_gae_lambda})"
+        f"[offline] advantage estimator={adv_estimator} gamma^H={gamma_h:.6f}"
+        + (f" lambda={adv_gae_lambda}" if adv_estimator == "gae" else "")
+        + f" mean={advantage_mean:+.4f} std={advantage_std:.4f}"
+    )
+    maybe_log(
+        metric_logger,
+        {
+            "offline_advantage/is_gae": float(adv_estimator == "gae"),
+            "offline_advantage/mean": advantage_mean,
+            "offline_advantage/std": advantage_std,
+            "offline_advantage/failure_mean": failure_mean,
+            "offline_advantage/gamma_h": gamma_h,
+            "offline_advantage/gae_lambda": (
+                adv_gae_lambda if adv_estimator == "gae" else 0.0
+            ),
+        },
+        step=0,
     )
     provider = OfflineAdvantageGProvider(
         vast_learner=vast_learner,
@@ -583,13 +645,20 @@ def main(cfg: DictConfig) -> None:
             "skip_rl": bool(skip_rl),
             "warmup_transitions_path": warmup_transitions_path,
             "algorithm": "vast_value_stitching_adaptation",
-            "g_mode": "advantage_offline_vast_stitched",
+            "g_mode": f"advantage_offline_{adv_estimator}",
+            "advantage_estimator": adv_estimator,
+            "advantage_gae_lambda": (
+                adv_gae_lambda if adv_estimator == "gae" else None
+            ),
+            "advantage_gamma_h": gamma_h,
+            "advantage_mean": advantage_mean,
+            "advantage_std": advantage_std,
+            "failure_mean": failure_mean,
             "vast_v_mode": str(vast_cfg.vast_v_mode),
             "vast_max_k": int(vast_cfg.vast_max_k),
             "vast_macro_horizon": int(H),
             "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
             "vast_comp_coef": float(vast_cfg.vast_comp_coef),
-            "vast_td1_fallback_fraction": vast_diagnostics.fallback_fraction,
             "stream_stats": streams.stats,
             "vast_buffer_stats": vast_buffer_stats,
             "replay_valid_windows": int(n_valid),

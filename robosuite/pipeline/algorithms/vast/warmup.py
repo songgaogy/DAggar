@@ -867,9 +867,7 @@ def main(cfg: DictConfig) -> None:
                 "data/freeze_post_success": float(freeze_post_success),
                 "vast/discount": float(vast_cfg.discount),
                 "vast/expectile_tau": float(vast_cfg.expectile_tau),
-                "vast/v_ensemble_size": float(vast_cfg.v_ensemble_size),
-                "vast/ensemble_lcb_beta": float(vast_cfg.ensemble_lcb_beta),
-                "vast/ensemble_bootstrap_prob": float(vast_cfg.ensemble_bootstrap_prob),
+                "vast/v_ensemble_size": float(vast.ensemble_size),
                 "vast/v_lr": float(vast_cfg.v_lr),
                 "vast/target_polyak": float(vast_cfg.target_polyak),
                 "vast/grad_clip_norm": float(vast_cfg.grad_clip_norm),
@@ -1000,9 +998,11 @@ def main(cfg: DictConfig) -> None:
             "state_proj_dim": int(vast_cfg.state_proj_dim),
             "proprio_proj_dim": int(vast_cfg.proprio_proj_dim),
             "proj_activation": str(vast_cfg.proj_activation),
-            "v_ensemble_size": int(vast_cfg.v_ensemble_size),
-            "ensemble_lcb_beta": float(vast_cfg.ensemble_lcb_beta),
+            "v_ensemble_size": int(vast.ensemble_size),
             "expectile_tau": float(vast_cfg.expectile_tau),
+            "ensemble_method": (
+                "independent_v_mean" if vast_cfg.vast_v_mode == "indep_ensemble" else None
+            ),
             "algorithm": "vast_value_stitching_adaptation",
             "vast_v_mode": str(vast_cfg.vast_v_mode),
             "vast_max_k": int(vast_cfg.vast_max_k),
@@ -1010,7 +1010,7 @@ def main(cfg: DictConfig) -> None:
             "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
             "action_horizon": int(vast_cfg.action_horizon),
         },
-        "schema_version": 7,
+        "schema_version": 8 if vast_cfg.vast_v_mode == "indep_ensemble" else 7,
         "algorithm": "vast_value_stitching_adaptation",
     }
     torch.save(payload, output_path)

@@ -22,7 +22,7 @@ algorithm:
   vast:
     enabled: true
     config:
-      vast_v_mode: "single_vast"  # single_vast | ensemble_lcb
+      vast_v_mode: "single_vast"  # single_vast | indep_ensemble
       vast_max_k: 10               # macro chunks; one chunk is action_horizon steps
       vast_comp_coef: 0.5
       vast_sampling_seed: ${seed}
@@ -30,10 +30,8 @@ algorithm:
       action_horizon: ${algorithm.flow.action_horizon}
       discount: 0.99
       expectile_tau: 0.9
-      # The ensemble fields are used only when vast_v_mode=ensemble_lcb.
+      # The ensemble size is used only when vast_v_mode=indep_ensemble.
       v_ensemble_size: 5
-      ensemble_lcb_beta: 0.5
-      ensemble_bootstrap_prob: 0.5
       g_lr: 1.0e-4
       v_lr: 1.0e-4
       target_polyak: 0.005

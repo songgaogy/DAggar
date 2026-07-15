@@ -22,32 +22,13 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 ENVIRONMENT="${ENVIRONMENT:-PickPlaceCereal}"
 SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
-SPLIT="${SPLIT:-fail}"      # success or fail or online
-VAST_CKPT_EXPLICIT=0
-if [[ -n "${VAST_CKPT:-}" || -n "${IQL_CKPT:-}" ]]; then
-  VAST_CKPT_EXPLICIT=1
-fi
-if [[ -n "${VAST_CKPT:-}" && -n "${IQL_CKPT:-}" ]]; then
-  echo "[ERROR] Set only VAST_CKPT; IQL_CKPT is a deprecated alias." >&2
-  exit 1
-fi
-if [[ -n "${IQL_CKPT:-}" ]]; then
-  echo "[WARN] IQL_CKPT is deprecated; use VAST_CKPT." >&2
-  VAST_CKPT="${IQL_CKPT}"
-fi
-VAST_CKPT="${VAST_CKPT:-outputs/dipole-rl-offline/latest/checkpoints/vast_state_finetuned.pt}"
-if [[ "${VAST_CKPT_EXPLICIT}" == "0" && ! -f "${VAST_CKPT}" ]]; then
-  LEGACY_CKPT="outputs/dipole-rl-offline/latest/checkpoints/iql_state_finetuned.pt"
-  if [[ -f "${LEGACY_CKPT}" ]]; then
-    echo "[WARN] Loading deprecated checkpoint ${LEGACY_CKPT}." >&2
-    VAST_CKPT="${LEGACY_CKPT}"
-  fi
-fi
+SPLIT="success"      # success or fail or online
+VAST_CKPT="outputs/dipole-rl-offline_vast/PickPlaceCereal_20260714_234032_vast-indep_ensemble_beta5_k-1_tau0p7/checkpoints/vast_state_finetuned.pt"
 NNPU_CKPT="${NNPU_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
 # -------------------------------------
 
@@ -106,6 +87,7 @@ echo "[vis_vast_finetuned] device=${DEVICE}"
 echo "[vis_vast_finetuned] gae_lambda=${GAE_LAMBDA}"
 
 for SEED in "${SEEDS[@]}"; do
+  echo
   echo "[vis_vast_finetuned] === running seed=${SEED} ==="
   "${PY}" -m robosuite.pipeline.offline.utils.vis_vast_finetuned \
     --vast-ckpt "${VAST_CKPT}" \

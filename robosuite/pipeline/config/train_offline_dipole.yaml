@@ -27,13 +27,13 @@ offline:
 
   # Phase B policy-update budget.
   num_train_steps: 15000
-  log_interval: 200
+  log_interval: 500
   plot_log_interval: null
   checkpoint_interval: 5000
   preencode_batch_size: 64
 
   # Result saving: ./outputs/dipole-rl-offline/<task>_<timestamp>_<postfix>.
-  run_root: "./outputs/dipole-rl-offline"
+  run_root: "./outputs/dipole-rl-offline_vast"
   run_subfix: ""
 
   # Phase A joint VAST G+V finetune (continues from warmup_ckpt).
@@ -44,10 +44,9 @@ offline:
     batch_size: 256
     preencode_cache: true
 
-  # TD1/GAE remain diagnostics. Phase B uses stitched advantage and falls back
-  # to TD1 only when fewer than two future macro chunks remain.
+  # Phase-B advantage read-out from the frozen VAST V/target-V values.
   advantage:
-    estimator: "vast_stitched"  # vast_stitched
+    estimator: "gae"  # gae | td1
     gae_lambda: 0.6
 
   # Pluggable branch-weight policy (offline/utils/branch_weights.py).

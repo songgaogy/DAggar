@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from robosuite.pipeline.algorithms.dipole.replay_buffer import DipoleReplayBuffer
@@ -70,14 +71,18 @@ def test_static_cache_matches_replay_sample_without_augmentation() -> None:
     assert torch.equal(cached.is_intervention, live.is_intervention)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Offline advantage cache lookup requires CUDA.",
+)
 def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
     buffer = _make_buffer()
     cache = buffer.build_static_cache(pin_memory=False)
     with buffer._lock:  # noqa: SLF001 - test verifies provider's start-index contract.
         valid_starts = list(buffer._get_valid_start_indices_locked())  # noqa: SLF001
     start_to_row = {int(start): row for row, start in enumerate(valid_starts)}
-    advantage_raw = torch.arange(len(valid_starts), dtype=torch.float32)
-    failure_raw = torch.zeros(len(valid_starts), dtype=torch.float32)
+    advantage_raw = torch.arange(len(valid_starts), dtype=torch.float32, device="cuda")
+    failure_raw = torch.zeros(len(valid_starts), dtype=torch.float32, device="cuda")
     provider = OfflineAdvantageGProvider(
         vast_learner=None,
         discriminator=None,
@@ -90,11 +95,12 @@ def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
     )
 
     np.random.seed(7)
-    batch = cache.sample(5, device="cpu", augment=False)
+    batch = cache.sample(5, device="cuda", augment=False)
     g = provider.compute_g_for_batch(batch)
     expected = torch.tensor(
         [2.0 * float(start_to_row[int(start)]) for start in batch.metadata["start_indices"]],
         dtype=torch.float32,
+        device="cuda",
     )
 
     torch.testing.assert_close(g, expected)

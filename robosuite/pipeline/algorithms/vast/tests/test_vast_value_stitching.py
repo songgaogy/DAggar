@@ -113,14 +113,14 @@ def test_stitched_advantage_uses_macro_discount_and_done_mask() -> None:
         g
         + discount
         * (1.0 - batch.future_dones)
-        * learner.target_v_lcb(batch.future_v_state_feature)
-        - learner.v_lcb(batch.v_state_feature)
+        * learner.target_v_value(batch.future_v_state_feature)
+        - learner.v_value(batch.v_state_feature)
     ).reshape(-1)
     torch.testing.assert_close(advantage, expected)
 
 
-def test_ensemble_lcb_vast_mode_preserves_configured_ensemble() -> None:
-    learner = _learner(_cfg(vast_v_mode="ensemble_lcb", v_ensemble_size=3))
+def test_indep_ensemble_vast_mode_preserves_configured_ensemble() -> None:
+    learner = _learner(_cfg(vast_v_mode="indep_ensemble", v_ensemble_size=3))
     assert learner.ensemble_size == 3
     assert learner.v(torch.randn(5, 12, device=DEVICE)).shape == (5, 3)
 

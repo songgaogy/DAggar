@@ -2,8 +2,9 @@
 
 The learner jointly trains the goal-conditioned macro-return model
 ``G(s, s_k, k)`` and an expectile value model. The shared dynamics encoder is
-injected and remains frozen. ``single_vast`` uses one V head, while
-``ensemble_lcb`` preserves the configurable soft-LCB ensemble ablation.
+injected and remains frozen. ``single_vast`` uses the unchanged single-head
+path, while ``indep_ensemble`` trains independent V / target-V pairs and reads
+their mean value.
 """
 
 from __future__ import annotations
@@ -37,9 +38,9 @@ class VASTLearner:
             From ``encoder.proprio_emb_dim``.
 
     V is a :class:`VEnsemble` of ``cfg.v_ensemble_size`` independent heads, each
-    owning its own state projector (so ``target_v`` Polyak-tracks the projectors
-    with the heads). The scalar value consumed everywhere is the soft-LCB
-    ``V_lcb = mean_k − β·std_k`` (:meth:`v_lcb` / :meth:`target_v_lcb`).
+    owning its own projector, target head, optimizer, and gradient clipping.
+    The scalar value consumed everywhere is the head mean; ensemble spread is
+    retained only as a diagnostic.
     """
 
     def __init__(
@@ -74,12 +75,11 @@ class VASTLearner:
         self.ensemble_size = (
             1 if self.vast_v_mode == "single_vast" else int(cfg.v_ensemble_size)
         )
-        self.lcb_beta = float(cfg.ensemble_lcb_beta)
         activation = str(cfg.proj_activation)
 
-        def _build_ensemble() -> VEnsemble:
+        def _build_ensemble(ensemble_size: int) -> VEnsemble:
             return VEnsemble(
-                ensemble_size=self.ensemble_size,
+                ensemble_size=ensemble_size,
                 state_feature_dim=self.state_feature_dim,
                 n_tokens=self.n_tokens,
                 proprio_dim=self.proprio_dim,
@@ -89,17 +89,45 @@ class VASTLearner:
                 activation=activation,
             ).to(device)
 
-        self.v: nn.Module = _build_ensemble()
-        self.target_v: nn.Module = _build_ensemble()
+        if self.vast_v_mode == "indep_ensemble":
+            # Preserve the single_vast G initialization for matched-seed
+            # ablations. V modules initialize on CPU before they move to CUDA,
+            # so only the CPU RNG stream must be advanced as a single-head pair.
+            initial_rng_state = torch.random.get_rng_state()
+            with torch.random.fork_rng(devices=[]):
+                torch.random.set_rng_state(initial_rng_state)
+                _build_ensemble(1)
+                _build_ensemble(1)
+                single_v_g_rng_state = torch.random.get_rng_state()
+        else:
+            single_v_g_rng_state = None
+
+        self.v: VEnsemble = _build_ensemble(self.ensemble_size)
+        self.target_v: VEnsemble = _build_ensemble(self.ensemble_size)
         self.target_v.load_state_dict(self.v.state_dict())
         for p in self.target_v.parameters():
             p.requires_grad_(False)
 
-        self.v_optim: torch.optim.Optimizer = torch.optim.AdamW(
-            self.v.parameters(),
-            lr=float(cfg.v_lr),
-            weight_decay=float(cfg.weight_decay),
-        )
+        self.v_optims: list[torch.optim.Optimizer] = []
+        if self.vast_v_mode == "single_vast":
+            self.v_optim: torch.optim.Optimizer | None = torch.optim.AdamW(
+                self.v.parameters(),
+                lr=float(cfg.v_lr),
+                weight_decay=float(cfg.weight_decay),
+            )
+        else:
+            self.v_optim = None
+            self.v_optims = [
+                torch.optim.AdamW(
+                    head.parameters(),
+                    lr=float(cfg.v_lr),
+                    weight_decay=float(cfg.weight_decay),
+                )
+                for head in self.v.heads
+            ]
+
+        if single_v_g_rng_state is not None:
+            torch.random.set_rng_state(single_v_g_rng_state)
 
         self.g: nn.Module = GoalConditionedValueNetwork(
             state_feature_dim=self.state_feature_dim,
@@ -120,23 +148,18 @@ class VASTLearner:
     # Internals                                                            #
     # ------------------------------------------------------------------ #
 
-    def _lcb(self, per_head: torch.Tensor) -> torch.Tensor:
-        """Soft-LCB reduction ``mean_k − β·std_k`` over the head axis.
+    @staticmethod
+    def _head_mean(per_head: torch.Tensor) -> torch.Tensor:
+        """Reduce per-head values ``(B, N)`` to their mean ``(B, 1)``."""
+        return per_head.mean(dim=-1, keepdim=True)
 
-        ``per_head`` is (B, N); returns (B, 1). Population std (unbiased=False)
-        so N==1 gives std==0 (β inert), matching the single-head V exactly.
-        """
-        mean = per_head.mean(dim=-1, keepdim=True)
-        std = per_head.std(dim=-1, unbiased=False, keepdim=True)
-        return mean - self.lcb_beta * std
+    def v_value(self, state_feature: torch.Tensor) -> torch.Tensor:
+        """Online scalar V: single head or independent-ensemble mean."""
+        return self._head_mean(self.v(state_feature))
 
-    def v_lcb(self, state_feature: torch.Tensor) -> torch.Tensor:
-        """Online-ensemble soft-LCB value ``V_lcb(s)`` -> (B, 1)."""
-        return self._lcb(self.v(state_feature))
-
-    def target_v_lcb(self, state_feature: torch.Tensor) -> torch.Tensor:
-        """Target-ensemble soft-LCB value -> (B, 1)."""
-        return self._lcb(self.target_v(state_feature))
+    def target_v_value(self, state_feature: torch.Tensor) -> torch.Tensor:
+        """Target scalar V: single head or independent-ensemble mean."""
+        return self._head_mean(self.target_v(state_feature))
 
     def g_value(
         self,
@@ -148,21 +171,23 @@ class VASTLearner:
         return self.g(state_feature, future_state_feature, k)
 
     def _bootstrap_target(self, step_batch: VASTStepBatch) -> torch.Tensor:
-        """Bellman target r + γ^H · (1 - done) · V_lcb_target(s')  -> (B, 1).
-
-        Shared across heads (each head regresses onto the same LCB target).
-        """
+        """Bellman targets for single V ``(B,1)`` or independent heads ``(B,N)``."""
         bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
         with torch.no_grad():
-            v_next = self.target_v_lcb(step_batch.next_v_state_feature)
+            v_next = self.target_v(step_batch.next_v_state_feature)
             target = step_batch.rewards + bootstrap_discount * (1.0 - step_batch.dones) * v_next
         return target
 
     @torch.no_grad()
     def _polyak_update(self) -> None:
         tau_p = float(self.cfg.target_polyak)
-        for tgt, src in zip(self.target_v.parameters(), self.v.parameters()):
-            tgt.data.mul_(1.0 - tau_p).add_(src.data, alpha=tau_p)
+        if self.vast_v_mode == "single_vast":
+            for tgt, src in zip(self.target_v.parameters(), self.v.parameters()):
+                tgt.data.mul_(1.0 - tau_p).add_(src.data, alpha=tau_p)
+            return
+        for target_head, online_head in zip(self.target_v.heads, self.v.heads):
+            for tgt, src in zip(target_head.parameters(), online_head.parameters()):
+                tgt.data.mul_(1.0 - tau_p).add_(src.data, alpha=tau_p)
 
     # ------------------------------------------------------------------ #
     # Training                                                            #
@@ -172,8 +197,8 @@ class VASTLearner:
         """Run one joint VAST G/V update and Polyak-update target V.
 
         G uses Monte-Carlo and composition losses. V uses expectile regression
-        against the detached stitched target. Ensemble mode additionally uses
-        the configured bootstrap mask and soft-LCB reduction.
+        against detached stitched targets. Independent ensemble heads use the
+        full batch and their paired target heads.
         """
         return self._update_vast(step_batch)
 
@@ -198,7 +223,7 @@ class VASTLearner:
             )
 
     def _vast_stitched_target(self, step_batch: VASTStepBatch) -> torch.Tensor:
-        """Detached ``G(s,s_k,k) + gamma^(kH)(1-done)V_target(s_k)``."""
+        """Detached stitched targets: ``(B,1)`` single or ``(B,N)`` ensemble."""
         self._require_vast_batch(step_batch)
         assert step_batch.future_v_state_feature is not None
         assert step_batch.k is not None
@@ -209,7 +234,7 @@ class VASTLearner:
                 step_batch.future_v_state_feature,
                 step_batch.k,
             )
-            v_future = self.target_v_lcb(step_batch.future_v_state_feature)
+            v_future = self.target_v(step_batch.future_v_state_feature)
             discount = torch.pow(
                 torch.full_like(g_tk, float(self.cfg.discount)),
                 step_batch.k.reshape_as(g_tk).to(g_tk.dtype)
@@ -257,21 +282,6 @@ class VASTLearner:
         # Build the detached target before stepping G so G and V are updated
         # from one coherent parameter snapshot.
         stitched_target = self._vast_stitched_target(step_batch)
-        v_all = self.v(step_batch.v_state_feature)
-        diff = stitched_target - v_all
-        if self.ensemble_size > 1:
-            bootstrap_mask = (
-                torch.rand_like(v_all) < float(self.cfg.ensemble_bootstrap_prob)
-            ).to(v_all.dtype)
-            if float(bootstrap_mask.sum().item()) == 0.0:
-                bootstrap_mask = torch.ones_like(v_all)
-        else:
-            bootstrap_mask = None
-        v_loss = expectile_v_loss(
-            diff,
-            float(self.cfg.expectile_tau),
-            weights=bootstrap_mask,
-        )
 
         self.g_optim.zero_grad(set_to_none=True)
         if bool(mask.bool().any().item()):
@@ -279,16 +289,45 @@ class VASTLearner:
             torch.nn.utils.clip_grad_norm_(self.g.parameters(), float(self.cfg.grad_clip_norm))
             self.g_optim.step()
 
-        self.v_optim.zero_grad(set_to_none=True)
-        v_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.v.parameters(), float(self.cfg.grad_clip_norm))
-        self.v_optim.step()
+        v_head_losses: list[torch.Tensor] = []
+        v_predictions: list[torch.Tensor] = []
+        if self.vast_v_mode == "single_vast":
+            assert self.v_optim is not None
+            v_all = self.v(step_batch.v_state_feature)
+            v_loss = expectile_v_loss(
+                stitched_target - v_all,
+                float(self.cfg.expectile_tau),
+            )
+            self.v_optim.zero_grad(set_to_none=True)
+            v_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.v.parameters(), float(self.cfg.grad_clip_norm))
+            self.v_optim.step()
+            v_head_losses.append(v_loss.detach())
+            v_predictions.append(v_all.detach())
+        else:
+            for head_index, (head, optim) in enumerate(zip(self.v.heads, self.v_optims)):
+                prediction = head(step_batch.v_state_feature)
+                head_target = stitched_target[:, head_index : head_index + 1]
+                head_loss = expectile_v_loss(
+                    head_target - prediction,
+                    float(self.cfg.expectile_tau),
+                )
+                optim.zero_grad(set_to_none=True)
+                head_loss.backward()
+                torch.nn.utils.clip_grad_norm_(head.parameters(), float(self.cfg.grad_clip_norm))
+                optim.step()
+                v_head_losses.append(head_loss.detach())
+                v_predictions.append(prediction.detach())
         self._polyak_update()
 
         with torch.no_grad():
-            v_lcb = self._lcb(v_all.detach())
-            v_std = v_all.detach().std(dim=-1, unbiased=False).mean()
-            stitched_advantage = stitched_target - v_lcb
+            v_all_detached = torch.cat(v_predictions, dim=-1)
+            v_mean = self._head_mean(v_all_detached)
+            v_std = v_all_detached.std(dim=-1, unbiased=False).mean()
+            stitched_target_mean = self._head_mean(stitched_target)
+            stitched_advantage = stitched_target_mean - v_mean
+            v_loss_values = torch.stack(v_head_losses)
+            v_loss = v_loss_values.mean()
             active = mask.sum().clamp_min(1.0)
             mc_abs = ((g_tk.detach() - returns).abs() * mask).sum() / active
             comp_abs = ((g_tk.detach() - composition_rhs.detach()).abs() * mask).sum() / active
@@ -300,10 +339,13 @@ class VASTLearner:
             "g_mc_error_abs_mean": float(mc_abs.item()),
             "g_comp_residual_abs_mean": float(comp_abs.item()),
             "v_loss": float(v_loss.detach().item()),
-            "v_mean": float(v_lcb.mean().item()),
+            "v_head_loss_mean": float(v_loss_values.mean().item()),
+            "v_head_loss_min": float(v_loss_values.min().item()),
+            "v_head_loss_max": float(v_loss_values.max().item()),
+            "v_mean": float(v_mean.mean().item()),
             "v_std_mean": float(v_std.item()),
-            "target_mean": float(stitched_target.mean().item()),
-            "stitched_target_mean": float(stitched_target.mean().item()),
+            "target_mean": float(stitched_target_mean.mean().item()),
+            "stitched_target_mean": float(stitched_target_mean.mean().item()),
             "stitched_advantage_mean": float(stitched_advantage.mean().item()),
             "td_error_abs_mean": float(stitched_advantage.abs().mean().item()),
             "k_mean": float(k.float().mean().item()),
@@ -322,16 +364,16 @@ class VASTLearner:
         rewards: torch.Tensor,
         dones: torch.Tensor,
     ) -> torch.Tensor:
-        """TD-residual advantage A = r + γ^H·(1-done)·V_lcb_target(s') - V_lcb(s).
+        """TD residual using the single head or independent-ensemble mean V.
 
         Shapes: features (B, D_state); rewards/dones (B, 1) or (B,). Returns
         (B,). This is the same backup V is trained on (:meth:`update`), read out
-        on the soft-LCB value, so the residual measures how much
+        on the scalar V readout, so the residual measures how much
         better-than-baseline the transition is.
         """
         bootstrap_discount = float(self.cfg.discount) ** int(self.cfg.action_horizon)
-        v_s = self.v_lcb(v_state_feature)
-        v_sp = self.target_v_lcb(next_v_state_feature)
+        v_s = self.v_value(v_state_feature)
+        v_sp = self.target_v_value(next_v_state_feature)
         rewards = rewards.reshape_as(v_s)
         dones = dones.reshape_as(v_s)
         advantage = rewards + bootstrap_discount * (1.0 - dones) * v_sp - v_s
@@ -352,8 +394,8 @@ class VASTLearner:
         non-terminal path and is intended for prevalidated Phase-B windows.
         """
         g_tk = self.g_value(v_state_feature, future_v_state_feature, k)
-        v_future = self.target_v_lcb(future_v_state_feature)
-        v_current = self.v_lcb(v_state_feature)
+        v_future = self.target_v_value(future_v_state_feature)
+        v_current = self.v_value(v_state_feature)
         dones = (
             torch.zeros_like(g_tk)
             if future_dones is None
@@ -377,11 +419,10 @@ class VASTLearner:
         state: dict[str, Any] = {
             "v": self.v.state_dict(),
             "target_v": self.target_v.state_dict(),
-            "v_optim": self.v_optim.state_dict(),
             "cfg": asdict(self.cfg),
             "algorithm": "vast_value_stitching_adaptation",
             "vast_v_mode": self.vast_v_mode,
-            "learner_schema_version": 7,
+            "learner_schema_version": 7 if self.vast_v_mode == "single_vast" else 8,
             "state_feature_dim": self.state_feature_dim,
             "chunk_feature_dim": self.chunk_feature_dim,
             "action_dim": self.action_dim,
@@ -396,6 +437,13 @@ class VASTLearner:
             "g": self.g.state_dict(),
             "g_optim": self.g_optim.state_dict(),
         }
+        if self.vast_v_mode == "single_vast":
+            assert self.v_optim is not None
+            state["v_optim"] = self.v_optim.state_dict()
+        else:
+            state["v_optims"] = [optim.state_dict() for optim in self.v_optims]
+            state["ensemble_method"] = "independent_v_mean"
+            state["ensemble_optimizer_count"] = len(self.v_optims)
         return state
 
     def load_state_dict(self, sd: dict[str, Any], strict: bool = True) -> None:
@@ -405,21 +453,27 @@ class VASTLearner:
                 "Q head (q_ensemble/q1). Re-run the VAST warmup."
             )
         schema = int(sd.get("learner_schema_version", -1))
-        if schema not in {6, 7}:
+        checkpoint_mode = str(sd.get("vast_v_mode", ""))
+        if checkpoint_mode == "ensemble_lcb":
+            raise ValueError(
+                "VASTLearner.load_state_dict: legacy ensemble_lcb checkpoints are "
+                "incompatible with indep_ensemble; re-run VAST warmup."
+            )
+        if schema not in {6, 7, 8}:
             raise ValueError(
                 "VASTLearner.load_state_dict: unsupported learner schema "
-                f"{schema}; expected schema 6 or 7."
+                f"{schema}; expected schema 6, 7, or 8."
             )
         if "state_feature_dim" not in sd or "v" not in sd:
             raise ValueError(
                 "VASTLearner.load_state_dict: checkpoint is missing required "
                 "VAST state metadata."
             )
-        if schema == 7:
+        if schema in {7, 8}:
             algorithm = str(sd.get("algorithm", ""))
             if algorithm != "vast_value_stitching_adaptation":
                 raise ValueError(
-                    "VASTLearner.load_state_dict: schema-7 checkpoint has "
+                    f"VASTLearner.load_state_dict: schema-{schema} checkpoint has "
                     f"algorithm={algorithm!r}; expected "
                     "'vast_value_stitching_adaptation'."
                 )
@@ -435,6 +489,22 @@ class VASTLearner:
                 FutureWarning,
                 stacklevel=2,
             )
+        if schema in {6, 7} and checkpoint_mode not in {"", "single_vast"}:
+            raise ValueError(
+                "VASTLearner.load_state_dict: pre-schema-8 ensemble checkpoints are "
+                "unsupported; re-run VAST warmup with vast_v_mode=indep_ensemble."
+            )
+        if schema == 8:
+            if checkpoint_mode != "indep_ensemble":
+                raise ValueError(
+                    "VASTLearner.load_state_dict: schema-8 is reserved for "
+                    f"indep_ensemble, got vast_v_mode={checkpoint_mode!r}."
+                )
+            if sd.get("ensemble_method") != "independent_v_mean":
+                raise ValueError(
+                    "VASTLearner.load_state_dict: schema-8 checkpoint has invalid "
+                    f"ensemble_method={sd.get('ensemble_method')!r}."
+                )
         if "g" not in sd or "g_optim" not in sd:
             raise ValueError(
                 "VASTLearner.load_state_dict: VAST checkpoint has no G/g_optim state. "
@@ -485,6 +555,24 @@ class VASTLearner:
                     )
         self.v.load_state_dict(sd["v"])
         self.target_v.load_state_dict(sd["target_v"])
-        self.v_optim.load_state_dict(sd["v_optim"])
+        if self.vast_v_mode == "single_vast":
+            assert self.v_optim is not None
+            self.v_optim.load_state_dict(sd["v_optim"])
+        else:
+            if int(sd.get("ensemble_optimizer_count", -1)) != self.ensemble_size:
+                raise ValueError(
+                    "VASTLearner.load_state_dict: ensemble_optimizer_count mismatch "
+                    f"(ckpt={sd.get('ensemble_optimizer_count')}, "
+                    f"runtime={self.ensemble_size})."
+                )
+            saved_optims = sd.get("v_optims")
+            if not isinstance(saved_optims, list) or len(saved_optims) != len(self.v_optims):
+                raise ValueError(
+                    "VASTLearner.load_state_dict: ensemble optimizer count mismatch "
+                    f"(ckpt={0 if not isinstance(saved_optims, list) else len(saved_optims)}, "
+                    f"runtime={len(self.v_optims)})."
+                )
+            for optim, saved_optim in zip(self.v_optims, saved_optims):
+                optim.load_state_dict(saved_optim)
         self.g.load_state_dict(sd["g"])
         self.g_optim.load_state_dict(sd["g_optim"])

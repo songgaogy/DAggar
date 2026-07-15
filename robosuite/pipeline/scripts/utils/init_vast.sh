@@ -14,7 +14,7 @@
 #   JOINT_STEPS       — joint G+V warmup loop length (default 30000).
 #   BATCH_SIZE        — minibatch size (default 512).
 #   DEVICE            — learner device (default cuda:0 inside CUDA_VISIBLE_DEVICES=1).
-#   VAST_V_MODE       — single_vast (default) or ensemble_lcb.
+#   VAST_V_MODE       — single_vast (default) or indep_ensemble.
 #   VAST_MAX_K        — maximum future distance in macro chunks (default 10).
 #   VAST_COMP_COEF    — composition-loss coefficient (default 0.5).
 #   EXPECTILE_TAU     — V expectile target (default 0.9).
@@ -42,12 +42,12 @@ BRANCH_NAME="dipole_rl-vast"
 
 # -------------------------------------
 ENVIRONMENT="PickPlaceCereal"
-NAME="tau0p7"
+NAME="tau0p7_en5"
 NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 SEED="${SEED:-42}"
 
 EXPECTILE_TAU=0.7
-VAST_V_MODE="single_vast"   # ensemble_lcb or single_vast
+VAST_V_MODE="indep_ensemble"   # indep_ensemble or single_vast
 V_ENSEMBLE_SIZE=5
 # -------------------------------------
 
@@ -58,7 +58,7 @@ JOINT_STEPS="${JOINT_STEPS:-40000}"
 PREENCODE_CACHE_DEVICE="${PREENCODE_CACHE_DEVICE:-learner}"
 PREFER_HDF5_SUCCESS_LABELS="${PREFER_HDF5_SUCCESS_LABELS:-true}"
 BULK_READ_HDF5_IMAGES="${BULK_READ_HDF5_IMAGES:-true}"
-# VAST defaults. Ensemble parameters are active only in ensemble_lcb mode.
+# VAST defaults. Ensemble size is active only in indep_ensemble mode.
 
 VAST_MAX_K="${VAST_MAX_K:-10}"
 VAST_COMP_COEF="${VAST_COMP_COEF:-0.5}"
@@ -74,8 +74,6 @@ NUM_TRAJECTORIES_FAIL="${NUM_TRAJECTORIES_FAIL:-}"
 SAVE_DATA="${SAVE_DATA:-true}"
 SAVE_DIR="${SAVE_DIR:-offline_data-vast}"
 
-LCB_BETA="${LCB_BETA:-0.5}"
-BOOTSTRAP_PROB="${BOOTSTRAP_PROB:-0.5}"
 OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/outputs/${BRANCH_NAME}/${NAME}/${ENVIRONMENT}}"
 OUTPUT_FILE="${OUTPUT_FILE:-${OUTPUT_DIR}/vast_state.pt}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
@@ -109,8 +107,6 @@ HYDRA_OVERRIDES=(
   "algorithm.vast.config.output_reward_coef=${OUTPUT_REWARD_COEF}"
   "algorithm.vast.config.disc_reward_coef=${DISC_REWARD_COEF}"
   "algorithm.vast.config.v_ensemble_size=${V_ENSEMBLE_SIZE}"
-  "algorithm.vast.config.ensemble_lcb_beta=${LCB_BETA}"
-  "algorithm.vast.config.ensemble_bootstrap_prob=${BOOTSTRAP_PROB}"
   "+warmup.output_path=${OUTPUT_FILE}"
   "+warmup.tensorboard_dir=${TENSORBOARD_DIR}"
   "+warmup.batch_size=${BATCH_SIZE}"
@@ -150,7 +146,7 @@ HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[init_vast] env=${ENVIRONMENT} device=${DEVICE} seed=${SEED}"
 echo "[init_vast] algorithm=vast_value_stitching_adaptation v_mode=${VAST_V_MODE} K=${VAST_MAX_K} comp_coef=${VAST_COMP_COEF} joint_steps=${JOINT_STEPS}"
-echo "[init_vast] value: expectile_tau=${EXPECTILE_TAU} g_lr=${G_LR} v_lr=${V_LR} v_ensemble_size=${V_ENSEMBLE_SIZE} lcb_beta=${LCB_BETA} bootstrap_prob=${BOOTSTRAP_PROB}"
+echo "[init_vast] value: expectile_tau=${EXPECTILE_TAU} g_lr=${G_LR} v_lr=${V_LR} v_ensemble_size=${V_ENSEMBLE_SIZE}"
 echo "[init_vast] reward: output_coef=${OUTPUT_REWARD_COEF} disc_coef=${DISC_REWARD_COEF} sampling_seed=${VAST_SAMPLING_SEED}"
 echo "[init_vast] output=${OUTPUT_FILE}"
 echo "[init_vast] offline_buffer_dir=${ROOT_DIR}/data/${DEMO_TASK_NAME}/${SAVE_DIR}"

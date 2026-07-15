@@ -2,13 +2,14 @@
 
 Online DIPOLE-RL weights the two flow branches with
 ``G = alpha * A - beta * disc`` where ``A`` is the configured value signal
-(:class:`AdvantageGProvider`). README step-4 requires the offline variant to use
-the **TD residual** instead::
+(:class:`AdvantageGProvider`). The offline variant builds GAE from the VAST
+one-macro-step TD residual::
 
-    A = r + gamma^H * V_lcb_target(s') - V_lcb(s)
+    delta_t = r + gamma^H * (1 - done_t) * V_target(s') - V(s)
+    A_t = delta_t + gamma^H * lambda * (1 - done_t) * A_{t+H}
 
-with ``V_lcb`` the soft-LCB ensemble value (``vast.v_lcb`` / ``vast.target_v_lcb``,
-``mean_k − β·std_k``), ``gamma^H`` (H=action_horizon) and ``r`` the
+with V read as the single head or independent-ensemble mean, ``gamma^H``
+(H=action_horizon) and ``r`` the
 chunk-aggregated reward — a drop-in replacement for ``Q - V`` with matching
 sign: larger A (better-than-V transition) raises ``w_pos``.
 
@@ -134,16 +135,16 @@ def precompute_offline_advantage(
     device: str,
     encode_batch_size: int = 64,
     estimator: str = "td1",
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 0.6,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[int, int]]:
     """Encode every valid chunk window once and compute its advantage.
 
-    Two ``estimator`` modes (both read the soft-LCB ensemble value via
+    Two ``estimator`` modes (both read the scalar V value via
     :meth:`VASTLearner.compute_td_advantage`, which masks the bootstrap at
     terminal windows with ``(1 - done)``):
 
     - ``"td1"``: the 1-step (macro-step) TD residual
-      ``delta_t = r_chunk + gamma^H*(1-done)*V_lcb_target(s') - V_lcb(s)``.
+      ``delta_t = r_chunk + gamma^H*(1-done)*V_target(s') - V(s)``.
     - ``"gae"``: GAE(``gae_lambda``) accumulated backward over each episode's
       chunk chain, ``A_t = delta_t + gamma^H*lambda*(1-done_t)*A_{t+H}``. This
       mirrors the read-out in ``vast/utils/vis_vast.py`` exactly. Offline
@@ -152,7 +153,7 @@ def precompute_offline_advantage(
       cross-section bootstrap).
 
     Returns ``(advantage_raw, failure_raw, start_to_row)``:
-      - ``advantage_raw`` / ``failure_raw``: CPU float tensors of shape ``(N,)``
+      - ``advantage_raw`` / ``failure_raw``: CUDA float tensors of shape ``(N,)``
         in ``_get_valid_start_indices_locked()`` order;
       - ``start_to_row``: maps a storage start index -> row in those tensors,
         so :class:`OfflineAdvantageGProvider` can gather by the start indices
@@ -191,8 +192,9 @@ def precompute_offline_advantage(
     delta_parts: list[torch.Tensor] = []
     done_parts: list[torch.Tensor] = []
     fail_parts: list[torch.Tensor] = []
-    # Bottleneck is frozen-encoder encode + V/disc forward per window batch;
-    # the subsequent GAE pass is a cheap CPU O(N) recursion.
+    # Bottleneck is frozen-encoder encode + V/disc forward per window batch.
+    # Keep the scalar caches on CUDA so GAE and Phase-B lookups never fall back
+    # to CPU tensor computation.
     n_windows = len(valid_starts)
     batch_offsets = range(0, n_windows, encode_bs)
     for offset in tqdm(
@@ -211,7 +213,7 @@ def precompute_offline_advantage(
             discriminator=discriminator,
             device=device,
         )
-        # 1-step (macro-step) TD residual on the soft-LCB value, done-masked —
+        # 1-step (macro-step) TD residual on the scalar V readout, done-masked —
         # identical definition to the online VASTLearner.compute_td_advantage and
         # the vis_vast.py read-out delta.
         delta = vast_learner.compute_td_advantage(
@@ -223,9 +225,9 @@ def precompute_offline_advantage(
         failure = discriminator.failure_score(
             chunk_feature=step_batch.chunk_feature
         ).reshape(-1)
-        delta_parts.append(delta.detach().to("cpu"))
-        done_parts.append(step_batch.dones.detach().to("cpu").reshape(-1))
-        fail_parts.append(failure.detach().to("cpu"))
+        delta_parts.append(delta.detach())
+        done_parts.append(step_batch.dones.detach().reshape(-1))
+        fail_parts.append(failure.detach())
 
     delta_raw = torch.cat(delta_parts, dim=0).reshape(-1)
     done_raw = torch.cat(done_parts, dim=0).reshape(-1)
@@ -271,7 +273,7 @@ def precompute_vast_offline_advantage(
     device: str,
     encode_batch_size: int = 64,
     sampling_seed: int | None = None,
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 0.6,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -430,7 +432,7 @@ def precompute_vast_offline_advantage(
         )
         stitched = vast_learner.compute_stitched_advantage(s, sk, k, done)
         g = vast_learner.g_value(s, sk, k).reshape(-1)
-        bootstrap = vast_learner.target_v_lcb(sk).reshape(-1)
+        bootstrap = vast_learner.target_v_value(sk).reshape(-1)
         discount = torch.pow(
             torch.full_like(k.reshape(-1), float(vast_cfg.discount)),
             k.reshape(-1) * H,
@@ -472,8 +474,8 @@ def precompute_vast_offline_advantage(
     stitched_raw = torch.cat(stitched_adv_parts).reshape(-1)
     advantage_raw = torch.where(fallback_raw, td1_raw, stitched_raw)
     gae_raw = _gae_over_episodes(
-        delta=td1_raw,
-        done=macro_dones,
+        delta=td1_raw.to(device),
+        done=macro_dones.to(device),
         valid_starts=valid_starts,
         episode_indices=episode_indices,
         start_to_row=start_to_row,
@@ -488,7 +490,7 @@ def precompute_vast_offline_advantage(
         bootstrap_values=torch.cat(bootstrap_parts).reshape(-1),
         stitched_targets=torch.cat(target_parts).reshape(-1),
         td1_advantage=td1_raw,
-        gae_advantage=gae_raw,
+        gae_advantage=gae_raw.cpu(),
         mc_errors=torch.cat(mc_error_parts).reshape(-1),
         composition_residuals=torch.cat(comp_parts).reshape(-1),
         td1_fallback=fallback_raw,
@@ -523,26 +525,60 @@ def _gae_over_episodes(
     ``t+H`` successor is the window ``horizon`` storage steps ahead **iff it is a
     valid window in the same episode** (else the chain terminates and ``A_t``
     falls back to the 1-step ``delta_t`` — matching vis_vast's boundary ``0``).
-    Rows are processed in descending start order so each successor is finalized
-    before its predecessor.
+    Rows are grouped by reverse dependency depth so every successor is finalized
+    before its predecessors. Arithmetic and indexing stay on CUDA.
     """
-    delta_l = delta.tolist()
-    done_l = done.tolist()
-    adv = list(delta_l)
-    coef = float(gamma_h) * float(lam)
+    delta_flat = delta.reshape(-1)
+    done_flat = done.reshape(-1)
+    if not delta_flat.is_cuda or not done_flat.is_cuda:
+        raise RuntimeError("Offline GAE requires CUDA tensors; CPU fallback is disabled.")
+    if done_flat.device != delta_flat.device:
+        raise ValueError(
+            f"GAE delta/done device mismatch: {delta_flat.device} vs {done_flat.device}."
+        )
+    if delta_flat.numel() != len(valid_starts) or done_flat.numel() != len(valid_starts):
+        raise ValueError(
+            "GAE delta, done, valid_starts, and episode_indices must have equal length."
+        )
+    if len(episode_indices) != len(valid_starts):
+        raise ValueError(
+            "GAE delta, done, valid_starts, and episode_indices must have equal length."
+        )
+
+    successors = [-1] * len(valid_starts)
+    depths = [0] * len(valid_starts)
     order = sorted(range(len(valid_starts)), key=lambda r: valid_starts[r], reverse=True)
     for r in order:
-        if done_l[r] > 0.5:
-            continue  # terminal window: no bootstrap, no propagation
         nb = start_to_row.get(int(valid_starts[r]) + int(horizon))
         if nb is None or episode_indices[nb] != episode_indices[r]:
-            continue  # no in-episode successor window -> 1-step delta
-        adv[r] = delta_l[r] + coef * adv[nb]
-    return torch.tensor(adv, dtype=delta.dtype, device=delta.device)
+            continue
+        successors[r] = int(nb)
+        depths[r] = depths[nb] + 1
+
+    adv = delta_flat.clone()
+    coef = float(gamma_h) * float(lam)
+    rows_by_depth: list[list[int]] = [
+        [] for _ in range(max(depths, default=0) + 1)
+    ]
+    for row, depth in enumerate(depths):
+        if depth > 0:
+            rows_by_depth[depth].append(row)
+    for rows in rows_by_depth[1:]:
+        row_idx = torch.tensor(rows, dtype=torch.long, device=delta_flat.device)
+        successor_idx = torch.tensor(
+            [successors[r] for r in rows],
+            dtype=torch.long,
+            device=delta_flat.device,
+        )
+        values = delta_flat.index_select(0, row_idx) + coef * (
+            1.0 - done_flat.index_select(0, row_idx)
+        ) * adv.index_select(0, successor_idx)
+        adv.index_copy_(0, row_idx, values)
+    return adv
 
 
 class OfflineAdvantageGProvider(AdvantageGProvider):
-    """``AdvantageGProvider`` that serves precomputed TD advantage by start index.
+    """Serve precomputed TD1/GAE advantage by static-buffer start index.
 
     Reuses the parent's ``bind_policy_cameras`` but replaces
     ``compute_g_for_batch`` with a cache lookup keyed on
@@ -568,8 +604,20 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
             alpha=alpha,
             beta=beta,
         )
-        self._advantage_raw = advantage_raw.detach().to("cpu").reshape(-1)
-        self._failure_raw = failure_raw.detach().to("cpu").reshape(-1)
+        advantage_raw = advantage_raw.detach().reshape(-1)
+        failure_raw = failure_raw.detach().reshape(-1)
+        if not advantage_raw.is_cuda or not failure_raw.is_cuda:
+            raise RuntimeError(
+                "OfflineAdvantageGProvider requires CUDA advantage/failure caches; "
+                "CPU fallback is disabled."
+            )
+        if advantage_raw.device != failure_raw.device:
+            raise ValueError(
+                "OfflineAdvantageGProvider advantage/failure device mismatch: "
+                f"{advantage_raw.device} vs {failure_raw.device}."
+            )
+        self._advantage_raw = advantage_raw
+        self._failure_raw = failure_raw
         self._start_to_row = dict(start_to_row)
 
     @torch.no_grad()
@@ -588,10 +636,15 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
                 "advantage. The replay buffer must stay static after precompute."
             ) from exc
 
-        row_idx = torch.tensor(rows, dtype=torch.long)
         device = batch.action_sequences_raw.device
-        advantage = self._advantage_raw.index_select(0, row_idx).to(device)
-        failure = self._failure_raw.index_select(0, row_idx).to(device)
+        if device != self._advantage_raw.device:
+            raise RuntimeError(
+                "Offline advantage cache and policy batch must share one CUDA device: "
+                f"cache={self._advantage_raw.device}, batch={device}."
+            )
+        row_idx = torch.tensor(rows, dtype=torch.long, device=device)
+        advantage = self._advantage_raw.index_select(0, row_idx)
+        failure = self._failure_raw.index_select(0, row_idx)
 
         g = self.alpha * advantage - self.beta * failure
         return g.reshape(-1)

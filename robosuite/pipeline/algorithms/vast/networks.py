@@ -256,21 +256,16 @@ class GoalConditionedValueNetwork(nn.Module):
 class VEnsemble(nn.Module):
     """N independent :class:`VStateNetwork` heads -> (B, N).
 
-    The value is learned by an *optimistic* expectile-TD backup guarded by a
-    soft ensemble LCB (``mean_k − β·std_k``).
-    The LCB needs the heads to *disagree* in the high-epistemic-uncertainty
-    (recoverable-state) region, so each head is a fully independent network with
-    its own Token/Group projector + head. Diversity comes from (1) independent
-    random init of the hidden Linears (Kaiming draws differ per head) and (2) a
-    per-head bootstrap mask on the loss (applied by ``VASTLearner.update``).
+    Each head is a fully independent network with its own Token/Group projector,
+    value head, paired target, optimizer, and clipping step. All heads use the
+    full batch; diversity comes from independent initialization and optimization.
 
     Note each head's final Linear is zero-init (calibrated V≡0 at startup), so
     the ensemble std starts at 0 and grows as the heads diverge under training —
-    that is expected; the LCB is inert (== mean) only at initialization.
+    that is expected.
 
     ``forward`` returns the stacked per-head scalar values ``(B, N)``; the
-    learner reduces them to the LCB. ``N == 1`` recovers a single head (std ≡ 0,
-    β inert) so the ensemble is a strict generalization of the old single V.
+    learner reduces them to their mean. ``N == 1`` recovers a single head.
     """
 
     def __init__(

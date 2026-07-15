@@ -3,8 +3,8 @@
 Load the pretrained VAST modules (``init_vast.sh`` output),
 **continue training** them (unfrozen) on the collected policy-rollout sections
 mixed with the exact transitions the warmup consumed, then save the finetuned
-checkpoint. The modules are frozen afterwards (in the training entry) and used
-to supply stitched advantage with TD1 tail fallback for weighted-BC.
+checkpoint. The modules are frozen afterwards (in the training entry), where
+their V/target-V readout supplies GAE for weighted-BC.
 
 Building blocks reused verbatim:
 - :class:`FlowDaggerReplayBuffer` (+ ``.load``) for the mixed transition store,
@@ -223,7 +223,7 @@ def save_finetuned_vast(
     nnpu_ckpt: str | None = None,
     extra_meta: dict[str, Any] | None = None,
 ) -> Path:
-    """Persist the finetuned VAST G/V learner as a schema-v7 checkpoint."""
+    """Persist a finetuned VAST G/V learner with mode-specific schema."""
     import torch
 
     path = Path(path)
@@ -245,8 +245,9 @@ def save_finetuned_vast(
         "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
         "action_horizon": int(vast_cfg.action_horizon),
         "v_ensemble_size": int(vast_learner.ensemble_size),
-        "ensemble_lcb_beta": float(vast_cfg.ensemble_lcb_beta),
-        "ensemble_bootstrap_prob": float(vast_cfg.ensemble_bootstrap_prob),
+        "ensemble_method": (
+            "independent_v_mean" if vast_cfg.vast_v_mode == "indep_ensemble" else None
+        ),
         "expectile_tau": float(vast_cfg.expectile_tau),
         "disc_reward_coef": float(vast_cfg.disc_reward_coef),
         "output_reward_coef": float(vast_cfg.output_reward_coef),
@@ -261,7 +262,7 @@ def save_finetuned_vast(
         "vast_state": vast_learner.state_dict(),
         "cfg": asdict(vast_cfg),
         "encoder_meta": encoder_meta,
-        "schema_version": 7,
+        "schema_version": 8 if vast_cfg.vast_v_mode == "indep_ensemble" else 7,
         "algorithm": "vast_value_stitching_adaptation",
     }
     torch.save(payload, path)
@@ -284,7 +285,7 @@ def validate_vast_checkpoint_payload(
     schema = int(payload["schema_version"])
     ckpt_cfg = payload.get("cfg", {})
     meta = payload.get("encoder_meta", {})
-    if schema == 7:
+    if schema in {7, 8}:
         algorithm = payload.get("algorithm", meta.get("algorithm"))
         if algorithm != VAST_ALGORITHM:
             raise ValueError(
@@ -300,7 +301,7 @@ def validate_vast_checkpoint_payload(
             )
     if require_finetuned and not bool(meta.get("finetuned_offline", False)):
         raise ValueError(
-            "offline.skip_rl=true requires a schema-v7 checkpoint (or deprecated "
+            "offline.skip_rl=true requires a schema-v7/v8 checkpoint (or deprecated "
             "schema-v6 checkpoint) with "
             "encoder_meta.finetuned_offline=true. Run Phase A first."
         )

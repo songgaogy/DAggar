@@ -798,9 +798,9 @@ def compute_metrics(
         aggregated = aggregate_chunk_reward(total_steps, float(cfg.discount)).to(learner.cfg.device)
         done = chunk_done_mask(dones).to(learner.cfg.device)
         v_all = learner.v(state_features[:, 0])          # (B, N) per-head
-        v = learner._lcb(v_all)                          # (B, 1) soft-LCB value
+        v = learner._head_mean(v_all)                    # (B, 1) scalar V readout
         v_std = v_all.std(dim=-1, unbiased=False, keepdim=True)  # ensemble band
-        next_v = learner.target_v_lcb(next_state)
+        next_v = learner.target_v_value(next_state)
         bootstrap_v = bootstrap_discount * (1.0 - done) * next_v
         td_target = aggregated + bootstrap_v
         for index, start in enumerate(batch_starts):
@@ -934,8 +934,8 @@ def compute_metrics(
             dtype=torch.float32,
             device=learner.cfg.device,
         ).unsqueeze(-1)
-        current_v = learner.v_lcb(current_state)
-        future_v = learner.target_v_lcb(future_state)
+        current_v = learner.v_value(current_state)
+        future_v = learner.target_v_value(future_state)
         g_value = learner.g_value(current_state, future_state, k_tensor)
         for local, start in enumerate(batch_starts):
             row = rows[offset + local]
@@ -1108,7 +1108,7 @@ def _save_value_diagnostics_png(
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(title)
 
-    axes[0].plot(steps, v, label="V_lcb", color="tab:orange")
+    axes[0].plot(steps, v, label="V", color="tab:orange")
     if v_std is not None:
         axes[0].fill_between(
             steps,
