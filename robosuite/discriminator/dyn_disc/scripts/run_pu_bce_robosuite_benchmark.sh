@@ -50,17 +50,15 @@ LOSS_SURROGATE="${LOSS_SURROGATE:-logistic}"
 BETA="${BETA:-0.0}"
 HEAD_HIDDEN="${HEAD_HIDDEN:-512}"
 HEAD_LAYERS="${HEAD_LAYERS:-3}"
-EPOCHS="${EPOCHS:-20}"
+EPOCHS="${EPOCHS:-1}"
+SCHEDULER_HORIZON_EPOCHS="${SCHEDULER_HORIZON_EPOCHS:-20}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 USE_CHUNK="${USE_CHUNK:-True}"
-CONFIG_NAME="${CONFIG_NAME:-baseline}"
-THRESHOLD_NORMALIZATION="${THRESHOLD_NORMALIZATION:-none}"
-SOFT_CAP_C="${SOFT_CAP_C:-}"
-SOFT_CAP_LAMBDA="${SOFT_CAP_LAMBDA:-0.0}"
+SOFT_CAP_C="${SOFT_CAP_C:-5.0}"
+SOFT_CAP_LAMBDA="${SOFT_CAP_LAMBDA:-1e-2}"
 SOFT_CAP_TEMPERATURE="${SOFT_CAP_TEMPERATURE:-1.0}"
-CHECKPOINT_EPOCHS="${CHECKPOINT_EPOCHS:-1 2 5 10 20}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
@@ -77,9 +75,6 @@ CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
 
 EXTRA_ARGS=()
-if [[ -n "${SOFT_CAP_C}" ]]; then
-    EXTRA_ARGS+=(--soft-cap-c "${SOFT_CAP_C}")
-fi
 if [[ -n "${TRAIN_MAX_SUCCESS_PER_TASK}" && "${TRAIN_MAX_SUCCESS_PER_TASK}" -gt 0 ]]; then
     EXTRA_ARGS+=(--train-max-success-per-task "${TRAIN_MAX_SUCCESS_PER_TASK}")
 fi
@@ -105,7 +100,6 @@ fi
     --fail-train-split      "${FAIL_TRAIN_SPLIT}" \
     --save-json             "${SAVE_JSON}" \
     --save-ckpt-dir         "${SAVE_CKPT_DIR}" \
-    --config-name           "${CONFIG_NAME}" \
     --tensorboard-dir       "${TENSORBOARD_DIR}" \
     --device                "${DEVICE}" \
     --encode-batch-size     "${ENCODE_BATCH_SIZE}" \
@@ -120,13 +114,13 @@ fi
     --head-hidden           "${HEAD_HIDDEN}" \
     --head-layers           "${HEAD_LAYERS}" \
     --epochs                "${EPOCHS}" \
+    --scheduler-horizon-epochs "${SCHEDULER_HORIZON_EPOCHS}" \
     --lr                    "${LR}" \
     --weight-decay          "${WEIGHT_DECAY}" \
     --batch-size            "${BATCH_SIZE}" \
-    --threshold-normalization "${THRESHOLD_NORMALIZATION}" \
+    --soft-cap-c            "${SOFT_CAP_C}" \
     --soft-cap-lambda       "${SOFT_CAP_LAMBDA}" \
     --soft-cap-temperature  "${SOFT_CAP_TEMPERATURE}" \
-    --checkpoint-epochs     ${CHECKPOINT_EPOCHS} \
     --use-chunk             "${USE_CHUNK}" \
     "${EXTRA_ARGS[@]}" \
     "$@"

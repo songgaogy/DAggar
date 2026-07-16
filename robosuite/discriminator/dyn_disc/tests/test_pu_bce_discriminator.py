@@ -265,38 +265,40 @@ def test_pu_threshold_determinism() -> None:
     assert tau_a == pytest.approx(tau_b, abs=1e-6), f"Non-deterministic threshold: {tau_a} vs {tau_b}"
 
 
-def test_epoch_boundary_normalization_and_cap_history() -> None:
+def test_default_fit_retains_sweep_scheduler_and_health_history() -> None:
     in_dim = 8
-    Z_p = _gaussian(160, in_dim, mean=+1.0, std=0.5, seed=80)
+    Z_p = _gaussian(128, in_dim, mean=+1.0, std=0.5, seed=80)
     Z_u = torch.cat([
-        _gaussian(80, in_dim, mean=+1.0, std=0.5, seed=81),
-        _gaussian(80, in_dim, mean=-1.0, std=0.5, seed=82),
+        _gaussian(64, in_dim, mean=+1.0, std=0.5, seed=81),
+        _gaussian(64, in_dim, mean=-1.0, std=0.5, seed=82),
     ])
     Z_calib = _gaussian(60, in_dim, mean=+1.0, std=0.5, seed=83)
-    callback_epochs: list[int] = []
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
+    det = PUBCEDiscriminator(in_dim=in_dim, device="cuda")
     thresholds = det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
         success_calib_per_task={"t": [Z_calib]},
-        pi_p=0.5,
-        epochs=2,
-        lr=3e-3,
-        batch_size=64,
-        delta=10.0,
         seed=0,
-        threshold_normalization="epoch_boundary",
-        soft_cap_c=5.0,
-        soft_cap_lambda=1e-2,
-        epoch_callback=lambda epoch, _detector: callback_epochs.append(epoch),
         verbose=False,
     )
 
-    assert callback_epochs == [1, 2]
-    assert abs(thresholds["t"]) <= 1e-5
-    assert det._completed_epochs == 2
-    assert len(det._train_history) == 2
+    assert "t" in thresholds
+    assert det.hidden == 512
+    assert det.num_layers == 3
+    assert det._pi_p == pytest.approx(0.3)
+    assert det._surrogate == "logistic"
+    assert det._threshold_normalization == "none"
+    assert det._soft_cap_c == pytest.approx(5.0)
+    assert det._soft_cap_lambda == pytest.approx(1e-2)
+    assert det._soft_cap_temperature == pytest.approx(1.0)
+    assert det._scheduler_horizon_epochs == 20
+    assert det._completed_epochs == 1
+    assert len(det._train_history) == 1
+    expected_lr = 3e-4 * (1.0 + np.cos(np.pi / 20.0)) / 2.0
+    assert det._train_history[-1]["lr"] == pytest.approx(expected_lr)
+    assert det._train_history[-1]["scheduler_horizon_epochs"] == 20
+    assert det._train_history[-1]["logit_center"] == pytest.approx(0.0)
     assert det._train_history[-1]["soft_cap_penalty"] > 0.0
     assert set(det._train_history[-1]["pools"]) == {
         "train_positive",
@@ -416,6 +418,7 @@ def test_state_dict_roundtrip() -> None:
     )
     sd = det.state_dict()
     assert sd["pi_p"] == pytest.approx(0.4, abs=1e-9)
+    assert sd["scheduler_horizon_epochs"] == 20
 
     det.head.set_logit_center(1.75)
     sd = det.state_dict()
@@ -425,6 +428,7 @@ def test_state_dict_roundtrip() -> None:
     det2.load_state_dict(sd)
     assert det2.thresholds["t"] == pytest.approx(det.thresholds["t"], abs=1e-6)
     assert det2._pi_p == pytest.approx(0.4, abs=1e-9)
+    assert det2._scheduler_horizon_epochs == 20
 
     z_probe = _gaussian(20, in_dim, mean=0.0, std=1.0, seed=34)
     g_a = det._logits_np(z_probe)

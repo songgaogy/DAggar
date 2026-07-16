@@ -1,4 +1,4 @@
-"""CUDA integration tests for nnPU snapshots, logging, and frozen loading."""
+"""CUDA integration tests for nnPU checkpointing, logging, and frozen loading."""
 
 from __future__ import annotations
 
@@ -46,11 +46,9 @@ def _adapter_shell(
 
     adapter = object.__new__(PUBCEBenchmarkDiscriminator)
     adapter.device = device
-    adapter.save_ckpt_dir = str(tmp_path / "snapshots")
+    adapter.save_ckpt_dir = str(tmp_path / "checkpoints")
     adapter._shared_detector = detector
     adapter._detectors_per_task = {"Task": detector}
-    adapter.epoch_checkpoint_paths = {}
-    adapter.checkpoint_epochs = (1, 2, 5, 10, 20)
     adapter.feature_source = "transformer"
     adapter.transformer_layer = 1
     adapter.use_chunk = True
@@ -60,7 +58,7 @@ def _adapter_shell(
     adapter.loss_surrogate = "logistic"
     adapter.nn_correction = True
     adapter.beta = 0.0
-    adapter.threshold_normalization = "epoch_boundary"
+    adapter.scheduler_horizon_epochs = 20
     adapter.soft_cap_c = 5.0
     adapter.soft_cap_lambda = 1e-2
     adapter.soft_cap_temperature = 1.0
@@ -77,34 +75,24 @@ def _adapter_shell(
     return adapter
 
 
-def test_adapter_epoch_snapshot_activation_reproduces_cuda_prediction(
+def test_adapter_saves_one_canonical_checkpoint_with_selected_config(
     tmp_path: Path,
 ) -> None:
     device = _cuda()
-    detector = _detector(device, center=1.75)
+    detector = _detector(device, center=0.0)
     adapter = _adapter_shell(tmp_path, detector, device)
-    generator = torch.Generator(device=device).manual_seed(17)
-    probe = torch.randn((13, 6), generator=generator, device=device)
+    checkpoint = adapter._save_checkpoint()
 
-    expected_scores = detector.failure_score_tensor(probe).detach().clone()
-    expected_decisions = expected_scores >= detector.threshold_tensor(probe, "Task")
-    adapter._snapshot_epoch(2, detector)
-    checkpoint = Path(adapter.epoch_checkpoint_paths[2])
-
-    detector.head.set_logit_center(-9.0)
-    with torch.no_grad():
-        next(detector.head.parameters()).add_(3.0)
-    payload = adapter.activate_checkpoint(checkpoint)
-
-    restored = adapter._shared_detector
-    assert restored is not None
-    restored_scores = restored.failure_score_tensor(probe)
-    restored_decisions = restored_scores >= restored.threshold_tensor(probe, "Task")
+    assert checkpoint == tmp_path / "checkpoints" / "pu_bce_head.pth"
+    assert checkpoint.is_file()
+    assert list(checkpoint.parent.glob("*.pth")) == [checkpoint]
+    payload = torch.load(checkpoint, map_location=device, weights_only=False)
     assert payload["epoch"] == 2
-    assert restored_scores.is_cuda
-    assert float(restored.head.logit_center) == pytest.approx(1.75)
-    torch.testing.assert_close(restored_scores, expected_scores)
-    torch.testing.assert_close(restored_decisions, expected_decisions)
+    assert payload["threshold_normalization"] == "none"
+    assert payload["soft_cap_c"] == pytest.approx(5.0)
+    assert payload["soft_cap_lambda"] == pytest.approx(1e-2)
+    assert payload["soft_cap_temperature"] == pytest.approx(1.0)
+    assert payload["scheduler_horizon_epochs"] == 20
 
 
 def test_tensorboard_callbacks_write_train_and_benchmark_events(

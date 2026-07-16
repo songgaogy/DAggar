@@ -24,17 +24,17 @@ unchanged):
     tau_task       = percentile(failure_score over success-calib frames, 100 - delta)
     pred_t = 1     iff failure_score_t >= tau_task
 
-nnPU risk (sigmoid surrogate, see ``_pu_risk`` for the exact form)
-------------------------------------------------------------------
+nnPU risk (logistic surrogate, see ``pu_risk`` for the exact form)
+-----------------------------------------------------------------
     R_pu = pi_p * E_p[ ell(+1, g) ]
            + max( 0,  E_u[ ell(-1, g) ] - pi_p * E_p[ ell(-1, g) ] )
 
 with the **non-negative correction** clamping the second (negative-risk) term at
 0. We use the clamped variant; the canonical Kiryo nnPU additionally performs a
 gradient-ascent step on ``-gamma * (negative-risk term)`` when it goes negative
-(see ``_pu_risk`` note). ``ell`` is the sigmoid surrogate
-``ell(y, g) = sigmoid(-y * g)`` (a.k.a. the "ramp"/sigmoid loss used in the
-original nnPU paper). Logistic loss is available via ``loss_surrogate='logistic'``.
+(see ``pu_risk`` note). The approved surrogate is logistic loss,
+``ell(y, g) = softplus(-y * g)``. The sigmoid surrogate remains available for
+legacy compatibility.
 
 **Hard constraint:** ``fit(...)`` does not run any evaluation or compute AUROC.
 It trains for a fixed number of epochs against the nnPU objective and then
@@ -63,15 +63,16 @@ from .single_bank_knn import DetectionResult
 class BCEHead(nn.Module):
     """MLP scalar-logit head on top of a frozen latent.
 
-    Architecture (num_layers=2, hidden=256):
+    Architecture (num_layers=3, hidden=512):
         Linear(in_dim, hidden) -> LayerNorm -> GELU
+        Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden, 1)
 
     Reused verbatim from the GT-split BCE head so checkpoints / geometry match.
     """
 
-    def __init__(self, in_dim: int, hidden: int = 256, num_layers: int = 2) -> None:
+    def __init__(self, in_dim: int, hidden: int = 512, num_layers: int = 3) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
@@ -152,7 +153,7 @@ def pu_risk(
     g_u: torch.Tensor,
     *,
     pi_p: float,
-    surrogate: str = "sigmoid",
+    surrogate: str = "logistic",
     nn_correction: bool = True,
     beta: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
@@ -163,7 +164,7 @@ def pu_risk(
         g_u: (Nu,) head logits on unlabeled frames.
         pi_p: class prior P(y=+1), the fraction of true positives in the
             unlabeled mixture.
-        surrogate: 'sigmoid' (default) or 'logistic'.
+        surrogate: 'logistic' (default) or legacy 'sigmoid'.
         nn_correction: when True, clamp the negative-risk term at ``-beta``
             (nnPU); when False, use the plain uPU estimator (may go negative).
         beta: lower clamp for the negative-risk term (Kiryo uses beta=0).
@@ -238,8 +239,8 @@ class PUBCEDiscriminator:
         self,
         in_dim: int,
         *,
-        hidden: int = 256,
-        num_layers: int = 2,
+        hidden: int = 512,
+        num_layers: int = 3,
         device: str = "cuda",
     ) -> None:
         self.in_dim = int(in_dim)
@@ -258,12 +259,13 @@ class PUBCEDiscriminator:
         self.calib_stats: Dict[str, PUCalibStats] = {}
         self._delta: Optional[float] = None
         self._pi_p: Optional[float] = None
-        self._surrogate: str = "sigmoid"
+        self._surrogate: str = "logistic"
         self._train_history: List[Dict[str, Any]] = []
         self._threshold_normalization: str = "none"
-        self._soft_cap_c: Optional[float] = None
-        self._soft_cap_lambda: float = 0.0
+        self._soft_cap_c: Optional[float] = 5.0
+        self._soft_cap_lambda: float = 1e-2
         self._soft_cap_temperature: float = 1.0
+        self._scheduler_horizon_epochs: int = 20
         self._completed_epochs: int = 0
 
     # ------------------------------------------------------------------ #
@@ -390,23 +392,9 @@ class PUBCEDiscriminator:
         success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
         delta: float,
-        update_center: bool,
         verbose: bool,
     ) -> None:
         q = 1.0 - float(delta) / 100.0
-        if update_center:
-            pooled_sequences = [
-                sequence
-                for sequences in success_calib_per_task.values()
-                for sequence in sequences
-                if sequence.numel() > 0
-            ]
-            raw_logits = self._pool_logits_cuda(pooled_sequences, raw=True)
-            if raw_logits.numel() == 0:
-                raise ValueError("success calibration pool is empty")
-            raw_tau = torch.quantile(-raw_logits, q)
-            self.head.set_logit_center(-raw_tau)
-
         self.thresholds = {}
         self.calib_stats = {}
         for task, calib_sequences in success_calib_per_task.items():
@@ -449,21 +437,20 @@ class PUBCEDiscriminator:
         unlabeled_features: Sequence[torch.Tensor],
         success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
-        pi_p: float = 0.5,
-        epochs: int = 20,
+        pi_p: float = 0.3,
+        epochs: int = 1,
+        scheduler_horizon_epochs: int = 20,
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
         delta: float = 10.0,
         seed: int = 0,
-        loss_surrogate: str = "sigmoid",
+        loss_surrogate: str = "logistic",
         nn_correction: bool = True,
         beta: float = 0.0,
-        threshold_normalization: str = "none",
-        soft_cap_c: Optional[float] = None,
-        soft_cap_lambda: float = 0.0,
+        soft_cap_c: Optional[float] = 5.0,
+        soft_cap_lambda: float = 1e-2,
         soft_cap_temperature: float = 1.0,
-        epoch_callback: Optional[Callable[[int, "PUBCEDiscriminator"], None]] = None,
         metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, float]:
@@ -477,12 +464,13 @@ class PUBCEDiscriminator:
             success_calib_per_task: ``{task_name: [(T_k, D), ...]}`` of disjoint
                 success-calib trajectories per task. Threshold is calibrated
                 per-task on these via the success_percentile rule.
-            pi_p: class prior P(y=+1) for the unlabeled mixture. Defaults to 0.5
-                with a logged warning -- it should be set from domain knowledge.
+            pi_p: class prior P(y=+1) for the unlabeled mixture.
             epochs: fixed epoch budget. No early stopping, no validation eval.
+            scheduler_horizon_epochs: cosine schedule horizon. The approved
+                one-epoch fit retains the 20-epoch sweep schedule at epoch 1.
             delta: percentile-based false-alarm budget in [0, 100]. ``tau =
                 percentile(failure_score on success-calib, 100 - delta)``.
-            loss_surrogate: 'sigmoid' (nnPU default) or 'logistic'.
+            loss_surrogate: 'logistic' (approved default) or legacy 'sigmoid'.
             nn_correction: enable the non-negative correction (clamp neg-risk).
             beta: lower clamp for the negative-risk term (Kiryo default 0).
         Returns:
@@ -492,17 +480,17 @@ class PUBCEDiscriminator:
             raise ValueError(f"delta must be in [0, 100], got {delta}")
         if epochs < 1:
             raise ValueError(f"epochs must be >= 1, got {epochs}")
+        if scheduler_horizon_epochs < epochs:
+            raise ValueError(
+                "scheduler_horizon_epochs must be >= epochs, got "
+                f"{scheduler_horizon_epochs} < {epochs}"
+            )
         if batch_size < 2:
             raise ValueError(f"batch_size must be >= 2, got {batch_size}")
         if not (0.0 < float(pi_p) < 1.0):
             raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
         if loss_surrogate not in ("sigmoid", "logistic"):
             raise ValueError(f"loss_surrogate must be 'sigmoid' or 'logistic', got {loss_surrogate!r}")
-        if threshold_normalization not in ("none", "epoch_boundary"):
-            raise ValueError(
-                "threshold_normalization must be 'none' or 'epoch_boundary', "
-                f"got {threshold_normalization!r}"
-            )
         if float(soft_cap_lambda) < 0.0:
             raise ValueError("soft_cap_lambda must be non-negative")
         if float(soft_cap_lambda) > 0.0 and (soft_cap_c is None or float(soft_cap_c) <= 0.0):
@@ -513,17 +501,17 @@ class PUBCEDiscriminator:
         self._delta = float(delta)
         self._pi_p = float(pi_p)
         self._surrogate = str(loss_surrogate)
-        self._threshold_normalization = str(threshold_normalization)
+        self._threshold_normalization = "none"
         self._soft_cap_c = None if soft_cap_c is None else float(soft_cap_c)
         self._soft_cap_lambda = float(soft_cap_lambda)
         self._soft_cap_temperature = float(soft_cap_temperature)
+        self._scheduler_horizon_epochs = int(scheduler_horizon_epochs)
         self._completed_epochs = 0
 
         if abs(float(pi_p) - 0.5) < 1e-9 and verbose:
             print(
-                "[pu_bce][fit] WARNING: pi_p left at the 0.5 default. The class "
-                "prior (fraction of success-like frames inside failure rollouts) "
-                "should be set from domain knowledge via --pi-p.",
+                "[pu_bce][fit] WARNING: pi_p=0.5 differs from the approved 0.3 "
+                "default.",
                 flush=True,
             )
 
@@ -593,7 +581,7 @@ class PUBCEDiscriminator:
             lr=float(lr),
             weight_decay=float(weight_decay),
         )
-        total_steps = int(epochs) * max(1, len(loader))
+        total_steps = int(scheduler_horizon_epochs) * max(1, len(loader))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=total_steps, eta_min=0.0
         )
@@ -665,7 +653,6 @@ class PUBCEDiscriminator:
             self._calibrate_epoch(
                 success_calib_per_task,
                 delta=float(delta),
-                update_center=self._threshold_normalization == "epoch_boundary",
                 verbose=False,
             )
             pool_stats: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -689,6 +676,7 @@ class PUBCEDiscriminator:
                 "num_batches": int(n_batches),
                 "nn_correction_fraction": float(n_correct) / float(max(1, n_batches)),
                 "lr": cur_lr,
+                "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
                 "logit_center": float(self.head.logit_center.item()),
                 "thresholds": dict(self.thresholds),
                 "pools": pool_stats,
@@ -697,8 +685,6 @@ class PUBCEDiscriminator:
             self._completed_epochs = int(epoch + 1)
             if metric_callback is not None:
                 metric_callback(int(epoch + 1), entry)
-            if epoch_callback is not None:
-                epoch_callback(int(epoch + 1), self)
             if verbose:
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
@@ -758,6 +744,7 @@ class PUBCEDiscriminator:
             "soft_cap_c": self._soft_cap_c,
             "soft_cap_lambda": float(self._soft_cap_lambda),
             "soft_cap_temperature": float(self._soft_cap_temperature),
+            "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
             "completed_epochs": int(self._completed_epochs),
             "calib_stats": {
                 str(k): {
@@ -801,6 +788,7 @@ class PUBCEDiscriminator:
         self._soft_cap_c = None if raw_cap is None else float(raw_cap)  # type: ignore[arg-type]
         self._soft_cap_lambda = float(state.get("soft_cap_lambda", 0.0))  # type: ignore[arg-type]
         self._soft_cap_temperature = float(state.get("soft_cap_temperature", 1.0))  # type: ignore[arg-type]
+        self._scheduler_horizon_epochs = int(state.get("scheduler_horizon_epochs", 20))  # type: ignore[arg-type]
         self._completed_epochs = int(state.get("completed_epochs", 0))  # type: ignore[arg-type]
         cs = state.get("calib_stats", {}) or {}
         self.calib_stats = {

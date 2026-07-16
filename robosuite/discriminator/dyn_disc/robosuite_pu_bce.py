@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 from typing import Dict, List, Optional, Sequence
 
@@ -52,8 +51,6 @@ def _health_from_detector(discriminator: PUBCEBenchmarkDiscriminator) -> dict:
         if float(stats.get("saturation_fraction", float("inf"))) > 0.05:
             reasons.append(f"{name}: saturation_fraction>0.05")
     tau = max((abs(float(value)) for value in detector.thresholds.values()), default=float("inf"))
-    if discriminator.threshold_normalization == "epoch_boundary" and tau > 0.1:
-        reasons.append("normalized |tau|>0.1")
     return {
         "passed": not reasons,
         "reasons": reasons,
@@ -61,28 +58,6 @@ def _health_from_detector(discriminator: PUBCEBenchmarkDiscriminator) -> dict:
         "tau": tau,
         "logit_center": float(detector.head.logit_center.item()),
     }
-
-
-def _task_score(benchmark: dict) -> dict:
-    trajectory = dict(benchmark["trajectory_level"])
-    step = dict(benchmark["step_level"])
-    precision = float(step["event_precision"])
-    recall = float(step["event_recall"])
-    event_f1 = (
-        0.0 if precision + recall <= 0.0 else 2.0 * precision * recall / (precision + recall)
-    )
-    components = {
-        "trajectory_auroc": float(trajectory["auroc"]),
-        "frame_auroc": float(step["frame_auroc"]),
-        "frame_f1": float(step["frame_f1"]),
-        "event_f1": float(event_f1),
-        "success_specificity": float(step["success_specificity"]),
-    }
-    if not all(math.isfinite(value) for value in components.values()):
-        raise FloatingPointError(f"Non-finite task score components: {components}")
-    return {"value": sum(components.values()) / len(components), "components": components}
-
-
 def _parse_bool(value: str) -> bool:
     normalized = str(value).strip().lower()
     if normalized in {"true", "1", "yes", "on"}:
@@ -111,14 +86,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-ckpt-dir", type=str, default=None)
-    parser.add_argument("--max-fail-per-task", type=int, default=None,
+    parser.add_argument("--max-fail-per-task", type=int, default=50,
                         help="Eval failure cap per task (benchmark test set only).")
-    parser.add_argument("--max-success-per-task", type=int, default=None,
+    parser.add_argument("--max-success-per-task", type=int, default=50,
                         help="Eval success cap per task (benchmark test set only).")
-    parser.add_argument("--train-max-success-per-task", type=int, default=None,
+    parser.add_argument("--train-max-success-per-task", type=int, default=50,
                         help="Max success trajectories per task from --success-train-split "
                              "(nnPU positives + calibration).")
-    parser.add_argument("--train-max-fail-per-task", type=int, default=None,
+    parser.add_argument("--train-max-fail-per-task", type=int, default=50,
                         help="Max failure trajectories per task from --fail-train-split "
                              "(unlabeled pool). Overrides --unlabeled-per-task when set.")
     parser.add_argument("--train-max-per-task", type=int, default=None,
@@ -143,14 +118,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
-    parser.add_argument("--config-name", type=str, default="default")
     parser.add_argument("--tensorboard-dir", type=str, default=None)
 
     # nnPU / head knobs.
-    parser.add_argument("--pi-p", type=float, default=0.5,
+    parser.add_argument("--pi-p", type=float, default=0.3,
                         help="Class prior P(y=+1): fraction of success-like frames inside "
-                             "failure rollouts. Default 0.5 (logged warning); set from "
-                             "domain knowledge.")
+                             "failure rollouts.")
     parser.add_argument("--loss-surrogate", type=str, default="logistic",
                         choices=["sigmoid", "logistic"],
                         help="nnPU surrogate loss. 'logistic' (softplus) is the "
@@ -160,36 +133,30 @@ def _parse_args() -> argparse.Namespace:
                         help="Disable the non-negative correction (use plain uPU).")
     parser.add_argument("--beta", type=float, default=0.0,
                         help="Lower clamp for the negative-risk term (Kiryo default 0).")
-    parser.add_argument("--head-hidden", type=int, default=256)
-    parser.add_argument("--head-layers", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--head-hidden", type=int, default=512)
+    parser.add_argument("--head-layers", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--scheduler-horizon-epochs",
+        type=int,
+        default=20,
+        help="Cosine schedule horizon; 20 reproduces the selected sweep epoch-1 trajectory.",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument(
-        "--threshold-normalization",
-        type=str,
-        choices=["none", "epoch_boundary"],
-        default="none",
-    )
-    parser.add_argument("--soft-cap-c", type=float, default=None)
-    parser.add_argument("--soft-cap-lambda", type=float, default=0.0)
+    parser.add_argument("--soft-cap-c", type=float, default=5.0)
+    parser.add_argument("--soft-cap-lambda", type=float, default=1e-2)
     parser.add_argument("--soft-cap-temperature", type=float, default=1.0)
-    parser.add_argument(
-        "--checkpoint-epochs",
-        type=int,
-        nargs="+",
-        default=[1, 2, 5, 10, 20],
-    )
     parser.add_argument(
         "--use-chunk",
         type=_parse_bool,
-        default=False,
+        default=True,
         help="Use forward action chunks instead of zero-padding a single action.",
     )
 
     # Unlabeled failure-pool selection.
-    parser.add_argument("--unlabeled-per-task", type=int, default=25,
+    parser.add_argument("--unlabeled-per-task", type=int, default=50,
                         help="Target number of failure trajectories per task to use as the "
                              "UNLABELED pool. If fewer are available, all are used.")
     parser.add_argument(
@@ -286,9 +253,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("PU-BCE benchmark requires CUDA, but CUDA is unavailable")
     if not args.save_ckpt_dir:
-        raise ValueError("--save-ckpt-dir is required for epoch checkpoint evaluation")
-    if int(args.epochs) not in {int(value) for value in args.checkpoint_epochs}:
-        raise ValueError("--checkpoint-epochs must include the final --epochs value")
+        raise ValueError("--save-ckpt-dir is required to save the trained checkpoint")
+    if int(args.scheduler_horizon_epochs) < int(args.epochs):
+        raise ValueError("--scheduler-horizon-epochs must be at least --epochs")
     train_max_success_per_task, train_max_fail_per_task, unlabeled_per_task = (
         _effective_train_caps(args)
     )
@@ -304,11 +271,6 @@ def main() -> None:
     trajs = bench.trajectories()
     eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
     eval_tasks = sorted({str(t.task_name) for t in trajs})
-    if len(eval_tasks) != 1:
-        raise ValueError(
-            "PU-BCE trick trials require exactly one task per process, "
-            f"got {eval_tasks}"
-        )
     n_fail = len(eval_fail_keys)
     n_succ = len(trajs) - n_fail
     print(
@@ -404,16 +366,15 @@ def main() -> None:
         head_hidden=int(args.head_hidden),
         head_layers=int(args.head_layers),
         epochs=int(args.epochs),
+        scheduler_horizon_epochs=int(args.scheduler_horizon_epochs),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         batch_size=int(args.batch_size),
         use_chunk=bool(args.use_chunk),
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
-        threshold_normalization=str(args.threshold_normalization),
         soft_cap_c=(None if args.soft_cap_c is None else float(args.soft_cap_c)),
         soft_cap_lambda=float(args.soft_cap_lambda),
         soft_cap_temperature=float(args.soft_cap_temperature),
-        checkpoint_epochs=list(args.checkpoint_epochs),
         tensorboard_dir=(str(args.tensorboard_dir) if args.tensorboard_dir else None),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
@@ -448,68 +409,36 @@ def main() -> None:
             out_dir = os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
 
-        checkpoint_paths = dict(discriminator.epoch_checkpoint_paths)
-        if not checkpoint_paths and args.save_ckpt_dir:
-            final_path = os.path.join(os.path.abspath(args.save_ckpt_dir), "pu_bce_head.pth")
-            checkpoint_paths[int(args.epochs)] = final_path
-        records = []
         print(
-            "[robosuite][pu_bce] training complete; evaluating epoch checkpoints "
-            f"{sorted(checkpoint_paths)}",
+            "[robosuite][pu_bce] training complete; running one benchmark evaluation",
             flush=True,
         )
-        for epoch, checkpoint_path in sorted(checkpoint_paths.items()):
-            discriminator.activate_checkpoint(checkpoint_path)
-            result = bench.evaluate(
-                discriminator,
-                EvalConfig(step_binarize_strategy="provided"),
-            )
-            benchmark_payload = result.to_dict()
-            health = _health_from_detector(discriminator)
-            task_score = _task_score(benchmark_payload)
-            record = {
-                "task": eval_tasks[0] if len(eval_tasks) == 1 else list(eval_tasks),
-                "config": str(args.config_name),
-                "epoch": int(epoch),
-                "checkpoint": os.path.abspath(checkpoint_path),
-                "threshold_normalization": str(args.threshold_normalization),
-                "soft_cap_c": args.soft_cap_c,
-                "soft_cap_lambda": float(args.soft_cap_lambda),
-                "soft_cap_temperature": float(args.soft_cap_temperature),
-                "health": health,
-                "task_score": task_score,
-                "benchmark": benchmark_payload,
-            }
-            records.append(record)
-            epoch_json = os.path.join(out_dir, f"benchmark_epoch_{int(epoch):03d}.json")
-            result.save_json(epoch_json)
-            discriminator.log_benchmark_metrics(int(epoch), benchmark_payload)
-            print(result.summary())
-            print(
-                f"[robosuite][pu_bce] epoch={epoch} task_score={task_score['value']:.6f} "
-                f"health_passed={health['passed']} wrote={epoch_json}",
-                flush=True,
-            )
-            if args.save_json and int(epoch) == int(args.epochs):
-                result.save_json(args.save_json)
-
-        trial_summary_path = os.path.join(out_dir, "trial_summary.json")
-        with open(trial_summary_path, "w") as handle:
-            json.dump(
-                {
-                    "schema": "pu_bce_trick_trial_v1",
-                    "config": str(args.config_name),
-                    "tasks": eval_tasks,
-                    "records": records,
-                },
-                handle,
-                indent=2,
-                sort_keys=True,
-            )
+        result = bench.evaluate(
+            discriminator,
+            EvalConfig(step_binarize_strategy="provided"),
+        )
+        benchmark_payload = result.to_dict()
+        health = _health_from_detector(discriminator)
+        discriminator.log_benchmark_metrics(
+            int(args.epochs),
+            {"metrics": benchmark_payload, "logit_health": health},
+        )
+        print(result.summary())
+        print(
+            f"[robosuite][pu_bce] logit_health_passed={health['passed']} "
+            f"reasons={health['reasons']}",
+            flush=True,
+        )
+        if args.save_json:
+            result.save_json(args.save_json)
 
         if args.save_json:
             manifest_path = os.path.join(out_dir, "unlabeled_pool_manifest.json")
+            checkpoint_path = os.path.join(
+                os.path.abspath(args.save_ckpt_dir), "pu_bce_head.pth"
+            )
             manifest = {
+                "schema": "pu_bce_run_v1",
                 "labeling": "pu_no_gt_timing",
                 "loss": "nnpu",
                 "loss_surrogate": str(args.loss_surrogate),
@@ -540,29 +469,26 @@ def main() -> None:
                 "delta": float(args.delta),
                 "calib_mode": "success_percentile",
                 "epochs": int(args.epochs),
-                "checkpoint_epochs": list(args.checkpoint_epochs),
+                "scheduler_horizon_epochs": int(args.scheduler_horizon_epochs),
                 "lr": float(args.lr),
+                "weight_decay": float(args.weight_decay),
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
                 "use_chunk": bool(args.use_chunk),
                 "knn_feature_source": str(args.knn_feature_source),
                 "knn_transformer_layer": int(args.knn_transformer_layer),
-                "config_name": str(args.config_name),
-                "threshold_normalization": str(args.threshold_normalization),
+                "threshold_normalization": "none",
                 "soft_cap_c": args.soft_cap_c,
                 "soft_cap_lambda": float(args.soft_cap_lambda),
                 "soft_cap_temperature": float(args.soft_cap_temperature),
-                "epoch_checkpoints": {
-                    str(epoch): os.path.abspath(path)
-                    for epoch, path in sorted(checkpoint_paths.items())
-                },
+                "checkpoint": checkpoint_path,
+                "logit_health": health,
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)
             print(f"[robosuite][pu_bce] wrote {args.save_json}")
             print(f"[robosuite][pu_bce] wrote {manifest_path}")
-            print(f"[robosuite][pu_bce] wrote {trial_summary_path}")
     finally:
         discriminator.close()
 

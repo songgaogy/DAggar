@@ -1,28 +1,23 @@
-"""Failure-detector visualization for the nnPU (PU-BCE) discriminator (robosuite).
+"""Reusable nnPU failure-detector visualization helpers.
 
 Renders per-trajectory MP4 (with HUD + red border on predicted-failure frames)
-and a multi-page PDF summary, driven by a fitted
-:class:`PUBCEBenchmarkDiscriminator`.
+and a multi-page PDF summary for a fitted
+:class:`PUBCEBenchmarkDiscriminator`. Training and benchmark orchestration live
+in their respective pipeline entry points; this module intentionally has no
+standalone CLI or fitting path.
 
 Threshold: the visualizer uses the detector's own per-task **success_percentile**
 threshold (``tau = percentile(success-calib failure scores, 100 - delta)``). No
 GT failure timing / two-class Youden is available in this branch (it would need
 failure labels). The HUD shows ``failure_score = -g(z)`` and that tau.
 
-Use ``--split`` to choose which eval trajectories are rendered:
-  * ``fail_rollout``    - sample from ``--fail-split``
-  * ``success_rollout`` - sample from ``--success-split`` (``is_failure=False``)
-  * ``both``            - sample from failure and success eval pools (default)
-
 Outputs:
     <out_dir>/videos/<video_id>.mp4
     <out_dir>/<pdf-name>.pdf
-    <out_dir>/checkpoints/pu_bce_head.pth  (only when fitting; absent under --load-ckpt)
 """
 
 from __future__ import annotations
 
-import argparse
 import os
 import random
 from dataclasses import dataclass
@@ -550,82 +545,16 @@ def _sample_trajectories_for_viz(
 
 
 # ---------------------------------------------------------------------- #
-# Unlabeled-pool selection (mirrors the runner)                          #
-# ---------------------------------------------------------------------- #
-
-
-def _select_unlabeled(
-    pool_by_task: Dict[str, List],
-    eval_tasks: Sequence[str],
-    unlabeled_per_task: int,
-) -> List:
-    out: List = []
-    for task in sorted(set(eval_tasks)):
-        pool = sorted(pool_by_task.get(task, []), key=lambda t: str(t.video_id))
-        n_take = min(len(pool), int(unlabeled_per_task))
-        if n_take == 0:
-            raise RuntimeError(
-                f"Task {task!r}: zero failure trajectories available; "
-                f"check --fail-train-split and --task."
-            )
-        if n_take < int(unlabeled_per_task):
-            print(
-                f"[pu_bce][viz] task={task}: only {n_take} failure trajectories "
-                f"(< --unlabeled-per-task={unlabeled_per_task}); using all.",
-                flush=True,
-            )
-        out.extend(pool[:n_take])
-    return out
-
-
-def _build_benchmark_and_pool(args: argparse.Namespace):
-    """Build the eval FailureBenchmark plus the disjoint unlabeled failure pool."""
-    from robosuite.discriminator.utils.robosuite_benchmark import (
-        FailureBenchmark,
-        discover_unlabeled_failures,
-    )
-
-    bench = FailureBenchmark(
-        data_root=args.data_root,
-        tasks=[str(args.task)],
-        fail_split=args.fail_split,
-        success_split=args.success_split,
-        max_fail_per_task=args.max_fail_per_task,
-        max_success_per_task=args.max_success_per_task,
-    )
-    trajs = bench.trajectories()
-    if not trajs:
-        raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
-
-    eval_fail_keys = {str(t.video_id) for t in trajs if bool(t.is_failure)}
-    all_fail = discover_unlabeled_failures(
-        data_root=args.data_root,
-        tasks=[str(args.task)],
-        split=args.fail_train_split,
-        max_fail_per_task=None,
-    )
-    all_fail = [t for t in all_fail if bool(t.is_failure)]
-    pool = [t for t in all_fail if str(t.video_id) not in eval_fail_keys]
-    pool_by_task: Dict[str, List] = {}
-    for t in pool:
-        pool_by_task.setdefault(str(t.task_name), []).append(t)
-    eval_tasks = sorted({str(t.task_name) for t in trajs})
-    unlabeled = _select_unlabeled(pool_by_task, eval_tasks, int(args.unlabeled_per_task))
-    print(
-        f"[pu_bce][viz] robosuite eval={len(trajs)} (fail={len(eval_fail_keys)}) "
-        f"pool={len(pool)} unlabeled_used={len(unlabeled)}",
-        flush=True,
-    )
-    return bench, trajs, unlabeled
-
-
-# ---------------------------------------------------------------------- #
 # Load nnPU head from disk without re-fitting                            #
 # ---------------------------------------------------------------------- #
 
 
 def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    payload = torch.load(
+        ckpt_path,
+        map_location=torch.device(disc.device),
+        weights_only=False,
+    )
     disc.use_chunk = bool(payload.get("use_chunk", False))
     state = payload["pu_bce_detector"]
     detector = PUBCEDiscriminator(
@@ -674,160 +603,3 @@ def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> N
         + ", ".join(f"{k}={v:.4f}" for k, v in sorted(detector.thresholds.items())),
         flush=True,
     )
-
-
-# ---------------------------------------------------------------------- #
-# CLI                                                                    #
-# ---------------------------------------------------------------------- #
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="both",
-        choices=["success_rollout", "fail_rollout", "both"],
-        help="Eval pool to visualize: fail_rollout, success_rollout, or both.",
-    )
-    parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
-    parser.add_argument("--data-root", type=str, default="data",
-                        help="Robosuite data root containing data/<task>/<split> directories.")
-    parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
-    parser.add_argument("--success-split", type=str, default="success_rollout-val")
-    parser.add_argument("--fail-train-split", type=str, default="fail_rollout")
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--num-trajs", type=int, default=4)
-    parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--pdf-name", type=str, default="pu_bce_scores.pdf")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--fps", type=int, default=20)
-    parser.add_argument("--border-thickness", type=int, default=10)
-    parser.add_argument("--max-fail-per-task", type=int, default=None)
-    parser.add_argument("--max-success-per-task", type=int, default=None)
-    parser.add_argument("--no-flip-vertical", action="store_true",
-                        help="Disable the default top/bottom flip applied to rendered frames.")
-    parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
-
-    # shared encoder / scoring knobs
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encode-batch-size", type=int, default=32)
-    parser.add_argument("--camera-to-view", type=str, default=None)
-    parser.add_argument("--camera-name", type=str, default="agentview")
-    parser.add_argument("--visual-weight", type=float, default=1.0)
-    parser.add_argument("--proprio-weight", type=float, default=2.0)
-    parser.add_argument("--action-weight", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=10.0)
-    parser.add_argument("--feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--transformer-layer", type=int, default=1)
-    parser.add_argument("--calib-fraction", type=float, default=0.2)
-    parser.add_argument("--quiet-fit", action="store_true")
-
-    # nnPU-specific
-    parser.add_argument("--pi-p", type=float, default=0.5)
-    parser.add_argument("--loss-surrogate", type=str, default="logistic",
-                        choices=["sigmoid", "logistic"])
-    parser.add_argument("--no-nn-correction", action="store_true")
-    parser.add_argument("--beta", type=float, default=0.0)
-    parser.add_argument("--head-hidden", type=int, default=256)
-    parser.add_argument("--head-layers", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--unlabeled-per-task", type=int, default=25)
-    parser.add_argument("--save-ckpt-dir", type=str, default=None,
-                        help="Where pu_bce_head.pth is written when fitting. "
-                             "Defaults to <out-dir>/checkpoints.")
-    parser.add_argument("--load-ckpt", type=str, default=None,
-                        help="Path to an existing pu_bce_head.pth; skip fit and restore "
-                             "the head + per-task thresholds from disk.")
-
-    parser.add_argument("--no-debug-score-stats", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
-
-    bench, trajs, unlabeled_trajs = _build_benchmark_and_pool(args)
-    sampled = _sample_trajectories_for_viz(
-        trajs,
-        task=str(args.task),
-        split=str(args.split),
-        num_trajs=int(args.num_trajs),
-        seed=int(args.seed),
-    )
-
-    save_ckpt_dir = args.save_ckpt_dir or os.path.join(str(args.out_dir), "checkpoints")
-    discriminator = PUBCEBenchmarkDiscriminator(
-        model_ckpt=str(args.model_ckpt),
-        unlabeled_fail_trajectories=unlabeled_trajs if not args.load_ckpt else [],
-        pi_p=float(args.pi_p),
-        loss_surrogate=str(args.loss_surrogate),
-        nn_correction=not bool(args.no_nn_correction),
-        beta=float(args.beta),
-        head_hidden=int(args.head_hidden),
-        head_layers=int(args.head_layers),
-        epochs=int(args.epochs),
-        lr=float(args.lr),
-        weight_decay=float(args.weight_decay),
-        batch_size=int(args.batch_size),
-        save_ckpt_dir=None if args.load_ckpt else save_ckpt_dir,
-        device=str(args.device),
-        encode_batch_size=int(args.encode_batch_size),
-        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
-        camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        action_weight=float(args.action_weight),
-        delta=float(args.delta),
-        feature_source=str(args.feature_source),
-        transformer_layer=int(args.transformer_layer),
-        calib_fraction=float(args.calib_fraction),
-        seed=int(args.seed),
-        verbose_fit=not bool(args.quiet_fit),
-    )
-
-    try:
-        if args.load_ckpt:
-            if not os.path.isfile(args.load_ckpt):
-                raise FileNotFoundError(f"--load-ckpt not found: {args.load_ckpt}")
-            print(f"[pu_bce][viz] loading nnPU head from {args.load_ckpt}; skipping fit.", flush=True)
-            _bootstrap_from_ckpt(discriminator, str(args.load_ckpt))
-        else:
-            print("[pu_bce][viz] fitting nnPU head on benchmark...", flush=True)
-            discriminator.fit_on_benchmark(trajs)
-
-        if str(args.task) not in discriminator._detectors_per_task:
-            available = sorted(discriminator._detectors_per_task)
-            raise RuntimeError(
-                f"Task {args.task!r} is not present in the fitted/loaded discriminator. "
-                f"Available tasks: {available}"
-            )
-
-        visualizer = PUBCEVisualizer(
-            discriminator,
-            camera_name=str(args.camera_name),
-            fps=int(args.fps),
-            border_thickness=int(args.border_thickness),
-            debug_score_stats=not bool(args.no_debug_score_stats),
-            flip_vertical=not bool(args.no_flip_vertical),
-        )
-        out_paths = visualizer.visualize(
-            sampled,
-            out_dir=str(args.out_dir),
-            pdf_name=str(args.pdf_name),
-            split=str(args.split),
-        )
-        print(
-            f"[pu_bce][viz] done. videos: {len(out_paths['videos'])}  pdf: {out_paths['pdf']}",
-            flush=True,
-        )
-    finally:
-        discriminator.close()
-
-
-if __name__ == "__main__":
-    main()
