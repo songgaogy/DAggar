@@ -32,6 +32,9 @@ from robosuite.pipeline.offline.discriminator.features import (
 from robosuite.pipeline.offline.discriminator.pools import LatentTrajectory
 
 
+POSITIVE_SAFETY_BOUNDARY = 1.25
+
+
 def _cuda() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for nnPU finetune tests.")
@@ -63,13 +66,21 @@ def _objective_config(batch_size: int = 8) -> dict[str, object]:
                 "batch_size": batch_size,
                 "positive_fraction": 0.5,
             },
-            "supervised_gt_bce": {
-                "type": "supervised_bce",
+            "gt_positive": {
+                "type": "positive_safety_margin",
                 "enabled": True,
                 "weight": 1.0,
-                "batch_size": batch_size,
-                "positive_fraction": 0.5,
-                "class_weights": {"positive": 0.5, "negative": 0.5},
+                "batch_size": batch_size // 2,
+                "safety_margin_weight": 1.0,
+                "margin_delta": 1.0,
+                "temperature": 1.0,
+                "boundary_source": "parent_checkpoint",
+            },
+            "gt_negative": {
+                "type": "negative_logistic",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size // 2,
             },
         },
     }
@@ -93,6 +104,7 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(),
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -110,6 +122,10 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     assert logged[0]["data/pretrain_positive_frames"] == 24.0
     assert logged[0]["data/pretrain_unlabeled_frames"] == 24.0
     assert logged[0]["data/offline_gt_negative_frames"] == 24.0
+    assert logged[0]["safety/m_k"] == pytest.approx(POSITIVE_SAFETY_BOUNDARY)
+    assert logged[0]["safety/target_logit"] == pytest.approx(
+        POSITIVE_SAFETY_BOUNDARY + 1.0
+    )
 
 
 def test_log_interval_reports_running_mean() -> None:
@@ -128,6 +144,7 @@ def test_log_interval_reports_running_mean() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=config,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -175,6 +192,7 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(batch_size=10),
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=1e-3,
@@ -208,7 +226,21 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         parent_payload=parent_payload,
         parent_checkpoint=tmp_path / "parent.pth",
         task_name="Task",
-        finetune_config={"epochs": 1, "lr": 1e-3},
+        finetune_config={
+            "method": "nnpu_replay_positive_safety_margin_gt_negative",
+            "epochs": 1,
+            "lr": 1e-3,
+            "resolved_positive_safety_margin": {
+                "task": "Task",
+                "boundary_source": "parent_checkpoint",
+                "parent_failure_threshold": -POSITIVE_SAFETY_BOUNDARY,
+                "m_k": POSITIVE_SAFETY_BOUNDARY,
+                "margin_delta": 1.0,
+                "target_logit": POSITIVE_SAFETY_BOUNDARY + 1.0,
+                "safety_margin_weight": 1.0,
+                "temperature": 1.0,
+            },
+        },
         data_provenance={
             "positive_frames": 24,
             "unlabeled_frames": 24,
@@ -237,8 +269,13 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     assert payload["proprio_indices"] == [1, 2]
     assert payload["success_train_video_ids"] == {"Task": ["positive-train"]}
     assert payload["success_calib_video_ids"] == {"Task": ["positive-calib"]}
-    assert payload["finetune_schema_version"] == 2
-    assert payload["finetune_method"] == "nnpu_replay_gt_bce"
+    assert payload["finetune_schema_version"] == 4
+    assert payload["finetune_method"] == (
+        "nnpu_replay_positive_safety_margin_gt_negative"
+    )
+    assert payload["finetune_config"]["resolved_positive_safety_margin"]["m_k"] == (
+        POSITIVE_SAFETY_BOUNDARY
+    )
     checkpoint = save_finetuned_checkpoint(
         payload,
         tmp_path / "pu_bce_head_finetuned.pth",
@@ -263,6 +300,24 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     )
     torch.testing.assert_close(
         frozen.failure_score(probe),
+        detector.failure_score_tensor(probe),
+    )
+
+    legacy_payload = dict(payload)
+    legacy_payload["finetune_schema_version"] = 2
+    legacy_payload["finetune_method"] = "nnpu_replay_gt_bce"
+    legacy_checkpoint = save_finetuned_checkpoint(
+        legacy_payload,
+        tmp_path / "pu_bce_head_finetuned_v2.pth",
+    )
+    legacy_detector, legacy_restored_payload = load_warmstart_detector(
+        legacy_checkpoint,
+        device=device,
+        expected_task="Task",
+    )
+    assert legacy_restored_payload["finetune_schema_version"] == 2
+    torch.testing.assert_close(
+        legacy_detector.failure_score_tensor(probe),
         detector.failure_score_tensor(probe),
     )
 

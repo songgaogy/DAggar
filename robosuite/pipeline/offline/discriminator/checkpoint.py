@@ -146,6 +146,14 @@ def build_finetuned_checkpoint_payload(
     payload.setdefault("delta", detector_state.get("delta"))
     if encoder_checkpoint is not None:
         payload["model_ckpt"] = str(Path(encoder_checkpoint).expanduser().resolve())
+    finetune_method = str(
+        finetune_config.get("method", "nnpu_replay_separate_gt_risks")
+    )
+    finetune_schema_version = (
+        4
+        if finetune_method == "nnpu_replay_positive_safety_margin_gt_negative"
+        else 3
+    )
     payload.update(
         {
             "epoch": int(finetune_config["epochs"]),
@@ -155,8 +163,8 @@ def build_finetuned_checkpoint_payload(
             "pu_bce_detector": detector_state,
             "parent_nnpu_checkpoint": parent_path,
             "finetuned_offline": True,
-            "finetune_schema_version": 2,
-            "finetune_method": "nnpu_replay_gt_bce",
+            "finetune_schema_version": finetune_schema_version,
+            "finetune_method": finetune_method,
             "finetune_task": str(task_name),
             "finetune_config": dict(finetune_config),
             "finetune_data": dict(data_provenance),

@@ -34,6 +34,8 @@ offline:
 
     objective:
       # null derives the epoch length from the pretrain replay pool sizes.
+      # L = lambda_pre * L_pre_nnpu
+      #   + lambda_P * (L_P_BCE + mu * L_P_safe) + lambda_N * L_N.
       steps_per_epoch: null
       terms:
         nnpu_replay:
@@ -43,15 +45,21 @@ offline:
           batch_size: 512
           positive_fraction: 0.5
 
-        supervised_gt_bce:
-          type: "supervised_bce"
+        gt_positive:
+          type: "positive_safety_margin"
           enabled: true
           weight: 0.025
-          batch_size: 512
-          positive_fraction: 0.5
-          class_weights:
-            positive: 0.5
-            negative: 0.5
+          batch_size: 256
+          safety_margin_weight: 1.0
+          margin_delta: 1.0
+          temperature: 1.0
+          boundary_source: "parent_checkpoint"
+
+        gt_negative:
+          type: "negative_logistic"
+          enabled: true
+          weight: 0.0125
+          batch_size: 256
 
 logging:
   use_tensorboard: true

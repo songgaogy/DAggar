@@ -51,7 +51,8 @@ Existing output is rejected unless overwrite is explicitly requested.
 
 ### Warm-start finetuning
 
-`offline/scripts/finetune_disc.sh` combines the extracted and collected pools.
+`offline/scripts/finetune_disc.sh` keeps the extracted replay pools separate from
+the collected GT pools.
 Collected episodes are split at intervention boundaries and episode ends. Only
 non-intervention `executed_action` rows are encoded, after checking equality with
 `policy_action`; human actions and counterfactual actions are excluded.
@@ -73,17 +74,25 @@ bash robosuite/pipeline/offline/scripts/finetune_disc.sh
 
 The standalone Hydra config is `pipeline/config/finetune_disc.yaml`. Launcher
 environment variables expose the parent checkpoint and optional encoder
-override, CUDA device, input paths, schedule, seed, run root/suffix, and logging
-interval. Defaults are AdamW with cosine decay for 10 epochs, learning rate
-`3e-5`, weight decay `1e-4`, batch size `512`, and seed `0`. TensorBoard is the
-only experiment logger.
+override, CUDA device, input paths, schedule, seed, run root/suffix, logging
+interval, `LAMBDA_PRE`, `LAMBDA_P`, `LAMBDA_N`, and the two GT batch sizes.
+The positive safety-margin controls are exposed as `SAFETY_MARGIN_WEIGHT`,
+`SAFETY_MARGIN_DELTA`, `SAFETY_MARGIN_TEMPERATURE`, and
+`SAFETY_MARGIN_BOUNDARY_SOURCE`.
+Defaults are AdamW with cosine decay for 10 epochs, learning rate `3e-5`, weight
+decay `1e-4`, and seed `0`. TensorBoard is the only experiment logger.
 
-Pretrain and online trajectories are merged within their respective P/U pools,
-sampled uniformly by frame within each group, and trained with the inherited
-50/50 P/U batch composition and checkpoint nnPU settings. Threshold calibration
-uses only the held-out original `positive_calib` split. The standalone command
-accepts a single-task parent checkpoint; a multi-task shared head is rejected
-because every task threshold would need its own held-out recalibration pool.
+The objective uses three independently sampled risks:
+`1.0 * L_pre-nnPU + 0.025 * (L_P_BCE + L_P_safe) + 0.0125 * L_N`. The safety
+term is `softplus((m_k + 1.0 - g) / 1.0)`, where `m_k=-tau_k` is frozen from
+the calibrated parent checkpoint. Pretrain replay draws 256
+frames each from the original positive and unlabeled pools. `L_P` draws 256
+frames from direct-success offline policy segments, while `L_N` draws 256
+frames from intervention GT windows. Offline success frames never enter the
+pretrain positive pool or the nnPU risk. Threshold calibration uses only the
+held-out original `positive_calib` split. The standalone command accepts a
+single-task parent checkpoint; a multi-task shared head is rejected because
+every task threshold would need its own held-out recalibration pool.
 
 Each run writes
 `outputs/discriminator-finetune/<task>_<timestamp>[_suffix]/` with:

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import pu_risk
+import robosuite.pipeline.offline.discriminator.objectives as objectives_module
 from robosuite.pipeline.offline.discriminator.objectives import (
     CUDAPoolSampler,
     LossTermConfig,
@@ -17,6 +18,12 @@ from robosuite.pipeline.offline.discriminator.objectives import (
     PRETRAIN_UNLABELED,
     build_objective,
 )
+
+
+POSITIVE_SAFETY_BOUNDARY = 1.25
+SAFETY_MARGIN_WEIGHT = 0.75
+MARGIN_DELTA = 0.4
+TEMPERATURE = 0.5
 
 
 def _cuda() -> torch.device:
@@ -45,13 +52,21 @@ def _config(*, steps_per_epoch: int | None = None) -> dict:
                 "batch_size": 8,
                 "positive_fraction": 0.5,
             },
-            "supervised_gt_bce": {
-                "type": "supervised_bce",
+            "gt_positive": {
+                "type": "positive_safety_margin",
                 "enabled": True,
                 "weight": 2.0,
-                "batch_size": 10,
-                "positive_fraction": 0.4,
-                "class_weights": {"positive": 0.25, "negative": 0.75},
+                "batch_size": 4,
+                "safety_margin_weight": SAFETY_MARGIN_WEIGHT,
+                "margin_delta": MARGIN_DELTA,
+                "temperature": TEMPERATURE,
+                "boundary_source": "parent_checkpoint",
+            },
+            "gt_negative": {
+                "type": "negative_logistic",
+                "enabled": True,
+                "weight": 3.0,
+                "batch_size": 6,
             },
         },
     }
@@ -70,7 +85,12 @@ def test_default_ratios_sample_each_named_pool_independently_with_replacement() 
     device = _cuda()
     pools = _pools(device)
     objective = build_objective(
-        _config(), pools=pools, nnpu_parameters=_parameters(), device=device, seed=17
+        _config(),
+        pools=pools,
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=17,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     batches = objective.sample_batches()
 
@@ -82,7 +102,12 @@ def test_default_ratios_sample_each_named_pool_independently_with_replacement() 
     assert torch.unique(batches[OFFLINE_GT_NEGATIVE], dim=0).shape[0] <= 2
 
     replay = build_objective(
-        _config(), pools=pools, nnpu_parameters=_parameters(), device=device, seed=17
+        _config(),
+        pools=pools,
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=17,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     replay_batches = replay.sample_batches()
     for name, expected in batches.items():
@@ -95,15 +120,15 @@ def test_baseline_batches_draw_1024_samples_across_four_pools() -> None:
     config["terms"]["nnpu_replay"].update(
         {"batch_size": 512, "positive_fraction": 0.5}
     )
-    config["terms"]["supervised_gt_bce"].update(
-        {"batch_size": 512, "positive_fraction": 0.5}
-    )
+    config["terms"]["gt_positive"]["batch_size"] = 256
+    config["terms"]["gt_negative"]["batch_size"] = 256
     objective = build_objective(
         config,
         pools=_pools(device),
         nnpu_parameters=_parameters(),
         device=device,
         seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
 
     batches = objective.sample_batches()
@@ -117,7 +142,7 @@ def test_baseline_batches_draw_1024_samples_across_four_pools() -> None:
     assert sum(int(batch.shape[0]) for batch in batches.values()) == 1024
 
 
-def test_composite_loss_matches_manual_nnpu_and_weighted_gt_bce() -> None:
+def test_composite_loss_matches_manual_three_risk_objective() -> None:
     device = _cuda()
     objective = build_objective(
         _config(steps_per_epoch=3),
@@ -125,6 +150,7 @@ def test_composite_loss_matches_manual_nnpu_and_weighted_gt_bce() -> None:
         nnpu_parameters=_parameters(),
         device=device,
         seed=1,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     logits = {
         PRETRAIN_POSITIVE: torch.tensor([1.0, -0.5], device=device),
@@ -142,35 +168,98 @@ def test_composite_loss_matches_manual_nnpu_and_weighted_gt_bce() -> None:
         nn_correction=True,
         beta=0.0,
     )["risk"]
-    expected_gt = (
-        0.25 * F.softplus(-logits[OFFLINE_POSITIVE]).mean()
-        + 0.75 * F.softplus(logits[OFFLINE_GT_NEGATIVE]).mean()
+    expected_positive_bce = F.softplus(-logits[OFFLINE_POSITIVE]).mean()
+    expected_positive_safety = F.softplus(
+        (
+            POSITIVE_SAFETY_BOUNDARY
+            + MARGIN_DELTA
+            - logits[OFFLINE_POSITIVE]
+        )
+        / TEMPERATURE
+    ).mean()
+    expected_positive = (
+        expected_positive_bce
+        + SAFETY_MARGIN_WEIGHT * expected_positive_safety
     )
+    expected_negative = F.softplus(logits[OFFLINE_GT_NEGATIVE]).mean()
     torch.testing.assert_close(result.raw_losses["nnpu_replay"], expected_nnpu)
-    torch.testing.assert_close(result.raw_losses["supervised_gt_bce"], expected_gt)
-    torch.testing.assert_close(result.loss, expected_nnpu + 2.0 * expected_gt)
+    torch.testing.assert_close(result.raw_losses["gt_positive"], expected_positive)
+    torch.testing.assert_close(result.raw_losses["gt_negative"], expected_negative)
     torch.testing.assert_close(
-        result.metrics["gt_bce/positive"],
-        F.softplus(-logits[OFFLINE_POSITIVE]).mean(),
+        result.loss, expected_nnpu + 2.0 * expected_positive + 3.0 * expected_negative
     )
     torch.testing.assert_close(
-        result.metrics["gt_bce/negative"],
-        F.softplus(logits[OFFLINE_GT_NEGATIVE]).mean(),
+        result.metrics["gt/positive_bce"], expected_positive_bce
+    )
+    torch.testing.assert_close(
+        result.metrics["gt/positive_safety_margin"], expected_positive_safety
+    )
+    torch.testing.assert_close(
+        result.metrics["gt/positive_combined"], expected_positive
+    )
+    torch.testing.assert_close(
+        result.metrics["safety/m_k"],
+        logits[OFFLINE_POSITIVE].new_tensor(POSITIVE_SAFETY_BOUNDARY),
+    )
+    torch.testing.assert_close(
+        result.metrics["safety/target_logit"],
+        logits[OFFLINE_POSITIVE].new_tensor(
+            POSITIVE_SAFETY_BOUNDARY + MARGIN_DELTA
+        ),
+    )
+    torch.testing.assert_close(
+        result.metrics["safety/margin_violation_fraction"],
+        (
+            logits[OFFLINE_POSITIVE]
+            < POSITIVE_SAFETY_BOUNDARY + MARGIN_DELTA
+        )
+        .to(dtype=torch.float32)
+        .mean(),
+    )
+    torch.testing.assert_close(
+        result.metrics["gt/negative_logistic"], expected_negative
     )
 
 
-def test_gt_negative_gradient_survives_nnpu_clamp_and_lowers_logit() -> None:
+def test_zero_safety_margin_weight_reduces_exactly_to_positive_bce() -> None:
+    device = _cuda()
+    config = _config(steps_per_epoch=1)
+    config["terms"]["gt_positive"]["safety_margin_weight"] = 0.0
+    objective = build_objective(
+        config,
+        pools=_pools(device),
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
+    )
+    logits = {
+        PRETRAIN_POSITIVE: torch.tensor([1.0, -0.5], device=device),
+        PRETRAIN_UNLABELED: torch.tensor([-1.0, 0.25], device=device),
+        OFFLINE_POSITIVE: torch.tensor([-2.0, 0.5, 3.0], device=device),
+        OFFLINE_GT_NEGATIVE: torch.tensor([-0.5, 1.0], device=device),
+    }
+
+    result = objective.compute(logits)
+    expected_bce = F.softplus(-logits[OFFLINE_POSITIVE]).mean()
+
+    torch.testing.assert_close(
+        result.raw_losses["gt_positive"], expected_bce, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        result.metrics["gt/positive_combined"], expected_bce, rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        result.weighted_losses["gt_positive"], 2.0 * expected_bce
+    )
+
+
+def test_gt_gradients_survive_nnpu_clamp_and_move_logits_in_correct_directions() -> None:
     device = _cuda()
     config = _config(steps_per_epoch=1)
     config["terms"]["nnpu_replay"]["batch_size"] = 4
-    config["terms"]["supervised_gt_bce"].update(
-        {
-            "weight": 1.0,
-            "batch_size": 4,
-            "positive_fraction": 0.5,
-            "class_weights": {"positive": 0.5, "negative": 0.5},
-        }
-    )
+    config["terms"]["gt_positive"].update({"weight": 1.0, "batch_size": 2})
+    config["terms"]["gt_negative"].update({"weight": 1.0, "batch_size": 2})
     parameters = NNPUParameters(
         pi_p=0.5,
         surrogate="sigmoid",
@@ -183,25 +272,45 @@ def test_gt_negative_gradient_survives_nnpu_clamp_and_lowers_logit() -> None:
         nnpu_parameters=parameters,
         device=device,
         seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
+    gt_positive = torch.nn.Parameter(torch.full((2,), -1.0, device=device))
     gt_negative = torch.nn.Parameter(torch.full((2,), 1.0, device=device))
-    optimizer = torch.optim.SGD([gt_negative], lr=0.1)
-    before = gt_negative.detach().clone()
+    optimizer = torch.optim.SGD([gt_positive, gt_negative], lr=0.1)
+    positive_before = gt_positive.detach().clone()
+    negative_before = gt_negative.detach().clone()
     result = objective.compute(
         {
             PRETRAIN_POSITIVE: torch.full((2,), 10.0, device=device),
             PRETRAIN_UNLABELED: torch.full((2,), -10.0, device=device),
-            OFFLINE_POSITIVE: torch.full((2,), 1.0, device=device),
+            OFFLINE_POSITIVE: gt_positive,
             OFFLINE_GT_NEGATIVE: gt_negative,
         }
     )
     assert result.metrics["nnpu/clamped"].item() == 1.0
     optimizer.zero_grad(set_to_none=True)
     result.loss.backward()
+    assert gt_positive.grad is not None
     assert gt_negative.grad is not None
+    expected_positive_grad = -(
+        torch.sigmoid(-gt_positive.detach())
+        + SAFETY_MARGIN_WEIGHT
+        / TEMPERATURE
+        * torch.sigmoid(
+            (
+                POSITIVE_SAFETY_BOUNDARY
+                + MARGIN_DELTA
+                - gt_positive.detach()
+            )
+            / TEMPERATURE
+        )
+    ) / gt_positive.numel()
+    torch.testing.assert_close(gt_positive.grad, expected_positive_grad)
+    assert torch.all(gt_positive.grad < 0.0)
     assert torch.all(gt_negative.grad > 0.0)
     optimizer.step()
-    assert torch.all(gt_negative.detach() < before)
+    assert torch.all(gt_positive.detach() > positive_before)
+    assert torch.all(gt_negative.detach() < negative_before)
 
 
 def test_head_path_uses_joint_loss_and_expected_batch_sizes() -> None:
@@ -212,6 +321,7 @@ def test_head_path_uses_joint_loss_and_expected_batch_sizes() -> None:
         nnpu_parameters=_parameters(),
         device=device,
         seed=3,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     head = torch.nn.Linear(3, 1, device=device)
     result = objective(head)
@@ -230,7 +340,12 @@ def test_steps_per_epoch_derivation_and_explicit_override() -> None:
     device = _cuda()
     pools = _pools(device)
     derived = build_objective(
-        _config(), pools=pools, nnpu_parameters=_parameters(), device=device, seed=0
+        _config(),
+        pools=pools,
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     assert derived.steps_per_epoch == 12  # floor(20 / 4 + 30 / 4)
     explicit = build_objective(
@@ -239,28 +354,83 @@ def test_steps_per_epoch_derivation_and_explicit_override() -> None:
         nnpu_parameters=_parameters(),
         device=device,
         seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     assert explicit.steps_per_epoch == 7
 
 
-def test_zero_gt_weight_reduces_to_pretrain_nnpu_replay() -> None:
+@pytest.mark.parametrize(
+    "term_name,pool_name",
+    [
+        ("gt_positive", OFFLINE_POSITIVE),
+        ("gt_negative", OFFLINE_GT_NEGATIVE),
+    ],
+)
+def test_zero_gt_weight_does_not_require_its_pool(
+    term_name: str, pool_name: str
+) -> None:
     device = _cuda()
     config = _config(steps_per_epoch=1)
-    config["terms"]["supervised_gt_bce"]["weight"] = 0.0
+    config["terms"][term_name]["weight"] = 0.0
     pools = _pools(device)
-    pools.pop(OFFLINE_POSITIVE)
-    pools.pop(OFFLINE_GT_NEGATIVE)
+    pools.pop(pool_name)
     objective = build_objective(
-        config, pools=pools, nnpu_parameters=_parameters(), device=device, seed=5
+        config,
+        pools=pools,
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=5,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
     )
     result = objective.compute(
         {
             PRETRAIN_POSITIVE: torch.tensor([1.0, 2.0], device=device),
             PRETRAIN_UNLABELED: torch.tensor([-1.0, 0.0], device=device),
+            **(
+                {}
+                if pool_name == OFFLINE_POSITIVE
+                else {OFFLINE_POSITIVE: torch.tensor([0.5], device=device)}
+            ),
+            **(
+                {}
+                if pool_name == OFFLINE_GT_NEGATIVE
+                else {OFFLINE_GT_NEGATIVE: torch.tensor([-0.5], device=device)}
+            ),
         }
     )
-    assert set(result.raw_losses) == {"nnpu_replay"}
-    torch.testing.assert_close(result.loss, result.raw_losses["nnpu_replay"])
+    assert term_name not in result.raw_losses
+
+
+def test_nnpu_risk_receives_only_pretrain_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _cuda()
+    objective = build_objective(
+        _config(steps_per_epoch=1),
+        pools=_pools(device),
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=0,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
+    )
+    logits = {
+        PRETRAIN_POSITIVE: torch.tensor([11.0, 12.0], device=device),
+        PRETRAIN_UNLABELED: torch.tensor([21.0, 22.0], device=device),
+        OFFLINE_POSITIVE: torch.tensor([31.0, 32.0], device=device),
+        OFFLINE_GT_NEGATIVE: torch.tensor([41.0, 42.0], device=device),
+    }
+    called = False
+
+    def recording_pu_risk(g_p: torch.Tensor, g_u: torch.Tensor, **kwargs):
+        nonlocal called
+        called = True
+        torch.testing.assert_close(g_p, logits[PRETRAIN_POSITIVE])
+        torch.testing.assert_close(g_u, logits[PRETRAIN_UNLABELED])
+        return pu_risk(g_p, g_u, **kwargs)
+
+    monkeypatch.setattr(objectives_module, "pu_risk", recording_pu_risk)
+    objective.compute(logits)
+    assert called
 
 
 @pytest.mark.parametrize(
@@ -276,6 +446,10 @@ def test_zero_gt_weight_reduces_to_pretrain_nnpu_replay() -> None:
             },
             "sum to 1",
         ),
+        (
+            {"type": "positive_logistic", "positive_fraction": 0.5},
+            "only valid for paired losses",
+        ),
     ],
 )
 def test_loss_term_validation(kwargs: dict, message: str) -> None:
@@ -283,6 +457,65 @@ def test_loss_term_validation(kwargs: dict, message: str) -> None:
     base.update(kwargs)
     with pytest.raises(ValueError, match=message):
         LossTermConfig(**base)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("safety_margin_weight", -0.1, "safety_margin_weight.*non-negative"),
+        ("margin_delta", -0.1, "margin_delta.*non-negative"),
+        ("temperature", 0.0, "temperature.*positive"),
+        ("temperature", float("inf"), "temperature.*finite"),
+        ("boundary_source", "current_head", "boundary_source"),
+    ],
+)
+def test_positive_safety_margin_term_rejects_invalid_parameters(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    kwargs = {
+        "name": "gt_positive",
+        "type": "positive_safety_margin",
+        "enabled": True,
+        "weight": 2.0,
+        "batch_size": 4,
+        "safety_margin_weight": SAFETY_MARGIN_WEIGHT,
+        "margin_delta": MARGIN_DELTA,
+        "temperature": TEMPERATURE,
+        "boundary_source": "parent_checkpoint",
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        LossTermConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "boundary,message",
+    [
+        (None, "positive_safety_boundary"),
+        (float("nan"), "positive_safety_boundary.*finite"),
+    ],
+)
+def test_positive_safety_margin_requires_finite_parent_boundary(
+    boundary: float | None,
+    message: str,
+) -> None:
+    device = _cuda()
+    kwargs = {}
+    if boundary is not None:
+        kwargs["positive_safety_boundary"] = boundary
+
+    with pytest.raises(ValueError, match=message):
+        build_objective(
+            _config(steps_per_epoch=1),
+            pools=_pools(device),
+            nnpu_parameters=_parameters(),
+            device=device,
+            seed=0,
+            **kwargs,
+        )
 
 
 def test_unknown_loss_and_missing_active_pool_fail_fast() -> None:
@@ -299,7 +532,56 @@ def test_unknown_loss_and_missing_active_pool_fail_fast() -> None:
             nnpu_parameters=_parameters(),
             device=device,
             seed=0,
+            positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         )
+
+
+def test_legacy_supervised_bce_cannot_overlap_separate_gt_risks() -> None:
+    device = _cuda()
+    config = _config(steps_per_epoch=1)
+    config["terms"]["legacy_gt_bce"] = {
+        "type": "supervised_bce",
+        "enabled": True,
+        "weight": 1.0,
+        "batch_size": 4,
+        "positive_fraction": 0.5,
+        "class_weights": {"positive": 0.5, "negative": 0.5},
+    }
+    with pytest.raises(ValueError, match="disjoint pools"):
+        build_objective(
+            config,
+            pools=_pools(device),
+            nnpu_parameters=_parameters(),
+            device=device,
+            seed=0,
+            positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
+        )
+
+
+def test_legacy_supervised_bce_remains_supported_as_an_alternative() -> None:
+    device = _cuda()
+    config = _config(steps_per_epoch=1)
+    config["terms"].pop("gt_positive")
+    config["terms"].pop("gt_negative")
+    config["terms"]["supervised_gt_bce"] = {
+        "type": "supervised_bce",
+        "enabled": True,
+        "weight": 0.025,
+        "batch_size": 8,
+        "positive_fraction": 0.5,
+        "class_weights": {"positive": 0.5, "negative": 0.5},
+    }
+    objective = build_objective(
+        config,
+        pools=_pools(device),
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=0,
+    )
+    batches = objective.sample_batches()
+    assert batches[OFFLINE_POSITIVE].shape[0] == 4
+    assert batches[OFFLINE_GT_NEGATIVE].shape[0] == 4
+    assert "supervised_gt_bce" in objective(torch.nn.Linear(3, 1, device=device)).raw_losses
 
 
 def test_cuda_guards_reject_cpu_without_fallback() -> None:

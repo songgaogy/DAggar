@@ -34,6 +34,12 @@ def configured_loss_terms(
     active_types = [term.type for term in active]
     if len(active_types) != len(set(active_types)):
         raise ValueError("Only one active term of each loss type is supported.")
+    active_pools = [pool for term in active for pool in term.pool_batch_sizes]
+    if len(active_pools) != len(set(active_pools)):
+        raise ValueError(
+            "Active loss terms must use disjoint pools; do not combine legacy "
+            "supervised_bce with separate GT risks."
+        )
     steps = objective_config.get("steps_per_epoch")
     if steps is None and "nnpu" not in active_types:
         raise ValueError(
@@ -54,11 +60,7 @@ def active_training_pool_names(
             pool
             for term in loss_terms
             if term.active
-            for pool in (
-                ("pretrain_positive", "pretrain_unlabeled")
-                if term.type == "nnpu"
-                else ("offline_positive", "offline_gt_negative")
-            )
+            for pool in term.pool_batch_sizes
         }
     )
 
@@ -81,10 +83,6 @@ def resolved_sampler_config(
     device: str,
 ) -> dict[str, Any]:
     """Record the independent replacement sampler implied by each loss term."""
-    pool_names = {
-        "nnpu": ("pretrain_positive", "pretrain_unlabeled"),
-        "supervised_bce": ("offline_positive", "offline_gt_negative"),
-    }
     return {
         "strategy": "independent_uniform_with_replacement",
         "seed": int(seed),
@@ -93,11 +91,9 @@ def resolved_sampler_config(
             term.name: {
                 "enabled": bool(term.enabled),
                 "active": bool(term.active),
-                "positive_pool": pool_names[term.type][0],
-                "negative_or_unlabeled_pool": pool_names[term.type][1],
+                "type": term.type,
                 "batch_size": int(term.batch_size),
-                "positive_batch_size": int(term.positive_batch_size),
-                "negative_or_unlabeled_batch_size": int(term.negative_batch_size),
+                "pool_batch_sizes": dict(term.pool_batch_sizes),
             }
             for term in loss_terms
         },

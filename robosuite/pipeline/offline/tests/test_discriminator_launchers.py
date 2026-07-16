@@ -30,6 +30,42 @@ def test_discriminator_launchers_parse_with_safe_environment_defaults() -> None:
     assert 'NNPU_ENCODER_CKPT="${NNPU_ENCODER_CKPT:-' in finetune_text
     assert 'NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"' in finetune_text
     assert "append_optional_override EPOCHS offline.discriminator_finetune.epochs" in finetune_text
+    assert (
+        "append_optional_override LAMBDA_PRE "
+        "offline.discriminator_finetune.objective.terms.nnpu_replay.weight"
+        in finetune_text
+    )
+    assert (
+        "append_optional_override LAMBDA_P "
+        "offline.discriminator_finetune.objective.terms.gt_positive.weight"
+        in finetune_text
+    )
+    assert (
+        "append_optional_override LAMBDA_N "
+        "offline.discriminator_finetune.objective.terms.gt_negative.weight"
+        in finetune_text
+    )
+    assert (
+        "append_optional_override GT_POSITIVE_BATCH_SIZE "
+        "offline.discriminator_finetune.objective.terms.gt_positive.batch_size"
+        in finetune_text
+    )
+    assert (
+        "append_optional_override GT_NEGATIVE_BATCH_SIZE "
+        "offline.discriminator_finetune.objective.terms.gt_negative.batch_size"
+        in finetune_text
+    )
+    for env_name, config_key in (
+        ("SAFETY_MARGIN_WEIGHT", "safety_margin_weight"),
+        ("SAFETY_MARGIN_DELTA", "margin_delta"),
+        ("SAFETY_MARGIN_TEMPERATURE", "temperature"),
+        ("SAFETY_MARGIN_BOUNDARY_SOURCE", "boundary_source"),
+    ):
+        assert (
+            f"append_optional_override {env_name} "
+            "offline.discriminator_finetune.objective.terms.gt_positive."
+            f"{config_key}"
+        ) in finetune_text
     assert 'EPOCHS="${EPOCHS:-' not in finetune_text
     assert "NNPU_CKPT is required for warm-start Step 3 finetuning" in finetune_text
     assert "use_only_offline" not in finetune_text
@@ -41,7 +77,7 @@ def test_discriminator_launchers_parse_with_safe_environment_defaults() -> None:
     assert "NUM_OFFLINE_SUCCESS_TRAJS" not in visualize_text
 
 
-def test_finetune_config_defaults_to_replay_nnpu_plus_supervised_gt_bce() -> None:
+def test_finetune_config_defaults_to_three_independent_risks() -> None:
     cfg = OmegaConf.load(CONFIG)
     finetune = cfg.offline.discriminator_finetune
 
@@ -55,11 +91,18 @@ def test_finetune_config_defaults_to_replay_nnpu_plus_supervised_gt_bce() -> Non
     assert finetune.objective.steps_per_epoch is None
     assert finetune.objective.terms.nnpu_replay.batch_size == 512
     assert finetune.objective.terms.nnpu_replay.positive_fraction == 0.5
-    gt_bce = finetune.objective.terms.supervised_gt_bce
-    assert gt_bce.weight == 0.025
-    assert gt_bce.batch_size == 512
-    assert gt_bce.class_weights.positive == 0.5
-    assert gt_bce.class_weights.negative == 0.5
+    gt_positive = finetune.objective.terms.gt_positive
+    assert gt_positive.type == "positive_safety_margin"
+    assert gt_positive.weight == 0.025
+    assert gt_positive.batch_size == 256
+    assert gt_positive.safety_margin_weight == 1.0
+    assert gt_positive.margin_delta == 1.0
+    assert gt_positive.temperature == 1.0
+    assert gt_positive.boundary_source == "parent_checkpoint"
+    gt_negative = finetune.objective.terms.gt_negative
+    assert gt_negative.type == "negative_logistic"
+    assert gt_negative.weight == 0.0125
+    assert gt_negative.batch_size == 256
 
     objective = OmegaConf.to_container(finetune.objective, resolve=True)
     assert isinstance(objective, dict)
@@ -69,11 +112,13 @@ def test_finetune_config_defaults_to_replay_nnpu_plus_supervised_gt_bce() -> Non
         device=str(cfg.algorithm.discriminator.learner_device),
     )
     assert sampler["strategy"] == "independent_uniform_with_replacement"
-    assert sampler["terms"]["nnpu_replay"]["positive_batch_size"] == 256
-    assert sampler["terms"]["nnpu_replay"][
-        "negative_or_unlabeled_batch_size"
-    ] == 256
-    assert sampler["terms"]["supervised_gt_bce"]["positive_batch_size"] == 256
-    assert sampler["terms"]["supervised_gt_bce"][
-        "negative_or_unlabeled_batch_size"
-    ] == 256
+    assert sampler["terms"]["nnpu_replay"]["pool_batch_sizes"] == {
+        "pretrain_positive": 256,
+        "pretrain_unlabeled": 256,
+    }
+    assert sampler["terms"]["gt_positive"]["pool_batch_sizes"] == {
+        "offline_positive": 256,
+    }
+    assert sampler["terms"]["gt_negative"]["pool_batch_sizes"] == {
+        "offline_gt_negative": 256,
+    }

@@ -1,4 +1,4 @@
-"""CUDA-only warm-start training for replay nnPU plus supervised GT BCE."""
+"""CUDA-only warm-start training for replay nnPU plus separate GT risks."""
 
 from __future__ import annotations
 
@@ -136,6 +136,7 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
         success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
         objective_config: Mapping[str, Any],
+        positive_safety_boundary: float | None = None,
         pi_p: float,
         epochs: int = 10,
         lr: float = 3e-5,
@@ -150,7 +151,7 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
         metric_callback: Optional[MetricCallback] = None,
         step_metric_callback: Optional[MetricCallback] = None,
     ) -> Dict[str, float]:
-        """Optimize the joint replay-nnPU and supervised-GT objective."""
+        """Optimize the joint replay-nnPU and separate supervised-GT objective."""
         if self.device.type != "cuda":
             raise ValueError(
                 f"PUBCEDiscriminatorFT.finetune requires a CUDA device, got {self.device}."
@@ -190,6 +191,7 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
             ),
             device=self.device,
             seed=int(seed),
+            positive_safety_boundary=positive_safety_boundary,
         )
         steps_per_epoch = int(objective.steps_per_epoch)
         optimizer = torch.optim.AdamW(
@@ -214,6 +216,11 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
             for epoch_step in range(steps_per_epoch):
                 optimizer.zero_grad(set_to_none=True)
                 result = objective(self.head)
+                if not bool(torch.isfinite(result.loss).item()):
+                    raise FloatingPointError(
+                        f"Non-finite discriminator loss at epoch={epoch + 1}, "
+                        f"step={epoch_step + 1}."
+                    )
                 result.loss.backward()
                 optimizer.step()
                 scheduler.step()
@@ -276,8 +283,19 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
                     f"loss={metrics['loss/total']:.5f} "
-                    f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f} "
-                    f"gt_bce={metrics.get('loss/supervised_gt_bce/raw', float('nan')):.5f} "
+                    f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f}/"
+                    f"{metrics.get('loss/nnpu_replay/weighted', float('nan')):.5f} "
+                    f"gt_p={metrics.get('loss/gt_positive/raw', float('nan')):.5f}/"
+                    f"{metrics.get('loss/gt_positive/weighted', float('nan')):.5f} "
+                    f"p_bce={metrics.get('gt/positive_bce', float('nan')):.5f} "
+                    f"p_safe={metrics.get('gt/positive_safety_margin', float('nan')):.5f} "
+                    f"p_violate={metrics.get('safety/margin_violation_fraction', float('nan')):.3f} "
+                    f"gt_n={metrics.get('loss/gt_negative/raw', float('nan')):.5f}/"
+                    f"{metrics.get('loss/gt_negative/weighted', float('nan')):.5f} "
+                    f"batch={int(metrics.get('batch/pretrain_positive', 0.0))}/"
+                    f"{int(metrics.get('batch/pretrain_unlabeled', 0.0))}/"
+                    f"{int(metrics.get('batch/offline_positive', 0.0))}/"
+                    f"{int(metrics.get('batch/offline_gt_negative', 0.0))} "
                     f"lr={metrics['lr']:.2e}",
                     flush=True,
                 )
@@ -360,6 +378,7 @@ def finetune_warmstart_detector(
     feature_pools: Mapping[str, Sequence[torch.Tensor]],
     calibration_features: Sequence[torch.Tensor],
     objective_config: Mapping[str, Any],
+    positive_safety_boundary: float | None = None,
     task_name: str,
     parent_payload: Mapping[str, Any],
     epochs: int,
@@ -377,6 +396,7 @@ def finetune_warmstart_detector(
         feature_pools,
         {str(task_name): list(calibration_features)},
         objective_config=objective_config,
+        positive_safety_boundary=positive_safety_boundary,
         pi_p=float(semantics["pi_p"]),
         epochs=int(epochs),
         lr=float(lr),

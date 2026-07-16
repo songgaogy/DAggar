@@ -82,6 +82,15 @@ append_optional_override WEIGHT_DECAY offline.discriminator_finetune.weight_deca
 append_optional_override ENCODE_BATCH_SIZE offline.discriminator_finetune.encode_batch_size
 append_optional_override LOG_INTERVAL offline.discriminator_finetune.log_interval
 append_optional_override SEED seed
+append_optional_override LAMBDA_PRE offline.discriminator_finetune.objective.terms.nnpu_replay.weight
+append_optional_override LAMBDA_P offline.discriminator_finetune.objective.terms.gt_positive.weight
+append_optional_override LAMBDA_N offline.discriminator_finetune.objective.terms.gt_negative.weight
+append_optional_override GT_POSITIVE_BATCH_SIZE offline.discriminator_finetune.objective.terms.gt_positive.batch_size
+append_optional_override GT_NEGATIVE_BATCH_SIZE offline.discriminator_finetune.objective.terms.gt_negative.batch_size
+append_optional_override SAFETY_MARGIN_WEIGHT offline.discriminator_finetune.objective.terms.gt_positive.safety_margin_weight
+append_optional_override SAFETY_MARGIN_DELTA offline.discriminator_finetune.objective.terms.gt_positive.margin_delta
+append_optional_override SAFETY_MARGIN_TEMPERATURE offline.discriminator_finetune.objective.terms.gt_positive.temperature
+append_optional_override SAFETY_MARGIN_BOUNDARY_SOURCE offline.discriminator_finetune.objective.terms.gt_positive.boundary_source
 
 if [[ -n "${NNPU_CAMERA_TO_VIEW}" ]]; then
   HYDRA_OVERRIDES+=("algorithm.discriminator.camera_to_view=${NNPU_CAMERA_TO_VIEW}")
