@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
@@ -93,6 +94,12 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         nn_correction: bool = True,
         beta: float = 0.0,
         save_ckpt_dir: Optional[str] = None,
+        threshold_normalization: str = "none",
+        soft_cap_c: Optional[float] = None,
+        soft_cap_lambda: float = 0.0,
+        soft_cap_temperature: float = 1.0,
+        checkpoint_epochs: Sequence[int] = (1, 2, 5, 10, 20),
+        tensorboard_dir: Optional[str] = None,
         # forwarded to the shared parent for encoding / cache parity
         device: str = "cuda",
         encode_batch_size: int = 32,
@@ -142,6 +149,20 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self.nn_correction = bool(nn_correction)
         self.beta = float(beta)
         self.save_ckpt_dir = None if save_ckpt_dir is None else str(save_ckpt_dir)
+        self.threshold_normalization = str(threshold_normalization)
+        self.soft_cap_c = None if soft_cap_c is None else float(soft_cap_c)
+        self.soft_cap_lambda = float(soft_cap_lambda)
+        self.soft_cap_temperature = float(soft_cap_temperature)
+        self.checkpoint_epochs = tuple(sorted({int(value) for value in checkpoint_epochs}))
+        if not self.checkpoint_epochs or min(self.checkpoint_epochs) < 1:
+            raise ValueError("checkpoint_epochs must contain positive epoch numbers")
+        if max(self.checkpoint_epochs) > self.epochs:
+            raise ValueError(
+                f"checkpoint epoch {max(self.checkpoint_epochs)} exceeds epochs={self.epochs}"
+            )
+        self.tensorboard_dir = None if tensorboard_dir is None else str(tensorboard_dir)
+        self._writer = None if self.tensorboard_dir is None else SummaryWriter(self.tensorboard_dir)
+        self.epoch_checkpoint_paths: Dict[int, str] = {}
 
         # Single shared detector across tasks (constructed in fit_on_benchmark
         # once the encoder's feature dim is known).
@@ -249,13 +270,13 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             out.append(self._encode(traj, frame_end=t_end))
         return out
 
-    def _save_checkpoint(self) -> Optional[Path]:
+    def _save_checkpoint(self, *, epoch: Optional[int] = None) -> Optional[Path]:
         if self.save_ckpt_dir is None or self._shared_detector is None:
             return None
         out_dir = Path(self.save_ckpt_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "epoch": int(self.epochs),
+            "epoch": int(self._shared_detector._completed_epochs if epoch is None else epoch),
             "in_dim": int(self._shared_detector.in_dim),
             "hidden": int(self._shared_detector.hidden),
             "num_layers": int(self._shared_detector.num_layers),
@@ -275,6 +296,11 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
+            "threshold_normalization": str(self.threshold_normalization),
+            "soft_cap_c": self.soft_cap_c,
+            "soft_cap_lambda": float(self.soft_cap_lambda),
+            "soft_cap_temperature": float(self.soft_cap_temperature),
+            "checkpoint_epochs": list(self.checkpoint_epochs),
             "seed": int(self.seed),
             "calib_fraction": float(self.calib_fraction),
             "delta": float(self.delta),
@@ -297,9 +323,69 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 str(t.video_id) for t in self.unlabeled_fail_trajectories
             ),
         }
-        fp = out_dir / "pu_bce_head.pth"
+        fp = (
+            out_dir / "pu_bce_head.pth"
+            if epoch is None
+            else out_dir / f"pu_bce_head_epoch_{int(epoch):03d}.pth"
+        )
         torch.save(payload, fp)
         return fp
+
+    @staticmethod
+    def _iter_scalar_metrics(prefix: str, value: Any):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_prefix = f"{prefix}/{key}" if prefix else str(key)
+                yield from PUBCEBenchmarkDiscriminator._iter_scalar_metrics(child_prefix, child)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            yield prefix, float(value)
+
+    def _record_epoch_metrics(self, epoch: int, metrics: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("train", metrics):
+            self._writer.add_scalar(tag, value, int(epoch))
+        self._writer.flush()
+
+    def _snapshot_epoch(self, epoch: int, detector: PUBCEDiscriminator) -> None:
+        del detector
+        if int(epoch) not in self.checkpoint_epochs:
+            return
+        if self.save_ckpt_dir is None:
+            return
+        path = self._save_checkpoint(epoch=int(epoch))
+        if path is None:
+            return
+        self.epoch_checkpoint_paths[int(epoch)] = str(path)
+        if self.verbose_fit:
+            print(f"[pu_bce][ckpt] wrote {path}", flush=True)
+
+    def activate_checkpoint(self, checkpoint: str | Path) -> dict:
+        """Activate one epoch checkpoint while retaining the encoder cache."""
+        payload = torch.load(
+            Path(checkpoint).expanduser().resolve(),
+            map_location=torch.device(self.device),
+            weights_only=False,
+        )
+        state = dict(payload["pu_bce_detector"])
+        detector = PUBCEDiscriminator(
+            in_dim=int(state["in_dim"]),
+            hidden=int(state["hidden"]),
+            num_layers=int(state["num_layers"]),
+            device=self.device,
+        )
+        detector.load_state_dict(state)
+        detector.head.eval()
+        self._shared_detector = detector
+        self._detectors_per_task = {task: detector for task in detector.thresholds}
+        return payload
+
+    def log_benchmark_metrics(self, epoch: int, payload: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("benchmark", payload):
+            self._writer.add_scalar(tag, value, int(epoch))
+        self._writer.flush()
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #
@@ -490,6 +576,12 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             loss_surrogate=self.loss_surrogate,
             nn_correction=self.nn_correction,
             beta=self.beta,
+            threshold_normalization=self.threshold_normalization,
+            soft_cap_c=self.soft_cap_c,
+            soft_cap_lambda=self.soft_cap_lambda,
+            soft_cap_temperature=self.soft_cap_temperature,
+            epoch_callback=self._snapshot_epoch,
+            metric_callback=self._record_epoch_metrics,
             verbose=self.verbose_fit,
         )
 
@@ -512,6 +604,11 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
+            "threshold_normalization": str(self.threshold_normalization),
+            "soft_cap_c": self.soft_cap_c,
+            "soft_cap_lambda": float(self.soft_cap_lambda),
+            "soft_cap_temperature": float(self.soft_cap_temperature),
+            "checkpoint_epochs": list(self.checkpoint_epochs),
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
@@ -537,10 +634,17 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 "calib_num_frames": None if cs is None else int(cs.num_calib_frames),
             }
 
-        # Final one-shot checkpoint (no mid-training snapshots).
+        # Canonical final checkpoint; epoch snapshots were emitted by the callback.
         ckpt_path = self._save_checkpoint()
         if ckpt_path is not None and self.verbose_fit:
             print(f"[pu_bce][ckpt] wrote {ckpt_path}", flush=True)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.flush()
+            self._writer.close()
+            self._writer = None
+        super().close()
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
         task = str(trajectory.task_name)

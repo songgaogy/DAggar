@@ -45,7 +45,7 @@ success_percentile rule only (no failure labels are ever used).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -86,13 +86,28 @@ class BCEHead(nn.Module):
             d = int(hidden)
         layers.append(nn.Linear(d, 1))
         self.net = nn.Sequential(*layers)
+        self.register_buffer("logit_center", torch.zeros((), dtype=torch.float32))
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def raw_forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: (B, D)  ->  (B,)
         return self.net(z).squeeze(-1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.raw_forward(z) - self.logit_center
+
+    @torch.no_grad()
+    def set_logit_center(self, value: float | torch.Tensor) -> None:
+        center = torch.as_tensor(
+            value,
+            device=self.logit_center.device,
+            dtype=self.logit_center.dtype,
+        )
+        if center.numel() != 1 or not bool(torch.isfinite(center).item()):
+            raise ValueError("logit center must be one finite scalar")
+        self.logit_center.copy_(center.reshape(()))
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +129,22 @@ def _surrogate_loss(g: torch.Tensor, positive: bool, surrogate: str) -> torch.Te
     if surrogate == "logistic":
         return torch.nn.functional.softplus(z)
     raise ValueError(f"unknown loss surrogate {surrogate!r}; expected 'sigmoid' or 'logistic'")
+
+
+def soft_logit_cap_penalty(
+    logits: torch.Tensor,
+    cap: float,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Return the linear soft-hinge penalty outside ``[-cap, cap]``."""
+    if float(cap) <= 0.0:
+        raise ValueError(f"cap must be positive, got {cap}")
+    if float(temperature) <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    if logits.numel() == 0:
+        raise ValueError("soft logit cap requires at least one logit")
+    t = torch.as_tensor(float(temperature), device=logits.device, dtype=logits.dtype)
+    return (t * torch.nn.functional.softplus((logits.abs() - float(cap)) / t)).mean()
 
 
 def pu_risk(
@@ -214,15 +245,26 @@ class PUBCEDiscriminator:
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
-
-        self.head: BCEHead = BCEHead(in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers).to(self.device)
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("PUBCEDiscriminator requires CUDA, but CUDA is unavailable")
+        with torch.device(self.device):
+            self.head = BCEHead(
+                in_dim=self.in_dim,
+                hidden=self.hidden,
+                num_layers=self.num_layers,
+            )
         self.thresholds: Dict[str, float] = {}
         self.calib_stats: Dict[str, PUCalibStats] = {}
         self._delta: Optional[float] = None
         self._pi_p: Optional[float] = None
         self._surrogate: str = "sigmoid"
-        self._train_history: List[Dict[str, float]] = []
+        self._train_history: List[Dict[str, Any]] = []
+        self._threshold_normalization: str = "none"
+        self._soft_cap_c: Optional[float] = None
+        self._soft_cap_lambda: float = 0.0
+        self._soft_cap_temperature: float = 1.0
+        self._completed_epochs: int = 0
 
     # ------------------------------------------------------------------ #
     # Internal forward helpers                                           #
@@ -238,6 +280,16 @@ class PUBCEDiscriminator:
         flat = features.reshape(-1, self.in_dim).to(self.device, dtype=torch.float32)
         logits = self.head(flat)
         return logits.reshape(leading_shape)
+
+    def raw_logits_tensor(self, features: torch.Tensor) -> torch.Tensor:
+        """Return the pre-normalization head output while preserving device flow."""
+        if features.shape[-1] != self.in_dim:
+            raise ValueError(
+                f"feature dim mismatch: expected {self.in_dim}, got {features.shape[-1]}"
+            )
+        leading_shape = features.shape[:-1]
+        flat = features.reshape(-1, self.in_dim).to(self.device, dtype=torch.float32)
+        return self.head.raw_forward(flat).reshape(leading_shape)
 
     def failure_score_tensor(self, features: torch.Tensor) -> torch.Tensor:
         """Return ``-g(z)``; larger values are more failure-like."""
@@ -275,6 +327,118 @@ class PUBCEDiscriminator:
             outs.append(g.detach().cpu().numpy().astype(np.float32))
         return np.concatenate(outs, axis=0)
 
+    @torch.no_grad()
+    def _pool_logits_cuda(
+        self,
+        features: Sequence[torch.Tensor],
+        *,
+        raw: bool,
+        batch_size: int = 4096,
+    ) -> torch.Tensor:
+        outputs: List[torch.Tensor] = []
+        was_training = self.head.training
+        self.head.eval()
+        for sequence in features:
+            flat = sequence.reshape(-1, sequence.shape[-1])
+            for start in range(0, int(flat.shape[0]), int(batch_size)):
+                chunk = flat[start : start + int(batch_size)].to(
+                    self.device, dtype=torch.float32, non_blocking=True
+                )
+                value = self.head.raw_forward(chunk) if raw else self.head(chunk)
+                outputs.append(value.detach())
+        if was_training:
+            self.head.train()
+        if not outputs:
+            return torch.empty((0,), device=self.device, dtype=torch.float32)
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _logit_summary(values: torch.Tensor) -> Dict[str, float]:
+        if values.device.type != "cuda":
+            raise ValueError("logit diagnostics must run on CUDA")
+        flat = values.reshape(-1).to(torch.float32)
+        if flat.numel() == 0:
+            raise ValueError("cannot summarize an empty logit pool")
+        finite = torch.isfinite(flat)
+        if not bool(finite.all().item()):
+            raise FloatingPointError("non-finite logits detected")
+        quantiles = torch.quantile(
+            flat,
+            torch.tensor([0.01, 0.5, 0.99], device=flat.device, dtype=flat.dtype),
+        )
+        abs_p99 = torch.quantile(flat.abs(), 0.99)
+        saturation = (flat.abs() > 9.21).to(torch.float32).mean()
+        return {
+            "num_frames": float(flat.numel()),
+            "all_finite": True,
+            "finite_fraction": 1.0,
+            "mean": float(flat.mean().item()),
+            "std": float(flat.std(unbiased=False).item()),
+            "min": float(flat.min().item()),
+            "max": float(flat.max().item()),
+            "p01": float(quantiles[0].item()),
+            "p50": float(quantiles[1].item()),
+            "p99": float(quantiles[2].item()),
+            "abs_p99": float(abs_p99.item()),
+            "max_abs": float(flat.abs().max().item()),
+            "saturation_fraction": float(saturation.item()),
+        }
+
+    @torch.no_grad()
+    def _calibrate_epoch(
+        self,
+        success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
+        *,
+        delta: float,
+        update_center: bool,
+        verbose: bool,
+    ) -> None:
+        q = 1.0 - float(delta) / 100.0
+        if update_center:
+            pooled_sequences = [
+                sequence
+                for sequences in success_calib_per_task.values()
+                for sequence in sequences
+                if sequence.numel() > 0
+            ]
+            raw_logits = self._pool_logits_cuda(pooled_sequences, raw=True)
+            if raw_logits.numel() == 0:
+                raise ValueError("success calibration pool is empty")
+            raw_tau = torch.quantile(-raw_logits, q)
+            self.head.set_logit_center(-raw_tau)
+
+        self.thresholds = {}
+        self.calib_stats = {}
+        for task, calib_sequences in success_calib_per_task.items():
+            sequences = [value for value in calib_sequences if value.numel() > 0]
+            if not sequences:
+                raise ValueError(
+                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
+                    "cannot calibrate threshold."
+                )
+            effective = self._pool_logits_cuda(sequences, raw=False)
+            failure_score = -effective
+            tau_tensor = torch.quantile(failure_score, q)
+            tau = float(tau_tensor.item())
+            self.thresholds[task] = tau
+            self.calib_stats[task] = PUCalibStats(
+                threshold=tau,
+                num_calib_frames=int(failure_score.numel()),
+                calib_score_min=float(failure_score.min().item()),
+                calib_score_max=float(failure_score.max().item()),
+                calib_score_mean=float(failure_score.mean().item()),
+                calib_score_std=float(failure_score.std(unbiased=False).item()),
+            )
+            if verbose:
+                print(
+                    f"[pu_bce][calib] task={task} tau={tau:.5f} "
+                    f"center={float(self.head.logit_center.item()):.5f} "
+                    f"n_calib={failure_score.numel()} "
+                    f"mean={failure_score.mean().item():.5f} "
+                    f"std={failure_score.std(unbiased=False).item():.5f}",
+                    flush=True,
+                )
+
     # ------------------------------------------------------------------ #
     # Fit                                                                #
     # ------------------------------------------------------------------ #
@@ -295,6 +459,12 @@ class PUBCEDiscriminator:
         loss_surrogate: str = "sigmoid",
         nn_correction: bool = True,
         beta: float = 0.0,
+        threshold_normalization: str = "none",
+        soft_cap_c: Optional[float] = None,
+        soft_cap_lambda: float = 0.0,
+        soft_cap_temperature: float = 1.0,
+        epoch_callback: Optional[Callable[[int, "PUBCEDiscriminator"], None]] = None,
+        metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """Train the shared head with the nnPU risk; calibrate per-task thresholds.
@@ -328,10 +498,26 @@ class PUBCEDiscriminator:
             raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
         if loss_surrogate not in ("sigmoid", "logistic"):
             raise ValueError(f"loss_surrogate must be 'sigmoid' or 'logistic', got {loss_surrogate!r}")
+        if threshold_normalization not in ("none", "epoch_boundary"):
+            raise ValueError(
+                "threshold_normalization must be 'none' or 'epoch_boundary', "
+                f"got {threshold_normalization!r}"
+            )
+        if float(soft_cap_lambda) < 0.0:
+            raise ValueError("soft_cap_lambda must be non-negative")
+        if float(soft_cap_lambda) > 0.0 and (soft_cap_c is None or float(soft_cap_c) <= 0.0):
+            raise ValueError("positive soft_cap_lambda requires positive soft_cap_c")
+        if float(soft_cap_temperature) <= 0.0:
+            raise ValueError("soft_cap_temperature must be positive")
 
         self._delta = float(delta)
         self._pi_p = float(pi_p)
         self._surrogate = str(loss_surrogate)
+        self._threshold_normalization = str(threshold_normalization)
+        self._soft_cap_c = None if soft_cap_c is None else float(soft_cap_c)
+        self._soft_cap_lambda = float(soft_cap_lambda)
+        self._soft_cap_temperature = float(soft_cap_temperature)
+        self._completed_epochs = 0
 
         if abs(float(pi_p) - 0.5) < 1e-9 and verbose:
             print(
@@ -397,9 +583,10 @@ class PUBCEDiscriminator:
         torch.manual_seed(int(seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
-        self.head = BCEHead(
-            in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers,
-        ).to(self.device)
+        with torch.device(self.device):
+            self.head = BCEHead(
+                in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers,
+            )
 
         optim = torch.optim.AdamW(
             self.head.parameters(),
@@ -411,11 +598,20 @@ class PUBCEDiscriminator:
             optim, T_max=total_steps, eta_min=0.0
         )
 
-        # ------- train loop (NO eval, NO AUROC) ----------
+        calib_sequences = [
+            sequence
+            for sequences in success_calib_per_task.values()
+            for sequence in sequences
+            if sequence.numel() > 0
+        ]
+
+        # ------- train loop (NO benchmark eval, NO AUROC) ----------
         self.head.train()
         self._train_history = []
         for epoch in range(int(epochs)):
             epoch_loss = 0.0
+            epoch_risk = 0.0
+            epoch_cap = 0.0
             epoch_neg = 0.0
             n_correct = 0  # batches where the nn-correction fired (neg_risk < -beta)
             n_batches = 0
@@ -437,68 +633,82 @@ class PUBCEDiscriminator:
                     nn_correction=bool(nn_correction),
                     beta=float(beta),
                 )
-                loss = parts["risk"]
+                if self._soft_cap_lambda > 0.0:
+                    cap_penalty = soft_logit_cap_penalty(
+                        g,
+                        cap=float(self._soft_cap_c),
+                        temperature=self._soft_cap_temperature,
+                    )
+                else:
+                    cap_penalty = torch.zeros((), device=g.device, dtype=g.dtype)
+                loss = parts["risk"] + self._soft_cap_lambda * cap_penalty
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError(
+                        f"non-finite training loss at epoch={epoch + 1}, batch={n_batches + 1}"
+                    )
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 optim.step()
                 scheduler.step()
                 epoch_loss += float(loss.detach().item())
+                epoch_risk += float(parts["risk"].detach().item())
+                epoch_cap += float(cap_penalty.detach().item())
                 epoch_neg += float(parts["neg_risk"].item())
                 if float(parts["neg_risk"].item()) < float(-beta):
                     n_correct += 1
                 n_batches += 1
             avg = epoch_loss / max(1, n_batches)
+            avg_risk = epoch_risk / max(1, n_batches)
+            avg_cap = epoch_cap / max(1, n_batches)
             avg_neg = epoch_neg / max(1, n_batches)
             cur_lr = float(optim.param_groups[0]["lr"])
-            self._train_history.append({
-                "epoch": float(epoch),
+            self._calibrate_epoch(
+                success_calib_per_task,
+                delta=float(delta),
+                update_center=self._threshold_normalization == "epoch_boundary",
+                verbose=False,
+            )
+            pool_stats: Dict[str, Dict[str, Dict[str, float]]] = {}
+            for pool_name, sequences in (
+                ("train_positive", p_seqs),
+                ("unlabeled_failure", u_seqs),
+                ("success_calib", calib_sequences),
+            ):
+                pool_stats[pool_name] = {
+                    "raw": self._logit_summary(self._pool_logits_cuda(sequences, raw=True)),
+                    "effective": self._logit_summary(self._pool_logits_cuda(sequences, raw=False)),
+                }
+            entry: Dict[str, Any] = {
+                "epoch": int(epoch + 1),
                 "loss": avg,
+                "nnpu_risk": avg_risk,
+                "soft_cap_penalty": avg_cap,
+                "soft_cap_weighted": self._soft_cap_lambda * avg_cap,
                 "neg_risk": avg_neg,
-                "nn_correction_batches": float(n_correct),
+                "nn_correction_batches": int(n_correct),
+                "num_batches": int(n_batches),
+                "nn_correction_fraction": float(n_correct) / float(max(1, n_batches)),
                 "lr": cur_lr,
-            })
+                "logit_center": float(self.head.logit_center.item()),
+                "thresholds": dict(self.thresholds),
+                "pools": pool_stats,
+            }
+            self._train_history.append(entry)
+            self._completed_epochs = int(epoch + 1)
+            if metric_callback is not None:
+                metric_callback(int(epoch + 1), entry)
+            if epoch_callback is not None:
+                epoch_callback(int(epoch + 1), self)
             if verbose:
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
-                    f"risk={avg:.5f} neg_risk={avg_neg:+.5f} "
+                    f"loss={avg:.5f} risk={avg_risk:.5f} cap={avg_cap:.5f} "
+                    f"neg_risk={avg_neg:+.5f} center={self.head.logit_center.item():+.5f} "
                     f"nn_corr_batches={n_correct}/{n_batches} "
                     f"lr={cur_lr:.2e} Np={Np} Nu={Nu} pi_p={float(pi_p):.3f}",
                     flush=True,
                 )
-
-        # ------- per-task threshold calibration on disjoint success-calib ----------
-        # success_percentile only (no failure labels available in this branch).
         self.head.eval()
-        self.thresholds = {}
-        self.calib_stats = {}
-        q = 100.0 * (1.0 - float(delta) / 100.0)
-        for task, calib_seqs in success_calib_per_task.items():
-            seqs = [t for t in calib_seqs if t.numel() > 0]
-            if not seqs:
-                raise ValueError(
-                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
-                    "cannot calibrate threshold."
-                )
-            calib_feats = torch.cat([s.to(torch.float32).reshape(-1, s.shape[-1]) for s in seqs], dim=0)
-            g_calib = self._logits_np(calib_feats)
-            failure_score = -g_calib  # higher = more failure
-            tau = float(np.percentile(failure_score.astype(np.float64), q=q))
-            self.thresholds[task] = tau
-            self.calib_stats[task] = PUCalibStats(
-                threshold=tau,
-                num_calib_frames=int(failure_score.size),
-                calib_score_min=float(failure_score.min()),
-                calib_score_max=float(failure_score.max()),
-                calib_score_mean=float(failure_score.mean()),
-                calib_score_std=float(failure_score.std()),
-            )
-            if verbose:
-                print(
-                    f"[pu_bce][calib] task={task} tau={tau:.5f} "
-                    f"n_calib={failure_score.size} "
-                    f"mean={failure_score.mean():.5f} std={failure_score.std():.5f}",
-                    flush=True,
-                )
 
         return dict(self.thresholds)
 
@@ -544,6 +754,11 @@ class PUBCEDiscriminator:
             "delta": None if self._delta is None else float(self._delta),
             "pi_p": None if self._pi_p is None else float(self._pi_p),
             "loss_surrogate": str(self._surrogate),
+            "threshold_normalization": str(self._threshold_normalization),
+            "soft_cap_c": self._soft_cap_c,
+            "soft_cap_lambda": float(self._soft_cap_lambda),
+            "soft_cap_temperature": float(self._soft_cap_temperature),
+            "completed_epochs": int(self._completed_epochs),
             "calib_stats": {
                 str(k): {
                     "threshold": float(v.threshold),
@@ -566,12 +781,27 @@ class PUBCEDiscriminator:
             self.in_dim = in_dim
             self.hidden = hidden
             self.num_layers = num_layers
-            self.head = BCEHead(in_dim=in_dim, hidden=hidden, num_layers=num_layers).to(self.device)
-        self.head.load_state_dict(state["head"])  # type: ignore[arg-type]
+            with torch.device(self.device):
+                self.head = BCEHead(in_dim=in_dim, hidden=hidden, num_layers=num_layers)
+        self.head.set_logit_center(0.0)
+        incompatible = self.head.load_state_dict(state["head"], strict=False)  # type: ignore[arg-type]
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        if missing - {"logit_center"} or unexpected:
+            raise RuntimeError(
+                "Incompatible PU-BCE head state: "
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            )
         self.thresholds = {str(k): float(v) for k, v in dict(state.get("thresholds", {})).items()}  # type: ignore[arg-type]
         self._delta = None if state.get("delta") is None else float(state["delta"])  # type: ignore[arg-type]
         self._pi_p = None if state.get("pi_p") is None else float(state["pi_p"])  # type: ignore[arg-type]
         self._surrogate = str(state.get("loss_surrogate", "sigmoid"))
+        self._threshold_normalization = str(state.get("threshold_normalization", "none"))
+        raw_cap = state.get("soft_cap_c")
+        self._soft_cap_c = None if raw_cap is None else float(raw_cap)  # type: ignore[arg-type]
+        self._soft_cap_lambda = float(state.get("soft_cap_lambda", 0.0))  # type: ignore[arg-type]
+        self._soft_cap_temperature = float(state.get("soft_cap_temperature", 1.0))  # type: ignore[arg-type]
+        self._completed_epochs = int(state.get("completed_epochs", 0))  # type: ignore[arg-type]
         cs = state.get("calib_stats", {}) or {}
         self.calib_stats = {
             str(k): PUCalibStats(

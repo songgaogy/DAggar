@@ -17,6 +17,7 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
     BCEHead,
     PUBCEDiscriminator,
     pu_risk,
+    soft_logit_cap_penalty,
 )
 
 
@@ -25,9 +26,26 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
 # --------------------------------------------------------------------------- #
 
 
+def _cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.fail("CUDA is required for dyn_disc tensor tests")
+    return torch.device("cuda")
+
+
+def test_requested_cuda_unavailable_does_not_fall_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        PUBCEDiscriminator(in_dim=4, hidden=8, num_layers=1, device="cuda")
+
+
 def _gaussian(n: int, dim: int, mean: float, std: float, seed: int) -> torch.Tensor:
-    g = torch.Generator(device="cpu").manual_seed(int(seed))
-    return torch.randn((n, dim), generator=g, dtype=torch.float32) * std + mean
+    device = _cuda_device()
+    g = torch.Generator(device=device).manual_seed(int(seed))
+    return torch.randn(
+        (n, dim), generator=g, dtype=torch.float32, device=device,
+    ) * std + mean
 
 
 def _auroc(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -60,10 +78,55 @@ class _StubTraj:
 
 
 def test_head_shapes() -> None:
-    head = BCEHead(in_dim=32, hidden=16, num_layers=2)
-    z = torch.randn(8, 32)
+    device = _cuda_device()
+    head = BCEHead(in_dim=32, hidden=16, num_layers=2).to(device)
+    z = torch.randn(8, 32, device=device)
     g = head(z)
     assert g.shape == (8,)
+    assert g.is_cuda
+
+
+def test_head_raw_and_effective_logits_use_detached_center() -> None:
+    device = _cuda_device()
+    head = BCEHead(in_dim=8, hidden=16, num_layers=2).to(device)
+    z = torch.randn(12, 8, device=device, requires_grad=True)
+
+    raw_before = head.raw_forward(z)
+    center_source = raw_before.mean() * 0.0 + 1.25
+    head.set_logit_center(center_source)
+
+    raw_after = head.raw_forward(z)
+    effective = head(z)
+    torch.testing.assert_close(raw_after, raw_before)
+    torch.testing.assert_close(effective, raw_after - 1.25)
+    assert head.logit_center.is_cuda
+    assert not head.logit_center.requires_grad
+    assert head.logit_center.grad_fn is None
+
+
+def test_soft_logit_cap_penalty_matches_formula_and_has_linear_tail_gradient() -> None:
+    device = _cuda_device()
+    logits = torch.tensor(
+        [-100.0, -8.0, 0.0, 8.0, 100.0],
+        dtype=torch.float32,
+        device=device,
+        requires_grad=True,
+    )
+    cap = 5.0
+    temperature = 1.0
+
+    penalty = soft_logit_cap_penalty(logits, cap=cap, temperature=temperature)
+    expected = (
+        temperature
+        * torch.nn.functional.softplus((logits.abs() - cap) / temperature)
+    ).mean()
+    torch.testing.assert_close(penalty, expected)
+
+    penalty.backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    assert float(logits.grad[0]) == pytest.approx(-1.0 / logits.numel(), abs=1e-6)
+    assert float(logits.grad[-1]) == pytest.approx(1.0 / logits.numel(), abs=1e-6)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,11 +143,12 @@ def test_nnpu_correction_triggers_and_clamps() -> None:
     With nn_correction the reported `neg_risk_used` is clamped to >= -beta and
     differs from the raw `neg_risk`; uPU (no correction) leaves it negative.
     """
-    torch.manual_seed(0)
+    device = _cuda_device()
+    torch.cuda.manual_seed_all(0)
     # Positives extremely positive => ell(-1,g_p)=sigmoid(g_p) ~ 1 => big subtracted term.
-    g_p = torch.full((64,), 8.0)
+    g_p = torch.full((64,), 8.0, device=device)
     # Unlabeled extremely negative => ell(-1,g_u)=sigmoid(g_u) ~ 0.
-    g_u = torch.full((64,), -8.0)
+    g_u = torch.full((64,), -8.0, device=device)
     pi = 0.5
 
     parts_nn = pu_risk(g_p, g_u, pi_p=pi, surrogate="sigmoid", nn_correction=True, beta=0.0)
@@ -103,8 +167,9 @@ def test_nnpu_correction_triggers_and_clamps() -> None:
 
 def test_nnpu_correction_inactive_when_positive() -> None:
     """When neg_risk >= -beta the correction is a no-op (used == raw)."""
-    g_p = torch.full((32,), -2.0)  # ell(-1,g_p)=sigmoid(g_p) small => subtracted term small
-    g_u = torch.full((32,), 2.0)   # ell(-1,g_u)=sigmoid(g_u) large => neg_risk positive
+    device = _cuda_device()
+    g_p = torch.full((32,), -2.0, device=device)  # ell(-1,g_p)=sigmoid(g_p) small
+    g_u = torch.full((32,), 2.0, device=device)   # ell(-1,g_u)=sigmoid(g_u) large
     parts = pu_risk(g_p, g_u, pi_p=0.5, surrogate="sigmoid", nn_correction=True, beta=0.0)
     assert float(parts["neg_risk"]) > 0.0
     assert float(parts["neg_risk_used"]) == pytest.approx(float(parts["neg_risk"]), abs=1e-6)
@@ -136,7 +201,7 @@ def test_pu_synthetic_separability() -> None:
 
     Z_calib = _gaussian(200, in_dim, mean=+1.5, std=0.6, seed=4)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=32, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=32, num_layers=2, device="cuda")
     thresholds = det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -180,7 +245,7 @@ def test_pu_threshold_determinism() -> None:
     Z_calib = _gaussian(80, in_dim, mean=+1.0, std=0.5, seed=13)
 
     def _run() -> float:
-        det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+        det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
         thr = det.fit(
             positive_features=[Z_p],
             unlabeled_features=[Z_u],
@@ -200,6 +265,46 @@ def test_pu_threshold_determinism() -> None:
     assert tau_a == pytest.approx(tau_b, abs=1e-6), f"Non-deterministic threshold: {tau_a} vs {tau_b}"
 
 
+def test_epoch_boundary_normalization_and_cap_history() -> None:
+    in_dim = 8
+    Z_p = _gaussian(160, in_dim, mean=+1.0, std=0.5, seed=80)
+    Z_u = torch.cat([
+        _gaussian(80, in_dim, mean=+1.0, std=0.5, seed=81),
+        _gaussian(80, in_dim, mean=-1.0, std=0.5, seed=82),
+    ])
+    Z_calib = _gaussian(60, in_dim, mean=+1.0, std=0.5, seed=83)
+    callback_epochs: list[int] = []
+
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
+    thresholds = det.fit(
+        positive_features=[Z_p],
+        unlabeled_features=[Z_u],
+        success_calib_per_task={"t": [Z_calib]},
+        pi_p=0.5,
+        epochs=2,
+        lr=3e-3,
+        batch_size=64,
+        delta=10.0,
+        seed=0,
+        threshold_normalization="epoch_boundary",
+        soft_cap_c=5.0,
+        soft_cap_lambda=1e-2,
+        epoch_callback=lambda epoch, _detector: callback_epochs.append(epoch),
+        verbose=False,
+    )
+
+    assert callback_epochs == [1, 2]
+    assert abs(thresholds["t"]) <= 1e-5
+    assert det._completed_epochs == 2
+    assert len(det._train_history) == 2
+    assert det._train_history[-1]["soft_cap_penalty"] > 0.0
+    assert set(det._train_history[-1]["pools"]) == {
+        "train_positive",
+        "unlabeled_failure",
+        "success_calib",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Score output + bad-prior guard                                              #
 # --------------------------------------------------------------------------- #
@@ -214,7 +319,7 @@ def test_score_emits_detection_result() -> None:
     ], dim=0)
     Z_calib = _gaussian(40, in_dim, mean=+1.0, std=0.5, seed=23)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -245,7 +350,7 @@ def test_invalid_prior_raises() -> None:
     Z_p = _gaussian(40, in_dim, mean=+1.0, std=0.5, seed=70)
     Z_u = _gaussian(40, in_dim, mean=0.0, std=0.5, seed=71)
     Z_calib = _gaussian(20, in_dim, mean=+1.0, std=0.5, seed=72)
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=8, num_layers=1, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=8, num_layers=1, device="cuda")
     for bad in (0.0, 1.0, -0.1, 1.5):
         with pytest.raises(ValueError):
             det.fit(
@@ -299,7 +404,7 @@ def test_state_dict_roundtrip() -> None:
     ], dim=0)
     Z_calib = _gaussian(30, in_dim, mean=+1.0, std=0.5, seed=33)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -312,7 +417,11 @@ def test_state_dict_roundtrip() -> None:
     sd = det.state_dict()
     assert sd["pi_p"] == pytest.approx(0.4, abs=1e-9)
 
-    det2 = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det.head.set_logit_center(1.75)
+    sd = det.state_dict()
+    assert float(sd["head"]["logit_center"]) == pytest.approx(1.75, abs=1e-6)
+
+    det2 = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det2.load_state_dict(sd)
     assert det2.thresholds["t"] == pytest.approx(det.thresholds["t"], abs=1e-6)
     assert det2._pi_p == pytest.approx(0.4, abs=1e-9)
@@ -321,3 +430,23 @@ def test_state_dict_roundtrip() -> None:
     g_a = det._logits_np(z_probe)
     g_b = det2._logits_np(z_probe)
     np.testing.assert_allclose(g_a, g_b, atol=1e-6)
+
+
+def test_legacy_state_without_logit_center_loads_with_zero_center() -> None:
+    device = _cuda_device()
+    in_dim = 8
+    source = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
+    z_probe = _gaussian(20, in_dim, mean=0.0, std=1.0, seed=40)
+    expected_raw = source.head.raw_forward(z_probe).detach().clone()
+
+    legacy_state = source.state_dict()
+    legacy_head_state = dict(legacy_state["head"])
+    legacy_head_state.pop("logit_center")
+    legacy_state["head"] = legacy_head_state
+
+    restored = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
+    restored.head.set_logit_center(torch.tensor(9.0, device=device))
+    restored.load_state_dict(legacy_state)
+
+    assert float(restored.head.logit_center) == pytest.approx(0.0, abs=1e-9)
+    torch.testing.assert_close(restored.head(z_probe), expected_raw)

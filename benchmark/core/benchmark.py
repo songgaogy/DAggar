@@ -258,7 +258,16 @@ class FailureBenchmark:
             iou_threshold=cfg.event_iou_threshold,
         )
 
-        step_metrics = {**frame_scores_metrics, **frame_bin, **event_metrics}
+        success_operational, success_details = _success_operational_metrics(
+            success_trajs=[trajs[i] for i in success_idx],
+            success_outputs=[outputs[i] for i in success_idx],
+        )
+        step_metrics = {
+            **frame_scores_metrics,
+            **frame_bin,
+            **event_metrics,
+            **success_operational,
+        }
 
         # 3d) Per-task step metrics.
         step_per_task: dict[str, dict] = {}
@@ -284,8 +293,25 @@ class FailureBenchmark:
             }
             step_per_task[task_name] = sub
 
+        # Success operational metrics are additive to the existing failure-only
+        # step metrics. A success-only task therefore still receives an entry.
+        success_tasks = [trajs[i].task_name for i in success_idx]
+        for task_name in sorted(set(success_tasks)):
+            task_mask = [j for j, name in enumerate(success_tasks) if name == task_name]
+            task_success_metrics, _ = _success_operational_metrics(
+                success_trajs=[trajs[success_idx[j]] for j in task_mask],
+                success_outputs=[outputs[success_idx[j]] for j in task_mask],
+            )
+            if task_success_metrics:
+                step_per_task.setdefault(task_name, {}).update(task_success_metrics)
+
         # 4) Per-trajectory details for downstream analysis.
         per_traj = []
+        success_detail_by_index = {
+            success_idx[j]: detail
+            for j, detail in enumerate(success_details)
+            if detail is not None
+        }
         for i, (traj, out) in enumerate(zip(trajs, outputs)):
             rec = {
                 "task_name": traj.task_name,
@@ -301,6 +327,9 @@ class FailureBenchmark:
                 ),
                 "failure_segments": list(traj.failure_segments),
             }
+            success_detail = success_detail_by_index.get(i)
+            if success_detail is not None:
+                rec.update(success_detail)
             per_traj.append(rec)
 
         total_seconds = float(time.perf_counter() - t_start)
@@ -325,6 +354,106 @@ class FailureBenchmark:
 # ---------------------------------------------------------------------- #
 # Thresholding helpers                                                   #
 # ---------------------------------------------------------------------- #
+
+
+def _success_operational_metrics(
+    success_trajs: list[BenchmarkTrajectory],
+    success_outputs: list[DiscriminatorOutput],
+) -> tuple[dict, list[Optional[dict]]]:
+    """Measure alarms on valid, actually scored pre-completion success frames.
+
+    These operational metrics intentionally use the discriminator-provided
+    binary predictions. If any success output does not provide predictions,
+    the metrics are omitted so discriminators that only expose scores retain
+    the previous benchmark behavior.
+    """
+    if len(success_trajs) != len(success_outputs):
+        raise ValueError(
+            "success trajectories / outputs length mismatch: "
+            f"{len(success_trajs)} vs {len(success_outputs)}"
+        )
+    if not success_trajs or any(o.predictions is None for o in success_outputs):
+        return {}, [None] * len(success_trajs)
+
+    total_valid_frames = 0
+    total_false_positive_frames = 0
+    trajectories_with_alarm = 0
+    per_trajectory: list[Optional[dict]] = []
+
+    for traj, out in zip(success_trajs, success_outputs):
+        num_frames = int(traj.num_frames)
+        predictions = np.asarray(out.predictions, dtype=np.int64).reshape(-1)
+        if int(predictions.shape[0]) != num_frames:
+            raise ValueError(
+                f"Predictions for {traj.video_id!r} have length "
+                f"{predictions.shape[0]}, expected {num_frames}."
+            )
+
+        valid_frames = _success_valid_frames(traj, out)
+        valid_predictions = predictions[:valid_frames]
+        positive = np.flatnonzero(valid_predictions == 1)
+        false_positive_frames = int(positive.size)
+        any_alarm = bool(false_positive_frames)
+
+        total_valid_frames += valid_frames
+        total_false_positive_frames += false_positive_frames
+        trajectories_with_alarm += int(any_alarm)
+        per_trajectory.append(
+            {
+                "success_valid_frames": valid_frames,
+                "success_false_positive_frames": false_positive_frames,
+                "success_frame_false_alarm_rate": (
+                    float(false_positive_frames / valid_frames)
+                    if valid_frames > 0
+                    else float("nan")
+                ),
+                "success_any_alarm": any_alarm,
+                "success_first_alarm_frame": int(positive[0]) if any_alarm else None,
+            }
+        )
+
+    num_trajectories = len(success_trajs)
+    frame_far = (
+        float(total_false_positive_frames / total_valid_frames)
+        if total_valid_frames > 0
+        else float("nan")
+    )
+    return {
+        "success_num_trajectories": num_trajectories,
+        "success_valid_frames": total_valid_frames,
+        "success_false_positive_frames": total_false_positive_frames,
+        "success_frame_false_alarm_rate": frame_far,
+        "success_specificity": 1.0 - frame_far,
+        "success_trajectories_with_alarm": trajectories_with_alarm,
+        "success_trajectory_alarm_rate": float(
+            trajectories_with_alarm / num_trajectories
+        ),
+    }, per_trajectory
+
+
+def _success_valid_frames(
+    trajectory: BenchmarkTrajectory,
+    output: DiscriminatorOutput,
+) -> int:
+    """Return the intersection of timeline, pre-done, and scored prefixes."""
+    num_frames = int(trajectory.num_frames)
+    limits = [num_frames]
+
+    prefix_fn = getattr(trajectory, "prefix_frames_before_done", None)
+    if callable(prefix_fn):
+        limits.append(int(prefix_fn()))
+
+    aux = output.aux if isinstance(output.aux, dict) else {}
+    if aux.get("success_prefix_frames") is not None:
+        limits.append(int(aux["success_prefix_frames"]))
+
+    for value in limits:
+        if not 0 <= value <= num_frames:
+            raise ValueError(
+                f"Invalid success valid-frame boundary for {trajectory.video_id!r}: "
+                f"{value} not in [0, {num_frames}]."
+            )
+    return int(min(limits))
 
 
 def _materialize_predictions(

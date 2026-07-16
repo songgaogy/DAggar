@@ -32,12 +32,18 @@ class FrozenNNPUDiscriminator:
             raise FileNotFoundError(f"nnPU checkpoint not found: {self.ckpt_path}")
         requested_device = torch.device(device)
         if requested_device.type == "cuda" and not torch.cuda.is_available():
-            requested_device = torch.device("cpu")
+            raise RuntimeError(
+                "FrozenNNPUDiscriminator requires CUDA, but CUDA is unavailable"
+            )
         self.device = requested_device
         self.task_name = str(task_name)
         self.encoder = encoder
 
-        payload = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
+        payload = torch.load(
+            self.ckpt_path,
+            map_location=self.device,
+            weights_only=False,
+        )
         if "pu_bce_detector" not in payload:
             legacy = "bce_detector" in payload
             hint = " Legacy BCE checkpoints are not compatible." if legacy else ""

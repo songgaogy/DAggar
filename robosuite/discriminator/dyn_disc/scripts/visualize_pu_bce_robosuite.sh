@@ -11,21 +11,19 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
-
-LOAD_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk/run_20260715_121551_PickPlaceCereal/checkpoints/pu_bce_head.pth"
-MODEL_CKPT="checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
-TASK="PickPlaceCereal"
-NUM_TRAJS=10     # per split for each
-FAIL_SPLIT="fail_rollout-val-labeled"
-SUCCESS_SPLIT="success_rollout-val"
-
+LOAD_CKPT="${LOAD_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk/run_20260715_121551_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth}"
+TASK="${TASK:-PickPlaceCereal}"
+NUM_TRAJS="${NUM_TRAJS:-10}"     # per split for each
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
 
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_viz_robosuite-chunk/${TASK}-${TIMESTAMP}}"
