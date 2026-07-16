@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .episodes import PolicySegment
+from .episodes import GTNegativeWindow, PolicySegment
 from .pools import DiscriminatorPools, LatentTrajectory, pool_stats
 
 
@@ -157,7 +157,7 @@ def encode_policy_segments(
         item = LatentTrajectory(
             features=latent_host,
             pool=segment.pool,
-            source="online",
+            source="offline",
             identifier=segment.identifier,
             metadata={
                 "source_episode_index": segment.source_episode_index,
@@ -175,4 +175,214 @@ def encode_policy_segments(
     return pools
 
 
-__all__ = ["build_action_windows", "encode_policy_segments"]
+@torch.inference_mode()
+def encode_gt_negative_windows(
+    windows: Sequence[GTNegativeWindow],
+    *,
+    encoder: Any,
+    camera_names: Sequence[str],
+    batch_size: int,
+) -> list[LatentTrajectory]:
+    """Encode intervention windows with event-local ``policy_action`` chunks."""
+    device = torch.device(encoder.device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(f"GT-negative window encoding requires CUDA, got {device}.")
+    if not hasattr(encoder, "use_chunk"):
+        raise AttributeError("FinetuneDynamicsEncoder is missing use_chunk provenance.")
+    if str(encoder.feature_source) != "transformer" or int(encoder.transformer_layer) != 1:
+        raise ValueError(
+            "GT-negative encoding requires checkpoint transformer layer-1 latents."
+        )
+    if any(parameter.requires_grad for parameter in encoder.inner_encoder.model.parameters()):
+        raise RuntimeError("Dynamics encoder must be frozen before discriminator finetuning.")
+    if int(batch_size) <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    encoder.bind_policy_cameras(list(camera_names))
+
+    horizon = int(encoder.inner_encoder.frameskip)
+    target_action_dim = int(encoder.inner_encoder.action_input_dim)
+    expected_action_dim = int(encoder.inner_encoder.action_dim_per_step)
+    trajectories: list[LatentTrajectory] = []
+    for window in tqdm(
+        windows,
+        desc="[disc_finetune][encode_gt_negative]",
+        unit="event",
+        leave=True,
+    ):
+        if window.hi <= window.lo or window.num_frames <= 0:
+            raise ValueError(f"GT-negative window {window.identifier} is empty.")
+        if any(index < window.lo or index >= window.hi for index in window.frame_indices):
+            raise ValueError(
+                f"GT-negative window {window.identifier} has frame indices outside "
+                f"[{window.lo}, {window.hi})."
+            )
+        episode = window.episode
+        policy_actions = np.asarray(episode["policy_action"], dtype=np.float32)
+        if policy_actions.ndim != 2 or int(policy_actions.shape[1]) != expected_action_dim:
+            raise ValueError(
+                f"Window {window.identifier} policy_action shape {policy_actions.shape} "
+                f"does not match (*, {expected_action_dim})."
+            )
+        actions = policy_actions[window.lo : window.hi]
+        if not bool(np.isfinite(actions).all()):
+            raise ValueError(
+                f"Window {window.identifier} policy_action contains non-finite values."
+            )
+        action_windows = build_action_windows(
+            actions,
+            horizon=horizon,
+            use_chunk=bool(encoder.use_chunk),
+            target_dim=target_action_dim,
+        )
+        features_cuda: list[torch.Tensor] = []
+        window_length = int(window.hi - window.lo)
+        for start in range(0, window_length, int(batch_size)):
+            end = min(window_length, start + int(batch_size))
+            absolute_lo = window.lo + start
+            absolute_hi = window.lo + end
+            images = _image_batch(
+                episode["obs"],
+                camera_names=camera_names,
+                lo=absolute_lo,
+                hi=absolute_hi,
+                device=device,
+            )
+            proprio = torch.from_numpy(
+                encoder.prepare_proprio(
+                    np.asarray(episode["obs"]["state"])[absolute_lo:absolute_hi]
+                )
+            ).to(device=device, non_blocking=True)
+            action_tensor = torch.from_numpy(action_windows[start:end]).to(
+                device=device, non_blocking=True
+            )
+            feature = encoder.encode_chunk(
+                image_obs_raw=images,
+                proprio_raw=proprio,
+                action_chunk=action_tensor,
+            )
+            if feature.device.type != "cuda" or feature.ndim != 2:
+                raise RuntimeError(
+                    f"Encoder returned invalid features: device={feature.device}, "
+                    f"shape={tuple(feature.shape)}."
+                )
+            features_cuda.append(feature.to(dtype=torch.float32))
+        latent = torch.cat(features_cuda, dim=0)
+        selected_offsets = torch.tensor(
+            [index - window.lo for index in window.frame_indices],
+            dtype=torch.long,
+            device=device,
+        )
+        latent = latent.index_select(0, selected_offsets)
+        latent_host = latent.contiguous().to(device="cpu", dtype=torch.float32)
+        trajectories.append(
+            LatentTrajectory(
+                features=latent_host,
+                pool="offline_gt_negative",
+                source="offline",
+                identifier=window.identifier,
+                metadata={
+                    "source_episode_index": window.source_episode_index,
+                    "gt_negative_kind": window.kind,
+                    "intervention_event_index": window.event_index,
+                    "intervention_start": window.intervention_lo,
+                    "intervention_end": window.intervention_hi,
+                    "window_start": window.lo,
+                    "window_end": window.hi,
+                    "frame_indices": list(window.frame_indices),
+                    "pre_frames": window.num_pre_frames,
+                    "post_frames": window.num_post_frames,
+                    "observation_source": "policy_prefix_and_human_intervention",
+                    "action_source": "policy_action",
+                    "post_boundary": "intervention_block",
+                    "chunk_boundary": "continuous_window",
+                    "tail_padding": "repeat_tail",
+                    "stored_gt_fail_ignored": True,
+                    "theory_deviation": (
+                        "Human-control observations mean this pool is not strictly "
+                        "a subset of offline policy-only unlabeled data."
+                    ),
+                    "use_chunk": bool(encoder.use_chunk),
+                },
+            )
+        )
+        del latent, features_cuda, selected_offsets
+    return trajectories
+
+
+def exclude_gt_frames_from_unlabeled(
+    trajectories: Sequence[LatentTrajectory],
+    windows: Sequence[GTNegativeWindow],
+) -> list[LatentTrajectory]:
+    """Remove selected pre-onset frames from offline-U latent trajectories."""
+    selected_keys = {
+        (int(window.source_episode_index), int(frame_index))
+        for window in windows
+        for frame_index in window.frame_indices
+    }
+    reserved: list[LatentTrajectory] = []
+    for trajectory in trajectories:
+        if trajectory.features.device.type != "cuda":
+            raise ValueError(
+                "Reserved-U feature filtering requires CUDA tensors; "
+                f"got {trajectory.features.device}."
+            )
+        metadata = trajectory.metadata
+        required = ("source_episode_index", "frame_start", "frame_end")
+        missing = [name for name in required if name not in metadata]
+        if missing:
+            raise KeyError(
+                f"Offline-U trajectory {trajectory.identifier} is missing metadata {missing}."
+            )
+        episode_index = int(metadata["source_episode_index"])
+        frame_start = int(metadata["frame_start"])
+        frame_end = int(metadata["frame_end"])
+        if frame_end - frame_start != int(trajectory.features.shape[0]):
+            raise ValueError(
+                f"Offline-U trajectory {trajectory.identifier} frame range "
+                f"[{frame_start}, {frame_end}) does not match feature length "
+                f"{trajectory.features.shape[0]}."
+            )
+        kept_offsets = [
+            offset
+            for offset in range(frame_end - frame_start)
+            if (episode_index, frame_start + offset) not in selected_keys
+        ]
+        run_index = 0
+        cursor = 0
+        while cursor < len(kept_offsets):
+            run_start = kept_offsets[cursor]
+            run_end = run_start + 1
+            cursor += 1
+            while cursor < len(kept_offsets) and kept_offsets[cursor] == run_end:
+                run_end += 1
+                cursor += 1
+            absolute_start = frame_start + run_start
+            absolute_end = frame_start + run_end
+            run_metadata = dict(metadata)
+            run_metadata.update(
+                {
+                    "frame_start": int(absolute_start),
+                    "frame_end": int(absolute_end),
+                    "gt_negative_frames_excluded": True,
+                    "parent_identifier": trajectory.identifier,
+                }
+            )
+            reserved.append(
+                LatentTrajectory(
+                    features=trajectory.features[run_start:run_end].contiguous(),
+                    pool="offline_unlabeled_reserved",
+                    source=trajectory.source,
+                    identifier=f"{trajectory.identifier}-reserved-{run_index:03d}",
+                    metadata=run_metadata,
+                )
+            )
+            run_index += 1
+    return reserved
+
+
+__all__ = [
+    "build_action_windows",
+    "encode_gt_negative_windows",
+    "encode_policy_segments",
+    "exclude_gt_frames_from_unlabeled",
+]

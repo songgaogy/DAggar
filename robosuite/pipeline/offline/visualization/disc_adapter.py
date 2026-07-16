@@ -18,6 +18,23 @@ class FinetunedPUBCEBenchmarkDiscriminator(PUBCEBenchmarkDiscriminator):
 
     _preselected_proprio_active = False
 
+    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple:
+        """Disambiguate the feature cache per trajectory.
+
+        In-memory offline episodes share the same source file and expose no
+        ``file_path``/``demo_path``/``cache_npz_path``, so the base key collides
+        across episodes and the first episode's latents get reused for all of
+        them. Append stable per-trajectory identifiers while preserving the base
+        feature-contract components.
+        """
+        base = super()._trajectory_key(trajectory)
+        identity = (
+            str(getattr(trajectory, "video_id", "")),
+            str(getattr(trajectory, "source_hdf5_path", "")),
+            str(getattr(trajectory, "source_demo_key", "")),
+        )
+        return tuple(base) + identity
+
     def _prepare_trajectory_tensors(
         self,
         trajectory: BenchmarkTrajectory,

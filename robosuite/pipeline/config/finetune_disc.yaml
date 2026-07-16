@@ -7,7 +7,7 @@ env:
 
 algorithm:
   discriminator:
-    checkpoint: null
+    checkpoint: null  # Required: calibrated parent nnPU head for warm-start.
     encoder_ckpt: null
     learner_device: "cuda:0"
     camera_to_view: {}
@@ -19,12 +19,39 @@ offline:
     epochs: 10
     lr: 3.0e-5
     weight_decay: 1.0e-4
-    batch_size: 512
     encode_batch_size: 32
     log_interval: 10
-    use_only_offline: false
     run_root: "./outputs/discriminator-finetune"
     run_subfix: ""
+
+    gt_negative:
+      pre_intervention_chunks: 1
+      post_intervention_chunks: 1
+      pre_end_chunk: 0
+      action_source: "policy_action"
+      post_boundary: "intervention_block"
+      chunk_boundary: "continuous_window"
+
+    objective:
+      # null derives the epoch length from the pretrain replay pool sizes.
+      steps_per_epoch: null
+      terms:
+        nnpu_replay:
+          type: "nnpu"
+          enabled: true
+          weight: 1.0
+          batch_size: 512
+          positive_fraction: 0.5
+
+        supervised_gt_bce:
+          type: "supervised_bce"
+          enabled: true
+          weight: 0.025
+          batch_size: 512
+          positive_fraction: 0.5
+          class_weights:
+            positive: 0.5
+            negative: 0.5
 
 logging:
   use_tensorboard: true

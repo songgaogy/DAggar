@@ -1,8 +1,10 @@
-"""CUDA-only warm-start training for an offline nnPU head."""
+"""CUDA-only warm-start training for replay nnPU plus supervised GT BCE."""
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Sequence
+import math
+import numbers
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -10,37 +12,16 @@ import torch
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
     PUCalibStats,
     PUBCEDiscriminator,
-    pu_risk,
 )
+
+from .objectives import NNPUParameters, build_objective
+
+
+MetricCallback = Callable[[Dict[str, float]], None]
 
 
 class PUBCEDiscriminatorFT(PUBCEDiscriminator):
-    """Pipeline-owned nnPU head that preserves loaded weights during finetuning."""
-
-    def _nnpu_optimization_step(
-        self,
-        positive_logits: torch.Tensor,
-        unlabeled_logits: torch.Tensor,
-        *,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler.LRScheduler,
-        pi_p: float,
-        nn_correction: bool,
-        beta: float,
-    ) -> Dict[str, torch.Tensor]:
-        parts = pu_risk(
-            positive_logits,
-            unlabeled_logits,
-            pi_p=float(pi_p),
-            surrogate=self._surrogate,
-            nn_correction=bool(nn_correction),
-            beta=float(beta),
-        )
-        optimizer.zero_grad(set_to_none=True)
-        parts["risk"].backward()
-        optimizer.step()
-        scheduler.step()
-        return parts
+    """Pipeline-owned nnPU head updated by a composable warm-start objective."""
 
     def _calibrate_success_thresholds(
         self,
@@ -57,7 +38,7 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
             seqs = [tensor for tensor in calib_seqs if tensor.numel() > 0]
             if not seqs:
                 raise ValueError(
-                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
+                    f"Task {task!r}: success calibration is empty; "
                     "cannot calibrate threshold."
                 )
             with torch.no_grad():
@@ -91,26 +72,85 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
                 )
         return dict(self.thresholds)
 
+    @staticmethod
+    def _cuda_feature_pools(
+        feature_pools: Mapping[str, Sequence[torch.Tensor]],
+        *,
+        device: torch.device,
+        in_dim: int,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+        cuda_pools: dict[str, torch.Tensor] = {}
+        pool_sizes: dict[str, int] = {}
+        for name, tensors in feature_pools.items():
+            sequences = [tensor.detach() for tensor in tensors if tensor.numel() > 0]
+            invalid_shapes = [tuple(tensor.shape) for tensor in sequences if tensor.ndim != 2]
+            if invalid_shapes:
+                raise ValueError(
+                    f"Feature pool {name!r} tensors must have shape (N, D), "
+                    f"got {invalid_shapes}."
+                )
+            pool_sizes[str(name)] = int(sum(int(tensor.shape[0]) for tensor in sequences))
+            if not sequences:
+                continue
+            latent_dims = {int(tensor.shape[-1]) for tensor in sequences}
+            if latent_dims != {int(in_dim)}:
+                raise ValueError(
+                    f"Feature pool {name!r} must have latent dim {in_dim}, "
+                    f"got {sorted(latent_dims)}."
+                )
+            with torch.no_grad():
+                cuda_pools[str(name)] = torch.cat(
+                    [
+                        tensor.to(
+                            device=device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        ).reshape(-1, in_dim)
+                        for tensor in sequences
+                    ],
+                    dim=0,
+                )
+        return cuda_pools, pool_sizes
+
+    def _mean_logits(self, features: torch.Tensor, *, batch_size: int = 4096) -> float:
+        if features.device.type != "cuda":
+            raise ValueError("Full-pool score summaries require CUDA features.")
+        was_training = self.head.training
+        self.head.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for start in range(0, int(features.shape[0]), int(batch_size)):
+                logits = self.head(features[start : start + int(batch_size)])
+                total += float(logits.sum().item())
+                count += int(logits.numel())
+        if was_training:
+            self.head.train()
+        if count == 0:
+            raise ValueError("Cannot summarize logits for an empty feature pool.")
+        return total / float(count)
+
     def finetune(
         self,
-        positive_features: Sequence[torch.Tensor],
-        unlabeled_features: Sequence[torch.Tensor],
+        feature_pools: Mapping[str, Sequence[torch.Tensor]],
         success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
+        objective_config: Mapping[str, Any],
         pi_p: float,
         epochs: int = 10,
         lr: float = 3e-5,
         weight_decay: float = 1e-4,
-        batch_size: int = 512,
         delta: float = 10.0,
         seed: int = 0,
         loss_surrogate: str = "logistic",
         nn_correction: bool = True,
         beta: float = 0.0,
+        log_interval: int = 10,
         verbose: bool = True,
-        metric_callback: Optional[Callable[[Dict[str, float]], None]] = None,
+        metric_callback: Optional[MetricCallback] = None,
+        step_metric_callback: Optional[MetricCallback] = None,
     ) -> Dict[str, float]:
-        """Warm-start nnPU optimization without reinitializing the head."""
+        """Optimize the joint replay-nnPU and supervised-GT objective."""
         if self.device.type != "cuda":
             raise ValueError(
                 f"PUBCEDiscriminatorFT.finetune requires a CUDA device, got {self.device}."
@@ -120,149 +160,125 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
                 "PUBCEDiscriminatorFT.finetune requires CUDA, but "
                 "torch.cuda.is_available() is False."
             )
-        if delta < 0.0 or delta > 100.0:
-            raise ValueError(f"delta must be in [0, 100], got {delta}")
-        if epochs < 1:
-            raise ValueError(f"epochs must be >= 1, got {epochs}")
-        if batch_size < 2:
-            raise ValueError(f"batch_size must be >= 2, got {batch_size}")
-        if int(batch_size) % 2 != 0:
-            raise ValueError(
-                "batch_size must be even for exact 50/50 P/U sampling, "
-                f"got {batch_size}"
-            )
-        if not (0.0 < float(pi_p) < 1.0):
-            raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
-        if loss_surrogate not in ("sigmoid", "logistic"):
-            raise ValueError(
-                "loss_surrogate must be 'sigmoid' or 'logistic', "
-                f"got {loss_surrogate!r}"
-            )
-
-        p_seqs = [tensor.detach() for tensor in positive_features if tensor.numel() > 0]
-        u_seqs = [tensor.detach() for tensor in unlabeled_features if tensor.numel() > 0]
-        if not p_seqs:
-            raise ValueError("positive_features is empty after filtering")
-        if not u_seqs:
-            raise ValueError("unlabeled_features is empty after filtering")
-
-        with torch.no_grad():
-            z_p = torch.cat(
-                [
-                    tensor.to(
-                        self.device, dtype=torch.float32, non_blocking=True
-                    ).reshape(-1, tensor.shape[-1])
-                    for tensor in p_seqs
-                ],
-                dim=0,
-            )
-            z_u = torch.cat(
-                [
-                    tensor.to(
-                        self.device, dtype=torch.float32, non_blocking=True
-                    ).reshape(-1, tensor.shape[-1])
-                    for tensor in u_seqs
-                ],
-                dim=0,
-            )
-        if z_p.shape[1] != self.in_dim or z_u.shape[1] != self.in_dim:
-            raise ValueError(
-                f"feature dim mismatch: in_dim={self.in_dim}, "
-                f"P={z_p.shape[1]}, U={z_u.shape[1]}"
-            )
+        if not 0.0 <= float(delta) <= 100.0:
+            raise ValueError(f"delta must be in [0, 100], got {delta}.")
+        if int(epochs) < 1 or int(log_interval) < 1:
+            raise ValueError("epochs and log_interval must be positive.")
+        if float(lr) < 0.0 or float(weight_decay) < 0.0:
+            raise ValueError("Learning rate and weight decay must be non-negative.")
 
         self._delta = float(delta)
         self._pi_p = float(pi_p)
         self._surrogate = str(loss_surrogate)
         self.head = self.head.to(self.device)
+        for parameter in self.head.parameters():
+            parameter.requires_grad_(True)
 
+        cuda_pools, pool_sizes = self._cuda_feature_pools(
+            feature_pools,
+            device=self.device,
+            in_dim=self.in_dim,
+        )
+        objective = build_objective(
+            objective_config,
+            pools=cuda_pools,
+            nnpu_parameters=NNPUParameters(
+                pi_p=float(pi_p),
+                surrogate=str(loss_surrogate),
+                nn_correction=bool(nn_correction),
+                beta=float(beta),
+            ),
+            device=self.device,
+            seed=int(seed),
+        )
+        steps_per_epoch = int(objective.steps_per_epoch)
         optimizer = torch.optim.AdamW(
             self.head.parameters(),
             lr=float(lr),
             weight_decay=float(weight_decay),
         )
-        n_p = int(z_p.shape[0])
-        n_u = int(z_u.shape[0])
-        steps_per_epoch = max(1, int(2 * (n_p + n_u) // int(batch_size)))
-        total_steps = int(epochs) * steps_per_epoch
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=total_steps,
+            T_max=int(epochs) * steps_per_epoch,
             eta_min=0.0,
         )
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed))
         torch.cuda.manual_seed_all(int(seed))
-        positive_batch_size = int(batch_size) // 2
-        unlabeled_batch_size = positive_batch_size
 
         self.head.train()
         self._train_history = []
+        global_step = 0
+        interval_totals: dict[str, float] = {}
+        interval_steps = 0
         for epoch in range(int(epochs)):
-            totals = {
-                "risk": 0.0,
-                "pos_risk": 0.0,
-                "neg_risk": 0.0,
-                "neg_risk_used": 0.0,
-                "nn_correction_batches": 0.0,
-            }
-            for _ in range(steps_per_epoch):
-                p_indices = torch.randint(
-                    n_p,
-                    (positive_batch_size,),
-                    device=self.device,
-                    generator=generator,
-                )
-                u_indices = torch.randint(
-                    n_u,
-                    (unlabeled_batch_size,),
-                    device=self.device,
-                    generator=generator,
-                )
-                parts = self._nnpu_optimization_step(
-                    self.head(z_p[p_indices]),
-                    self.head(z_u[u_indices]),
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    pi_p=float(pi_p),
-                    nn_correction=bool(nn_correction),
-                    beta=float(beta),
-                )
-                totals["risk"] += float(parts["risk"].detach().item())
-                totals["pos_risk"] += float(parts["pos_risk"].item())
-                totals["neg_risk"] += float(parts["neg_risk"].item())
-                totals["neg_risk_used"] += float(parts["neg_risk_used"].item())
-                if float(parts["neg_risk"].item()) < float(-beta):
-                    totals["nn_correction_batches"] += 1.0
+            totals: dict[str, float] = {}
+            for epoch_step in range(steps_per_epoch):
+                optimizer.zero_grad(set_to_none=True)
+                result = objective(self.head)
+                result.loss.backward()
+                optimizer.step()
+                scheduler.step()
+                global_step += 1
+
+                step_metrics = {
+                    key: float(value.detach().item())
+                    for key, value in result.metrics.items()
+                }
+                for key, value in step_metrics.items():
+                    totals[key] = totals.get(key, 0.0) + value
+                    interval_totals[key] = interval_totals.get(key, 0.0) + value
+                interval_steps += 1
+                if (
+                    step_metric_callback is not None
+                    and global_step % int(log_interval) == 0
+                ):
+                    running_metrics = {
+                        key: value / float(interval_steps)
+                        for key, value in interval_totals.items()
+                    }
+                    step_metric_callback(
+                        {
+                            "epoch": float(epoch),
+                            "epoch_step": float(epoch_step + 1),
+                            "global_step": float(global_step),
+                            "lr": float(optimizer.param_groups[0]["lr"]),
+                            **running_metrics,
+                        }
+                    )
+                    interval_totals.clear()
+                    interval_steps = 0
 
             metrics = {
                 "epoch": float(epoch),
-                "risk": totals["risk"] / float(steps_per_epoch),
-                "pos_risk": totals["pos_risk"] / float(steps_per_epoch),
-                "neg_risk": totals["neg_risk"] / float(steps_per_epoch),
-                "neg_risk_used": totals["neg_risk_used"] / float(steps_per_epoch),
-                "nn_correction_batches": float(totals["nn_correction_batches"]),
-                "nn_correction_fraction": (
-                    totals["nn_correction_batches"] / float(steps_per_epoch)
-                ),
-                "lr": float(optimizer.param_groups[0]["lr"]),
+                "global_step": float(global_step),
                 "steps": float(steps_per_epoch),
-                "num_positive_frames": float(n_p),
-                "num_unlabeled_frames": float(n_u),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                **{
+                    key: value / float(steps_per_epoch)
+                    for key, value in totals.items()
+                },
+                **{
+                    f"data/{name}_frames": float(size)
+                    for name, size in pool_sizes.items()
+                },
             }
+            if "nnpu/clamped" in metrics:
+                metrics["nnpu/clamp_fraction"] = metrics["nnpu/clamped"]
+            if "offline_positive" in cuda_pools and "offline_gt_negative" in cuda_pools:
+                positive_mean = self._mean_logits(cuda_pools["offline_positive"])
+                negative_mean = self._mean_logits(cuda_pools["offline_gt_negative"])
+                metrics["scores/offline_positive_logit_mean"] = positive_mean
+                metrics["scores/gt_negative_logit_mean"] = negative_mean
+                metrics["scores/delta_gt"] = positive_mean - negative_mean
             self._train_history.append(dict(metrics))
             if metric_callback is not None:
                 metric_callback(dict(metrics))
             if verbose:
-                nn_corr_batches = int(metrics["nn_correction_batches"])
-                nn_corr_text = f"{nn_corr_batches}/{int(metrics['steps'])}"
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
-                    f"risk={metrics['risk']:.5f} neg_risk={metrics['neg_risk']:+.5f} "
-                    f"nn_corr_batches={nn_corr_text} "
-                    f"lr={metrics['lr']:.2e} Np={n_p} Nu={n_u} "
-                    f"pi_p={float(pi_p):.3f} surrogate={self._surrogate} "
-                    f"nn_correction={bool(nn_correction)} beta={float(beta):.3g}",
+                    f"loss={metrics['loss/total']:.5f} "
+                    f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f} "
+                    f"gt_bce={metrics.get('loss/supervised_gt_bce/raw', float('nan')):.5f} "
+                    f"lr={metrics['lr']:.2e}",
                     flush=True,
                 )
 
@@ -290,62 +306,90 @@ def require_cuda_device(device: str | torch.device) -> torch.device:
     return resolved
 
 
+def _required_parent_value(
+    parent_payload: Mapping[str, Any], state: Mapping[str, Any], key: str
+) -> Any:
+    value = parent_payload.get(key)
+    if value is None:
+        value = state.get(key)
+    if value is None:
+        raise KeyError(f"Parent nnPU checkpoint is missing {key}.")
+    return value
+
+
+def resolve_parent_nnpu_semantics(
+    parent_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve and strictly validate immutable parent loss/calibration semantics."""
+    state = dict(parent_payload.get("pu_bce_detector", {}))
+    raw_delta = _required_parent_value(parent_payload, state, "delta")
+    if isinstance(raw_delta, bool) or not isinstance(raw_delta, numbers.Real):
+        raise TypeError(
+            f"Parent nnPU delta must be a real number, got {raw_delta!r}."
+        )
+    delta = float(raw_delta)
+    if not math.isfinite(delta) or not 0.0 <= delta <= 100.0:
+        raise ValueError(f"Parent nnPU delta must be in [0, 100], got {raw_delta!r}.")
+    raw_pi_p = _required_parent_value(parent_payload, state, "pi_p")
+    raw_beta = _required_parent_value(parent_payload, state, "beta")
+    for key, value in (("pi_p", raw_pi_p), ("beta", raw_beta)):
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
+            raise TypeError(
+                f"Parent nnPU {key} must be a real number, got {value!r}."
+            )
+    parameters = NNPUParameters(
+        pi_p=raw_pi_p,
+        surrogate=_required_parent_value(parent_payload, state, "loss_surrogate"),
+        nn_correction=_required_parent_value(
+            parent_payload, state, "nn_correction"
+        ),
+        beta=raw_beta,
+    )
+    return {
+        "pi_p": parameters.pi_p,
+        "loss_surrogate": parameters.surrogate,
+        "nn_correction": parameters.nn_correction,
+        "beta": parameters.beta,
+        "delta": delta,
+    }
+
+
 def finetune_warmstart_detector(
     detector: PUBCEDiscriminatorFT,
     *,
-    positive_features: Sequence[torch.Tensor],
-    unlabeled_features: Sequence[torch.Tensor],
+    feature_pools: Mapping[str, Sequence[torch.Tensor]],
     calibration_features: Sequence[torch.Tensor],
+    objective_config: Mapping[str, Any],
     task_name: str,
-    parent_payload: dict,
+    parent_payload: Mapping[str, Any],
     epochs: int,
     lr: float,
     weight_decay: float,
-    batch_size: int,
     seed: int,
-    metric_callback: Callable[[dict[str, float]], None] | None = None,
+    log_interval: int,
+    metric_callback: MetricCallback | None = None,
+    step_metric_callback: MetricCallback | None = None,
     verbose: bool = True,
 ) -> dict[str, float]:
-    """Continue nnPU training with checkpoint loss semantics and fresh optimizer."""
-    state = dict(parent_payload.get("pu_bce_detector", {}))
-    pi_p_raw = parent_payload.get("pi_p")
-    if pi_p_raw is None:
-        pi_p_raw = state.get("pi_p")
-    if pi_p_raw is None:
-        raise KeyError("Parent nnPU checkpoint is missing pi_p.")
-    delta_raw = parent_payload.get("delta")
-    if delta_raw is None:
-        delta_raw = state.get("delta")
-    if delta_raw is None:
-        raise KeyError("Parent nnPU checkpoint is missing calibration delta.")
-    surrogate = str(
-        parent_payload.get("loss_surrogate")
-        if parent_payload.get("loss_surrogate") is not None
-        else state.get("loss_surrogate", "logistic")
-    )
-    nn_correction = parent_payload.get("nn_correction")
-    if nn_correction is None:
-        nn_correction = state.get("nn_correction", True)
-    beta_raw = parent_payload.get("beta")
-    if beta_raw is None:
-        beta_raw = state.get("beta", 0.0)
-    beta = float(beta_raw)
+    """Warm-start with immutable parent nnPU semantics and the configured objectives."""
+    semantics = resolve_parent_nnpu_semantics(parent_payload)
     return detector.finetune(
-        positive_features=positive_features,
-        unlabeled_features=unlabeled_features,
-        success_calib_per_task={str(task_name): list(calibration_features)},
-        pi_p=float(pi_p_raw),
+        feature_pools,
+        {str(task_name): list(calibration_features)},
+        objective_config=objective_config,
+        pi_p=float(semantics["pi_p"]),
         epochs=int(epochs),
         lr=float(lr),
         weight_decay=float(weight_decay),
-        batch_size=int(batch_size),
-        delta=float(delta_raw),
+        delta=float(semantics["delta"]),
         seed=int(seed),
-        loss_surrogate=surrogate,
-        nn_correction=nn_correction,
-        beta=beta,
+        loss_surrogate=str(semantics["loss_surrogate"]),
+        nn_correction=semantics["nn_correction"],
+        beta=float(semantics["beta"]),
+        log_interval=int(log_interval),
         verbose=bool(verbose),
         metric_callback=metric_callback,
+        step_metric_callback=step_metric_callback,
     )
 
 
@@ -353,4 +397,5 @@ __all__ = [
     "PUBCEDiscriminatorFT",
     "finetune_warmstart_detector",
     "require_cuda_device",
+    "resolve_parent_nnpu_semantics",
 ]

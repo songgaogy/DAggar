@@ -141,8 +141,70 @@ def sample_offline_trajectories(
     return sampled
 
 
+def sample_offline_trajectory_pools(
+    episodes_path: str | Path,
+    *,
+    task: str,
+    num_trajs: int,
+    seed: int,
+    fps: int,
+    video_size: int = 256,
+) -> dict[str, list[OfflineEpisodeTrajectory]]:
+    """Load once and sample the general and policy-only success pools."""
+    payload = load_offline_episodes(episodes_path)
+    payload_task = payload.get("task_name")
+    if payload_task is not None and str(payload_task) != str(task):
+        raise ValueError(
+            f"Offline episodes task mismatch: payload={payload_task!r}, cli={task!r}."
+        )
+    episodes = list(payload["episodes"])
+    if int(num_trajs) <= 0:
+        raise ValueError(f"--num-trajs must be positive, got {num_trajs}.")
+
+    candidate_indices = {
+        "offline": list(range(len(episodes))),
+        "offline-success": [
+            index
+            for index, episode in enumerate(episodes)
+            if str(episode["terminal_reason"]) == "success"
+            and not bool(
+                np.asarray(episode["is_intervention"], dtype=np.bool_).any()
+            )
+        ],
+    }
+    if not candidate_indices["offline-success"]:
+        raise RuntimeError(
+            "No policy-only successful offline trajectories were found: expected "
+            "terminal_reason='success' with no intervention frames."
+        )
+
+    sampled_pools: dict[str, list[OfflineEpisodeTrajectory]] = {}
+    for pool_name, candidates in candidate_indices.items():
+        count = min(int(num_trajs), len(candidates))
+        indices = random.Random(int(seed)).sample(candidates, count)
+        sampled_pools[pool_name] = [
+            offline_trajectory(
+                episodes[index],
+                episode_index=index,
+                task=str(task),
+                camera_names=payload["camera_names"],
+                fps=int(fps),
+                source_path=str(payload["_resolved_path"]),
+                video_size=int(video_size),
+            )
+            for index in indices
+        ]
+        print(
+            f"[pu_bce][viz] sampled {count}/{len(candidates)} {pool_name} "
+            f"trajectories from {payload['_resolved_path']} (seed={int(seed)})",
+            flush=True,
+        )
+    return sampled_pools
+
+
 __all__ = [
     "OfflineEpisodeTrajectory",
     "offline_trajectory",
     "sample_offline_trajectories",
+    "sample_offline_trajectory_pools",
 ]

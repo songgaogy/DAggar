@@ -161,35 +161,6 @@ def load_pretrain_pools(
     return pools, manifest
 
 
-def combine_pools(
-    pretrain: DiscriminatorPools,
-    online: DiscriminatorPools,
-    *,
-    use_only_offline: bool = False,
-) -> DiscriminatorPools:
-    """Naturally mix frames within P/U and retain pretrain-only calibration."""
-    if online.calibration:
-        raise ValueError("Online calibration is disabled; use pretrain positive_calib only.")
-    combined = DiscriminatorPools(
-        positive=[*pretrain.positive, *online.positive],
-        unlabeled=list(online.unlabeled)
-        if use_only_offline
-        else [*pretrain.unlabeled, *online.unlabeled],
-        calibration=list(pretrain.calibration),
-    )
-    if not combined.positive or not combined.unlabeled or not combined.calibration:
-        raise ValueError("Combined discriminator pools require non-empty P, U, and calibration.")
-    combined.stats = {
-        **pool_stats(combined),
-        "pretrain": dict(pretrain.stats),
-        "online": dict(online.stats),
-        "use_only_offline": bool(use_only_offline),
-        "mixing": "natural_uniform_frames_within_balanced_pu",
-        "calibration_source": "pretrain_positive_calib_only",
-    }
-    return combined
-
-
 def feature_tensors(
     trajectories: Sequence[LatentTrajectory],
 ) -> list[torch.Tensor]:
@@ -200,7 +171,6 @@ __all__ = [
     "PRETRAIN_SCHEMA_VERSION",
     "DiscriminatorPools",
     "LatentTrajectory",
-    "combine_pools",
     "feature_tensors",
     "load_pretrain_pools",
     "pool_stats",

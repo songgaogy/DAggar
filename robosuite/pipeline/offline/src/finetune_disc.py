@@ -1,9 +1,8 @@
-"""Standalone CUDA-only warm-start finetuning for the offline nnPU head."""
+"""Standalone CUDA-only nnPU-replay plus supervised-GT finetuning."""
 
 from __future__ import annotations
 
 import datetime
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -15,23 +14,32 @@ from omegaconf import DictConfig, OmegaConf
 from robosuite.pipeline.offline.discriminator import (
     FinetuneDynamicsEncoder,
     build_finetuned_checkpoint_payload,
-    combine_pools,
+    build_gt_negative_windows,
+    encode_gt_negative_windows,
     encode_policy_segments,
     feature_tensors,
     finetune_warmstart_detector,
-    PUBCEDiscriminatorFT,
     load_offline_episodes,
     load_pretrain_pools,
     load_warmstart_detector,
     optional_file,
     required_path,
     require_cuda_device,
+    resolve_parent_nnpu_semantics,
     resolved_config_dict,
     safe_run_suffix,
     save_finetuned_checkpoint,
     sha256_file,
     split_policy_segments,
     validate_finetune_contract,
+)
+from robosuite.pipeline.offline.discriminator.finetune_setup import (
+    active_training_pool_names,
+    configured_loss_terms,
+    mapping_config,
+    reserved_unlabeled_provenance,
+    resolved_sampler_config,
+    trajectory_stats,
 )
 from robosuite.pipeline.utils import (
     maybe_build_metric_logger,
@@ -41,18 +49,9 @@ from robosuite.pipeline.utils import (
 )
 
 
-DEFAULT_FROM_INIT_HEAD_HIDDEN = 256
-DEFAULT_FROM_INIT_HEAD_LAYERS = 2
-DEFAULT_FROM_INIT_PI_P = 0.5
-DEFAULT_FROM_INIT_LOSS_SURROGATE = "logistic"
-DEFAULT_FROM_INIT_NN_CORRECTION = True
-DEFAULT_FROM_INIT_BETA = 0.0
-DEFAULT_FROM_INIT_DELTA = 10.0
-
-
 @hydra.main(version_base="1.2", config_path="../../config", config_name="finetune_disc")
 def main(cfg: DictConfig) -> None:
-    """Encode policy segments, warm-start the nnPU head, and recalibrate it."""
+    """Encode named pools, warm-start the nnPU head, and recalibrate it."""
     if bool(OmegaConf.select(cfg, "logging.use_wandb", default=False)):
         raise ValueError(
             "Discriminator finetuning supports TensorBoard only; WandB is disabled."
@@ -72,8 +71,11 @@ def main(cfg: DictConfig) -> None:
         disc_cfg.checkpoint,
         name="algorithm.discriminator.checkpoint",
     )
-    parent_from_scratch = parent_checkpoint is None
-    bootstrap_checkpoint: Path | None = None
+    if parent_checkpoint is None:
+        raise ValueError(
+            "algorithm.discriminator.checkpoint is required; Step 3 supports "
+            "warm-start finetuning only."
+        )
     encoder_checkpoint = optional_file(
         disc_cfg.encoder_ckpt,
         name="algorithm.discriminator.encoder_ckpt",
@@ -88,22 +90,52 @@ def main(cfg: DictConfig) -> None:
     )
 
     epochs = int(finetune_cfg.epochs)
-    batch_size = int(finetune_cfg.batch_size)
     encode_batch_size = int(finetune_cfg.encode_batch_size)
     log_interval = int(finetune_cfg.log_interval)
-    use_only_offline = bool(finetune_cfg.use_only_offline)
-    if min(epochs, batch_size, encode_batch_size, log_interval) <= 0:
-        raise ValueError("epochs, batch sizes, and log_interval must all be positive.")
-    if batch_size < 2 or batch_size % 2 != 0:
-        raise ValueError(
-            "offline.discriminator_finetune.batch_size must be even and at least 2 "
-            "for exact 50/50 P/U sampling."
-        )
+    if min(epochs, encode_batch_size, log_interval) <= 0:
+        raise ValueError("epochs, encode_batch_size, and log_interval must be positive.")
     if float(finetune_cfg.lr) < 0.0 or float(finetune_cfg.weight_decay) < 0.0:
         raise ValueError("Learning rate and weight decay must be non-negative.")
 
+    objective_config = mapping_config(
+        finetune_cfg.objective,
+        name="offline.discriminator_finetune.objective",
+    )
+    loss_terms = configured_loss_terms(objective_config)
+    active_training_pools = active_training_pool_names(loss_terms)
+    gt_config = mapping_config(
+        finetune_cfg.gt_negative,
+        name="offline.discriminator_finetune.gt_negative",
+    )
+    required_gt_semantics = {
+        "action_source": "policy_action",
+        "post_boundary": "intervention_block",
+        "chunk_boundary": "continuous_window",
+    }
+    for key, expected in required_gt_semantics.items():
+        if str(gt_config.get(key)) != expected:
+            raise ValueError(
+                f"gt_negative.{key} must be {expected!r}, got {gt_config.get(key)!r}."
+            )
+    pre_intervention_chunks = int(gt_config.get("pre_intervention_chunks", -1))
+    post_intervention_chunks = int(gt_config.get("post_intervention_chunks", -1))
+    if pre_intervention_chunks < 0 or post_intervention_chunks <= 0:
+        raise ValueError(
+            "gt_negative pre_intervention_chunks must be non-negative and "
+            "post_intervention_chunks must be positive."
+        )
+    pre_end_chunks = int(gt_config.get("pre_end_chunk", 0))
+    if pre_end_chunks < 0:
+        raise ValueError("gt_negative pre_end_chunk must be non-negative.")
+
     pretrain_pools, pretrain_manifest = load_pretrain_pools(pretrain_path)
     offline_payload = load_offline_episodes(episodes_path)
+    detector, parent_payload = load_warmstart_detector(
+        parent_checkpoint,
+        device=device,
+        expected_task=task_name,
+    )
+
     manifest_feature = dict(pretrain_manifest.get("feature_contract", {}))
     manifest_camera_map = {
         str(key): str(value)
@@ -124,70 +156,6 @@ def main(cfg: DictConfig) -> None:
         if manifest_proprio is None
         else [int(value) for value in manifest_proprio]
     )
-
-    if parent_checkpoint is None:
-        manifest_checkpoint = dict(pretrain_manifest.get("checkpoint", {}))
-        if "model_ckpt" not in manifest_checkpoint:
-            raise ValueError(
-                "from-init mode requires pretrain manifest field checkpoint.model_ckpt."
-            )
-        feature_source = str(manifest_feature.get("feature_source", "transformer"))
-        transformer_layer = int(manifest_feature.get("transformer_layer", 1))
-        use_chunk = bool(manifest_feature.get("use_chunk", False))
-        model_ckpt = manifest_checkpoint.get("model_ckpt")
-        if model_ckpt is None:
-            raise ValueError(
-                "from-init mode requires pretrain manifest field checkpoint.model_ckpt."
-            )
-        normalized_model_ckpt = to_absolute_path(str(model_ckpt))
-        model_ckpt_sha = manifest_checkpoint.get("model_ckpt_sha256")
-        normalizer_ckpt = manifest_checkpoint.get("normalizer_ckpt")
-        normalizer_ckpt_sha = manifest_checkpoint.get("normalizer_ckpt_sha256")
-        in_dim = int(manifest_feature.get("latent_dim", 0))
-        if in_dim <= 0:
-            raise ValueError(
-                "from-init mode requires feature_contract.latent_dim > 0 in manifest."
-            )
-        with tempfile.NamedTemporaryFile(suffix=".pth", prefix="robosuite-", delete=False) as temp_file:
-            bootstrap_checkpoint = Path(temp_file.name)
-            init_probe = PUBCEDiscriminatorFT(
-                in_dim=in_dim,
-                hidden=DEFAULT_FROM_INIT_HEAD_HIDDEN,
-                num_layers=DEFAULT_FROM_INIT_HEAD_LAYERS,
-                device=str(device),
-            )
-            synthetic_payload = {
-                "feature_source": feature_source,
-                "transformer_layer": transformer_layer,
-                "use_chunk": use_chunk,
-                "model_ckpt": normalized_model_ckpt,
-                "in_dim": in_dim,
-                "hidden": DEFAULT_FROM_INIT_HEAD_HIDDEN,
-                "num_layers": DEFAULT_FROM_INIT_HEAD_LAYERS,
-                "model_ckpt_sha256": model_ckpt_sha,
-                "normalizer_ckpt": normalizer_ckpt,
-                "normalizer_ckpt_sha256": normalizer_ckpt_sha,
-                "pi_p": DEFAULT_FROM_INIT_PI_P,
-                "loss_surrogate": DEFAULT_FROM_INIT_LOSS_SURROGATE,
-                "nn_correction": DEFAULT_FROM_INIT_NN_CORRECTION,
-                "beta": DEFAULT_FROM_INIT_BETA,
-                "delta": DEFAULT_FROM_INIT_DELTA,
-                "pu_bce_detector": init_probe.state_dict(),
-                "proprio_indices": None
-                if manifest_feature.get("proprio_indices") is None
-                else [int(value) for value in manifest_feature.get("proprio_indices")],
-            }
-            torch.save(synthetic_payload, temp_file.name)
-            parent_checkpoint = bootstrap_checkpoint
-            detector = init_probe
-            parent_payload: dict[str, Any] = synthetic_payload.copy()
-    else:
-        detector, parent_payload = load_warmstart_detector(
-            parent_checkpoint,
-            device=device,
-            expected_task=task_name,
-        )
-
     with torch.device(device):
         encoder = FinetuneDynamicsEncoder(
             nnpu_ckpt_path=parent_checkpoint,
@@ -196,7 +164,6 @@ def main(cfg: DictConfig) -> None:
             camera_to_view=(configured_camera_map or manifest_camera_map),
             proprio_indices=effective_proprio,
         )
-
     validate_finetune_contract(
         task_name=task_name,
         parent_checkpoint=parent_checkpoint,
@@ -204,80 +171,95 @@ def main(cfg: DictConfig) -> None:
         pretrain_manifest=pretrain_manifest,
         offline_payload=offline_payload,
         encoder=encoder,
-        require_parent_checksum_match=not parent_from_scratch,
+        require_parent_checksum_match=True,
     )
+
     segments, segment_stats = split_policy_segments(offline_payload)
-    online_pools = encode_policy_segments(
+    offline_pools = encode_policy_segments(
         segments,
         encoder=encoder,
         camera_names=list(offline_payload["camera_names"]),
         batch_size=encode_batch_size,
     )
-    combined_pools = combine_pools(
-        pretrain_pools,
-        online_pools,
-        use_only_offline=use_only_offline,
+    gt_windows, gt_window_stats = build_gt_negative_windows(
+        offline_payload,
+        pre_intervention_chunks=pre_intervention_chunks,
+        post_intervention_chunks=post_intervention_chunks,
+        frameskip=int(encoder.inner_encoder.frameskip),
+        pre_end_chunks=pre_end_chunks,
     )
-    if int(combined_pools.stats["latent_dim"]) != int(detector.in_dim):
+    supervised_gt_active = any(
+        term.active and term.type == "supervised_bce" for term in loss_terms
+    )
+    gt_negative = (
+        encode_gt_negative_windows(
+            gt_windows,
+            encoder=encoder,
+            camera_names=list(offline_payload["camera_names"]),
+            batch_size=encode_batch_size,
+        )
+        if supervised_gt_active
+        else []
+    )
+
+    named_trajectories = {
+        "pretrain_positive": list(pretrain_pools.positive),
+        "pretrain_unlabeled": list(pretrain_pools.unlabeled),
+        "pretrain_calibration": list(pretrain_pools.calibration),
+        "offline_positive": list(offline_pools.positive),
+        "offline_gt_negative": list(gt_negative),
+    }
+    named_pool_stats = {
+        name: trajectory_stats(items) for name, items in named_trajectories.items()
+    }
+    reserved_stats, reserved_shards = reserved_unlabeled_provenance(
+        offline_pools.unlabeled,
+        selected_frame_keys=gt_window_stats["selected_frame_keys"],
+    )
+    named_pool_stats["offline_unlabeled_reserved"] = reserved_stats
+    empty_active_pools = [
+        name
+        for name in active_training_pools
+        if int(named_pool_stats[name]["frames"]) <= 0
+    ]
+    if empty_active_pools:
         raise ValueError(
-            f"Combined latent dim {combined_pools.stats['latent_dim']} "
-            f"!= head dim {detector.in_dim}."
+            f"Active objectives require non-empty pools: {empty_active_pools}."
+        )
+    latent_dims = {
+        int(stats["latent_dim"])
+        for stats in named_pool_stats.values()
+        if int(stats.get("latent_dim", 0)) > 0
+    }
+    if latent_dims != {int(detector.in_dim)}:
+        raise ValueError(
+            f"Named pool latent dims {sorted(latent_dims)} != head dim {detector.in_dim}."
         )
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = safe_run_suffix(finetune_cfg.run_subfix)
-    directory_name = (
-        f"{task_name}_{timestamp}_{suffix}" if suffix else f"{task_name}_{timestamp}"
-    )
-    run_root = Path(to_absolute_path(str(finetune_cfg.run_root))).resolve()
-    run_dir = run_root / directory_name
-    if run_dir.exists():
-        raise FileExistsError(f"Finetune run directory already exists: {run_dir}")
-    (run_dir / "checkpoints").mkdir(parents=True)
-    run_name = f"{task_name}__discriminator_finetune__{timestamp}"
-    parent_checkpoint_tag = "from_init" if parent_from_scratch else str(parent_checkpoint)
-    write_resolved_config(cfg, run_dir)
-    metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
-
-    detector_state = parent_payload["pu_bce_detector"]
-    delta_value = parent_payload.get("delta")
-    if delta_value is None:
-        delta_value = detector_state.get("delta")
-    if delta_value is None:
-        if parent_from_scratch:
-            delta_value = DEFAULT_FROM_INIT_DELTA
-        else:
-            raise KeyError("Parent nnPU payload is missing calibration delta.")
-    pi_p_value = parent_payload.get("pi_p")
-    if pi_p_value is None:
-        pi_p_value = detector_state.get("pi_p")
-    if pi_p_value is None:
-        raise KeyError("Parent nnPU payload is missing class prior pi_p.")
-    loss_surrogate_value = parent_payload.get("loss_surrogate")
-    if loss_surrogate_value is None:
-        loss_surrogate_value = detector_state.get("loss_surrogate", "logistic")
-    nn_correction_value = parent_payload.get("nn_correction")
-    if nn_correction_value is None:
-        nn_correction_value = detector_state.get("nn_correction", True)
-    beta_value = parent_payload.get("beta")
-    if beta_value is None:
-        beta_value = detector_state.get("beta", DEFAULT_FROM_INIT_BETA)
-    finetune_config = {
+    parent_nnpu = resolve_parent_nnpu_semantics(parent_payload)
+    finetune_config: dict[str, Any] = {
+        "method": "nnpu_replay_gt_bce",
         "optimizer": "AdamW",
         "schedule": "cosine",
         "epochs": epochs,
         "lr": float(finetune_cfg.lr),
         "weight_decay": float(finetune_cfg.weight_decay),
-        "batch_size": batch_size,
         "encode_batch_size": encode_batch_size,
-        "use_only_offline": use_only_offline,
+        "log_interval": log_interval,
         "seed": int(cfg.seed),
         "device": str(device),
-        "pi_p": float(pi_p_value),
-        "loss_surrogate": str(loss_surrogate_value),
-        "nn_correction": bool(nn_correction_value),
-        "beta": float(beta_value),
-        "delta": float(delta_value),
+        "objective": objective_config,
+        "sampler": resolved_sampler_config(
+            loss_terms,
+            seed=int(cfg.seed),
+            device=str(device),
+        ),
+        "gt_negative": gt_config,
+        "parent_nnpu": {
+            key: parent_nnpu[key]
+            for key in ("pi_p", "loss_surrogate", "nn_correction", "beta")
+        },
+        "delta": float(parent_nnpu["delta"]),
     }
     data_provenance = {
         "parent_checkpoint_sha256": sha256_file(parent_checkpoint),
@@ -287,15 +269,52 @@ def main(cfg: DictConfig) -> None:
         "pretrain_manifest": pretrain_manifest,
         "offline_episodes_path": str(episodes_path),
         "offline_nnpu_checkpoint": offline_payload.get("nnpu_checkpoint"),
-        "use_only_offline": use_only_offline,
         "parent_model_checkpoint": parent_payload.get("model_ckpt"),
         "resolved_encoder_checkpoint": str(encoder.encoder_checkpoint),
         "resolved_encoder_sha256": sha256_file(encoder.encoder_checkpoint),
         "resolved_normalizer_checkpoint": encoder.normalizer_checkpoint,
         "resolved_normalizer_sha256": sha256_file(encoder.normalizer_checkpoint),
         "segment_stats": segment_stats,
-        "pool_stats": combined_pools.stats,
-        "online_segments": [
+        "gt_negative_rule": gt_window_stats,
+        "named_pool_stats": named_pool_stats,
+        "named_pool_sources": {
+            "pretrain_positive": {
+                "dataset": "pretrain_manifest",
+                "split": "positive_train",
+                "role": "nnpu_positive",
+            },
+            "pretrain_unlabeled": {
+                "dataset": "pretrain_manifest",
+                "split": "unlabeled_train",
+                "role": "nnpu_unlabeled",
+            },
+            "pretrain_calibration": {
+                "dataset": "pretrain_manifest",
+                "split": "positive_calib",
+                "role": "success_only_recalibration",
+            },
+            "offline_positive": {
+                "dataset": "offline_episodes",
+                "observations": "final_policy_segment_direct_success",
+                "actions": "executed_action_equal_to_policy_action",
+                "role": "supervised_bce_positive",
+            },
+            "offline_gt_negative": {
+                "dataset": "offline_episodes",
+                "observations": "policy_prefix_and_human_intervention",
+                "actions": "policy_action",
+                "role": "supervised_bce_negative",
+            },
+            "offline_unlabeled_reserved": {
+                "dataset": "offline_episodes",
+                "observations": "policy_only_excluding_gt_selected_frames",
+                "role": "reserved_not_used_by_active_loss",
+            },
+        },
+        "active_training_pools": active_training_pools,
+        "reserved_pools": ["offline_unlabeled_reserved"],
+        "offline_unlabeled_reserved_shards": reserved_shards,
+        "offline_segments": [
             {
                 "id": segment.identifier,
                 "pool": segment.pool,
@@ -308,72 +327,151 @@ def main(cfg: DictConfig) -> None:
             for segment in segments
         ],
         "calibration_source": "pretrain_positive_calib_only",
+        "theory_deviation": gt_window_stats["theory_deviation"],
     }
 
-    maybe_log(
-        metric_logger,
-        {
-            "data/positive_frames": combined_pools.stats["positive_frames"],
-            "data/unlabeled_frames": combined_pools.stats["unlabeled_frames"],
-            "data/calibration_frames": combined_pools.stats["calibration_frames"],
-            "data/online_positive_frames": online_pools.stats["positive_frames"],
-            "data/online_unlabeled_frames": online_pools.stats["unlabeled_frames"],
-            "data/excluded_human_frames": segment_stats["excluded_human_frames"],
-        },
-        step=0,
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = safe_run_suffix(finetune_cfg.run_subfix)
+    directory_name = (
+        f"{task_name}_{timestamp}_{suffix}" if suffix else f"{task_name}_{timestamp}"
     )
+    run_root = Path(to_absolute_path(str(finetune_cfg.run_root))).resolve()
+    run_dir = run_root / directory_name
+    if run_dir.exists():
+        raise FileExistsError(f"Finetune run directory already exists: {run_dir}")
+    (run_dir / "checkpoints").mkdir(parents=True)
+    run_name = f"{task_name}__discriminator_finetune__{timestamp}"
+    write_resolved_config(cfg, run_dir)
+    metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
 
-    def log_epoch(metrics: dict[str, float]) -> None:
-        step = int(metrics["epoch"]) + 1
+    initial_metrics: dict[str, float] = {
+        f"data/{name}_frames": float(stats["frames"])
+        for name, stats in named_pool_stats.items()
+    }
+    initial_metrics.update(
+        {
+            f"data/{name}_trajectories": float(stats["trajectories"])
+            for name, stats in named_pool_stats.items()
+        }
+    )
+    initial_metrics.update(
+        {
+            "data/gt_intervention_events": float(
+                gt_window_stats["intervention_events"]
+            ),
+            "data/gt_negative_windows": float(
+                gt_window_stats["gt_negative_windows"]
+            ),
+            "data/gt_pre_frames": float(gt_window_stats["pre_frames"]),
+            "data/gt_post_frames": float(gt_window_stats["post_frames"]),
+            "data/gt_pre_truncated_events": float(
+                gt_window_stats["pre_truncated_events"]
+            ),
+            "data/gt_post_truncated_events": float(
+                gt_window_stats["post_truncated_events"]
+            ),
+            "data/gt_deduplicated_frames": float(
+                gt_window_stats["deduplicated_frames"]
+            ),
+            "data/gt_non_success_episodes": float(
+                gt_window_stats["non_success_episodes"]
+            ),
+            "data/gt_pre_end_windows": float(
+                gt_window_stats["pre_end_windows"]
+            ),
+            "data/gt_pre_end_frames": float(
+                gt_window_stats["pre_end_frames"]
+            ),
+            "data/gt_pre_end_truncated_events": float(
+                gt_window_stats["pre_end_truncated_events"]
+            ),
+            "data/excluded_human_frames": float(
+                segment_stats["excluded_human_frames"]
+            ),
+        }
+    )
+    maybe_log(metric_logger, initial_metrics, step=0)
+
+    last_global_step = 0
+
+    def log_step(metrics: dict[str, float]) -> None:
+        nonlocal last_global_step
+        last_global_step = int(metrics["global_step"])
         maybe_log(
             metric_logger,
             {
-                f"finetune/{key}": value
+                f"step/{key}": value
                 for key, value in metrics.items()
-                if key != "epoch"
+                if key not in {"global_step", "epoch", "epoch_step"}
             },
-            step=step,
+            step=last_global_step,
         )
-        nn_corr_batches = int(metrics["nn_correction_batches"])
-        nn_corr_steps = max(1, int(metrics["steps"]))
         print(
-            f"[pu_bce][fit] epoch={step}/{epochs} "
-            f"risk={metrics['risk']:.5f} neg_risk={metrics['neg_risk']:+.5f} "
-            f"nn_corr_batches={nn_corr_batches}/{nn_corr_steps} "
-            f"lr={metrics['lr']:.2e} Np={int(metrics['num_positive_frames'])} "
-            f"Nu={int(metrics['num_unlabeled_frames'])} "
-            f"pi_p={finetune_config['pi_p']:.3f} "
-            f"surrogate={finetune_config['loss_surrogate']} "
-            f"nn_correction={finetune_config['nn_correction']} "
-            f"beta={finetune_config['beta']:.3g}",
+            f"[pu_bce][step] step={last_global_step} "
+            f"epoch={int(metrics['epoch']) + 1}/{epochs} "
+            f"epoch_step={int(metrics['epoch_step'])} "
+            f"loss={metrics['loss/total']:.5f} lr={metrics['lr']:.2e}",
+            flush=True,
+        )
+
+    def log_epoch(metrics: dict[str, float]) -> None:
+        nonlocal last_global_step
+        last_global_step = int(metrics["global_step"])
+        maybe_log(
+            metric_logger,
+            {
+                key: value
+                for key, value in metrics.items()
+                if key not in {"global_step", "epoch"}
+            },
+            step=last_global_step,
+        )
+        print(
+            f"[pu_bce][fit] epoch={int(metrics['epoch']) + 1}/{epochs} "
+            f"loss={metrics['loss/total']:.5f} "
+            f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f} "
+            f"gt_bce={metrics.get('loss/supervised_gt_bce/raw', float('nan')):.5f} "
+            f"clamp_fraction={metrics.get('nnpu/clamp_fraction', 0.0):.3f} "
+            f"delta_gt={metrics.get('scores/delta_gt', float('nan')):+.5f} "
+            f"lr={metrics['lr']:.2e}",
             flush=True,
         )
 
     try:
         print(
-            f"[robosuite][pu_bce] task={task_name} epochs={epochs} lr={float(finetune_cfg.lr):.2e} "
-            f"init_mode={'from_init' if parent_from_scratch else 'from_checkpoint'} "
-            f"batch_size={batch_size} feat_dim={int(detector.in_dim)} "
-            f"Np={int(combined_pools.stats['positive_frames'])} "
-            f"Nu={int(combined_pools.stats['unlabeled_frames'])} "
-            f"N_calib={int(combined_pools.stats['calibration_frames'])}",
+            f"[robosuite][pu_bce] task={task_name} method=nnpu_replay_gt_bce "
+            f"epochs={epochs} lr={float(finetune_cfg.lr):.2e} "
+            f"feat_dim={int(detector.in_dim)} "
+            f"NpreP={named_pool_stats['pretrain_positive']['frames']} "
+            f"NpreU={named_pool_stats['pretrain_unlabeled']['frames']} "
+            f"NoffP={named_pool_stats['offline_positive']['frames']} "
+            f"NgtN={named_pool_stats['offline_gt_negative']['frames']}",
             flush=True,
         )
         thresholds = finetune_warmstart_detector(
             detector,
-            positive_features=feature_tensors(combined_pools.positive),
-            unlabeled_features=feature_tensors(combined_pools.unlabeled),
-            calibration_features=feature_tensors(combined_pools.calibration),
+            feature_pools={
+                name: feature_tensors(items)
+                for name, items in named_trajectories.items()
+                if name in active_training_pools
+            },
+            calibration_features=feature_tensors(pretrain_pools.calibration),
+            objective_config=objective_config,
             task_name=task_name,
             parent_payload=parent_payload,
             epochs=epochs,
             lr=float(finetune_cfg.lr),
             weight_decay=float(finetune_cfg.weight_decay),
-            batch_size=batch_size,
             seed=int(cfg.seed),
+            log_interval=log_interval,
             metric_callback=log_epoch,
+            step_metric_callback=log_step,
             verbose=False,
         )
+        if detector._train_history:  # noqa: SLF001
+            finetune_config["resolved_steps_per_epoch"] = int(
+                detector._train_history[-1]["steps"]  # noqa: SLF001
+            )
         checkpoint_payload = build_finetuned_checkpoint_payload(
             detector,
             parent_payload=parent_payload,
@@ -393,9 +491,10 @@ def main(cfg: DictConfig) -> None:
             "started_at": timestamp,
             "task_name": task_name,
             "output_checkpoint": str(output_checkpoint),
-            "parent_checkpoint": parent_checkpoint_tag,
+            "parent_checkpoint": str(parent_checkpoint),
             "encoder_checkpoint": str(encoder.encoder_checkpoint),
-            "from_init": bool(parent_from_scratch),
+            "from_init": False,
+            "finetune_method": "nnpu_replay_gt_bce",
             "finetune_config": finetune_config,
             "data": data_provenance,
             "thresholds": thresholds,
@@ -406,12 +505,10 @@ def main(cfg: DictConfig) -> None:
         maybe_log(
             metric_logger,
             {f"calibration/threshold/{key}": value for key, value in thresholds.items()},
-            step=epochs,
+            step=max(last_global_step, epochs),
         )
         print(f"[robosuite][pu_bce] saved checkpoint={output_checkpoint}", flush=True)
     finally:
-        if bootstrap_checkpoint is not None and bootstrap_checkpoint.exists():
-            bootstrap_checkpoint.unlink()
         if metric_logger is not None:
             metric_logger.flush()
             metric_logger.close()

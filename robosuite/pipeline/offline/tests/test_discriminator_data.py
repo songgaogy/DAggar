@@ -7,14 +7,13 @@ import numpy as np
 import pytest
 
 from robosuite.pipeline.offline.discriminator import (
-    DiscriminatorPools,
-    LatentTrajectory,
     build_action_windows,
-    combine_pools,
     load_pretrain_pools,
+    resolve_parent_nnpu_semantics,
     split_policy_segments,
     validate_offline_payload,
 )
+from robosuite.pipeline.offline.discriminator.episodes import build_gt_negative_windows
 
 
 def _episode(
@@ -102,6 +101,139 @@ def test_all_human_episode_produces_no_training_segment() -> None:
     assert stats["excluded_human_frames"] == 3
 
 
+def test_gt_negative_window_uses_chunk_scaled_contiguous_pre_and_post_frames() -> None:
+    episode = _episode(
+        [False] * 10 + [True] * 9 + [False] * 2,
+        terminal_reason="manual_reset",
+    )
+    payload = validate_offline_payload(_payload(episode))
+
+    windows, stats = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=2,
+        post_intervention_chunks=3,
+        frameskip=3,
+    )
+
+    assert len(windows) == 1
+    window = windows[0]
+    assert (window.lo, window.onset, window.hi) == (4, 10, 19)
+    assert window.frame_indices == tuple(range(4, 19))
+    assert window.num_pre_frames == 6
+    assert window.num_post_frames == 9
+    assert stats["gt_negative_frames"] == 15
+    assert stats["post_truncated_events"] == 0
+    assert stats["stored_gt_fail_ignored"] is True
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ([True, True], (0, 0, 2)),
+        ([False, True, True], (0, 1, 3)),
+        ([False, False, True], (0, 2, 3)),
+    ],
+)
+def test_gt_negative_window_truncates_at_episode_and_intervention_boundaries(
+    flags: list[bool], expected: tuple[int, int, int]
+) -> None:
+    payload = validate_offline_payload(
+        _payload(_episode(flags, terminal_reason="manual_reset"))
+    )
+
+    windows, stats = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=4,
+        post_intervention_chunks=4,
+        frameskip=2,
+    )
+
+    assert [(window.lo, window.onset, window.hi) for window in windows] == [expected]
+    assert stats["pre_truncated_events"] == 1
+    assert stats["post_truncated_events"] == 1
+
+
+def test_gt_negative_multiple_events_stay_local_and_are_globally_unique() -> None:
+    flags = [False, False, True, True, False, False, False, True, False]
+    payload = validate_offline_payload(
+        _payload(_episode(flags, terminal_reason="manual_reset"))
+    )
+
+    windows, stats = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=2,
+        post_intervention_chunks=2,
+        frameskip=1,
+    )
+
+    assert [(window.lo, window.onset, window.hi) for window in windows] == [
+        (0, 2, 4),
+        (5, 7, 8),
+    ]
+    keys = [
+        (window.source_episode_index, frame)
+        for window in windows
+        for frame in window.frame_indices
+    ]
+    assert len(keys) == len(set(keys))
+    assert stats["intervention_events"] == 2
+    assert stats["deduplicated_frames"] == 0
+    assert [event["event_index"] for event in stats["events"]] == [0, 1]
+
+
+def test_gt_negative_action_chunks_cross_onset_but_not_event_window() -> None:
+    episode = _episode(
+        [False, False, True, True, False], terminal_reason="manual_reset", action_dim=1
+    )
+    payload = validate_offline_payload(_payload(episode))
+    windows, _ = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=2,
+        post_intervention_chunks=2,
+        frameskip=1,
+    )
+    window = windows[0]
+    policy = np.asarray(episode["policy_action"])[window.lo : window.hi]
+
+    chunks = build_action_windows(policy, horizon=3, use_chunk=True)
+
+    np.testing.assert_array_equal(
+        chunks,
+        [
+            [0.0, 1.0, 2.0],
+            [1.0, 2.0, 3.0],
+            [2.0, 3.0, 3.0],
+            [3.0, 3.0, 3.0],
+        ],
+    )
+    assert not np.any(chunks == np.asarray(episode["executed_action"])[2, 0])
+
+
+def test_gt_negative_routing_ignores_stored_gt_fail() -> None:
+    episode_a = _episode([False, True, True], terminal_reason="manual_reset")
+    episode_b = _episode([False, True, True], terminal_reason="manual_reset")
+    episode_a["gt_fail"] = np.asarray([False, False, False], dtype=np.bool_)
+    episode_b["gt_fail"] = np.asarray([True, False, True], dtype=np.bool_)
+
+    windows_a, stats_a = build_gt_negative_windows(
+        validate_offline_payload(_payload(episode_a)),
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=2,
+    )
+    windows_b, stats_b = build_gt_negative_windows(
+        validate_offline_payload(_payload(episode_b)),
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=2,
+    )
+
+    assert [(item.lo, item.hi, item.frame_indices) for item in windows_a] == [
+        (item.lo, item.hi, item.frame_indices) for item in windows_b
+    ]
+    assert stats_a == stats_b
+
+
 @pytest.mark.parametrize(
     "terminal_reason",
     ["manual_reset", "max_steps", "env_done", "interrupted"],
@@ -144,88 +276,79 @@ def test_legacy_single_action_mode_zero_pads() -> None:
     )
 
 
-def test_combined_calibration_remains_pretrain_only() -> None:
-    feature = np.zeros((2, 3), dtype=np.float32)
-    pretrain_calibration = LatentTrajectory(
-        features=feature,  # type: ignore[arg-type]
-        pool="calibration",
-        source="pretrain",
-        identifier="held-out",
-    )
-    pretrain = DiscriminatorPools(
-        positive=[
-            LatentTrajectory(feature, "positive", "pretrain", "pretrain-positive")  # type: ignore[arg-type]
-        ],
-        unlabeled=[
-            LatentTrajectory(feature, "unlabeled", "pretrain", "pretrain-unlabeled")  # type: ignore[arg-type]
-        ],
-        calibration=[pretrain_calibration],
-    )
-    online = DiscriminatorPools(
-        positive=[
-            LatentTrajectory(feature, "positive", "online", "online-positive")  # type: ignore[arg-type]
-        ],
-        unlabeled=[
-            LatentTrajectory(feature, "unlabeled", "online", "online-unlabeled")  # type: ignore[arg-type]
-        ],
-    )
-
-    combined = combine_pools(pretrain, online)
-
-    assert combined.calibration == [pretrain_calibration]
-    assert [item.identifier for item in combined.positive] == [
-        "pretrain-positive",
-        "online-positive",
-    ]
-    assert [item.identifier for item in combined.unlabeled] == [
-        "pretrain-unlabeled",
-        "online-unlabeled",
-    ]
-
-
-def test_use_only_offline_drops_pretrain_unlabeled_pool() -> None:
-    feature = np.zeros((2, 3), dtype=np.float32)
-    pretrain_calibration = LatentTrajectory(
-        features=feature,  # type: ignore[arg-type]
-        pool="calibration",
-        source="pretrain",
-        identifier="held-out",
-    )
-    pretrain = DiscriminatorPools(
-        positive=[
-            LatentTrajectory(feature, "positive", "pretrain", "pretrain-positive")  # type: ignore[arg-type]
-        ],
-        unlabeled=[
-            LatentTrajectory(feature, "unlabeled", "pretrain", "pretrain-unlabeled")  # type: ignore[arg-type]
-        ],
-        calibration=[pretrain_calibration],
-    )
-    online = DiscriminatorPools(
-        positive=[
-            LatentTrajectory(feature, "positive", "online", "online-positive")  # type: ignore[arg-type]
-        ],
-        unlabeled=[
-            LatentTrajectory(feature, "unlabeled", "online", "online-unlabeled")  # type: ignore[arg-type]
-        ],
-    )
-
-    combined = combine_pools(pretrain, online, use_only_offline=True)
-
-    assert combined.calibration == [pretrain_calibration]
-    assert [item.identifier for item in combined.positive] == [
-        "pretrain-positive",
-        "online-positive",
-    ]
-    assert [item.identifier for item in combined.unlabeled] == ["online-unlabeled"]
-    assert combined.stats["use_only_offline"] is True
-
-
 def test_non_intervention_action_mismatch_is_rejected() -> None:
     episode = _episode([False, True], terminal_reason="manual_reset")
     episode["executed_action"][0, 0] += 0.1  # type: ignore[index]
 
     with pytest.raises(ValueError, match="executed/policy action mismatch"):
         validate_offline_payload(_payload(episode))
+
+
+def test_non_finite_policy_action_is_rejected() -> None:
+    episode = _episode([False, True], terminal_reason="manual_reset")
+    episode["policy_action"][1, 0] = np.nan  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="policy_action contains non-finite"):
+        validate_offline_payload(_payload(episode))
+
+
+def test_parent_nnpu_semantics_are_strictly_inherited() -> None:
+    semantics = resolve_parent_nnpu_semantics(
+        {
+            "pu_bce_detector": {
+                "pi_p": 0.3,
+                "delta": 10.0,
+                "loss_surrogate": "logistic",
+            },
+            "nn_correction": True,
+            "beta": 0.0,
+        }
+    )
+
+    assert semantics == {
+        "pi_p": 0.3,
+        "loss_surrogate": "logistic",
+        "nn_correction": True,
+        "beta": 0.0,
+        "delta": 10.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (lambda payload: payload.pop("beta"), "missing beta"),
+        (
+            lambda payload: payload.__setitem__("nn_correction", "false"),
+            "nn_correction must be bool",
+        ),
+        (
+            lambda payload: payload.__setitem__("beta", True),
+            "beta must be a real number",
+        ),
+        (
+            lambda payload: payload.__setitem__("pi_p", "0.3"),
+            "pi_p must be a real number",
+        ),
+        (
+            lambda payload: payload.__setitem__("delta", "10.0"),
+            "delta must be a real number",
+        ),
+    ],
+)
+def test_invalid_parent_nnpu_semantics_fail_fast(mutation, error: str) -> None:
+    payload = {
+        "pi_p": 0.3,
+        "delta": 10.0,
+        "loss_surrogate": "logistic",
+        "nn_correction": True,
+        "beta": 0.0,
+        "pu_bce_detector": {},
+    }
+    mutation(payload)
+
+    with pytest.raises((KeyError, TypeError, ValueError), match=error):
+        resolve_parent_nnpu_semantics(payload)
 
 
 def test_pretrain_calibration_overlap_is_rejected_before_loading_shards(tmp_path) -> None:

@@ -12,7 +12,7 @@ import torch
 
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
-import robosuite.pipeline.offline.discriminator.trainer as trainer_module
+import robosuite.pipeline.offline.discriminator.objectives as objectives_module
 from robosuite.pipeline.offline.discriminator import (
     PUBCEDiscriminatorFT,
     build_finetuned_checkpoint_payload,
@@ -24,6 +24,12 @@ from robosuite.pipeline.offline.discriminator import (
     split_policy_segments,
     validate_offline_payload,
 )
+from robosuite.pipeline.offline.discriminator.episodes import build_gt_negative_windows
+from robosuite.pipeline.offline.discriminator.features import (
+    encode_gt_negative_windows,
+    exclude_gt_frames_from_unlabeled,
+)
+from robosuite.pipeline.offline.discriminator.pools import LatentTrajectory
 
 
 def _cuda() -> torch.device:
@@ -32,16 +38,46 @@ def _cuda() -> torch.device:
     return torch.device("cuda:0")
 
 
-def _feature_pools(device: torch.device) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    positive = [torch.randn((24, 6), device=device) + 1.0]
-    unlabeled = [torch.randn((24, 6), device=device) - 0.5]
+def _feature_pools(
+    device: torch.device,
+) -> tuple[dict[str, list[torch.Tensor]], list[torch.Tensor]]:
+    positive = torch.randn((24, 6), device=device) + 1.0
+    unlabeled = torch.randn((24, 6), device=device) - 0.5
     calibration = [torch.randn((12, 6), device=device) + 1.0]
-    return positive, unlabeled, calibration
+    return {
+        "pretrain_positive": [positive],
+        "pretrain_unlabeled": [unlabeled],
+        "offline_positive": [positive.clone()],
+        "offline_gt_negative": [unlabeled.clone()],
+    }, calibration
+
+
+def _objective_config(batch_size: int = 8) -> dict[str, object]:
+    return {
+        "steps_per_epoch": 1,
+        "terms": {
+            "nnpu_replay": {
+                "type": "nnpu",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size,
+                "positive_fraction": 0.5,
+            },
+            "supervised_gt_bce": {
+                "type": "supervised_bce",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size,
+                "positive_fraction": 0.5,
+                "class_weights": {"positive": 0.5, "negative": 0.5},
+            },
+        },
+    }
 
 
 def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     device = _cuda()
-    positive, unlabeled, calibration = _feature_pools(device)
+    feature_pools, calibration = _feature_pools(device)
     with torch.device(device):
         detector = PUBCEDiscriminatorFT(
             in_dim=6, hidden=8, num_layers=1, device=str(device)
@@ -54,13 +90,12 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     logged: list[dict[str, float]] = []
 
     thresholds = detector.finetune(
-        positive,
-        unlabeled,
+        feature_pools,
         {"Task": calibration},
+        objective_config=_objective_config(),
         pi_p=0.3,
         epochs=1,
         lr=0.0,
-        batch_size=8,
         seed=7,
         loss_surrogate="logistic",
         metric_callback=logged.append,
@@ -72,8 +107,43 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     assert "Task" in thresholds
     assert thresholds["Task"] != 1.0e9
     assert len(logged) == 1
-    assert logged[0]["num_positive_frames"] == 24.0
-    assert logged[0]["num_unlabeled_frames"] == 24.0
+    assert logged[0]["data/pretrain_positive_frames"] == 24.0
+    assert logged[0]["data/pretrain_unlabeled_frames"] == 24.0
+    assert logged[0]["data/offline_gt_negative_frames"] == 24.0
+
+
+def test_log_interval_reports_running_mean() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    config = _objective_config()
+    config["steps_per_epoch"] = 2
+    interval_logs: list[dict[str, float]] = []
+    epoch_logs: list[dict[str, float]] = []
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        pi_p=0.3,
+        epochs=1,
+        lr=0.0,
+        seed=3,
+        loss_surrogate="logistic",
+        log_interval=2,
+        metric_callback=epoch_logs.append,
+        step_metric_callback=interval_logs.append,
+        verbose=False,
+    )
+
+    assert len(interval_logs) == 1
+    assert len(epoch_logs) == 1
+    assert interval_logs[0]["loss/total"] == pytest.approx(
+        epoch_logs[0]["loss/total"]
+    )
 
 
 def test_finetune_updates_head_and_checkpoint_remains_loadable(
@@ -81,7 +151,7 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = _cuda()
-    positive, unlabeled, calibration = _feature_pools(device)
+    feature_pools, calibration = _feature_pools(device)
     with torch.device(device):
         detector = PUBCEDiscriminatorFT(
             in_dim=6, hidden=8, num_layers=1, device=str(device)
@@ -94,21 +164,20 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     }
 
     sampled_sizes: list[tuple[int, int]] = []
-    original_pu_risk = trainer_module.pu_risk
+    original_pu_risk = objectives_module.pu_risk
 
     def recording_pu_risk(g_p: torch.Tensor, g_u: torch.Tensor, **kwargs):
         sampled_sizes.append((int(g_p.shape[0]), int(g_u.shape[0])))
         return original_pu_risk(g_p, g_u, **kwargs)
 
-    monkeypatch.setattr(trainer_module, "pu_risk", recording_pu_risk)
+    monkeypatch.setattr(objectives_module, "pu_risk", recording_pu_risk)
     detector.finetune(
-        positive,
-        unlabeled,
+        feature_pools,
         {"Task": calibration},
+        objective_config=_objective_config(batch_size=10),
         pi_p=0.3,
         epochs=1,
         lr=1e-3,
-        batch_size=10,
         seed=11,
         loss_surrogate="logistic",
         verbose=False,
@@ -168,6 +237,8 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     assert payload["proprio_indices"] == [1, 2]
     assert payload["success_train_video_ids"] == {"Task": ["positive-train"]}
     assert payload["success_calib_video_ids"] == {"Task": ["positive-calib"]}
+    assert payload["finetune_schema_version"] == 2
+    assert payload["finetune_method"] == "nnpu_replay_gt_bce"
     checkpoint = save_finetuned_checkpoint(
         payload,
         tmp_path / "pu_bce_head_finetuned.pth",
@@ -200,7 +271,7 @@ def test_finetune_rejects_cpu_before_touching_features() -> None:
     detector = object.__new__(PUBCEDiscriminatorFT)
     detector.device = torch.device("cpu")
     with pytest.raises(ValueError, match="requires a CUDA device"):
-        detector.finetune([], [], {}, pi_p=0.3)
+        detector.finetune({}, {}, objective_config={}, pi_p=0.3)
 
 
 def test_public_device_guards_reject_cpu() -> None:
@@ -294,9 +365,14 @@ def test_cuda_encoding_freezes_encoder_and_never_crosses_segment_boundaries() ->
     assert encoder.bound_cameras == ["agentview"]
     assert len(pools.unlabeled) == 1
     assert len(pools.positive) == 1
+    assert pools.unlabeled[0].source == "offline"
+    assert pools.positive[0].source == "offline"
     torch.testing.assert_close(encoder.inner_encoder.model.weight, before)
     assert encoder.inner_encoder.model.weight.grad is None
-    assert all(not parameter.requires_grad for parameter in encoder.inner_encoder.model.parameters())
+    assert all(
+        not parameter.requires_grad
+        for parameter in encoder.inner_encoder.model.parameters()
+    )
     expected_first = torch.tensor(
         [
             [1.0, 2.0, 3.0, 4.0, 3.0, 4.0],
@@ -312,6 +388,88 @@ def test_cuda_encoding_freezes_encoder_and_never_crosses_segment_boundaries() ->
     )
     torch.testing.assert_close(encoder.seen_actions[0], expected_first)
     torch.testing.assert_close(encoder.seen_actions[1], expected_second)
+
+
+def test_cuda_gt_negative_encoding_uses_policy_actions_across_onset() -> None:
+    device = _cuda()
+    payload = validate_offline_payload(_encoding_payload())
+    windows, _ = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=3,
+    )
+    encoder = _FakeFrozenEncoder(device)
+
+    trajectories = encode_gt_negative_windows(
+        windows,
+        encoder=encoder,
+        camera_names=["agentview"],
+        batch_size=16,
+    )
+
+    assert len(trajectories) == 1
+    assert trajectories[0].pool == "offline_gt_negative"
+    assert trajectories[0].source == "offline"
+    assert trajectories[0].metadata["action_source"] == "policy_action"
+    expected = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [3.0, 4.0, 5.0, 6.0, 5.0, 6.0],
+            [5.0, 6.0, 5.0, 6.0, 5.0, 6.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    torch.testing.assert_close(encoder.seen_actions[0], expected)
+    torch.testing.assert_close(trajectories[0].features.to(device), expected)
+    assert not torch.any(encoder.seen_actions[0] == 50.0)
+
+
+def test_cuda_reserved_unlabeled_excludes_selected_pre_onset_frames() -> None:
+    device = _cuda()
+    payload = validate_offline_payload(
+        {
+            **_encoding_payload(),
+            "episodes": [
+                {
+                    **_encoding_payload()["episodes"][0],  # type: ignore[index]
+                    "is_intervention": np.asarray(
+                        [False, False, True, True], dtype=np.bool_
+                    ),
+                    "success": np.asarray([False] * 4, dtype=np.bool_),
+                    "terminal_reason": "manual_reset",
+                }
+            ],
+        }
+    )
+    windows, _ = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=1,
+    )
+    features = torch.arange(12, dtype=torch.float32, device=device).reshape(2, 6)
+    trajectory = LatentTrajectory(
+        features=features,
+        pool="unlabeled",
+        source="offline",
+        identifier="episode-0-policy-prefix",
+        metadata={
+            "source_episode_index": 0,
+            "frame_start": 0,
+            "frame_end": 2,
+        },
+    )
+
+    reserved = exclude_gt_frames_from_unlabeled([trajectory], windows)
+
+    assert len(reserved) == 1
+    assert reserved[0].pool == "offline_unlabeled_reserved"
+    assert reserved[0].metadata["frame_start"] == 0
+    assert reserved[0].metadata["frame_end"] == 1
+    assert reserved[0].features.device.type == "cuda"
+    torch.testing.assert_close(reserved[0].features, features[:1])
 
 
 def test_pretrain_manifest_and_shards_round_trip_from_cuda(tmp_path: Path) -> None:

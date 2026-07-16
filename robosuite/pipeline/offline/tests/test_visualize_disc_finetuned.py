@@ -10,12 +10,14 @@ import pytest
 import torch
 
 from robosuite.pipeline.offline.visualization import disc_renderer as viz_module
+from robosuite.pipeline.offline.visualization import disc_episodes as episodes_module
 from robosuite.pipeline.offline.visualization.disc_adapter import (
     FinetunedPUBCEBenchmarkDiscriminator,
 )
 from robosuite.pipeline.offline.visualization.disc_episodes import (
     offline_trajectory as _offline_trajectory,
     sample_offline_trajectories as _sample_offline_trajectories,
+    sample_offline_trajectory_pools as _sample_offline_trajectory_pools,
 )
 from robosuite.pipeline.offline.visualization.disc_renderer import (
     FinetunedPUBCEVisualizer as PUBCEVisualizer,
@@ -27,7 +29,12 @@ from robosuite.pipeline.offline.visualization.disc_contract import (
 )
 
 
-def _episode(index: int, *, interventions: list[bool]) -> dict[str, object]:
+def _episode(
+    index: int,
+    *,
+    interventions: list[bool],
+    terminal_reason: str = "manual_reset",
+) -> dict[str, object]:
     length = len(interventions)
     policy = np.full((length, 2), float(index), dtype=np.float32)
     executed = policy.copy()
@@ -38,15 +45,18 @@ def _episode(index: int, *, interventions: list[bool]) -> dict[str, object]:
     frames = np.full((length, 4, 4, 3), index, dtype=np.uint8)
     done = np.zeros((length,), dtype=np.bool_)
     done[-1] = True
+    success = np.zeros((length,), dtype=np.bool_)
+    if terminal_reason == "success":
+        success[-1] = True
     return {
         "obs": {"state": state, "agentview": frames},
         "next_obs": {"state": state + 1.0, "agentview": frames},
         "executed_action": executed,
         "policy_action": policy,
         "is_intervention": np.asarray(interventions, dtype=np.bool_),
-        "success": np.zeros((length,), dtype=np.bool_),
+        "success": success,
         "done": done,
-        "terminal_reason": "manual_reset",
+        "terminal_reason": terminal_reason,
     }
 
 
@@ -178,6 +188,77 @@ def test_offline_sampling_caps_at_episode_count(tmp_path) -> None:
     assert sorted(item.episode_index for item in sampled) == [0, 1]
 
 
+def test_offline_pool_sampling_filters_policy_only_success_and_is_reproducible(
+    monkeypatch, tmp_path
+) -> None:
+    episodes = [
+        _episode(0, interventions=[False, False], terminal_reason="success"),
+        _episode(1, interventions=[False, True], terminal_reason="success"),
+        _episode(2, interventions=[False, False], terminal_reason="manual_reset"),
+        _episode(3, interventions=[False], terminal_reason="success"),
+        _episode(4, interventions=[False, False], terminal_reason="success"),
+        _episode(5, interventions=[False], terminal_reason="success"),
+    ]
+    path = tmp_path / "offline_episodes.pt"
+    torch.save(_payload(*episodes), path)
+    load_calls = 0
+    real_load = episodes_module.load_offline_episodes
+
+    def counted_load(episodes_path):
+        nonlocal load_calls
+        load_calls += 1
+        return real_load(episodes_path)
+
+    monkeypatch.setattr(episodes_module, "load_offline_episodes", counted_load)
+
+    first = _sample_offline_trajectory_pools(
+        path, task="Task", num_trajs=3, seed=7, fps=17
+    )
+    assert load_calls == 1
+    second = _sample_offline_trajectory_pools(
+        path, task="Task", num_trajs=3, seed=7, fps=17
+    )
+    assert load_calls == 2
+    legacy = _sample_offline_trajectories(
+        path, task="Task", num_trajs=3, seed=7, fps=17
+    )
+
+    assert [item.episode_index for item in first["offline"]] == [
+        item.episode_index for item in legacy
+    ]
+    success_indices = [
+        item.episode_index for item in first["offline-success"]
+    ]
+    assert success_indices == [
+        item.episode_index for item in second["offline-success"]
+    ]
+    assert len(success_indices) == len(set(success_indices)) == 3
+    assert set(success_indices) <= {0, 3, 4, 5}
+    for trajectory in first["offline-success"]:
+        source = episodes[trajectory.episode_index]
+        assert trajectory.terminal_reason == "success"
+        assert not bool(trajectory.intervention_mask.any())
+        np.testing.assert_array_equal(
+            trajectory.load_actions(), source["policy_action"]
+        )
+
+
+def test_offline_pool_sampling_rejects_empty_policy_success_pool(tmp_path) -> None:
+    path = tmp_path / "offline_episodes.pt"
+    torch.save(
+        _payload(
+            _episode(0, interventions=[False], terminal_reason="manual_reset"),
+            _episode(1, interventions=[True], terminal_reason="success"),
+        ),
+        path,
+    )
+
+    with pytest.raises(RuntimeError, match="No policy-only successful"):
+        _sample_offline_trajectory_pools(
+            path, task="Task", num_trajs=1, seed=0, fps=20
+        )
+
+
 def test_offline_sampling_rejects_task_mismatch_and_invalid_payload(tmp_path) -> None:
     mismatch = tmp_path / "mismatch.pt"
     torch.save(_payload(_episode(0, interventions=[False]), task="OtherTask"), mismatch)
@@ -256,6 +337,44 @@ def test_scoring_propagates_offline_intervention_render_policy() -> None:
     assert hidden.intervention_frames == 1
     np.testing.assert_array_equal(shown.intervention_mask, [False])
     assert shown.intervention_frames == 0
+
+
+def test_offline_success_visualization_uses_separate_directory(
+    monkeypatch, tmp_path
+) -> None:
+    trajectory = _trajectory(intervention=False)
+    visualizer = PUBCEVisualizer(SimpleNamespace(), flip_vertical=False)
+    monkeypatch.setattr(
+        visualizer,
+        "_score_trajectory",
+        lambda item: _per_trajectory_viz(interventions=[False]),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        visualizer,
+        "render_video",
+        lambda item, viz, path: rendered.append(path),
+    )
+    monkeypatch.setattr(visualizer, "render_pdf", lambda *args, **kwargs: None)
+
+    result = visualizer.visualize(
+        [trajectory],
+        out_dir=str(tmp_path),
+        pdf_name="finetuned_scores_offline-success.pdf",
+        split="offline-success",
+    )
+
+    expected = (
+        tmp_path
+        / "videos"
+        / "offline-success"
+        / "offline_episode_000000.mp4"
+    )
+    assert rendered == [str(expected)]
+    assert result["videos"] == [str(expected)]
+    assert result["pdf"] == str(
+        tmp_path / "finetuned_scores_offline-success.pdf"
+    )
 
 
 def test_offline_preselected_proprio_skips_checkpoint_indices() -> None:

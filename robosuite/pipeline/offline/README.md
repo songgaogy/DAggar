@@ -101,7 +101,8 @@ training history, pool statistics, and recalibration metadata.
 The visualization launcher loads only the finetuned checkpoint and runs the
 pipeline-owned finetuned visualizer on deterministic samples from
 `fail_rollout-val-labeled`, `success_rollout-val`, and the collected offline
-episodes:
+episodes. It also samples `offline-success` episodes that terminated successfully
+without any intervention frames:
 
 ```bash
 FINETUNED_CKPT=/path/to/pu_bce_head_finetuned.pth \
@@ -110,8 +111,9 @@ TASK=PickPlaceCereal \
 bash robosuite/pipeline/offline/scripts/vis_disc_finetuned.sh
 ```
 
-It writes one MP4 per trajectory plus `finetuned_scores.pdf` and
-`finetuned_scores_offline.pdf` under the finetune run's
+It writes one MP4 per trajectory plus `finetuned_scores.pdf`,
+`finetuned_scores_offline.pdf`, and `finetuned_scores_offline-success.pdf` under
+the finetune run's
 `visualization/val-seed<seed>/` directory by default. This command does not fit
 a head or run benchmark evaluation.
 

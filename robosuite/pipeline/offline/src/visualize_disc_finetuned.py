@@ -17,7 +17,7 @@ from robosuite.pipeline.offline.visualization import (
     FinetunedPUBCEBenchmarkDiscriminator,
     FinetunedPUBCEVisualizer,
     load_finetuned_visualization_contract,
-    sample_offline_trajectories,
+    sample_offline_trajectory_pools,
     validate_runtime_normalizer,
 )
 
@@ -127,7 +127,7 @@ def main() -> None:
         num_trajs=int(args.num_trajs),
         seed=int(args.seed),
     )
-    sampled_offline = sample_offline_trajectories(
+    sampled_offline_pools = sample_offline_trajectory_pools(
         args.offline_episodes,
         task=str(args.task),
         num_trajs=int(args.num_trajs),
@@ -179,16 +179,24 @@ def main() -> None:
             split=str(args.split),
         )
         offline_paths = visualizer.visualize(
-            sampled_offline,
+            sampled_offline_pools["offline"],
             out_dir=str(args.out_dir),
             pdf_name="finetuned_scores_offline.pdf",
             split="offline",
+        )
+        offline_success_paths = visualizer.visualize(
+            sampled_offline_pools["offline-success"],
+            out_dir=str(args.out_dir),
+            pdf_name="finetuned_scores_offline-success.pdf",
+            split="offline-success",
         )
         print(
             f"[pu_bce][viz] done. eval_videos={len(eval_paths['videos'])} "
             f"eval_pdf={eval_paths['pdf']} "
             f"offline_videos={len(offline_paths['videos'])} "
-            f"offline_pdf={offline_paths['pdf']}",
+            f"offline_pdf={offline_paths['pdf']} "
+            f"offline_success_videos={len(offline_success_paths['videos'])} "
+            f"offline_success_pdf={offline_success_paths['pdf']}",
             flush=True,
         )
     finally:

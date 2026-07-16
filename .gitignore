@@ -138,6 +138,10 @@ checkpoints/
 error.txt
 /tmp
 robosuite/pipeline/docs/*
+!robosuite/pipeline/docs/*/
+robosuite/pipeline/docs/**/*.*
+!robosuite/pipeline/docs/*.md
+!robosuite/pipeline/docs/**/*.md
 
 # ------------------------------------------------------------
 # allow tracking lpb_v2 config/data (overrides env/ and data/ above)
