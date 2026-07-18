@@ -9,7 +9,10 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from robosuite.discriminator.dyn_disc.detectors.pu_bce import pu_risk
+from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
+    pu_risk,
+    quadratic_logit_cap_penalty,
+)
 
 
 PRETRAIN_POSITIVE = "pretrain_positive"
@@ -47,6 +50,61 @@ def _finite_float(value: Any, *, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite, got {value!r}.")
     return result
+
+
+@dataclass(frozen=True)
+class QuadraticLogitCapConfig:
+    """Validated replay-only quadratic logit cap regularizer."""
+
+    enabled: bool = True
+    scope: str = "nnpu_replay"
+    cap: float = 2.0
+    weight: float = 1.0e-2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("quadratic_logit_cap.enabled must be bool.")
+        if self.scope != "nnpu_replay":
+            raise ValueError(
+                "quadratic_logit_cap.scope must be 'nnpu_replay', "
+                f"got {self.scope!r}."
+            )
+        cap = _finite_float(self.cap, name="quadratic_logit_cap.cap")
+        weight = _finite_float(self.weight, name="quadratic_logit_cap.weight")
+        if cap <= 0.0:
+            raise ValueError("quadratic_logit_cap.cap must be positive.")
+        if weight < 0.0:
+            raise ValueError("quadratic_logit_cap.weight must be non-negative.")
+        object.__setattr__(self, "cap", cap)
+        object.__setattr__(self, "weight", weight)
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.weight > 0.0
+
+
+@dataclass(frozen=True)
+class FixedLogitNormalizer:
+    """Fixed affine transform shared by every objective term."""
+
+    enabled: bool = False
+    center: float = 0.0
+    scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("logit_normalization.enabled must be bool.")
+        center = _finite_float(self.center, name="logit_normalization.center")
+        scale = _finite_float(self.scale, name="logit_normalization.scale")
+        if scale <= 0.0:
+            raise ValueError("logit_normalization.scale must be positive.")
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "scale", scale)
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return logits
+        return (logits - self.center) / self.scale
 
 
 @dataclass(frozen=True)
@@ -372,6 +430,8 @@ class CompositeDiscriminatorObjective:
         *,
         sampler: CUDAPoolSampler,
         nnpu_parameters: NNPUParameters,
+        quadratic_logit_cap: QuadraticLogitCapConfig | None = None,
+        logit_normalizer: FixedLogitNormalizer | None = None,
         positive_safety_boundary: float | None = None,
         steps_per_epoch: int | None = None,
     ) -> None:
@@ -401,6 +461,13 @@ class CompositeDiscriminatorObjective:
         self.active_terms = tuple(active)
         self.sampler = sampler
         self.nnpu_parameters = nnpu_parameters
+        self.quadratic_logit_cap = quadratic_logit_cap
+        self.logit_normalizer = logit_normalizer or FixedLogitNormalizer()
+        if quadratic_logit_cap is not None and quadratic_logit_cap.active:
+            if "nnpu" not in active_types:
+                raise ValueError(
+                    "Active quadratic_logit_cap requires an active nnPU replay term."
+                )
         safety_terms = [
             term for term in self.active_terms if term.type == "positive_safety_margin"
         ]
@@ -413,6 +480,10 @@ class CompositeDiscriminatorObjective:
                 positive_safety_boundary,
                 name="positive_safety_boundary",
             )
+            if self.logit_normalizer.enabled:
+                self.positive_safety_boundary = (
+                    self.positive_safety_boundary - self.logit_normalizer.center
+                ) / self.logit_normalizer.scale
         else:
             self.positive_safety_boundary = None
         self.steps_per_epoch = self._resolve_steps_per_epoch(steps_per_epoch)
@@ -447,6 +518,11 @@ class CompositeDiscriminatorObjective:
     def compute(self, batch_logits: Mapping[str, torch.Tensor]) -> ObjectiveResult:
         if not isinstance(batch_logits, Mapping):
             raise TypeError("batch_logits must be a mapping keyed by pool name.")
+        raw_batch_logits = batch_logits
+        batch_logits = {
+            name: self.logit_normalizer(logits)
+            for name, logits in raw_batch_logits.items()
+        }
         raw_losses: dict[str, torch.Tensor] = {}
         weighted_losses: dict[str, torch.Tensor] = {}
         metrics: dict[str, torch.Tensor] = {}
@@ -549,6 +625,31 @@ class CompositeDiscriminatorObjective:
             metrics[f"loss/{term.name}/weighted"] = weighted_loss.detach()
 
         total_loss = sum(weighted_losses.values())
+        if self.quadratic_logit_cap is not None and self.quadratic_logit_cap.active:
+            replay_logits = torch.cat(
+                [
+                    self._validated_logits(batch_logits, PRETRAIN_POSITIVE),
+                    self._validated_logits(batch_logits, PRETRAIN_UNLABELED),
+                ],
+                dim=0,
+            )
+            cap_penalty = quadratic_logit_cap_penalty(
+                replay_logits,
+                cap=self.quadratic_logit_cap.cap,
+            )
+            weighted_cap = self.quadratic_logit_cap.weight * cap_penalty
+            total_loss = total_loss + weighted_cap
+            metrics.update(
+                {
+                    "regularization/quadratic_logit_cap": cap_penalty.detach(),
+                    "regularization/quadratic_logit_cap_weighted": weighted_cap.detach(),
+                    "regularization/quadratic_logit_cap_fraction_outside": (
+                        replay_logits.detach().abs() > self.quadratic_logit_cap.cap
+                    )
+                    .to(dtype=torch.float32)
+                    .mean(),
+                }
+            )
         if total_loss.ndim != 0 or total_loss.device.type != "cuda":
             raise RuntimeError("Composite objective must produce a scalar CUDA loss.")
         metrics["loss/total"] = total_loss.detach()
@@ -602,6 +703,7 @@ def build_objective(
     device: str | torch.device,
     seed: int,
     positive_safety_boundary: float | None = None,
+    logit_normalizer: FixedLogitNormalizer | None = None,
 ) -> CompositeDiscriminatorObjective:
     """Build a validated objective from the ``objective`` config mapping."""
     if not isinstance(config, Mapping):
@@ -637,6 +739,14 @@ def build_objective(
         if isinstance(nnpu_parameters, NNPUParameters)
         else NNPUParameters(**dict(nnpu_parameters))
     )
+    raw_quadratic_cap = config.get("quadratic_logit_cap")
+    if raw_quadratic_cap is not None and not isinstance(raw_quadratic_cap, Mapping):
+        raise TypeError("objective.quadratic_logit_cap must be a mapping or null.")
+    quadratic_logit_cap = (
+        None
+        if raw_quadratic_cap is None
+        else QuadraticLogitCapConfig(**dict(raw_quadratic_cap))
+    )
     active_terms = [term for term in terms if term.active]
     if not active_terms:
         raise ValueError("At least one enabled loss term must have positive weight.")
@@ -656,6 +766,8 @@ def build_objective(
         terms,
         sampler=sampler,
         nnpu_parameters=parameters,
+        quadratic_logit_cap=quadratic_logit_cap,
+        logit_normalizer=logit_normalizer,
         positive_safety_boundary=positive_safety_boundary,
         steps_per_epoch=config.get("steps_per_epoch"),
     )
@@ -671,5 +783,7 @@ __all__ = [
     "OFFLINE_POSITIVE",
     "PRETRAIN_POSITIVE",
     "PRETRAIN_UNLABELED",
+    "FixedLogitNormalizer",
+    "QuadraticLogitCapConfig",
     "build_objective",
 ]

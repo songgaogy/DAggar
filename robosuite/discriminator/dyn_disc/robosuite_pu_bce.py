@@ -145,9 +145,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--soft-cap-c", type=float, default=5.0)
-    parser.add_argument("--soft-cap-lambda", type=float, default=1e-2)
-    parser.add_argument("--soft-cap-temperature", type=float, default=1.0)
+    parser.add_argument("--quadratic-cap-c", type=float, default=2.0)
+    parser.add_argument("--quadratic-cap-lambda", type=float, default=1e-2)
     parser.add_argument(
         "--use-chunk",
         type=_parse_bool,
@@ -372,9 +371,10 @@ def main() -> None:
         batch_size=int(args.batch_size),
         use_chunk=bool(args.use_chunk),
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
-        soft_cap_c=(None if args.soft_cap_c is None else float(args.soft_cap_c)),
-        soft_cap_lambda=float(args.soft_cap_lambda),
-        soft_cap_temperature=float(args.soft_cap_temperature),
+        quadratic_cap_c=(
+            None if args.quadratic_cap_c is None else float(args.quadratic_cap_c)
+        ),
+        quadratic_cap_lambda=float(args.quadratic_cap_lambda),
         tensorboard_dir=(str(args.tensorboard_dir) if args.tensorboard_dir else None),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
@@ -419,8 +419,11 @@ def main() -> None:
         )
         benchmark_payload = result.to_dict()
         health = _health_from_detector(discriminator)
+        detector = discriminator._shared_detector
+        if detector is None:
+            raise RuntimeError("Missing trained detector before benchmark logging")
         discriminator.log_benchmark_metrics(
-            int(args.epochs),
+            int(detector._completed_steps),
             {"metrics": benchmark_payload, "logit_health": health},
         )
         print(result.summary())
@@ -438,9 +441,10 @@ def main() -> None:
                 os.path.abspath(args.save_ckpt_dir), "pu_bce_head.pth"
             )
             manifest = {
-                "schema": "pu_bce_run_v1",
+                "schema": "pu_bce_run_v2",
                 "labeling": "pu_no_gt_timing",
                 "loss": "nnpu",
+                "effective_logit_penalty": "quadratic_hinge",
                 "loss_surrogate": str(args.loss_surrogate),
                 "nn_correction": not bool(args.no_nn_correction),
                 "beta": float(args.beta),
@@ -479,9 +483,8 @@ def main() -> None:
                 "knn_feature_source": str(args.knn_feature_source),
                 "knn_transformer_layer": int(args.knn_transformer_layer),
                 "threshold_normalization": "none",
-                "soft_cap_c": args.soft_cap_c,
-                "soft_cap_lambda": float(args.soft_cap_lambda),
-                "soft_cap_temperature": float(args.soft_cap_temperature),
+                "quadratic_cap_c": args.quadratic_cap_c,
+                "quadratic_cap_lambda": float(args.quadratic_cap_lambda),
                 "checkpoint": checkpoint_path,
                 "logit_health": health,
             }

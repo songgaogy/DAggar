@@ -149,11 +149,7 @@ def build_finetuned_checkpoint_payload(
     finetune_method = str(
         finetune_config.get("method", "nnpu_replay_separate_gt_risks")
     )
-    finetune_schema_version = (
-        4
-        if finetune_method == "nnpu_replay_positive_safety_margin_gt_negative"
-        else 3
-    )
+    finetune_schema_version = 5
     payload.update(
         {
             "epoch": int(finetune_config["epochs"]),
@@ -174,6 +170,9 @@ def build_finetuned_checkpoint_payload(
                 "delta": detector_state.get("delta"),
                 "thresholds": dict(detector_state.get("thresholds", {})),
                 "calib_stats": dict(detector_state.get("calib_stats", {})),
+                "logit_normalization": dict(
+                    detector_state.get("logit_normalization", {})
+                ),
             },
         }
     )

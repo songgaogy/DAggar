@@ -95,9 +95,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         nn_correction: bool = True,
         beta: float = 0.0,
         save_ckpt_dir: Optional[str] = None,
-        soft_cap_c: Optional[float] = 5.0,
-        soft_cap_lambda: float = 1e-2,
-        soft_cap_temperature: float = 1.0,
+        quadratic_cap_c: Optional[float] = 2.0,
+        quadratic_cap_lambda: float = 1e-2,
         tensorboard_dir: Optional[str] = None,
         # forwarded to the shared parent for encoding / cache parity
         device: str = "cuda",
@@ -153,9 +152,10 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self.nn_correction = bool(nn_correction)
         self.beta = float(beta)
         self.save_ckpt_dir = None if save_ckpt_dir is None else str(save_ckpt_dir)
-        self.soft_cap_c = None if soft_cap_c is None else float(soft_cap_c)
-        self.soft_cap_lambda = float(soft_cap_lambda)
-        self.soft_cap_temperature = float(soft_cap_temperature)
+        self.quadratic_cap_c = (
+            None if quadratic_cap_c is None else float(quadratic_cap_c)
+        )
+        self.quadratic_cap_lambda = float(quadratic_cap_lambda)
         self.tensorboard_dir = None if tensorboard_dir is None else str(tensorboard_dir)
         self._writer = None if self.tensorboard_dir is None else SummaryWriter(self.tensorboard_dir)
 
@@ -272,6 +272,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "epoch": int(self._shared_detector._completed_epochs),
+            "global_step": int(self._shared_detector._completed_steps),
             "in_dim": int(self._shared_detector.in_dim),
             "hidden": int(self._shared_detector.hidden),
             "num_layers": int(self._shared_detector.num_layers),
@@ -292,9 +293,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
             "threshold_normalization": "none",
-            "soft_cap_c": self.soft_cap_c,
-            "soft_cap_lambda": float(self.soft_cap_lambda),
-            "soft_cap_temperature": float(self.soft_cap_temperature),
+            "quadratic_cap_c": self.quadratic_cap_c,
+            "quadratic_cap_lambda": float(self.quadratic_cap_lambda),
             "scheduler_horizon_epochs": int(self.scheduler_horizon_epochs),
             "seed": int(self.seed),
             "calib_fraction": float(self.calib_fraction),
@@ -331,18 +331,24 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             yield prefix, float(value)
 
-    def _record_epoch_metrics(self, epoch: int, metrics: Dict[str, Any]) -> None:
+    def _record_step_metrics(self, step: int, metrics: Dict[str, Any]) -> None:
         if self._writer is None:
             return
-        for tag, value in self._iter_scalar_metrics("train", metrics):
-            self._writer.add_scalar(tag, value, int(epoch))
+        for tag, value in self._iter_scalar_metrics("train_step", metrics):
+            self._writer.add_scalar(tag, value, int(step))
+
+    def _record_epoch_metrics(self, step: int, metrics: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("train_epoch", metrics):
+            self._writer.add_scalar(tag, value, int(step))
         self._writer.flush()
 
-    def log_benchmark_metrics(self, epoch: int, payload: Dict[str, Any]) -> None:
+    def log_benchmark_metrics(self, step: int, payload: Dict[str, Any]) -> None:
         if self._writer is None:
             return
         for tag, value in self._iter_scalar_metrics("benchmark", payload):
-            self._writer.add_scalar(tag, value, int(epoch))
+            self._writer.add_scalar(tag, value, int(step))
         self._writer.flush()
 
     # ------------------------------------------------------------------ #
@@ -535,10 +541,10 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             loss_surrogate=self.loss_surrogate,
             nn_correction=self.nn_correction,
             beta=self.beta,
-            soft_cap_c=self.soft_cap_c,
-            soft_cap_lambda=self.soft_cap_lambda,
-            soft_cap_temperature=self.soft_cap_temperature,
-            metric_callback=self._record_epoch_metrics,
+            quadratic_cap_c=self.quadratic_cap_c,
+            quadratic_cap_lambda=self.quadratic_cap_lambda,
+            step_metric_callback=self._record_step_metrics,
+            epoch_metric_callback=self._record_epoch_metrics,
             verbose=self.verbose_fit,
         )
 
@@ -563,9 +569,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
             "threshold_normalization": "none",
-            "soft_cap_c": self.soft_cap_c,
-            "soft_cap_lambda": float(self.soft_cap_lambda),
-            "soft_cap_temperature": float(self.soft_cap_temperature),
+            "quadratic_cap_c": self.quadratic_cap_c,
+            "quadratic_cap_lambda": float(self.quadratic_cap_lambda),
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),

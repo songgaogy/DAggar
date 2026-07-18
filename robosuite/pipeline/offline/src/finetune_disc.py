@@ -96,10 +96,16 @@ def main(cfg: DictConfig) -> None:
     )
 
     epochs = int(finetune_cfg.epochs)
+    scheduler_horizon_epochs = int(finetune_cfg.scheduler_horizon_epochs)
     encode_batch_size = int(finetune_cfg.encode_batch_size)
     log_interval = int(finetune_cfg.log_interval)
     if min(epochs, encode_batch_size, log_interval) <= 0:
         raise ValueError("epochs, encode_batch_size, and log_interval must be positive.")
+    if scheduler_horizon_epochs < epochs:
+        raise ValueError(
+            "scheduler_horizon_epochs must be >= epochs, got "
+            f"{scheduler_horizon_epochs} < {epochs}."
+        )
     if float(finetune_cfg.lr) < 0.0 or float(finetune_cfg.weight_decay) < 0.0:
         raise ValueError("Learning rate and weight decay must be non-negative.")
 
@@ -288,6 +294,7 @@ def main(cfg: DictConfig) -> None:
         "method": finetune_method,
         "optimizer": "AdamW",
         "schedule": "cosine",
+        "scheduler_horizon_epochs": scheduler_horizon_epochs,
         "epochs": epochs,
         "lr": float(finetune_cfg.lr),
         "weight_decay": float(finetune_cfg.weight_decay),
@@ -484,6 +491,10 @@ def main(cfg: DictConfig) -> None:
     def log_epoch(metrics: dict[str, float]) -> None:
         nonlocal last_global_step
         last_global_step = int(metrics["global_step"])
+        positive_bce = metrics.get(
+            "gt/positive_bce",
+            metrics.get("gt/positive_logistic", float("nan")),
+        )
         maybe_log(
             metric_logger,
             {
@@ -500,11 +511,14 @@ def main(cfg: DictConfig) -> None:
             f"{metrics.get('loss/nnpu_replay/weighted', float('nan')):.5f} "
             f"gt_p={metrics.get('loss/gt_positive/raw', float('nan')):.5f}/"
             f"{metrics.get('loss/gt_positive/weighted', float('nan')):.5f} "
-            f"p_bce={metrics.get('gt/positive_bce', float('nan')):.5f} "
+            f"p_bce={positive_bce:.5f} "
             f"p_safe={metrics.get('gt/positive_safety_margin', float('nan')):.5f} "
             f"p_violate={metrics.get('safety/margin_violation_fraction', float('nan')):.3f} "
             f"gt_n={metrics.get('loss/gt_negative/raw', float('nan')):.5f}/"
             f"{metrics.get('loss/gt_negative/weighted', float('nan')):.5f} "
+            f"cap={metrics.get('regularization/quadratic_logit_cap', 0.0):.5f}/"
+            f"{metrics.get('regularization/quadratic_logit_cap_weighted', 0.0):.5f} "
+            f"cap_out={metrics.get('regularization/quadratic_logit_cap_fraction_outside', 0.0):.3f} "
             f"batch={int(metrics.get('batch/pretrain_positive', 0.0))}/"
             f"{int(metrics.get('batch/pretrain_unlabeled', 0.0))}/"
             f"{int(metrics.get('batch/offline_positive', 0.0))}/"
@@ -519,6 +533,7 @@ def main(cfg: DictConfig) -> None:
         print(
             f"[robosuite][pu_bce] task={task_name} method={finetune_method} "
             f"epochs={epochs} lr={float(finetune_cfg.lr):.2e} "
+            f"scheduler_horizon_epochs={scheduler_horizon_epochs} "
             f"feat_dim={int(detector.in_dim)} "
             f"NpreP={named_pool_stats['pretrain_positive']['frames']} "
             f"NpreU={named_pool_stats['pretrain_unlabeled']['frames']} "
@@ -549,6 +564,7 @@ def main(cfg: DictConfig) -> None:
             task_name=task_name,
             parent_payload=parent_payload,
             epochs=epochs,
+            scheduler_horizon_epochs=scheduler_horizon_epochs,
             lr=float(finetune_cfg.lr),
             weight_decay=float(finetune_cfg.weight_decay),
             seed=int(cfg.seed),
@@ -561,6 +577,9 @@ def main(cfg: DictConfig) -> None:
             finetune_config["resolved_steps_per_epoch"] = int(
                 detector._train_history[-1]["steps"]  # noqa: SLF001
             )
+        finetune_config["resolved_logit_normalization"] = dict(
+            detector._logit_normalization  # noqa: SLF001
+        )
         checkpoint_payload = build_finetuned_checkpoint_payload(
             detector,
             parent_payload=parent_payload,

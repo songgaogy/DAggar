@@ -120,9 +120,8 @@ def test_cli_defaults_match_selected_health_config(monkeypatch: pytest.MonkeyPat
     assert args.lr == pytest.approx(3e-4)
     assert args.weight_decay == pytest.approx(1e-4)
     assert args.batch_size == 512
-    assert args.soft_cap_c == pytest.approx(5.0)
-    assert args.soft_cap_lambda == pytest.approx(1e-2)
-    assert args.soft_cap_temperature == pytest.approx(1.0)
+    assert args.quadratic_cap_c == pytest.approx(2.0)
+    assert args.quadratic_cap_lambda == pytest.approx(1e-2)
     assert args.max_fail_per_task == 50
     assert args.max_success_per_task == 50
     assert args.train_max_success_per_task == 50
@@ -147,9 +146,8 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
     assert defaults["scheduler_horizon_epochs"] == 20
     assert defaults["use_chunk"] is True
     assert defaults["loss_surrogate"] == "logistic"
-    assert defaults["soft_cap_c"] == pytest.approx(5.0)
-    assert defaults["soft_cap_lambda"] == pytest.approx(1e-2)
-    assert defaults["soft_cap_temperature"] == pytest.approx(1.0)
+    assert defaults["quadratic_cap_c"] == pytest.approx(2.0)
+    assert defaults["quadratic_cap_lambda"] == pytest.approx(1e-2)
     assert defaults["lr"] == pytest.approx(3e-4)
     assert defaults["weight_decay"] == pytest.approx(1e-4)
     assert defaults["batch_size"] == 512
@@ -166,8 +164,8 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
     assert fit_defaults["epochs"] == 1
     assert fit_defaults["scheduler_horizon_epochs"] == 20
     assert fit_defaults["loss_surrogate"] == "logistic"
-    assert fit_defaults["soft_cap_c"] == pytest.approx(5.0)
-    assert fit_defaults["soft_cap_lambda"] == pytest.approx(1e-2)
+    assert fit_defaults["quadratic_cap_c"] == pytest.approx(2.0)
+    assert fit_defaults["quadratic_cap_lambda"] == pytest.approx(1e-2)
     assert inspect.signature(pu_risk).parameters["surrogate"].default == "logistic"
 
     launcher = Path(
@@ -176,8 +174,8 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
     for expected in (
         'EPOCHS="${EPOCHS:-1}"',
         'SCHEDULER_HORIZON_EPOCHS="${SCHEDULER_HORIZON_EPOCHS:-20}"',
-        'SOFT_CAP_C="${SOFT_CAP_C:-5.0}"',
-        'SOFT_CAP_LAMBDA="${SOFT_CAP_LAMBDA:-1e-2}"',
+        'QUADRATIC_CAP_C="${QUADRATIC_CAP_C:-2.0}"',
+        'QUADRATIC_CAP_LAMBDA="${QUADRATIC_CAP_LAMBDA:-1e-2}"',
     ):
         assert expected in launcher
 

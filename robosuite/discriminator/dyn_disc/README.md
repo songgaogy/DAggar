@@ -49,9 +49,9 @@ epochs. `epochs=1` with `scheduler_horizon_epochs=20` reproduces the first
 optimization epoch of the 20-epoch sweep that produced the selected checkpoint.
 The horizon must be greater than or equal to the requested training epochs.
 
-The soft-cap parameters remain explicit CLI and Python parameters for research
-overrides. Such overrides are not production defaults and can invalidate the
-documented five-task health result.
+The quadratic-cap parameters remain explicit CLI and Python parameters for
+research overrides. Such overrides are not production defaults and can
+invalidate the documented five-task health result.
 
 ## Run the benchmark once
 
@@ -91,6 +91,13 @@ override pair is:
 ```bash
 --epochs 1 --scheduler-horizon-epochs 20
 ```
+
+The effective-logit cap uses the quadratic hinge
+`mean(relu(abs(g) - c)^2)` with `--quadratic-cap-c 2` and
+`--quadratic-cap-lambda 1e-2` by default. TensorBoard records lightweight
+training scalars after every optimizer step under `train_step/*`; epoch-level
+calibration and logit-pool diagnostics are stored under `train_epoch/*` at the
+last global step of each epoch.
 
 Training and evaluation pools are disjoint by `video_id`. Failure rollouts are
 used whole as the unlabeled pool, and benchmark evaluation starts only after

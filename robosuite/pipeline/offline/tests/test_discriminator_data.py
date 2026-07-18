@@ -10,6 +10,7 @@ from robosuite.pipeline.offline.discriminator import (
     build_action_windows,
     load_pretrain_pools,
     resolve_parent_nnpu_semantics,
+    resolve_parent_success_boundary,
     split_policy_segments,
     validate_offline_payload,
 )
@@ -312,6 +313,20 @@ def test_parent_nnpu_semantics_are_strictly_inherited() -> None:
         "beta": 0.0,
         "delta": 10.0,
     }
+
+
+def test_normalization_center_is_negative_parent_failure_threshold() -> None:
+    payload = {
+        "pu_bce_detector": {
+            "thresholds": {"PickPlaceCereal": -1.75},
+        }
+    }
+
+    center = resolve_parent_success_boundary(payload, "PickPlaceCereal")
+
+    assert center == pytest.approx(1.75)
+    with pytest.raises(KeyError, match="no threshold"):
+        resolve_parent_success_boundary(payload, "OtherTask")
 
 
 @pytest.mark.parametrize(

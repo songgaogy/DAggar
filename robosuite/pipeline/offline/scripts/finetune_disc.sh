@@ -15,13 +15,13 @@ export PYTHONFAULTHANDLER=1
 
 # -----------------------------------------------------------------------
 TASK="${TASK:-PickPlaceCereal}"
-NNPU_CKPT="${NNPU_CKPT:-}"
+NNPU_CKPT="${NNPU_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2/run_20260717_121451_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
 NNPU_ENCODER_CKPT="${NNPU_ENCODER_CKPT:-checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth}"
 NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"
 # -----------------------------------------------------------------------
 
 OFFLINE_EPISODES="${OFFLINE_EPISODES:-data/${TASK}/offline_data/offline_episodes.pt}"
-PRETRAIN_DIR="${PRETRAIN_DIR:-data/${TASK}/discriminator-pretrain}"
+PRETRAIN_DIR="${PRETRAIN_DIR:-data/${TASK}/discriminator-pretrain-quadratic-c2-l1e2-v2}"
 
 RUN_ROOT="${RUN_ROOT:-./outputs/discriminator-finetune}"
 RUN_SUBFIX="${RUN_SUBFIX:-}"
@@ -77,20 +77,34 @@ append_optional_override() {
   fi
 }
 append_optional_override EPOCHS offline.discriminator_finetune.epochs
+append_optional_override SCHEDULER_HORIZON_EPOCHS offline.discriminator_finetune.scheduler_horizon_epochs
 append_optional_override LR offline.discriminator_finetune.lr
 append_optional_override WEIGHT_DECAY offline.discriminator_finetune.weight_decay
 append_optional_override ENCODE_BATCH_SIZE offline.discriminator_finetune.encode_batch_size
 append_optional_override LOG_INTERVAL offline.discriminator_finetune.log_interval
 append_optional_override SEED seed
+append_optional_override G_NORMALIZATION_ENABLED offline.discriminator_finetune.objective.logit_normalization.enabled
 append_optional_override LAMBDA_PRE offline.discriminator_finetune.objective.terms.nnpu_replay.weight
 append_optional_override LAMBDA_P offline.discriminator_finetune.objective.terms.gt_positive.weight
 append_optional_override LAMBDA_N offline.discriminator_finetune.objective.terms.gt_negative.weight
+append_optional_override GT_POSITIVE_TYPE offline.discriminator_finetune.objective.terms.gt_positive.type
 append_optional_override GT_POSITIVE_BATCH_SIZE offline.discriminator_finetune.objective.terms.gt_positive.batch_size
 append_optional_override GT_NEGATIVE_BATCH_SIZE offline.discriminator_finetune.objective.terms.gt_negative.batch_size
-append_optional_override SAFETY_MARGIN_WEIGHT offline.discriminator_finetune.objective.terms.gt_positive.safety_margin_weight
-append_optional_override SAFETY_MARGIN_DELTA offline.discriminator_finetune.objective.terms.gt_positive.margin_delta
-append_optional_override SAFETY_MARGIN_TEMPERATURE offline.discriminator_finetune.objective.terms.gt_positive.temperature
-append_optional_override SAFETY_MARGIN_BOUNDARY_SOURCE offline.discriminator_finetune.objective.terms.gt_positive.boundary_source
+append_optional_override QUADRATIC_CAP_ENABLED offline.discriminator_finetune.objective.quadratic_logit_cap.enabled
+append_optional_override QUADRATIC_CAP_C offline.discriminator_finetune.objective.quadratic_logit_cap.cap
+append_optional_override QUADRATIC_CAP_LAMBDA offline.discriminator_finetune.objective.quadratic_logit_cap.weight
+
+if [[ "${GT_POSITIVE_TYPE:-positive_logistic}" == "positive_safety_margin" ]]; then
+  HYDRA_OVERRIDES+=(
+    "+offline.discriminator_finetune.objective.terms.gt_positive.safety_margin_weight=${SAFETY_MARGIN_WEIGHT:-1.0}"
+    "+offline.discriminator_finetune.objective.terms.gt_positive.margin_delta=${SAFETY_MARGIN_DELTA:-1.0}"
+    "+offline.discriminator_finetune.objective.terms.gt_positive.temperature=${SAFETY_MARGIN_TEMPERATURE:-1.0}"
+    "+offline.discriminator_finetune.objective.terms.gt_positive.boundary_source=${SAFETY_MARGIN_BOUNDARY_SOURCE:-parent_checkpoint}"
+  )
+elif [[ -v SAFETY_MARGIN_WEIGHT || -v SAFETY_MARGIN_DELTA || -v SAFETY_MARGIN_TEMPERATURE || -v SAFETY_MARGIN_BOUNDARY_SOURCE ]]; then
+  echo "[ERROR] Safety-margin overrides require GT_POSITIVE_TYPE=positive_safety_margin." >&2
+  exit 1
+fi
 
 if [[ -n "${NNPU_CAMERA_TO_VIEW}" ]]; then
   HYDRA_OVERRIDES+=("algorithm.discriminator.camera_to_view=${NNPU_CAMERA_TO_VIEW}")

@@ -17,7 +17,7 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
     BCEHead,
     PUBCEDiscriminator,
     pu_risk,
-    soft_logit_cap_penalty,
+    quadratic_logit_cap_penalty,
 )
 
 
@@ -104,29 +104,28 @@ def test_head_raw_and_effective_logits_use_detached_center() -> None:
     assert head.logit_center.grad_fn is None
 
 
-def test_soft_logit_cap_penalty_matches_formula_and_has_linear_tail_gradient() -> None:
+def test_quadratic_logit_cap_penalty_matches_formula_and_gradient() -> None:
     device = _cuda_device()
     logits = torch.tensor(
-        [-100.0, -8.0, 0.0, 8.0, 100.0],
+        [-5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0],
         dtype=torch.float32,
         device=device,
         requires_grad=True,
     )
-    cap = 5.0
-    temperature = 1.0
+    cap = 2.0
 
-    penalty = soft_logit_cap_penalty(logits, cap=cap, temperature=temperature)
-    expected = (
-        temperature
-        * torch.nn.functional.softplus((logits.abs() - cap) / temperature)
-    ).mean()
+    penalty = quadratic_logit_cap_penalty(logits, cap=cap)
+    expected = torch.relu(logits.abs() - cap).square().mean()
     torch.testing.assert_close(penalty, expected)
 
     penalty.backward()
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
-    assert float(logits.grad[0]) == pytest.approx(-1.0 / logits.numel(), abs=1e-6)
-    assert float(logits.grad[-1]) == pytest.approx(1.0 / logits.numel(), abs=1e-6)
+    expected_grad = torch.tensor(
+        [-6.0 / 7.0, 0.0, 0.0, 0.0, 0.0, 0.0, 6.0 / 7.0],
+        device=device,
+    )
+    torch.testing.assert_close(logits.grad, expected_grad)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,12 +273,16 @@ def test_default_fit_retains_sweep_scheduler_and_health_history() -> None:
     ])
     Z_calib = _gaussian(60, in_dim, mean=+1.0, std=0.5, seed=83)
 
+    step_events = []
+    epoch_events = []
     det = PUBCEDiscriminator(in_dim=in_dim, device="cuda")
     thresholds = det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
         success_calib_per_task={"t": [Z_calib]},
         seed=0,
+        step_metric_callback=lambda step, payload: step_events.append((step, payload)),
+        epoch_metric_callback=lambda step, payload: epoch_events.append((step, payload)),
         verbose=False,
     )
 
@@ -289,17 +292,34 @@ def test_default_fit_retains_sweep_scheduler_and_health_history() -> None:
     assert det._pi_p == pytest.approx(0.3)
     assert det._surrogate == "logistic"
     assert det._threshold_normalization == "none"
-    assert det._soft_cap_c == pytest.approx(5.0)
-    assert det._soft_cap_lambda == pytest.approx(1e-2)
-    assert det._soft_cap_temperature == pytest.approx(1.0)
+    assert det._quadratic_cap_c == pytest.approx(2.0)
+    assert det._quadratic_cap_lambda == pytest.approx(1e-2)
     assert det._scheduler_horizon_epochs == 20
     assert det._completed_epochs == 1
+    assert det._completed_steps == len(step_events) > 0
+    assert [step for step, _ in step_events] == list(
+        range(1, det._completed_steps + 1)
+    )
+    assert len(epoch_events) == 1
+    assert epoch_events[0][0] == det._completed_steps
+    assert {
+        "loss",
+        "nnpu_risk",
+        "quadratic_cap_penalty",
+        "quadratic_cap_weighted",
+        "neg_risk",
+        "nn_correction_active",
+        "lr",
+    } == set(step_events[-1][1])
+    assert all(np.isfinite(value) for value in step_events[-1][1].values())
     assert len(det._train_history) == 1
     expected_lr = 3e-4 * (1.0 + np.cos(np.pi / 20.0)) / 2.0
     assert det._train_history[-1]["lr"] == pytest.approx(expected_lr)
     assert det._train_history[-1]["scheduler_horizon_epochs"] == 20
+    assert det._train_history[-1]["global_step"] == det._completed_steps
     assert det._train_history[-1]["logit_center"] == pytest.approx(0.0)
-    assert det._train_history[-1]["soft_cap_penalty"] > 0.0
+    assert np.isfinite(det._train_history[-1]["quadratic_cap_penalty"])
+    assert det._train_history[-1]["quadratic_cap_penalty"] >= 0.0
     assert set(det._train_history[-1]["pools"]) == {
         "train_positive",
         "unlabeled_failure",

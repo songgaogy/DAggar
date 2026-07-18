@@ -10,6 +10,7 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import pu_risk
 import robosuite.pipeline.offline.discriminator.objectives as objectives_module
 from robosuite.pipeline.offline.discriminator.objectives import (
     CUDAPoolSampler,
+    FixedLogitNormalizer,
     LossTermConfig,
     NNPUParameters,
     OFFLINE_GT_NEGATIVE,
@@ -218,6 +219,72 @@ def test_composite_loss_matches_manual_three_risk_objective() -> None:
     )
     torch.testing.assert_close(
         result.metrics["gt/negative_logistic"], expected_negative
+    )
+
+
+def test_quadratic_logit_cap_matches_dyn_disc_on_normalized_replay_logits() -> None:
+    device = _cuda()
+    config = _config(steps_per_epoch=1)
+    config["terms"]["gt_positive"] = {
+        "type": "positive_logistic",
+        "enabled": True,
+        "weight": 2.0,
+        "batch_size": 4,
+    }
+    config["quadratic_logit_cap"] = {
+        "enabled": True,
+        "scope": "nnpu_replay",
+        "cap": 2.0,
+        "weight": 0.25,
+    }
+    normalizer = FixedLogitNormalizer(enabled=True, center=1.0, scale=2.0)
+    objective = build_objective(
+        config,
+        pools=_pools(device),
+        nnpu_parameters=_parameters(),
+        device=device,
+        seed=0,
+        logit_normalizer=normalizer,
+    )
+    logits = {
+        PRETRAIN_POSITIVE: torch.tensor([4.0, -3.0], device=device),
+        PRETRAIN_UNLABELED: torch.tensor([0.5, -0.25], device=device),
+        OFFLINE_POSITIVE: torch.tensor([100.0], device=device),
+        OFFLINE_GT_NEGATIVE: torch.tensor([-100.0], device=device),
+    }
+
+    result = objective.compute(logits)
+    effective = {name: normalizer(value) for name, value in logits.items()}
+    replay_logits = torch.cat(
+        [effective[PRETRAIN_POSITIVE], effective[PRETRAIN_UNLABELED]], dim=0
+    )
+    expected_cap = torch.relu(replay_logits.abs() - 2.0).square().mean()
+    expected_nnpu = pu_risk(
+        effective[PRETRAIN_POSITIVE],
+        effective[PRETRAIN_UNLABELED],
+        pi_p=0.3,
+        surrogate="logistic",
+        nn_correction=True,
+        beta=0.0,
+    )["risk"]
+    expected_positive = F.softplus(-effective[OFFLINE_POSITIVE]).mean()
+    expected_negative = F.softplus(effective[OFFLINE_GT_NEGATIVE]).mean()
+    three_terms = sum(result.weighted_losses.values())
+
+    torch.testing.assert_close(result.raw_losses["nnpu_replay"], expected_nnpu)
+    torch.testing.assert_close(result.raw_losses["gt_positive"], expected_positive)
+    torch.testing.assert_close(result.raw_losses["gt_negative"], expected_negative)
+    torch.testing.assert_close(
+        result.metrics["regularization/quadratic_logit_cap"], expected_cap
+    )
+    torch.testing.assert_close(
+        result.metrics["regularization/quadratic_logit_cap_weighted"],
+        0.25 * expected_cap,
+    )
+    torch.testing.assert_close(result.loss, three_terms + 0.25 * expected_cap)
+    torch.testing.assert_close(
+        result.metrics["regularization/quadratic_logit_cap_fraction_outside"],
+        (replay_logits.abs() > 2.0).to(dtype=torch.float32).mean(),
     )
 
 

@@ -33,6 +33,7 @@ def _detector(device: torch.device, *, center: float) -> PUBCEDiscriminator:
     detector.head.set_logit_center(center)
     detector.thresholds = {"Task": 0.25}
     detector._completed_epochs = 2
+    detector._completed_steps = 17
     return detector
 
 
@@ -59,9 +60,8 @@ def _adapter_shell(
     adapter.nn_correction = True
     adapter.beta = 0.0
     adapter.scheduler_horizon_epochs = 20
-    adapter.soft_cap_c = 5.0
-    adapter.soft_cap_lambda = 1e-2
-    adapter.soft_cap_temperature = 1.0
+    adapter.quadratic_cap_c = 2.0
+    adapter.quadratic_cap_lambda = 1e-2
     adapter.seed = 0
     adapter.calib_fraction = 0.2
     adapter.delta = 10.0
@@ -88,10 +88,10 @@ def test_adapter_saves_one_canonical_checkpoint_with_selected_config(
     assert list(checkpoint.parent.glob("*.pth")) == [checkpoint]
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
     assert payload["epoch"] == 2
+    assert payload["global_step"] == 17
     assert payload["threshold_normalization"] == "none"
-    assert payload["soft_cap_c"] == pytest.approx(5.0)
-    assert payload["soft_cap_lambda"] == pytest.approx(1e-2)
-    assert payload["soft_cap_temperature"] == pytest.approx(1.0)
+    assert payload["quadratic_cap_c"] == pytest.approx(2.0)
+    assert payload["quadratic_cap_lambda"] == pytest.approx(1e-2)
     assert payload["scheduler_horizon_epochs"] == 20
 
 
@@ -102,20 +102,28 @@ def test_tensorboard_callbacks_write_train_and_benchmark_events(
     log_dir = tmp_path / "tensorboard"
     adapter = object.__new__(PUBCEBenchmarkDiscriminator)
     adapter._writer = SummaryWriter(log_dir=str(log_dir))
-    cuda_values = torch.tensor([1.25, 0.875], device=device)
+    cuda_values = torch.tensor([1.25, 0.75, 0.875], device=device)
 
-    adapter._record_epoch_metrics(
+    adapter._record_step_metrics(
+        1,
+        {
+            "loss": float(cuda_values[0].item()),
+            "quadratic_cap_penalty": 0.5,
+            "all_finite": True,
+        },
+    )
+    adapter._record_step_metrics(
         2,
         {
-            "loss": {"total": float(cuda_values[0].item())},
-            "pools": {"train_positive": {"effective": {"abs_p99": 4.5}}},
+            "loss": float(cuda_values[1].item()),
+            "quadratic_cap_penalty": 0.25,
             "all_finite": True,
         },
     )
     adapter.log_benchmark_metrics(
         2,
         {
-            "task_score": float(cuda_values[1].item()),
+            "task_score": float(cuda_values[2].item()),
             "healthy": True,
         },
     )
@@ -128,17 +136,20 @@ def test_tensorboard_callbacks_write_train_and_benchmark_events(
     accumulator.Reload()
     scalar_tags = set(accumulator.Tags()["scalars"])
     assert {
-        "train/loss/total",
-        "train/pools/train_positive/effective/abs_p99",
+        "train_step/loss",
+        "train_step/quadratic_cap_penalty",
         "benchmark/task_score",
     } <= scalar_tags
-    assert "train/all_finite" not in scalar_tags
+    assert "train_step/all_finite" not in scalar_tags
     assert "benchmark/healthy" not in scalar_tags
 
-    train_event = accumulator.Scalars("train/loss/total")[-1]
+    train_events = accumulator.Scalars("train_step/loss")
+    penalty_events = accumulator.Scalars("train_step/quadratic_cap_penalty")
     benchmark_event = accumulator.Scalars("benchmark/task_score")[-1]
-    assert train_event.step == 2
-    assert train_event.value == pytest.approx(1.25)
+    assert [event.step for event in train_events] == [1, 2]
+    assert [event.value for event in train_events] == pytest.approx([1.25, 0.75])
+    assert [event.step for event in penalty_events] == [1, 2]
+    assert [event.value for event in penalty_events] == pytest.approx([0.5, 0.25])
     assert benchmark_event.step == 2
     assert benchmark_event.value == pytest.approx(0.875)
 

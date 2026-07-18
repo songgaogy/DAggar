@@ -89,18 +89,3 @@ echo "[vis_disc_finetuned] output=${OUT_DIR} device=${DEVICE}"
   "$@"
 
 echo "[vis_disc_finetuned] wrote MP4 files and PDFs: ${OUT_DIR}/finetuned_scores.pdf, ${OUT_DIR}/finetuned_scores_offline.pdf, ${OUT_DIR}/finetuned_scores_offline-success.pdf"
-
-echo "[vis_disc_finetuned] checking GT-fail detection on offline episodes"
-"${PY}" -m robosuite.pipeline.offline.discriminator.test_finetuned \
-  --load-ckpt "${FINETUNED_CKPT}" \
-  --model-ckpt "${MODEL_CKPT}" \
-  --offline-episodes "${OFFLINE_EPISODES}" \
-  --task "${TASK}" \
-  --device "${DEVICE}" \
-  --encode-batch-size "${ENCODE_BATCH_SIZE}" \
-  --out-dir "${OUT_DIR}" \
-  --report-name "gt_fail_detection.json" \
-  --seed "${SEED}" \
-  "${EXTRA_ARGS[@]}"
-
-echo "[vis_disc_finetuned] wrote ${OUT_DIR}/gt_fail_detection.json"

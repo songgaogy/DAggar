@@ -56,9 +56,8 @@ LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 USE_CHUNK="${USE_CHUNK:-True}"
-SOFT_CAP_C="${SOFT_CAP_C:-5.0}"
-SOFT_CAP_LAMBDA="${SOFT_CAP_LAMBDA:-1e-2}"
-SOFT_CAP_TEMPERATURE="${SOFT_CAP_TEMPERATURE:-1.0}"
+QUADRATIC_CAP_C="${QUADRATIC_CAP_C:-2.0}"
+QUADRATIC_CAP_LAMBDA="${QUADRATIC_CAP_LAMBDA:-1e-2}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
@@ -118,9 +117,8 @@ fi
     --lr                    "${LR}" \
     --weight-decay          "${WEIGHT_DECAY}" \
     --batch-size            "${BATCH_SIZE}" \
-    --soft-cap-c            "${SOFT_CAP_C}" \
-    --soft-cap-lambda       "${SOFT_CAP_LAMBDA}" \
-    --soft-cap-temperature  "${SOFT_CAP_TEMPERATURE}" \
+    --quadratic-cap-c       "${QUADRATIC_CAP_C}" \
+    --quadratic-cap-lambda  "${QUADRATIC_CAP_LAMBDA}" \
     --use-chunk             "${USE_CHUNK}" \
     "${EXTRA_ARGS[@]}" \
     "$@"

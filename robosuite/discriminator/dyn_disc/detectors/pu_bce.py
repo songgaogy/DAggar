@@ -148,6 +148,18 @@ def soft_logit_cap_penalty(
     return (t * torch.nn.functional.softplus((logits.abs() - float(cap)) / t)).mean()
 
 
+def quadratic_logit_cap_penalty(
+    logits: torch.Tensor,
+    cap: float,
+) -> torch.Tensor:
+    """Return the mean squared hinge violation outside ``[-cap, cap]``."""
+    if float(cap) <= 0.0:
+        raise ValueError(f"cap must be positive, got {cap}")
+    if logits.numel() == 0:
+        raise ValueError("quadratic logit cap requires at least one logit")
+    return torch.relu(logits.abs() - float(cap)).square().mean()
+
+
 def pu_risk(
     g_p: torch.Tensor,
     g_u: torch.Tensor,
@@ -262,11 +274,11 @@ class PUBCEDiscriminator:
         self._surrogate: str = "logistic"
         self._train_history: List[Dict[str, Any]] = []
         self._threshold_normalization: str = "none"
-        self._soft_cap_c: Optional[float] = 5.0
-        self._soft_cap_lambda: float = 1e-2
-        self._soft_cap_temperature: float = 1.0
+        self._quadratic_cap_c: Optional[float] = 2.0
+        self._quadratic_cap_lambda: float = 1e-2
         self._scheduler_horizon_epochs: int = 20
         self._completed_epochs: int = 0
+        self._completed_steps: int = 0
 
     # ------------------------------------------------------------------ #
     # Internal forward helpers                                           #
@@ -448,10 +460,10 @@ class PUBCEDiscriminator:
         loss_surrogate: str = "logistic",
         nn_correction: bool = True,
         beta: float = 0.0,
-        soft_cap_c: Optional[float] = 5.0,
-        soft_cap_lambda: float = 1e-2,
-        soft_cap_temperature: float = 1.0,
-        metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+        quadratic_cap_c: Optional[float] = 2.0,
+        quadratic_cap_lambda: float = 1e-2,
+        step_metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+        epoch_metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """Train the shared head with the nnPU risk; calibrate per-task thresholds.
@@ -491,22 +503,26 @@ class PUBCEDiscriminator:
             raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
         if loss_surrogate not in ("sigmoid", "logistic"):
             raise ValueError(f"loss_surrogate must be 'sigmoid' or 'logistic', got {loss_surrogate!r}")
-        if float(soft_cap_lambda) < 0.0:
-            raise ValueError("soft_cap_lambda must be non-negative")
-        if float(soft_cap_lambda) > 0.0 and (soft_cap_c is None or float(soft_cap_c) <= 0.0):
-            raise ValueError("positive soft_cap_lambda requires positive soft_cap_c")
-        if float(soft_cap_temperature) <= 0.0:
-            raise ValueError("soft_cap_temperature must be positive")
+        if float(quadratic_cap_lambda) < 0.0:
+            raise ValueError("quadratic_cap_lambda must be non-negative")
+        if float(quadratic_cap_lambda) > 0.0 and (
+            quadratic_cap_c is None or float(quadratic_cap_c) <= 0.0
+        ):
+            raise ValueError(
+                "positive quadratic_cap_lambda requires positive quadratic_cap_c"
+            )
 
         self._delta = float(delta)
         self._pi_p = float(pi_p)
         self._surrogate = str(loss_surrogate)
         self._threshold_normalization = "none"
-        self._soft_cap_c = None if soft_cap_c is None else float(soft_cap_c)
-        self._soft_cap_lambda = float(soft_cap_lambda)
-        self._soft_cap_temperature = float(soft_cap_temperature)
+        self._quadratic_cap_c = (
+            None if quadratic_cap_c is None else float(quadratic_cap_c)
+        )
+        self._quadratic_cap_lambda = float(quadratic_cap_lambda)
         self._scheduler_horizon_epochs = int(scheduler_horizon_epochs)
         self._completed_epochs = 0
+        self._completed_steps = 0
 
         if abs(float(pi_p) - 0.5) < 1e-9 and verbose:
             print(
@@ -621,15 +637,14 @@ class PUBCEDiscriminator:
                     nn_correction=bool(nn_correction),
                     beta=float(beta),
                 )
-                if self._soft_cap_lambda > 0.0:
-                    cap_penalty = soft_logit_cap_penalty(
+                if self._quadratic_cap_lambda > 0.0:
+                    cap_penalty = quadratic_logit_cap_penalty(
                         g,
-                        cap=float(self._soft_cap_c),
-                        temperature=self._soft_cap_temperature,
+                        cap=float(self._quadratic_cap_c),
                     )
                 else:
                     cap_penalty = torch.zeros((), device=g.device, dtype=g.dtype)
-                loss = parts["risk"] + self._soft_cap_lambda * cap_penalty
+                loss = parts["risk"] + self._quadratic_cap_lambda * cap_penalty
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError(
                         f"non-finite training loss at epoch={epoch + 1}, batch={n_batches + 1}"
@@ -638,6 +653,25 @@ class PUBCEDiscriminator:
                 loss.backward()
                 optim.step()
                 scheduler.step()
+                self._completed_steps += 1
+                cur_lr = float(optim.param_groups[0]["lr"])
+                if step_metric_callback is not None:
+                    step_metric_callback(
+                        self._completed_steps,
+                        {
+                            "loss": float(loss.detach().item()),
+                            "nnpu_risk": float(parts["risk"].detach().item()),
+                            "quadratic_cap_penalty": float(cap_penalty.detach().item()),
+                            "quadratic_cap_weighted": float(
+                                self._quadratic_cap_lambda * cap_penalty.detach().item()
+                            ),
+                            "neg_risk": float(parts["neg_risk"].item()),
+                            "nn_correction_active": float(
+                                float(parts["neg_risk"].item()) < float(-beta)
+                            ),
+                            "lr": cur_lr,
+                        },
+                    )
                 epoch_loss += float(loss.detach().item())
                 epoch_risk += float(parts["risk"].detach().item())
                 epoch_cap += float(cap_penalty.detach().item())
@@ -669,22 +703,23 @@ class PUBCEDiscriminator:
                 "epoch": int(epoch + 1),
                 "loss": avg,
                 "nnpu_risk": avg_risk,
-                "soft_cap_penalty": avg_cap,
-                "soft_cap_weighted": self._soft_cap_lambda * avg_cap,
+                "quadratic_cap_penalty": avg_cap,
+                "quadratic_cap_weighted": self._quadratic_cap_lambda * avg_cap,
                 "neg_risk": avg_neg,
                 "nn_correction_batches": int(n_correct),
                 "num_batches": int(n_batches),
                 "nn_correction_fraction": float(n_correct) / float(max(1, n_batches)),
                 "lr": cur_lr,
                 "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
+                "global_step": int(self._completed_steps),
                 "logit_center": float(self.head.logit_center.item()),
                 "thresholds": dict(self.thresholds),
                 "pools": pool_stats,
             }
             self._train_history.append(entry)
             self._completed_epochs = int(epoch + 1)
-            if metric_callback is not None:
-                metric_callback(int(epoch + 1), entry)
+            if epoch_metric_callback is not None:
+                epoch_metric_callback(self._completed_steps, entry)
             if verbose:
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
@@ -741,11 +776,11 @@ class PUBCEDiscriminator:
             "pi_p": None if self._pi_p is None else float(self._pi_p),
             "loss_surrogate": str(self._surrogate),
             "threshold_normalization": str(self._threshold_normalization),
-            "soft_cap_c": self._soft_cap_c,
-            "soft_cap_lambda": float(self._soft_cap_lambda),
-            "soft_cap_temperature": float(self._soft_cap_temperature),
+            "quadratic_cap_c": self._quadratic_cap_c,
+            "quadratic_cap_lambda": float(self._quadratic_cap_lambda),
             "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
             "completed_epochs": int(self._completed_epochs),
+            "completed_steps": int(self._completed_steps),
             "calib_stats": {
                 str(k): {
                     "threshold": float(v.threshold),
@@ -784,12 +819,12 @@ class PUBCEDiscriminator:
         self._pi_p = None if state.get("pi_p") is None else float(state["pi_p"])  # type: ignore[arg-type]
         self._surrogate = str(state.get("loss_surrogate", "sigmoid"))
         self._threshold_normalization = str(state.get("threshold_normalization", "none"))
-        raw_cap = state.get("soft_cap_c")
-        self._soft_cap_c = None if raw_cap is None else float(raw_cap)  # type: ignore[arg-type]
-        self._soft_cap_lambda = float(state.get("soft_cap_lambda", 0.0))  # type: ignore[arg-type]
-        self._soft_cap_temperature = float(state.get("soft_cap_temperature", 1.0))  # type: ignore[arg-type]
+        raw_cap = state.get("quadratic_cap_c")
+        self._quadratic_cap_c = None if raw_cap is None else float(raw_cap)  # type: ignore[arg-type]
+        self._quadratic_cap_lambda = float(state.get("quadratic_cap_lambda", 0.0))  # type: ignore[arg-type]
         self._scheduler_horizon_epochs = int(state.get("scheduler_horizon_epochs", 20))  # type: ignore[arg-type]
         self._completed_epochs = int(state.get("completed_epochs", 0))  # type: ignore[arg-type]
+        self._completed_steps = int(state.get("completed_steps", 0))  # type: ignore[arg-type]
         cs = state.get("calib_stats", {}) or {}
         self.calib_stats = {
             str(k): PUCalibStats(
