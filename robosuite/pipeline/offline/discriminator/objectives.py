@@ -9,7 +9,10 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from robosuite.discriminator.dyn_disc.detectors.pu_bce import pu_risk
+from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
+    pu_risk,
+    quadratic_logit_cap_penalty,
+)
 
 
 PRETRAIN_POSITIVE = "pretrain_positive"
@@ -20,12 +23,20 @@ OFFLINE_GT_NEGATIVE = "offline_gt_negative"
 _TERM_POOLS = {
     "nnpu": (PRETRAIN_POSITIVE, PRETRAIN_UNLABELED),
     "supervised_bce": (OFFLINE_POSITIVE, OFFLINE_GT_NEGATIVE),
+    "positive_logistic": (OFFLINE_POSITIVE,),
+    "positive_safety_margin": (OFFLINE_POSITIVE,),
+    "negative_logistic": (OFFLINE_GT_NEGATIVE,),
 }
 _TERM_TYPE_ALIASES = {
     "nnpu": "nnpu",
     "nnpu_replay": "nnpu",
     "supervised_bce": "supervised_bce",
     "supervised_gt_bce": "supervised_bce",
+    "positive_logistic": "positive_logistic",
+    "gt_positive": "positive_logistic",
+    "positive_safety_margin": "positive_safety_margin",
+    "negative_logistic": "negative_logistic",
+    "gt_negative": "negative_logistic",
 }
 
 
@@ -42,6 +53,61 @@ def _finite_float(value: Any, *, name: str) -> float:
 
 
 @dataclass(frozen=True)
+class QuadraticLogitCapConfig:
+    """Validated replay-only quadratic logit cap regularizer."""
+
+    enabled: bool = True
+    scope: str = "nnpu_replay"
+    cap: float = 2.0
+    weight: float = 1.0e-2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("quadratic_logit_cap.enabled must be bool.")
+        if self.scope != "nnpu_replay":
+            raise ValueError(
+                "quadratic_logit_cap.scope must be 'nnpu_replay', "
+                f"got {self.scope!r}."
+            )
+        cap = _finite_float(self.cap, name="quadratic_logit_cap.cap")
+        weight = _finite_float(self.weight, name="quadratic_logit_cap.weight")
+        if cap <= 0.0:
+            raise ValueError("quadratic_logit_cap.cap must be positive.")
+        if weight < 0.0:
+            raise ValueError("quadratic_logit_cap.weight must be non-negative.")
+        object.__setattr__(self, "cap", cap)
+        object.__setattr__(self, "weight", weight)
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.weight > 0.0
+
+
+@dataclass(frozen=True)
+class FixedLogitNormalizer:
+    """Fixed affine transform shared by every objective term."""
+
+    enabled: bool = False
+    center: float = 0.0
+    scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("logit_normalization.enabled must be bool.")
+        center = _finite_float(self.center, name="logit_normalization.center")
+        scale = _finite_float(self.scale, name="logit_normalization.scale")
+        if scale <= 0.0:
+            raise ValueError("logit_normalization.scale must be positive.")
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "scale", scale)
+
+    def __call__(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return logits
+        return (logits - self.center) / self.scale
+
+
+@dataclass(frozen=True)
 class LossTermConfig:
     """Validated configuration for one independently sampled loss term."""
 
@@ -50,8 +116,12 @@ class LossTermConfig:
     enabled: bool = True
     weight: float = 1.0
     batch_size: int = 512
-    positive_fraction: float = 0.5
+    positive_fraction: float | None = None
     class_weights: Mapping[str, float] | None = None
+    safety_margin_weight: float | None = None
+    margin_delta: float | None = None
+    temperature: float | None = None
+    boundary_source: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -70,10 +140,92 @@ class LossTermConfig:
         object.__setattr__(self, "weight", weight)
         if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int):
             raise TypeError(f"{self.name}.batch_size must be an integer.")
-        if self.batch_size < 2:
-            raise ValueError(f"{self.name}.batch_size must be at least 2.")
+        paired = self.type in {"nnpu", "supervised_bce"}
+        minimum_batch_size = 2 if paired else 1
+        if self.batch_size < minimum_batch_size:
+            raise ValueError(
+                f"{self.name}.batch_size must be at least {minimum_batch_size}."
+            )
+        if not paired:
+            if self.positive_fraction is not None:
+                raise ValueError(
+                    f"{self.name}.positive_fraction is only valid for paired losses."
+                )
+            if self.class_weights is not None:
+                raise ValueError(
+                    f"{self.name}.class_weights is only valid for supervised_bce."
+                )
+            safety_values = {
+                "safety_margin_weight": self.safety_margin_weight,
+                "margin_delta": self.margin_delta,
+                "temperature": self.temperature,
+                "boundary_source": self.boundary_source,
+            }
+            if self.type != "positive_safety_margin":
+                configured = sorted(
+                    key for key, value in safety_values.items() if value is not None
+                )
+                if configured:
+                    raise ValueError(
+                        f"{self.name} safety-margin options are only valid for "
+                        f"positive_safety_margin, got {configured}."
+                    )
+                return
+            missing = sorted(
+                key for key, value in safety_values.items() if value is None
+            )
+            if missing:
+                raise ValueError(
+                    f"{self.name} positive_safety_margin is missing {missing}."
+                )
+            safety_weight = _finite_float(
+                self.safety_margin_weight,
+                name=f"{self.name}.safety_margin_weight",
+            )
+            margin_delta = _finite_float(
+                self.margin_delta,
+                name=f"{self.name}.margin_delta",
+            )
+            temperature = _finite_float(
+                self.temperature,
+                name=f"{self.name}.temperature",
+            )
+            if safety_weight < 0.0:
+                raise ValueError(
+                    f"{self.name}.safety_margin_weight must be non-negative."
+                )
+            if margin_delta < 0.0:
+                raise ValueError(f"{self.name}.margin_delta must be non-negative.")
+            if temperature <= 0.0:
+                raise ValueError(f"{self.name}.temperature must be positive.")
+            if self.boundary_source != "parent_checkpoint":
+                raise ValueError(
+                    f"{self.name}.boundary_source must be 'parent_checkpoint', "
+                    f"got {self.boundary_source!r}."
+                )
+            object.__setattr__(self, "safety_margin_weight", safety_weight)
+            object.__setattr__(self, "margin_delta", margin_delta)
+            object.__setattr__(self, "temperature", temperature)
+            return
+
+        configured_safety = sorted(
+            key
+            for key, value in {
+                "safety_margin_weight": self.safety_margin_weight,
+                "margin_delta": self.margin_delta,
+                "temperature": self.temperature,
+                "boundary_source": self.boundary_source,
+            }.items()
+            if value is not None
+        )
+        if configured_safety:
+            raise ValueError(
+                f"{self.name} safety-margin options are only valid for "
+                f"positive_safety_margin, got {configured_safety}."
+            )
+
         fraction = _finite_float(
-            self.positive_fraction,
+            0.5 if self.positive_fraction is None else self.positive_fraction,
             name=f"{self.name}.positive_fraction",
         )
         positive_size = self.batch_size * fraction
@@ -121,11 +273,23 @@ class LossTermConfig:
 
     @property
     def positive_batch_size(self) -> int:
+        if self.positive_fraction is None:
+            raise ValueError(f"{self.name} does not define a positive batch split.")
         return int(round(self.batch_size * self.positive_fraction))
 
     @property
     def negative_batch_size(self) -> int:
         return int(self.batch_size - self.positive_batch_size)
+
+    @property
+    def pool_batch_sizes(self) -> dict[str, int]:
+        pools = _TERM_POOLS[self.type]
+        if len(pools) == 1:
+            return {pools[0]: int(self.batch_size)}
+        return {
+            pools[0]: int(self.positive_batch_size),
+            pools[1]: int(self.negative_batch_size),
+        }
 
     @property
     def active(self) -> bool:
@@ -266,6 +430,9 @@ class CompositeDiscriminatorObjective:
         *,
         sampler: CUDAPoolSampler,
         nnpu_parameters: NNPUParameters,
+        quadratic_logit_cap: QuadraticLogitCapConfig | None = None,
+        logit_normalizer: FixedLogitNormalizer | None = None,
+        positive_safety_boundary: float | None = None,
         steps_per_epoch: int | None = None,
     ) -> None:
         if not terms:
@@ -279,9 +446,13 @@ class CompositeDiscriminatorObjective:
         active_types = [term.type for term in active]
         if len(active_types) != len(set(active_types)):
             raise ValueError("Only one active term of each loss type is supported.")
-        required_pools = {
-            pool_name for term in active for pool_name in _TERM_POOLS[term.type]
-        }
+        active_pools = [pool_name for term in active for pool_name in term.pool_batch_sizes]
+        if len(active_pools) != len(set(active_pools)):
+            raise ValueError(
+                "Active loss terms must use disjoint pools; do not combine legacy "
+                "supervised_bce with separate GT risks."
+            )
+        required_pools = {pool_name for term in active for pool_name in term.pool_batch_sizes}
         missing = sorted(required_pools - set(sampler.pool_sizes))
         if missing:
             raise ValueError(f"Active objectives require missing pools: {missing}.")
@@ -290,6 +461,31 @@ class CompositeDiscriminatorObjective:
         self.active_terms = tuple(active)
         self.sampler = sampler
         self.nnpu_parameters = nnpu_parameters
+        self.quadratic_logit_cap = quadratic_logit_cap
+        self.logit_normalizer = logit_normalizer or FixedLogitNormalizer()
+        if quadratic_logit_cap is not None and quadratic_logit_cap.active:
+            if "nnpu" not in active_types:
+                raise ValueError(
+                    "Active quadratic_logit_cap requires an active nnPU replay term."
+                )
+        safety_terms = [
+            term for term in self.active_terms if term.type == "positive_safety_margin"
+        ]
+        if safety_terms:
+            if positive_safety_boundary is None:
+                raise ValueError(
+                    "positive_safety_boundary is required for positive_safety_margin."
+                )
+            self.positive_safety_boundary = _finite_float(
+                positive_safety_boundary,
+                name="positive_safety_boundary",
+            )
+            if self.logit_normalizer.enabled:
+                self.positive_safety_boundary = (
+                    self.positive_safety_boundary - self.logit_normalizer.center
+                ) / self.logit_normalizer.scale
+        else:
+            self.positive_safety_boundary = None
         self.steps_per_epoch = self._resolve_steps_per_epoch(steps_per_epoch)
 
     def _resolve_steps_per_epoch(self, override: int | None) -> int:
@@ -315,37 +511,37 @@ class CompositeDiscriminatorObjective:
     def sample_batches(self) -> dict[str, torch.Tensor]:
         batches: dict[str, torch.Tensor] = {}
         for term in self.active_terms:
-            positive_pool, negative_pool = _TERM_POOLS[term.type]
-            batches[positive_pool] = self.sampler.sample(
-                positive_pool, term.positive_batch_size
-            )
-            batches[negative_pool] = self.sampler.sample(
-                negative_pool, term.negative_batch_size
-            )
+            for pool_name, batch_size in term.pool_batch_sizes.items():
+                batches[pool_name] = self.sampler.sample(pool_name, batch_size)
         return batches
 
     def compute(self, batch_logits: Mapping[str, torch.Tensor]) -> ObjectiveResult:
         if not isinstance(batch_logits, Mapping):
             raise TypeError("batch_logits must be a mapping keyed by pool name.")
+        raw_batch_logits = batch_logits
+        batch_logits = {
+            name: self.logit_normalizer(logits)
+            for name, logits in raw_batch_logits.items()
+        }
         raw_losses: dict[str, torch.Tensor] = {}
         weighted_losses: dict[str, torch.Tensor] = {}
         metrics: dict[str, torch.Tensor] = {}
         batch_sizes: dict[str, int] = {}
 
         for term in self.active_terms:
-            positive_pool, negative_pool = _TERM_POOLS[term.type]
-            positive_logits = self._validated_logits(batch_logits, positive_pool)
-            negative_logits = self._validated_logits(batch_logits, negative_pool)
-            batch_sizes[positive_pool] = int(positive_logits.numel())
-            batch_sizes[negative_pool] = int(negative_logits.numel())
-            metrics[f"batch/{positive_pool}"] = positive_logits.new_tensor(
-                float(positive_logits.numel())
-            )
-            metrics[f"batch/{negative_pool}"] = negative_logits.new_tensor(
-                float(negative_logits.numel())
-            )
+            term_logits = {
+                pool_name: self._validated_logits(batch_logits, pool_name)
+                for pool_name in term.pool_batch_sizes
+            }
+            for pool_name, logits in term_logits.items():
+                batch_sizes[pool_name] = int(logits.numel())
+                metrics[f"batch/{pool_name}"] = logits.new_tensor(
+                    float(logits.numel())
+                )
 
             if term.type == "nnpu":
+                positive_logits = term_logits[PRETRAIN_POSITIVE]
+                negative_logits = term_logits[PRETRAIN_UNLABELED]
                 parts = pu_risk(
                     positive_logits,
                     negative_logits,
@@ -368,8 +564,10 @@ class CompositeDiscriminatorObjective:
                         "nnpu/clamped": clamped.to(dtype=torch.float32),
                     }
                 )
-            else:
+            elif term.type == "supervised_bce":
                 assert term.class_weights is not None
+                positive_logits = term_logits[OFFLINE_POSITIVE]
+                negative_logits = term_logits[OFFLINE_GT_NEGATIVE]
                 positive_bce = F.softplus(-positive_logits).mean()
                 negative_bce = F.softplus(negative_logits).mean()
                 raw_loss = (
@@ -382,6 +580,43 @@ class CompositeDiscriminatorObjective:
                         "gt_bce/negative": negative_bce.detach(),
                     }
                 )
+            elif term.type == "positive_logistic":
+                raw_loss = F.softplus(-term_logits[OFFLINE_POSITIVE]).mean()
+                metrics["gt/positive_logistic"] = raw_loss.detach()
+            elif term.type == "positive_safety_margin":
+                assert term.safety_margin_weight is not None
+                assert term.margin_delta is not None
+                assert term.temperature is not None
+                assert self.positive_safety_boundary is not None
+                positive_logits = term_logits[OFFLINE_POSITIVE]
+                positive_bce = F.softplus(-positive_logits).mean()
+                boundary = positive_logits.new_tensor(self.positive_safety_boundary)
+                target_logit = boundary + float(term.margin_delta)
+                positive_safety = F.softplus(
+                    (target_logit - positive_logits) / float(term.temperature)
+                ).mean()
+                raw_loss = (
+                    positive_bce
+                    + float(term.safety_margin_weight) * positive_safety
+                )
+                metrics.update(
+                    {
+                        "gt/positive_bce": positive_bce.detach(),
+                        "gt/positive_safety_margin": positive_safety.detach(),
+                        "gt/positive_combined": raw_loss.detach(),
+                        "safety/m_k": boundary.detach(),
+                        "safety/target_logit": target_logit.detach(),
+                        "safety/margin_violation_fraction": (
+                            positive_logits.detach() < target_logit
+                        )
+                        .to(dtype=torch.float32)
+                        .mean(),
+                    }
+                )
+            else:
+                assert term.type == "negative_logistic"
+                raw_loss = F.softplus(term_logits[OFFLINE_GT_NEGATIVE]).mean()
+                metrics["gt/negative_logistic"] = raw_loss.detach()
 
             weighted_loss = term.weight * raw_loss
             raw_losses[term.name] = raw_loss
@@ -390,6 +625,31 @@ class CompositeDiscriminatorObjective:
             metrics[f"loss/{term.name}/weighted"] = weighted_loss.detach()
 
         total_loss = sum(weighted_losses.values())
+        if self.quadratic_logit_cap is not None and self.quadratic_logit_cap.active:
+            replay_logits = torch.cat(
+                [
+                    self._validated_logits(batch_logits, PRETRAIN_POSITIVE),
+                    self._validated_logits(batch_logits, PRETRAIN_UNLABELED),
+                ],
+                dim=0,
+            )
+            cap_penalty = quadratic_logit_cap_penalty(
+                replay_logits,
+                cap=self.quadratic_logit_cap.cap,
+            )
+            weighted_cap = self.quadratic_logit_cap.weight * cap_penalty
+            total_loss = total_loss + weighted_cap
+            metrics.update(
+                {
+                    "regularization/quadratic_logit_cap": cap_penalty.detach(),
+                    "regularization/quadratic_logit_cap_weighted": weighted_cap.detach(),
+                    "regularization/quadratic_logit_cap_fraction_outside": (
+                        replay_logits.detach().abs() > self.quadratic_logit_cap.cap
+                    )
+                    .to(dtype=torch.float32)
+                    .mean(),
+                }
+            )
         if total_loss.ndim != 0 or total_loss.device.type != "cuda":
             raise RuntimeError("Composite objective must produce a scalar CUDA loss.")
         metrics["loss/total"] = total_loss.detach()
@@ -442,6 +702,8 @@ def build_objective(
     nnpu_parameters: NNPUParameters | Mapping[str, Any],
     device: str | torch.device,
     seed: int,
+    positive_safety_boundary: float | None = None,
+    logit_normalizer: FixedLogitNormalizer | None = None,
 ) -> CompositeDiscriminatorObjective:
     """Build a validated objective from the ``objective`` config mapping."""
     if not isinstance(config, Mapping):
@@ -461,6 +723,10 @@ def build_objective(
             "batch_size",
             "positive_fraction",
             "class_weights",
+            "safety_margin_weight",
+            "margin_delta",
+            "temperature",
+            "boundary_source",
         }
         if unknown:
             raise ValueError(f"Unknown options for objective term {name!r}: {sorted(unknown)}.")
@@ -473,13 +739,21 @@ def build_objective(
         if isinstance(nnpu_parameters, NNPUParameters)
         else NNPUParameters(**dict(nnpu_parameters))
     )
+    raw_quadratic_cap = config.get("quadratic_logit_cap")
+    if raw_quadratic_cap is not None and not isinstance(raw_quadratic_cap, Mapping):
+        raise TypeError("objective.quadratic_logit_cap must be a mapping or null.")
+    quadratic_logit_cap = (
+        None
+        if raw_quadratic_cap is None
+        else QuadraticLogitCapConfig(**dict(raw_quadratic_cap))
+    )
     active_terms = [term for term in terms if term.active]
     if not active_terms:
         raise ValueError("At least one enabled loss term must have positive weight.")
     required_pools = {
         pool_name
         for term in active_terms
-        for pool_name in _TERM_POOLS[term.type]
+        for pool_name in term.pool_batch_sizes
     }
     missing = sorted(required_pools - set(pools))
     if missing:
@@ -492,6 +766,9 @@ def build_objective(
         terms,
         sampler=sampler,
         nnpu_parameters=parameters,
+        quadratic_logit_cap=quadratic_logit_cap,
+        logit_normalizer=logit_normalizer,
+        positive_safety_boundary=positive_safety_boundary,
         steps_per_epoch=config.get("steps_per_epoch"),
     )
 
@@ -506,5 +783,7 @@ __all__ = [
     "OFFLINE_POSITIVE",
     "PRETRAIN_POSITIVE",
     "PRETRAIN_UNLABELED",
+    "FixedLogitNormalizer",
+    "QuadraticLogitCapConfig",
     "build_objective",
 ]

@@ -15,6 +15,7 @@ from robosuite.pipeline.offline.visualization.disc_adapter import (
     FinetunedPUBCEBenchmarkDiscriminator,
 )
 from robosuite.pipeline.offline.visualization.disc_episodes import (
+    load_offline_success_trajectories as _load_offline_success_trajectories,
     offline_trajectory as _offline_trajectory,
     sample_offline_trajectories as _sample_offline_trajectories,
     sample_offline_trajectory_pools as _sample_offline_trajectory_pools,
@@ -257,6 +258,30 @@ def test_offline_pool_sampling_rejects_empty_policy_success_pool(tmp_path) -> No
         _sample_offline_trajectory_pools(
             path, task="Task", num_trajs=1, seed=0, fps=20
         )
+
+
+def test_full_offline_success_loader_preserves_source_order_and_success_cutoff(
+    tmp_path,
+) -> None:
+    episodes = [
+        _episode(0, interventions=[False, False], terminal_reason="success"),
+        _episode(1, interventions=[False, True], terminal_reason="success"),
+        _episode(2, interventions=[False], terminal_reason="manual_reset"),
+        _episode(3, interventions=[False, False, False], terminal_reason="success"),
+    ]
+    path = tmp_path / "offline_episodes.pt"
+    torch.save(_payload(*episodes), path)
+
+    trajectories, metadata = _load_offline_success_trajectories(
+        path, task="Task", fps=20
+    )
+
+    assert [item.episode_index for item in trajectories] == [0, 3]
+    assert all(not item.is_failure for item in trajectories)
+    assert [item.prefix_frames_before_done() for item in trajectories] == [1, 2]
+    assert metadata["source_episode_count"] == 4
+    assert metadata["eligible_episode_count"] == 2
+    assert metadata["eligible_episode_indices"] == [0, 3]
 
 
 def test_offline_sampling_rejects_task_mismatch_and_invalid_payload(tmp_path) -> None:

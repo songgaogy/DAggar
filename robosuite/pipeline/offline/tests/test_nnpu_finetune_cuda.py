@@ -30,12 +30,77 @@ from robosuite.pipeline.offline.discriminator.features import (
     exclude_gt_frames_from_unlabeled,
 )
 from robosuite.pipeline.offline.discriminator.pools import LatentTrajectory
+from robosuite.pipeline.offline.discriminator.objectives import FixedLogitNormalizer
+from robosuite.pipeline.offline.discriminator.trainer import (
+    compute_fixed_robust_normalizer,
+    fold_fixed_logit_normalizer_,
+)
+from robosuite.pipeline.offline.discriminator.test_finetuned import (
+    score_summary_cuda,
+    validate_rebuilt_gt_provenance,
+)
+
+
+POSITIVE_SAFETY_BOUNDARY = 1.25
 
 
 def _cuda() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for nnPU finetune tests.")
     return torch.device("cuda:0")
+
+
+def test_gt_fail_summary_uses_inclusive_threshold_and_cuda_quantiles() -> None:
+    device = _cuda()
+    scores = torch.tensor([-1.0, 0.0, 1.0, 3.0], device=device)
+
+    summary = score_summary_cuda(scores, 0.0)
+
+    assert summary["n_frames"] == 4
+    assert summary["n_fail"] == 3
+    assert summary["n_missed"] == 1
+    assert summary["detection_rate"] == pytest.approx(0.75)
+    assert summary["miss_rate"] == pytest.approx(0.25)
+    assert summary["score_median"] == pytest.approx(0.5)
+    assert summary["margin_min"] == pytest.approx(-1.0)
+
+
+def test_gt_fail_summary_handles_empty_groups_and_rejects_invalid_scores() -> None:
+    device = _cuda()
+    empty = score_summary_cuda(torch.empty((0,), device=device), 0.0)
+    assert empty["n_frames"] == 0
+    assert empty["detection_rate"] is None
+    assert empty["score_q01"] is None
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        score_summary_cuda(torch.tensor([0.0, float("nan")], device=device), 0.0)
+    with pytest.raises(ValueError, match="require CUDA"):
+        score_summary_cuda(torch.tensor([0.0]), 0.0)
+
+
+def test_gt_fail_rebuilt_provenance_requires_exact_training_frames() -> None:
+    expected = {
+        "intervention_events": 2,
+        "gt_negative_windows": 2,
+        "gt_negative_frames": 4,
+        "pre_frames": 2,
+        "post_frames": 2,
+        "pre_end_windows": 0,
+        "pre_end_frames": 0,
+        "deduplicated_frames": 0,
+        "selected_frame_keys": [[0, 1], [0, 2], [1, 3], [1, 4]],
+    }
+    validate_rebuilt_gt_provenance(dict(expected), expected)
+
+    changed = dict(expected)
+    changed["selected_frame_keys"] = [[0, 1], [0, 2], [1, 3], [1, 5]]
+    with pytest.raises(ValueError, match="selected_frame_keys differ"):
+        validate_rebuilt_gt_provenance(changed, expected)
+
+    changed = dict(expected)
+    changed["gt_negative_frames"] = 3
+    with pytest.raises(ValueError, match="gt_negative_frames"):
+        validate_rebuilt_gt_provenance(changed, expected)
 
 
 def _feature_pools(
@@ -63,16 +128,130 @@ def _objective_config(batch_size: int = 8) -> dict[str, object]:
                 "batch_size": batch_size,
                 "positive_fraction": 0.5,
             },
-            "supervised_gt_bce": {
-                "type": "supervised_bce",
+            "gt_positive": {
+                "type": "positive_safety_margin",
                 "enabled": True,
                 "weight": 1.0,
-                "batch_size": batch_size,
-                "positive_fraction": 0.5,
-                "class_weights": {"positive": 0.5, "negative": 0.5},
+                "batch_size": batch_size // 2,
+                "safety_margin_weight": 1.0,
+                "margin_delta": 1.0,
+                "temperature": 1.0,
+                "boundary_source": "parent_checkpoint",
+            },
+            "gt_negative": {
+                "type": "negative_logistic",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size // 2,
             },
         },
     }
+
+
+def test_fixed_robust_normalizer_uses_cuda_held_out_logits() -> None:
+    device = _cuda()
+    head = torch.nn.Linear(1, 1, device=device)
+    with torch.no_grad():
+        head.weight.fill_(2.0)
+        head.bias.fill_(-1.0)
+    calibration = [
+        torch.tensor([[0.0], [1.0], [2.0], [3.0], [4.0]], device=device)
+    ]
+    center = 0.75
+
+    normalizer = compute_fixed_robust_normalizer(
+        head,
+        calibration,
+        center=center,
+        device=device,
+        batch_size=2,
+    )
+
+    logits = head(calibration[0]).reshape(-1)
+    quartiles = torch.quantile(
+        logits,
+        torch.tensor([0.25, 0.75], device=device, dtype=logits.dtype),
+    )
+    assert normalizer.enabled is True
+    assert normalizer.center == pytest.approx(center)
+    assert normalizer.scale == pytest.approx(
+        float(((quartiles[1] - quartiles[0]) / 1.349).item())
+    )
+    assert head.training is True
+
+
+def test_fixed_robust_normalizer_rejects_degenerate_success_logits() -> None:
+    device = _cuda()
+    head = torch.nn.Linear(2, 1, device=device)
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.fill_(3.0)
+
+    with pytest.raises(ValueError, match="non-positive or non-finite robust scale"):
+        compute_fixed_robust_normalizer(
+            head,
+            [torch.randn((8, 2), device=device)],
+            center=0.0,
+            device=device,
+        )
+
+
+def test_folding_fixed_normalizer_is_exact_for_standard_head() -> None:
+    device = _cuda()
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    detector.head.set_logit_center(0.4)
+    probe = torch.randn((17, 6), device=device)
+    normalizer = FixedLogitNormalizer(enabled=True, center=1.25, scale=0.625)
+    with torch.no_grad():
+        expected = normalizer(detector.head(probe)).clone()
+
+    fold_fixed_logit_normalizer_(detector.head, normalizer)
+
+    with torch.no_grad():
+        actual = detector.head(probe)
+    torch.testing.assert_close(actual, expected, rtol=1.0e-6, atol=1.0e-6)
+    assert detector.head.logit_center.item() == pytest.approx(
+        (0.4 + 1.25) / 0.625
+    )
+
+
+def test_success_recalibration_uses_cuda_quantile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _cuda()
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    calibration = [torch.randn((19, 6), device=device)]
+    original_quantile = torch.quantile
+    seen_devices: list[torch.device] = []
+
+    def recording_quantile(values: torch.Tensor, q: torch.Tensor | float, *args, **kwargs):
+        seen_devices.append(values.device)
+        assert values.device.type == "cuda"
+        if torch.is_tensor(q):
+            assert q.device.type == "cuda"
+        return original_quantile(values, q, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "quantile", recording_quantile)
+    with torch.no_grad():
+        expected = float(
+            original_quantile(-detector.head(calibration[0]), 0.9).item()
+        )
+
+    thresholds = detector._calibrate_success_thresholds(  # noqa: SLF001
+        {"Task": calibration},
+        delta=10.0,
+        verbose=False,
+    )
+
+    assert seen_devices == [device]
+    assert thresholds["Task"] == pytest.approx(expected)
+    assert detector.calib_stats["Task"].num_calib_frames == 19
 
 
 def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
@@ -93,6 +272,7 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(),
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -110,6 +290,10 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     assert logged[0]["data/pretrain_positive_frames"] == 24.0
     assert logged[0]["data/pretrain_unlabeled_frames"] == 24.0
     assert logged[0]["data/offline_gt_negative_frames"] == 24.0
+    assert logged[0]["safety/m_k"] == pytest.approx(POSITIVE_SAFETY_BOUNDARY)
+    assert logged[0]["safety/target_logit"] == pytest.approx(
+        POSITIVE_SAFETY_BOUNDARY + 1.0
+    )
 
 
 def test_log_interval_reports_running_mean() -> None:
@@ -128,6 +312,7 @@ def test_log_interval_reports_running_mean() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=config,
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -144,6 +329,115 @@ def test_log_interval_reports_running_mean() -> None:
     assert interval_logs[0]["loss/total"] == pytest.approx(
         epoch_logs[0]["loss/total"]
     )
+
+
+def test_positive_logistic_needs_no_parent_boundary_and_uses_long_scheduler() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    config = _objective_config()
+    config["terms"]["gt_positive"] = {
+        "type": "positive_logistic",
+        "enabled": True,
+        "weight": 0.025,
+        "batch_size": 4,
+    }
+    config["quadratic_logit_cap"] = {
+        "enabled": True,
+        "scope": "nnpu_replay",
+        "cap": 2.0,
+        "weight": 1.0e-2,
+    }
+    logged: list[dict[str, float]] = []
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        positive_safety_boundary=None,
+        pi_p=0.3,
+        epochs=2,
+        scheduler_horizon_epochs=20,
+        lr=3.0e-5,
+        seed=0,
+        loss_surrogate="logistic",
+        metric_callback=logged.append,
+        verbose=False,
+    )
+
+    assert len(logged) == 2
+    assert logged[-1]["scheduler/horizon_epochs"] == 20.0
+    assert logged[-1]["lr"] > 0.0
+    assert "gt/positive_logistic" in logged[-1]
+    assert "safety/m_k" not in logged[-1]
+    assert logged[-1]["regularization/quadratic_logit_cap"] >= 0.0
+    assert detector._scheduler_horizon_epochs == 20  # noqa: SLF001
+    assert detector._completed_epochs == 2  # noqa: SLF001
+
+
+def test_finetune_normalizes_all_terms_folds_once_and_round_trips_state() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    probe = torch.randn((11, 6), device=device)
+    center = 0.35
+    with torch.no_grad():
+        before = detector.head(probe).clone()
+    config = _objective_config()
+    config["terms"]["gt_positive"] = {
+        "type": "positive_logistic",
+        "enabled": True,
+        "weight": 0.025,
+        "batch_size": 4,
+    }
+    config["logit_normalization"] = {
+        "enabled": True,
+        "method": "fixed_robust_iqr",
+    }
+    config["quadratic_logit_cap"] = {
+        "enabled": True,
+        "scope": "nnpu_replay",
+        "cap": 2.0,
+        "weight": 1.0e-2,
+    }
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        logit_normalization_center=center,
+        pi_p=0.3,
+        epochs=1,
+        lr=0.0,
+        seed=0,
+        loss_surrogate="logistic",
+        verbose=False,
+    )
+
+    normalization = detector.state_dict()["logit_normalization"]
+    assert normalization["enabled"] is True
+    assert normalization["folded"] is True
+    assert normalization["center"] == pytest.approx(center)
+    assert normalization["scale"] > 0.0
+    with torch.no_grad():
+        expected = (before - center) / normalization["scale"]
+        folded = detector.head(probe)
+    torch.testing.assert_close(folded, expected, rtol=1.0e-5, atol=1.0e-5)
+
+    with torch.device(device):
+        restored = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    restored.load_state_dict(detector.state_dict())
+    assert restored.state_dict()["logit_normalization"] == normalization
+    with torch.no_grad():
+        torch.testing.assert_close(restored.head(probe), folded)
 
 
 def test_finetune_updates_head_and_checkpoint_remains_loadable(
@@ -175,6 +469,7 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(batch_size=10),
+        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=1e-3,
@@ -208,7 +503,21 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         parent_payload=parent_payload,
         parent_checkpoint=tmp_path / "parent.pth",
         task_name="Task",
-        finetune_config={"epochs": 1, "lr": 1e-3},
+        finetune_config={
+            "method": "nnpu_replay_positive_safety_margin_gt_negative",
+            "epochs": 1,
+            "lr": 1e-3,
+            "resolved_positive_safety_margin": {
+                "task": "Task",
+                "boundary_source": "parent_checkpoint",
+                "parent_failure_threshold": -POSITIVE_SAFETY_BOUNDARY,
+                "m_k": POSITIVE_SAFETY_BOUNDARY,
+                "margin_delta": 1.0,
+                "target_logit": POSITIVE_SAFETY_BOUNDARY + 1.0,
+                "safety_margin_weight": 1.0,
+                "temperature": 1.0,
+            },
+        },
         data_provenance={
             "positive_frames": 24,
             "unlabeled_frames": 24,
@@ -237,8 +546,18 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     assert payload["proprio_indices"] == [1, 2]
     assert payload["success_train_video_ids"] == {"Task": ["positive-train"]}
     assert payload["success_calib_video_ids"] == {"Task": ["positive-calib"]}
-    assert payload["finetune_schema_version"] == 2
-    assert payload["finetune_method"] == "nnpu_replay_gt_bce"
+    assert payload["finetune_schema_version"] == 5
+    assert payload["finetune_method"] == (
+        "nnpu_replay_positive_safety_margin_gt_negative"
+    )
+    assert payload["finetune_config"]["resolved_positive_safety_margin"]["m_k"] == (
+        POSITIVE_SAFETY_BOUNDARY
+    )
+    saved_normalization = payload["finetune_recalibration"]["logit_normalization"]
+    assert saved_normalization["enabled"] is False
+    assert saved_normalization["folded"] is False
+    assert saved_normalization["center"] == pytest.approx(0.0)
+    assert saved_normalization["scale"] == pytest.approx(1.0)
     checkpoint = save_finetuned_checkpoint(
         payload,
         tmp_path / "pu_bce_head_finetuned.pth",
@@ -263,6 +582,24 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     )
     torch.testing.assert_close(
         frozen.failure_score(probe),
+        detector.failure_score_tensor(probe),
+    )
+
+    legacy_payload = dict(payload)
+    legacy_payload["finetune_schema_version"] = 2
+    legacy_payload["finetune_method"] = "nnpu_replay_gt_bce"
+    legacy_checkpoint = save_finetuned_checkpoint(
+        legacy_payload,
+        tmp_path / "pu_bce_head_finetuned_v2.pth",
+    )
+    legacy_detector, legacy_restored_payload = load_warmstart_detector(
+        legacy_checkpoint,
+        device=device,
+        expected_task="Task",
+    )
+    assert legacy_restored_payload["finetune_schema_version"] == 2
+    torch.testing.assert_close(
+        legacy_detector.failure_score_tensor(probe),
         detector.failure_score_tensor(probe),
     )
 

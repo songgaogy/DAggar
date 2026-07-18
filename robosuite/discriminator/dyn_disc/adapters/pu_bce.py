@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
@@ -81,18 +82,22 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         *,
         model_ckpt: str,
         unlabeled_fail_trajectories: Sequence[BenchmarkTrajectory],
-        pi_p: float = 0.5,
-        head_hidden: int = 256,
-        head_layers: int = 2,
-        epochs: int = 20,
+        pi_p: float = 0.3,
+        head_hidden: int = 512,
+        head_layers: int = 3,
+        epochs: int = 1,
+        scheduler_horizon_epochs: int = 20,
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
-        use_chunk: bool = False,
-        loss_surrogate: str = "sigmoid",
+        use_chunk: bool = True,
+        loss_surrogate: str = "logistic",
         nn_correction: bool = True,
         beta: float = 0.0,
         save_ckpt_dir: Optional[str] = None,
+        quadratic_cap_c: Optional[float] = 2.0,
+        quadratic_cap_lambda: float = 1e-2,
+        tensorboard_dir: Optional[str] = None,
         # forwarded to the shared parent for encoding / cache parity
         device: str = "cuda",
         encode_batch_size: int = 32,
@@ -135,6 +140,11 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self.head_hidden = int(head_hidden)
         self.head_layers = int(head_layers)
         self.epochs = int(epochs)
+        self.scheduler_horizon_epochs = int(scheduler_horizon_epochs)
+        if self.epochs < 1:
+            raise ValueError("epochs must be positive")
+        if self.scheduler_horizon_epochs < self.epochs:
+            raise ValueError("scheduler_horizon_epochs must be at least epochs")
         self.lr = float(lr)
         self.weight_decay = float(weight_decay)
         self.batch_size = int(batch_size)
@@ -142,6 +152,12 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self.nn_correction = bool(nn_correction)
         self.beta = float(beta)
         self.save_ckpt_dir = None if save_ckpt_dir is None else str(save_ckpt_dir)
+        self.quadratic_cap_c = (
+            None if quadratic_cap_c is None else float(quadratic_cap_c)
+        )
+        self.quadratic_cap_lambda = float(quadratic_cap_lambda)
+        self.tensorboard_dir = None if tensorboard_dir is None else str(tensorboard_dir)
+        self._writer = None if self.tensorboard_dir is None else SummaryWriter(self.tensorboard_dir)
 
         # Single shared detector across tasks (constructed in fit_on_benchmark
         # once the encoder's feature dim is known).
@@ -255,7 +271,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         out_dir = Path(self.save_ckpt_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "epoch": int(self.epochs),
+            "epoch": int(self._shared_detector._completed_epochs),
+            "global_step": int(self._shared_detector._completed_steps),
             "in_dim": int(self._shared_detector.in_dim),
             "hidden": int(self._shared_detector.hidden),
             "num_layers": int(self._shared_detector.num_layers),
@@ -275,6 +292,10 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
+            "threshold_normalization": "none",
+            "quadratic_cap_c": self.quadratic_cap_c,
+            "quadratic_cap_lambda": float(self.quadratic_cap_lambda),
+            "scheduler_horizon_epochs": int(self.scheduler_horizon_epochs),
             "seed": int(self.seed),
             "calib_fraction": float(self.calib_fraction),
             "delta": float(self.delta),
@@ -300,6 +321,35 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         fp = out_dir / "pu_bce_head.pth"
         torch.save(payload, fp)
         return fp
+
+    @staticmethod
+    def _iter_scalar_metrics(prefix: str, value: Any):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_prefix = f"{prefix}/{key}" if prefix else str(key)
+                yield from PUBCEBenchmarkDiscriminator._iter_scalar_metrics(child_prefix, child)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            yield prefix, float(value)
+
+    def _record_step_metrics(self, step: int, metrics: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("train_step", metrics):
+            self._writer.add_scalar(tag, value, int(step))
+
+    def _record_epoch_metrics(self, step: int, metrics: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("train_epoch", metrics):
+            self._writer.add_scalar(tag, value, int(step))
+        self._writer.flush()
+
+    def log_benchmark_metrics(self, step: int, payload: Dict[str, Any]) -> None:
+        if self._writer is None:
+            return
+        for tag, value in self._iter_scalar_metrics("benchmark", payload):
+            self._writer.add_scalar(tag, value, int(step))
+        self._writer.flush()
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #
@@ -482,6 +532,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             success_calib_per_task=success_calib_per_task,
             pi_p=self.pi_p,
             epochs=self.epochs,
+            scheduler_horizon_epochs=self.scheduler_horizon_epochs,
             lr=self.lr,
             weight_decay=self.weight_decay,
             batch_size=self.batch_size,
@@ -490,6 +541,10 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             loss_surrogate=self.loss_surrogate,
             nn_correction=self.nn_correction,
             beta=self.beta,
+            quadratic_cap_c=self.quadratic_cap_c,
+            quadratic_cap_lambda=self.quadratic_cap_lambda,
+            step_metric_callback=self._record_step_metrics,
+            epoch_metric_callback=self._record_epoch_metrics,
             verbose=self.verbose_fit,
         )
 
@@ -500,6 +555,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self._global_stats = {
             "feat_dim": int(feat_dim),
             "epochs": int(self.epochs),
+            "scheduler_horizon_epochs": int(self.scheduler_horizon_epochs),
             "lr": float(self.lr),
             "weight_decay": float(self.weight_decay),
             "batch_size": int(self.batch_size),
@@ -512,6 +568,9 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
+            "threshold_normalization": "none",
+            "quadratic_cap_c": self.quadratic_cap_c,
+            "quadratic_cap_lambda": float(self.quadratic_cap_lambda),
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
             "transformer_layer": int(self.transformer_layer),
@@ -537,10 +596,17 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 "calib_num_frames": None if cs is None else int(cs.num_calib_frames),
             }
 
-        # Final one-shot checkpoint (no mid-training snapshots).
+        # Save the one canonical checkpoint after the fixed training budget.
         ckpt_path = self._save_checkpoint()
         if ckpt_path is not None and self.verbose_fit:
             print(f"[pu_bce][ckpt] wrote {ckpt_path}", flush=True)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.flush()
+            self._writer.close()
+            self._writer = None
+        super().close()
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
         task = str(trajectory.task_name)

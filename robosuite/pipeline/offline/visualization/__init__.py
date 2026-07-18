@@ -8,6 +8,7 @@ from .disc_contract import (
 )
 from .disc_episodes import (
     OfflineEpisodeTrajectory,
+    load_offline_success_trajectories,
     offline_trajectory,
     sample_offline_trajectories,
     sample_offline_trajectory_pools,
@@ -20,6 +21,7 @@ __all__ = [
     "FinetunedTrajectoryViz",
     "FinetunedVisualizationContract",
     "OfflineEpisodeTrajectory",
+    "load_offline_success_trajectories",
     "load_finetuned_visualization_contract",
     "offline_trajectory",
     "sample_offline_trajectories",

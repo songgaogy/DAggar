@@ -7,7 +7,7 @@ env:
 
 algorithm:
   discriminator:
-    checkpoint: null  # Required: calibrated parent nnPU head for warm-start.
+    checkpoint: "checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2/run_20260717_121451_PickPlaceCereal/checkpoints/pu_bce_head.pth"
     encoder_ckpt: null
     learner_device: "cuda:0"
     camera_to_view: {}
@@ -15,9 +15,10 @@ algorithm:
 offline:
   discriminator_finetune:
     episodes_path: "data/${env.environment}/offline_data/offline_episodes.pt"
-    pretrain_dir: "data/${env.environment}/discriminator-pretrain"
-    epochs: 10
-    lr: 3.0e-5
+    pretrain_dir: "data/${env.environment}/discriminator-pretrain-quadratic-c2-l1e2-v2"
+    epochs: 20
+    scheduler_horizon_epochs: 20
+    lr: 1.0e-5
     weight_decay: 1.0e-4
     encode_batch_size: 32
     log_interval: 10
@@ -34,24 +35,36 @@ offline:
 
     objective:
       # null derives the epoch length from the pretrain replay pool sizes.
+      # L = lambda_pre * L_pre_nnpu + lambda_P * L_P + lambda_N * L_N
+      #   + lambda_cap * R_cap(pretrain P/U).
       steps_per_epoch: null
+      logit_normalization:
+        enabled: true
+        method: "fixed_robust_iqr"
+      quadratic_logit_cap:
+        enabled: true
+        scope: "nnpu_replay"
+        cap: 2.0
+        weight: 1.0e-2
       terms:
         nnpu_replay:
           type: "nnpu"
           enabled: true
-          weight: 1.0
-          batch_size: 512
+          weight: 0.1
+          batch_size: 256
           positive_fraction: 0.5
 
-        supervised_gt_bce:
-          type: "supervised_bce"
+        gt_positive:
+          type: "positive_logistic"
           enabled: true
-          weight: 0.025
-          batch_size: 512
-          positive_fraction: 0.5
-          class_weights:
-            positive: 0.5
-            negative: 0.5
+          weight: 0.2
+          batch_size: 128
+
+        gt_negative:
+          type: "negative_logistic"
+          enabled: true
+          weight: 0.01
+          batch_size: 128
 
 logging:
   use_tensorboard: true

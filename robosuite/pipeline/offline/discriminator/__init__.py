@@ -31,9 +31,11 @@ from .features import (
 from .objectives import (
     CUDAPoolSampler,
     CompositeDiscriminatorObjective,
+    FixedLogitNormalizer,
     LossTermConfig,
     NNPUParameters,
     ObjectiveResult,
+    QuadraticLogitCapConfig,
     build_objective,
 )
 from .pools import (
@@ -45,9 +47,12 @@ from .pools import (
 )
 from .trainer import (
     PUBCEDiscriminatorFT,
+    compute_fixed_robust_normalizer,
     finetune_warmstart_detector,
+    fold_fixed_logit_normalizer_,
     require_cuda_device,
     resolve_parent_nnpu_semantics,
+    resolve_parent_success_boundary,
 )
 
 __all__ = [
@@ -62,6 +67,8 @@ __all__ = [
     "PolicySegment",
     "CUDAPoolSampler",
     "CompositeDiscriminatorObjective",
+    "FixedLogitNormalizer",
+    "QuadraticLogitCapConfig",
     "build_action_windows",
     "build_gt_negative_windows",
     "build_objective",
@@ -71,6 +78,8 @@ __all__ = [
     "exclude_gt_frames_from_unlabeled",
     "feature_tensors",
     "finetune_warmstart_detector",
+    "compute_fixed_robust_normalizer",
+    "fold_fixed_logit_normalizer_",
     "load_offline_episodes",
     "load_pretrain_pools",
     "load_warmstart_detector",
@@ -79,6 +88,7 @@ __all__ = [
     "required_path",
     "require_cuda_device",
     "resolve_parent_nnpu_semantics",
+    "resolve_parent_success_boundary",
     "resolved_config_dict",
     "safe_run_suffix",
     "save_finetuned_checkpoint",

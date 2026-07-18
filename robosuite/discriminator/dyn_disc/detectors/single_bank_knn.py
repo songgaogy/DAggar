@@ -116,7 +116,9 @@ class DynEncoder:
         feature_source: str = "encoder",
         transformer_layer: int = -1,
     ) -> None:
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("DynEncoder requires CUDA, but CUDA is unavailable")
         feature_source = str(feature_source)
         if feature_source not in {"encoder", "transformer"}:
             raise ValueError(f"feature_source must be 'encoder' or 'transformer', got {feature_source!r}")

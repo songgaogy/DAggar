@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,11 @@ from robosuite.pipeline.utils import (
 )
 
 
+FINETUNE_METHOD = "nnpu_replay_positive_safety_margin_gt_negative"
+SEPARATE_GT_FINETUNE_METHOD = "nnpu_replay_separate_gt_risks"
+LEGACY_FINETUNE_METHOD = "nnpu_replay_gt_bce"
+
+
 @hydra.main(version_base="1.2", config_path="../../config", config_name="finetune_disc")
 def main(cfg: DictConfig) -> None:
     """Encode named pools, warm-start the nnPU head, and recalibrate it."""
@@ -90,10 +96,16 @@ def main(cfg: DictConfig) -> None:
     )
 
     epochs = int(finetune_cfg.epochs)
+    scheduler_horizon_epochs = int(finetune_cfg.scheduler_horizon_epochs)
     encode_batch_size = int(finetune_cfg.encode_batch_size)
     log_interval = int(finetune_cfg.log_interval)
     if min(epochs, encode_batch_size, log_interval) <= 0:
         raise ValueError("epochs, encode_batch_size, and log_interval must be positive.")
+    if scheduler_horizon_epochs < epochs:
+        raise ValueError(
+            "scheduler_horizon_epochs must be >= epochs, got "
+            f"{scheduler_horizon_epochs} < {epochs}."
+        )
     if float(finetune_cfg.lr) < 0.0 or float(finetune_cfg.weight_decay) < 0.0:
         raise ValueError("Learning rate and weight decay must be non-negative.")
 
@@ -102,6 +114,13 @@ def main(cfg: DictConfig) -> None:
         name="offline.discriminator_finetune.objective",
     )
     loss_terms = configured_loss_terms(objective_config)
+    active_term_types = {term.type for term in loss_terms if term.active}
+    if "positive_safety_margin" in active_term_types:
+        finetune_method = FINETUNE_METHOD
+    elif active_term_types & {"positive_logistic", "negative_logistic"}:
+        finetune_method = SEPARATE_GT_FINETUNE_METHOD
+    else:
+        finetune_method = LEGACY_FINETUNE_METHOD
     active_training_pools = active_training_pool_names(loss_terms)
     gt_config = mapping_config(
         finetune_cfg.gt_negative,
@@ -135,6 +154,39 @@ def main(cfg: DictConfig) -> None:
         device=device,
         expected_task=task_name,
     )
+    safety_term = next(
+        (
+            term
+            for term in loss_terms
+            if term.active and term.type == "positive_safety_margin"
+        ),
+        None,
+    )
+    positive_safety_boundary: float | None = None
+    resolved_positive_safety_margin: dict[str, Any] | None = None
+    if safety_term is not None:
+        parent_failure_threshold = float(detector.thresholds[task_name])
+        if not math.isfinite(parent_failure_threshold):
+            raise ValueError(
+                f"Parent threshold for {task_name!r} must be finite, "
+                f"got {parent_failure_threshold!r}."
+            )
+        positive_safety_boundary = -parent_failure_threshold
+        assert safety_term.margin_delta is not None
+        assert safety_term.safety_margin_weight is not None
+        assert safety_term.temperature is not None
+        resolved_positive_safety_margin = {
+            "task": task_name,
+            "boundary_source": safety_term.boundary_source,
+            "parent_failure_threshold": parent_failure_threshold,
+            "m_k": positive_safety_boundary,
+            "margin_delta": float(safety_term.margin_delta),
+            "target_logit": (
+                positive_safety_boundary + float(safety_term.margin_delta)
+            ),
+            "safety_margin_weight": float(safety_term.safety_margin_weight),
+            "temperature": float(safety_term.temperature),
+        }
 
     manifest_feature = dict(pretrain_manifest.get("feature_contract", {}))
     manifest_camera_map = {
@@ -188,8 +240,9 @@ def main(cfg: DictConfig) -> None:
         frameskip=int(encoder.inner_encoder.frameskip),
         pre_end_chunks=pre_end_chunks,
     )
-    supervised_gt_active = any(
-        term.active and term.type == "supervised_bce" for term in loss_terms
+    gt_negative_active = any(
+        term.active and term.type in {"supervised_bce", "negative_logistic"}
+        for term in loss_terms
     )
     gt_negative = (
         encode_gt_negative_windows(
@@ -198,7 +251,7 @@ def main(cfg: DictConfig) -> None:
             camera_names=list(offline_payload["camera_names"]),
             batch_size=encode_batch_size,
         )
-        if supervised_gt_active
+        if gt_negative_active
         else []
     )
 
@@ -238,9 +291,10 @@ def main(cfg: DictConfig) -> None:
 
     parent_nnpu = resolve_parent_nnpu_semantics(parent_payload)
     finetune_config: dict[str, Any] = {
-        "method": "nnpu_replay_gt_bce",
+        "method": finetune_method,
         "optimizer": "AdamW",
         "schedule": "cosine",
+        "scheduler_horizon_epochs": scheduler_horizon_epochs,
         "epochs": epochs,
         "lr": float(finetune_cfg.lr),
         "weight_decay": float(finetune_cfg.weight_decay),
@@ -261,6 +315,10 @@ def main(cfg: DictConfig) -> None:
         },
         "delta": float(parent_nnpu["delta"]),
     }
+    if resolved_positive_safety_margin is not None:
+        finetune_config["resolved_positive_safety_margin"] = dict(
+            resolved_positive_safety_margin
+        )
     data_provenance = {
         "parent_checkpoint_sha256": sha256_file(parent_checkpoint),
         "pretrain_manifest_path": str(
@@ -297,13 +355,29 @@ def main(cfg: DictConfig) -> None:
                 "dataset": "offline_episodes",
                 "observations": "final_policy_segment_direct_success",
                 "actions": "executed_action_equal_to_policy_action",
-                "role": "supervised_bce_positive",
+                "role": (
+                    "gt_positive_bce_plus_safety_margin"
+                    if "positive_safety_margin" in active_term_types
+                    else (
+                        "gt_positive_logistic_only"
+                        if "positive_logistic" in active_term_types
+                        else "reserved_not_used_by_active_loss"
+                    )
+                ),
             },
             "offline_gt_negative": {
                 "dataset": "offline_episodes",
                 "observations": "policy_prefix_and_human_intervention",
                 "actions": "policy_action",
-                "role": "supervised_bce_negative",
+                "role": (
+                    "gt_negative_logistic_only"
+                    if "negative_logistic" in active_term_types
+                    else (
+                        "supervised_bce_negative"
+                        if "supervised_bce" in active_term_types
+                        else "reserved_not_used_by_active_loss"
+                    )
+                ),
             },
             "offline_unlabeled_reserved": {
                 "dataset": "offline_episodes",
@@ -417,6 +491,10 @@ def main(cfg: DictConfig) -> None:
     def log_epoch(metrics: dict[str, float]) -> None:
         nonlocal last_global_step
         last_global_step = int(metrics["global_step"])
+        positive_bce = metrics.get(
+            "gt/positive_bce",
+            metrics.get("gt/positive_logistic", float("nan")),
+        )
         maybe_log(
             metric_logger,
             {
@@ -429,8 +507,22 @@ def main(cfg: DictConfig) -> None:
         print(
             f"[pu_bce][fit] epoch={int(metrics['epoch']) + 1}/{epochs} "
             f"loss={metrics['loss/total']:.5f} "
-            f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f} "
-            f"gt_bce={metrics.get('loss/supervised_gt_bce/raw', float('nan')):.5f} "
+            f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f}/"
+            f"{metrics.get('loss/nnpu_replay/weighted', float('nan')):.5f} "
+            f"gt_p={metrics.get('loss/gt_positive/raw', float('nan')):.5f}/"
+            f"{metrics.get('loss/gt_positive/weighted', float('nan')):.5f} "
+            f"p_bce={positive_bce:.5f} "
+            f"p_safe={metrics.get('gt/positive_safety_margin', float('nan')):.5f} "
+            f"p_violate={metrics.get('safety/margin_violation_fraction', float('nan')):.3f} "
+            f"gt_n={metrics.get('loss/gt_negative/raw', float('nan')):.5f}/"
+            f"{metrics.get('loss/gt_negative/weighted', float('nan')):.5f} "
+            f"cap={metrics.get('regularization/quadratic_logit_cap', 0.0):.5f}/"
+            f"{metrics.get('regularization/quadratic_logit_cap_weighted', 0.0):.5f} "
+            f"cap_out={metrics.get('regularization/quadratic_logit_cap_fraction_outside', 0.0):.3f} "
+            f"batch={int(metrics.get('batch/pretrain_positive', 0.0))}/"
+            f"{int(metrics.get('batch/pretrain_unlabeled', 0.0))}/"
+            f"{int(metrics.get('batch/offline_positive', 0.0))}/"
+            f"{int(metrics.get('batch/offline_gt_negative', 0.0))} "
             f"clamp_fraction={metrics.get('nnpu/clamp_fraction', 0.0):.3f} "
             f"delta_gt={metrics.get('scores/delta_gt', float('nan')):+.5f} "
             f"lr={metrics['lr']:.2e}",
@@ -439,8 +531,9 @@ def main(cfg: DictConfig) -> None:
 
     try:
         print(
-            f"[robosuite][pu_bce] task={task_name} method=nnpu_replay_gt_bce "
+            f"[robosuite][pu_bce] task={task_name} method={finetune_method} "
             f"epochs={epochs} lr={float(finetune_cfg.lr):.2e} "
+            f"scheduler_horizon_epochs={scheduler_horizon_epochs} "
             f"feat_dim={int(detector.in_dim)} "
             f"NpreP={named_pool_stats['pretrain_positive']['frames']} "
             f"NpreU={named_pool_stats['pretrain_unlabeled']['frames']} "
@@ -448,6 +541,16 @@ def main(cfg: DictConfig) -> None:
             f"NgtN={named_pool_stats['offline_gt_negative']['frames']}",
             flush=True,
         )
+        if resolved_positive_safety_margin is not None:
+            print(
+                "[robosuite][pu_bce] positive_safety_margin "
+                f"m_k={resolved_positive_safety_margin['m_k']:.10f} "
+                f"target={resolved_positive_safety_margin['target_logit']:.10f} "
+                f"mu={resolved_positive_safety_margin['safety_margin_weight']:.6g} "
+                f"delta={resolved_positive_safety_margin['margin_delta']:.6g} "
+                f"temperature={resolved_positive_safety_margin['temperature']:.6g}",
+                flush=True,
+            )
         thresholds = finetune_warmstart_detector(
             detector,
             feature_pools={
@@ -457,9 +560,11 @@ def main(cfg: DictConfig) -> None:
             },
             calibration_features=feature_tensors(pretrain_pools.calibration),
             objective_config=objective_config,
+            positive_safety_boundary=positive_safety_boundary,
             task_name=task_name,
             parent_payload=parent_payload,
             epochs=epochs,
+            scheduler_horizon_epochs=scheduler_horizon_epochs,
             lr=float(finetune_cfg.lr),
             weight_decay=float(finetune_cfg.weight_decay),
             seed=int(cfg.seed),
@@ -472,6 +577,9 @@ def main(cfg: DictConfig) -> None:
             finetune_config["resolved_steps_per_epoch"] = int(
                 detector._train_history[-1]["steps"]  # noqa: SLF001
             )
+        finetune_config["resolved_logit_normalization"] = dict(
+            detector._logit_normalization  # noqa: SLF001
+        )
         checkpoint_payload = build_finetuned_checkpoint_payload(
             detector,
             parent_payload=parent_payload,
@@ -494,7 +602,7 @@ def main(cfg: DictConfig) -> None:
             "parent_checkpoint": str(parent_checkpoint),
             "encoder_checkpoint": str(encoder.encoder_checkpoint),
             "from_init": False,
-            "finetune_method": "nnpu_replay_gt_bce",
+            "finetune_method": finetune_method,
             "finetune_config": finetune_config,
             "data": data_provenance,
             "thresholds": thresholds,

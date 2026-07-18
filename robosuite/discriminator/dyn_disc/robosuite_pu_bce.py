@@ -20,6 +20,8 @@ import json
 import os
 from typing import Dict, List, Optional, Sequence
 
+import torch
+
 from benchmark.core import EvalConfig
 from robosuite.discriminator.utils.robosuite_benchmark import (
     FailureBenchmark,
@@ -31,6 +33,31 @@ from robosuite.discriminator.utils.robosuite_benchmark import (
 from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
 
 
+def _health_from_detector(discriminator: PUBCEBenchmarkDiscriminator) -> dict:
+    detector = discriminator._shared_detector
+    if detector is None or not detector._train_history:
+        raise RuntimeError("Missing detector train history for health evaluation")
+    latest = detector._train_history[-1]
+    pools = {
+        str(name): dict(values["effective"])
+        for name, values in dict(latest["pools"]).items()
+    }
+    reasons: List[str] = []
+    for name, stats in pools.items():
+        if not bool(stats.get("all_finite", False)):
+            reasons.append(f"{name}: non-finite logits")
+        if float(stats.get("abs_p99", float("inf"))) > 9.21:
+            reasons.append(f"{name}: abs_p99>9.21")
+        if float(stats.get("saturation_fraction", float("inf"))) > 0.05:
+            reasons.append(f"{name}: saturation_fraction>0.05")
+    tau = max((abs(float(value)) for value in detector.thresholds.values()), default=float("inf"))
+    return {
+        "passed": not reasons,
+        "reasons": reasons,
+        "pools": pools,
+        "tau": tau,
+        "logit_center": float(detector.head.logit_center.item()),
+    }
 def _parse_bool(value: str) -> bool:
     normalized = str(value).strip().lower()
     if normalized in {"true", "1", "yes", "on"}:
@@ -59,14 +86,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--tasks", nargs="*", default=None)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument("--save-ckpt-dir", type=str, default=None)
-    parser.add_argument("--max-fail-per-task", type=int, default=None,
+    parser.add_argument("--max-fail-per-task", type=int, default=50,
                         help="Eval failure cap per task (benchmark test set only).")
-    parser.add_argument("--max-success-per-task", type=int, default=None,
+    parser.add_argument("--max-success-per-task", type=int, default=50,
                         help="Eval success cap per task (benchmark test set only).")
-    parser.add_argument("--train-max-success-per-task", type=int, default=None,
+    parser.add_argument("--train-max-success-per-task", type=int, default=50,
                         help="Max success trajectories per task from --success-train-split "
                              "(nnPU positives + calibration).")
-    parser.add_argument("--train-max-fail-per-task", type=int, default=None,
+    parser.add_argument("--train-max-fail-per-task", type=int, default=50,
                         help="Max failure trajectories per task from --fail-train-split "
                              "(unlabeled pool). Overrides --unlabeled-per-task when set.")
     parser.add_argument("--train-max-per-task", type=int, default=None,
@@ -91,12 +118,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
+    parser.add_argument("--tensorboard-dir", type=str, default=None)
 
     # nnPU / head knobs.
-    parser.add_argument("--pi-p", type=float, default=0.5,
+    parser.add_argument("--pi-p", type=float, default=0.3,
                         help="Class prior P(y=+1): fraction of success-like frames inside "
-                             "failure rollouts. Default 0.5 (logged warning); set from "
-                             "domain knowledge.")
+                             "failure rollouts.")
     parser.add_argument("--loss-surrogate", type=str, default="logistic",
                         choices=["sigmoid", "logistic"],
                         help="nnPU surrogate loss. 'logistic' (softplus) is the "
@@ -106,21 +133,29 @@ def _parse_args() -> argparse.Namespace:
                         help="Disable the non-negative correction (use plain uPU).")
     parser.add_argument("--beta", type=float, default=0.0,
                         help="Lower clamp for the negative-risk term (Kiryo default 0).")
-    parser.add_argument("--head-hidden", type=int, default=256)
-    parser.add_argument("--head-layers", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--head-hidden", type=int, default=512)
+    parser.add_argument("--head-layers", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument(
+        "--scheduler-horizon-epochs",
+        type=int,
+        default=20,
+        help="Cosine schedule horizon; 20 reproduces the selected sweep epoch-1 trajectory.",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--quadratic-cap-c", type=float, default=2.0)
+    parser.add_argument("--quadratic-cap-lambda", type=float, default=1e-2)
     parser.add_argument(
         "--use-chunk",
         type=_parse_bool,
-        default=False,
+        default=True,
         help="Use forward action chunks instead of zero-padding a single action.",
     )
 
     # Unlabeled failure-pool selection.
-    parser.add_argument("--unlabeled-per-task", type=int, default=25,
+    parser.add_argument("--unlabeled-per-task", type=int, default=50,
                         help="Target number of failure trajectories per task to use as the "
                              "UNLABELED pool. If fewer are available, all are used.")
     parser.add_argument(
@@ -211,6 +246,15 @@ def _select_unlabeled(
 
 def main() -> None:
     args = _parse_args()
+    requested_device = torch.device(args.device)
+    if requested_device.type != "cuda":
+        raise ValueError(f"PU-BCE benchmark requires a CUDA device, got {requested_device}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("PU-BCE benchmark requires CUDA, but CUDA is unavailable")
+    if not args.save_ckpt_dir:
+        raise ValueError("--save-ckpt-dir is required to save the trained checkpoint")
+    if int(args.scheduler_horizon_epochs) < int(args.epochs):
+        raise ValueError("--scheduler-horizon-epochs must be at least --epochs")
     train_max_success_per_task, train_max_fail_per_task, unlabeled_per_task = (
         _effective_train_caps(args)
     )
@@ -321,11 +365,17 @@ def main() -> None:
         head_hidden=int(args.head_hidden),
         head_layers=int(args.head_layers),
         epochs=int(args.epochs),
+        scheduler_horizon_epochs=int(args.scheduler_horizon_epochs),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         batch_size=int(args.batch_size),
         use_chunk=bool(args.use_chunk),
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
+        quadratic_cap_c=(
+            None if args.quadratic_cap_c is None else float(args.quadratic_cap_c)
+        ),
+        quadratic_cap_lambda=float(args.quadratic_cap_lambda),
+        tensorboard_dir=(str(args.tensorboard_dir) if args.tensorboard_dir else None),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
@@ -349,24 +399,52 @@ def main() -> None:
             trajs,
             train_success_trajectories=train_success_trajs,
         )
+        calib_summary = discriminator.calibration_summary()
+        print("[robosuite][pu_bce] calibration summary:", calib_summary)
+        if args.save_json:
+            out_dir = os.path.dirname(os.path.abspath(args.save_json))
+        elif args.save_ckpt_dir:
+            out_dir = os.path.dirname(os.path.abspath(args.save_ckpt_dir))
+        else:
+            out_dir = os.getcwd()
+        os.makedirs(out_dir, exist_ok=True)
 
-        print("[robosuite][pu_bce] training complete; running bench.evaluate(...)", flush=True)
+        print(
+            "[robosuite][pu_bce] training complete; running one benchmark evaluation",
+            flush=True,
+        )
         result = bench.evaluate(
             discriminator,
             EvalConfig(step_binarize_strategy="provided"),
         )
+        benchmark_payload = result.to_dict()
+        health = _health_from_detector(discriminator)
+        detector = discriminator._shared_detector
+        if detector is None:
+            raise RuntimeError("Missing trained detector before benchmark logging")
+        discriminator.log_benchmark_metrics(
+            int(detector._completed_steps),
+            {"metrics": benchmark_payload, "logit_health": health},
+        )
         print(result.summary())
-        calib_summary = discriminator.calibration_summary()
-        print("[robosuite][pu_bce] calibration summary:", calib_summary)
+        print(
+            f"[robosuite][pu_bce] logit_health_passed={health['passed']} "
+            f"reasons={health['reasons']}",
+            flush=True,
+        )
+        if args.save_json:
+            result.save_json(args.save_json)
 
         if args.save_json:
-            out_dir = os.path.dirname(os.path.abspath(args.save_json))
-            os.makedirs(out_dir, exist_ok=True)
-            result.save_json(args.save_json)
             manifest_path = os.path.join(out_dir, "unlabeled_pool_manifest.json")
+            checkpoint_path = os.path.join(
+                os.path.abspath(args.save_ckpt_dir), "pu_bce_head.pth"
+            )
             manifest = {
+                "schema": "pu_bce_run_v2",
                 "labeling": "pu_no_gt_timing",
                 "loss": "nnpu",
+                "effective_logit_penalty": "quadratic_hinge",
                 "loss_surrogate": str(args.loss_surrogate),
                 "nn_correction": not bool(args.no_nn_correction),
                 "beta": float(args.beta),
@@ -395,13 +473,20 @@ def main() -> None:
                 "delta": float(args.delta),
                 "calib_mode": "success_percentile",
                 "epochs": int(args.epochs),
+                "scheduler_horizon_epochs": int(args.scheduler_horizon_epochs),
                 "lr": float(args.lr),
+                "weight_decay": float(args.weight_decay),
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
                 "use_chunk": bool(args.use_chunk),
                 "knn_feature_source": str(args.knn_feature_source),
                 "knn_transformer_layer": int(args.knn_transformer_layer),
+                "threshold_normalization": "none",
+                "quadratic_cap_c": args.quadratic_cap_c,
+                "quadratic_cap_lambda": float(args.quadratic_cap_lambda),
+                "checkpoint": checkpoint_path,
+                "logit_health": health,
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)

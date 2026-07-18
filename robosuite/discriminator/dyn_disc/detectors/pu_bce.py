@@ -24,17 +24,17 @@ unchanged):
     tau_task       = percentile(failure_score over success-calib frames, 100 - delta)
     pred_t = 1     iff failure_score_t >= tau_task
 
-nnPU risk (sigmoid surrogate, see ``_pu_risk`` for the exact form)
-------------------------------------------------------------------
+nnPU risk (logistic surrogate, see ``pu_risk`` for the exact form)
+-----------------------------------------------------------------
     R_pu = pi_p * E_p[ ell(+1, g) ]
            + max( 0,  E_u[ ell(-1, g) ] - pi_p * E_p[ ell(-1, g) ] )
 
 with the **non-negative correction** clamping the second (negative-risk) term at
 0. We use the clamped variant; the canonical Kiryo nnPU additionally performs a
 gradient-ascent step on ``-gamma * (negative-risk term)`` when it goes negative
-(see ``_pu_risk`` note). ``ell`` is the sigmoid surrogate
-``ell(y, g) = sigmoid(-y * g)`` (a.k.a. the "ramp"/sigmoid loss used in the
-original nnPU paper). Logistic loss is available via ``loss_surrogate='logistic'``.
+(see ``pu_risk`` note). The approved surrogate is logistic loss,
+``ell(y, g) = softplus(-y * g)``. The sigmoid surrogate remains available for
+legacy compatibility.
 
 **Hard constraint:** ``fit(...)`` does not run any evaluation or compute AUROC.
 It trains for a fixed number of epochs against the nnPU objective and then
@@ -45,7 +45,7 @@ success_percentile rule only (no failure labels are ever used).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -63,15 +63,16 @@ from .single_bank_knn import DetectionResult
 class BCEHead(nn.Module):
     """MLP scalar-logit head on top of a frozen latent.
 
-    Architecture (num_layers=2, hidden=256):
+    Architecture (num_layers=3, hidden=512):
         Linear(in_dim, hidden) -> LayerNorm -> GELU
+        Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden,  hidden) -> LayerNorm -> GELU
         Linear(hidden, 1)
 
     Reused verbatim from the GT-split BCE head so checkpoints / geometry match.
     """
 
-    def __init__(self, in_dim: int, hidden: int = 256, num_layers: int = 2) -> None:
+    def __init__(self, in_dim: int, hidden: int = 512, num_layers: int = 3) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {num_layers}")
@@ -86,13 +87,28 @@ class BCEHead(nn.Module):
             d = int(hidden)
         layers.append(nn.Linear(d, 1))
         self.net = nn.Sequential(*layers)
+        self.register_buffer("logit_center", torch.zeros((), dtype=torch.float32))
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def raw_forward(self, z: torch.Tensor) -> torch.Tensor:
         # z: (B, D)  ->  (B,)
         return self.net(z).squeeze(-1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.raw_forward(z) - self.logit_center
+
+    @torch.no_grad()
+    def set_logit_center(self, value: float | torch.Tensor) -> None:
+        center = torch.as_tensor(
+            value,
+            device=self.logit_center.device,
+            dtype=self.logit_center.dtype,
+        )
+        if center.numel() != 1 or not bool(torch.isfinite(center).item()):
+            raise ValueError("logit center must be one finite scalar")
+        self.logit_center.copy_(center.reshape(()))
 
 
 # --------------------------------------------------------------------------- #
@@ -116,12 +132,40 @@ def _surrogate_loss(g: torch.Tensor, positive: bool, surrogate: str) -> torch.Te
     raise ValueError(f"unknown loss surrogate {surrogate!r}; expected 'sigmoid' or 'logistic'")
 
 
+def soft_logit_cap_penalty(
+    logits: torch.Tensor,
+    cap: float,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Return the linear soft-hinge penalty outside ``[-cap, cap]``."""
+    if float(cap) <= 0.0:
+        raise ValueError(f"cap must be positive, got {cap}")
+    if float(temperature) <= 0.0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    if logits.numel() == 0:
+        raise ValueError("soft logit cap requires at least one logit")
+    t = torch.as_tensor(float(temperature), device=logits.device, dtype=logits.dtype)
+    return (t * torch.nn.functional.softplus((logits.abs() - float(cap)) / t)).mean()
+
+
+def quadratic_logit_cap_penalty(
+    logits: torch.Tensor,
+    cap: float,
+) -> torch.Tensor:
+    """Return the mean squared hinge violation outside ``[-cap, cap]``."""
+    if float(cap) <= 0.0:
+        raise ValueError(f"cap must be positive, got {cap}")
+    if logits.numel() == 0:
+        raise ValueError("quadratic logit cap requires at least one logit")
+    return torch.relu(logits.abs() - float(cap)).square().mean()
+
+
 def pu_risk(
     g_p: torch.Tensor,
     g_u: torch.Tensor,
     *,
     pi_p: float,
-    surrogate: str = "sigmoid",
+    surrogate: str = "logistic",
     nn_correction: bool = True,
     beta: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
@@ -132,7 +176,7 @@ def pu_risk(
         g_u: (Nu,) head logits on unlabeled frames.
         pi_p: class prior P(y=+1), the fraction of true positives in the
             unlabeled mixture.
-        surrogate: 'sigmoid' (default) or 'logistic'.
+        surrogate: 'logistic' (default) or legacy 'sigmoid'.
         nn_correction: when True, clamp the negative-risk term at ``-beta``
             (nnPU); when False, use the plain uPU estimator (may go negative).
         beta: lower clamp for the negative-risk term (Kiryo uses beta=0).
@@ -207,22 +251,34 @@ class PUBCEDiscriminator:
         self,
         in_dim: int,
         *,
-        hidden: int = 256,
-        num_layers: int = 2,
+        hidden: int = 512,
+        num_layers: int = 3,
         device: str = "cuda",
     ) -> None:
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
-
-        self.head: BCEHead = BCEHead(in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers).to(self.device)
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("PUBCEDiscriminator requires CUDA, but CUDA is unavailable")
+        with torch.device(self.device):
+            self.head = BCEHead(
+                in_dim=self.in_dim,
+                hidden=self.hidden,
+                num_layers=self.num_layers,
+            )
         self.thresholds: Dict[str, float] = {}
         self.calib_stats: Dict[str, PUCalibStats] = {}
         self._delta: Optional[float] = None
         self._pi_p: Optional[float] = None
-        self._surrogate: str = "sigmoid"
-        self._train_history: List[Dict[str, float]] = []
+        self._surrogate: str = "logistic"
+        self._train_history: List[Dict[str, Any]] = []
+        self._threshold_normalization: str = "none"
+        self._quadratic_cap_c: Optional[float] = 2.0
+        self._quadratic_cap_lambda: float = 1e-2
+        self._scheduler_horizon_epochs: int = 20
+        self._completed_epochs: int = 0
+        self._completed_steps: int = 0
 
     # ------------------------------------------------------------------ #
     # Internal forward helpers                                           #
@@ -238,6 +294,16 @@ class PUBCEDiscriminator:
         flat = features.reshape(-1, self.in_dim).to(self.device, dtype=torch.float32)
         logits = self.head(flat)
         return logits.reshape(leading_shape)
+
+    def raw_logits_tensor(self, features: torch.Tensor) -> torch.Tensor:
+        """Return the pre-normalization head output while preserving device flow."""
+        if features.shape[-1] != self.in_dim:
+            raise ValueError(
+                f"feature dim mismatch: expected {self.in_dim}, got {features.shape[-1]}"
+            )
+        leading_shape = features.shape[:-1]
+        flat = features.reshape(-1, self.in_dim).to(self.device, dtype=torch.float32)
+        return self.head.raw_forward(flat).reshape(leading_shape)
 
     def failure_score_tensor(self, features: torch.Tensor) -> torch.Tensor:
         """Return ``-g(z)``; larger values are more failure-like."""
@@ -275,6 +341,104 @@ class PUBCEDiscriminator:
             outs.append(g.detach().cpu().numpy().astype(np.float32))
         return np.concatenate(outs, axis=0)
 
+    @torch.no_grad()
+    def _pool_logits_cuda(
+        self,
+        features: Sequence[torch.Tensor],
+        *,
+        raw: bool,
+        batch_size: int = 4096,
+    ) -> torch.Tensor:
+        outputs: List[torch.Tensor] = []
+        was_training = self.head.training
+        self.head.eval()
+        for sequence in features:
+            flat = sequence.reshape(-1, sequence.shape[-1])
+            for start in range(0, int(flat.shape[0]), int(batch_size)):
+                chunk = flat[start : start + int(batch_size)].to(
+                    self.device, dtype=torch.float32, non_blocking=True
+                )
+                value = self.head.raw_forward(chunk) if raw else self.head(chunk)
+                outputs.append(value.detach())
+        if was_training:
+            self.head.train()
+        if not outputs:
+            return torch.empty((0,), device=self.device, dtype=torch.float32)
+        return torch.cat(outputs, dim=0)
+
+    @staticmethod
+    def _logit_summary(values: torch.Tensor) -> Dict[str, float]:
+        if values.device.type != "cuda":
+            raise ValueError("logit diagnostics must run on CUDA")
+        flat = values.reshape(-1).to(torch.float32)
+        if flat.numel() == 0:
+            raise ValueError("cannot summarize an empty logit pool")
+        finite = torch.isfinite(flat)
+        if not bool(finite.all().item()):
+            raise FloatingPointError("non-finite logits detected")
+        quantiles = torch.quantile(
+            flat,
+            torch.tensor([0.01, 0.5, 0.99], device=flat.device, dtype=flat.dtype),
+        )
+        abs_p99 = torch.quantile(flat.abs(), 0.99)
+        saturation = (flat.abs() > 9.21).to(torch.float32).mean()
+        return {
+            "num_frames": float(flat.numel()),
+            "all_finite": True,
+            "finite_fraction": 1.0,
+            "mean": float(flat.mean().item()),
+            "std": float(flat.std(unbiased=False).item()),
+            "min": float(flat.min().item()),
+            "max": float(flat.max().item()),
+            "p01": float(quantiles[0].item()),
+            "p50": float(quantiles[1].item()),
+            "p99": float(quantiles[2].item()),
+            "abs_p99": float(abs_p99.item()),
+            "max_abs": float(flat.abs().max().item()),
+            "saturation_fraction": float(saturation.item()),
+        }
+
+    @torch.no_grad()
+    def _calibrate_epoch(
+        self,
+        success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
+        *,
+        delta: float,
+        verbose: bool,
+    ) -> None:
+        q = 1.0 - float(delta) / 100.0
+        self.thresholds = {}
+        self.calib_stats = {}
+        for task, calib_sequences in success_calib_per_task.items():
+            sequences = [value for value in calib_sequences if value.numel() > 0]
+            if not sequences:
+                raise ValueError(
+                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
+                    "cannot calibrate threshold."
+                )
+            effective = self._pool_logits_cuda(sequences, raw=False)
+            failure_score = -effective
+            tau_tensor = torch.quantile(failure_score, q)
+            tau = float(tau_tensor.item())
+            self.thresholds[task] = tau
+            self.calib_stats[task] = PUCalibStats(
+                threshold=tau,
+                num_calib_frames=int(failure_score.numel()),
+                calib_score_min=float(failure_score.min().item()),
+                calib_score_max=float(failure_score.max().item()),
+                calib_score_mean=float(failure_score.mean().item()),
+                calib_score_std=float(failure_score.std(unbiased=False).item()),
+            )
+            if verbose:
+                print(
+                    f"[pu_bce][calib] task={task} tau={tau:.5f} "
+                    f"center={float(self.head.logit_center.item()):.5f} "
+                    f"n_calib={failure_score.numel()} "
+                    f"mean={failure_score.mean().item():.5f} "
+                    f"std={failure_score.std(unbiased=False).item():.5f}",
+                    flush=True,
+                )
+
     # ------------------------------------------------------------------ #
     # Fit                                                                #
     # ------------------------------------------------------------------ #
@@ -285,16 +449,21 @@ class PUBCEDiscriminator:
         unlabeled_features: Sequence[torch.Tensor],
         success_calib_per_task: Dict[str, Sequence[torch.Tensor]],
         *,
-        pi_p: float = 0.5,
-        epochs: int = 20,
+        pi_p: float = 0.3,
+        epochs: int = 1,
+        scheduler_horizon_epochs: int = 20,
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
         delta: float = 10.0,
         seed: int = 0,
-        loss_surrogate: str = "sigmoid",
+        loss_surrogate: str = "logistic",
         nn_correction: bool = True,
         beta: float = 0.0,
+        quadratic_cap_c: Optional[float] = 2.0,
+        quadratic_cap_lambda: float = 1e-2,
+        step_metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+        epoch_metric_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """Train the shared head with the nnPU risk; calibrate per-task thresholds.
@@ -307,12 +476,13 @@ class PUBCEDiscriminator:
             success_calib_per_task: ``{task_name: [(T_k, D), ...]}`` of disjoint
                 success-calib trajectories per task. Threshold is calibrated
                 per-task on these via the success_percentile rule.
-            pi_p: class prior P(y=+1) for the unlabeled mixture. Defaults to 0.5
-                with a logged warning -- it should be set from domain knowledge.
+            pi_p: class prior P(y=+1) for the unlabeled mixture.
             epochs: fixed epoch budget. No early stopping, no validation eval.
+            scheduler_horizon_epochs: cosine schedule horizon. The approved
+                one-epoch fit retains the 20-epoch sweep schedule at epoch 1.
             delta: percentile-based false-alarm budget in [0, 100]. ``tau =
                 percentile(failure_score on success-calib, 100 - delta)``.
-            loss_surrogate: 'sigmoid' (nnPU default) or 'logistic'.
+            loss_surrogate: 'logistic' (approved default) or legacy 'sigmoid'.
             nn_correction: enable the non-negative correction (clamp neg-risk).
             beta: lower clamp for the negative-risk term (Kiryo default 0).
         Returns:
@@ -322,22 +492,42 @@ class PUBCEDiscriminator:
             raise ValueError(f"delta must be in [0, 100], got {delta}")
         if epochs < 1:
             raise ValueError(f"epochs must be >= 1, got {epochs}")
+        if scheduler_horizon_epochs < epochs:
+            raise ValueError(
+                "scheduler_horizon_epochs must be >= epochs, got "
+                f"{scheduler_horizon_epochs} < {epochs}"
+            )
         if batch_size < 2:
             raise ValueError(f"batch_size must be >= 2, got {batch_size}")
         if not (0.0 < float(pi_p) < 1.0):
             raise ValueError(f"pi_p (class prior) must be in (0, 1), got {pi_p}")
         if loss_surrogate not in ("sigmoid", "logistic"):
             raise ValueError(f"loss_surrogate must be 'sigmoid' or 'logistic', got {loss_surrogate!r}")
+        if float(quadratic_cap_lambda) < 0.0:
+            raise ValueError("quadratic_cap_lambda must be non-negative")
+        if float(quadratic_cap_lambda) > 0.0 and (
+            quadratic_cap_c is None or float(quadratic_cap_c) <= 0.0
+        ):
+            raise ValueError(
+                "positive quadratic_cap_lambda requires positive quadratic_cap_c"
+            )
 
         self._delta = float(delta)
         self._pi_p = float(pi_p)
         self._surrogate = str(loss_surrogate)
+        self._threshold_normalization = "none"
+        self._quadratic_cap_c = (
+            None if quadratic_cap_c is None else float(quadratic_cap_c)
+        )
+        self._quadratic_cap_lambda = float(quadratic_cap_lambda)
+        self._scheduler_horizon_epochs = int(scheduler_horizon_epochs)
+        self._completed_epochs = 0
+        self._completed_steps = 0
 
         if abs(float(pi_p) - 0.5) < 1e-9 and verbose:
             print(
-                "[pu_bce][fit] WARNING: pi_p left at the 0.5 default. The class "
-                "prior (fraction of success-like frames inside failure rollouts) "
-                "should be set from domain knowledge via --pi-p.",
+                "[pu_bce][fit] WARNING: pi_p=0.5 differs from the approved 0.3 "
+                "default.",
                 flush=True,
             )
 
@@ -397,25 +587,35 @@ class PUBCEDiscriminator:
         torch.manual_seed(int(seed))
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(int(seed))
-        self.head = BCEHead(
-            in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers,
-        ).to(self.device)
+        with torch.device(self.device):
+            self.head = BCEHead(
+                in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers,
+            )
 
         optim = torch.optim.AdamW(
             self.head.parameters(),
             lr=float(lr),
             weight_decay=float(weight_decay),
         )
-        total_steps = int(epochs) * max(1, len(loader))
+        total_steps = int(scheduler_horizon_epochs) * max(1, len(loader))
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optim, T_max=total_steps, eta_min=0.0
         )
 
-        # ------- train loop (NO eval, NO AUROC) ----------
+        calib_sequences = [
+            sequence
+            for sequences in success_calib_per_task.values()
+            for sequence in sequences
+            if sequence.numel() > 0
+        ]
+
+        # ------- train loop (NO benchmark eval, NO AUROC) ----------
         self.head.train()
         self._train_history = []
         for epoch in range(int(epochs)):
             epoch_loss = 0.0
+            epoch_risk = 0.0
+            epoch_cap = 0.0
             epoch_neg = 0.0
             n_correct = 0  # batches where the nn-correction fired (neg_risk < -beta)
             n_batches = 0
@@ -437,68 +637,99 @@ class PUBCEDiscriminator:
                     nn_correction=bool(nn_correction),
                     beta=float(beta),
                 )
-                loss = parts["risk"]
+                if self._quadratic_cap_lambda > 0.0:
+                    cap_penalty = quadratic_logit_cap_penalty(
+                        g,
+                        cap=float(self._quadratic_cap_c),
+                    )
+                else:
+                    cap_penalty = torch.zeros((), device=g.device, dtype=g.dtype)
+                loss = parts["risk"] + self._quadratic_cap_lambda * cap_penalty
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError(
+                        f"non-finite training loss at epoch={epoch + 1}, batch={n_batches + 1}"
+                    )
                 optim.zero_grad(set_to_none=True)
                 loss.backward()
                 optim.step()
                 scheduler.step()
+                self._completed_steps += 1
+                cur_lr = float(optim.param_groups[0]["lr"])
+                if step_metric_callback is not None:
+                    step_metric_callback(
+                        self._completed_steps,
+                        {
+                            "loss": float(loss.detach().item()),
+                            "nnpu_risk": float(parts["risk"].detach().item()),
+                            "quadratic_cap_penalty": float(cap_penalty.detach().item()),
+                            "quadratic_cap_weighted": float(
+                                self._quadratic_cap_lambda * cap_penalty.detach().item()
+                            ),
+                            "neg_risk": float(parts["neg_risk"].item()),
+                            "nn_correction_active": float(
+                                float(parts["neg_risk"].item()) < float(-beta)
+                            ),
+                            "lr": cur_lr,
+                        },
+                    )
                 epoch_loss += float(loss.detach().item())
+                epoch_risk += float(parts["risk"].detach().item())
+                epoch_cap += float(cap_penalty.detach().item())
                 epoch_neg += float(parts["neg_risk"].item())
                 if float(parts["neg_risk"].item()) < float(-beta):
                     n_correct += 1
                 n_batches += 1
             avg = epoch_loss / max(1, n_batches)
+            avg_risk = epoch_risk / max(1, n_batches)
+            avg_cap = epoch_cap / max(1, n_batches)
             avg_neg = epoch_neg / max(1, n_batches)
             cur_lr = float(optim.param_groups[0]["lr"])
-            self._train_history.append({
-                "epoch": float(epoch),
+            self._calibrate_epoch(
+                success_calib_per_task,
+                delta=float(delta),
+                verbose=False,
+            )
+            pool_stats: Dict[str, Dict[str, Dict[str, float]]] = {}
+            for pool_name, sequences in (
+                ("train_positive", p_seqs),
+                ("unlabeled_failure", u_seqs),
+                ("success_calib", calib_sequences),
+            ):
+                pool_stats[pool_name] = {
+                    "raw": self._logit_summary(self._pool_logits_cuda(sequences, raw=True)),
+                    "effective": self._logit_summary(self._pool_logits_cuda(sequences, raw=False)),
+                }
+            entry: Dict[str, Any] = {
+                "epoch": int(epoch + 1),
                 "loss": avg,
+                "nnpu_risk": avg_risk,
+                "quadratic_cap_penalty": avg_cap,
+                "quadratic_cap_weighted": self._quadratic_cap_lambda * avg_cap,
                 "neg_risk": avg_neg,
-                "nn_correction_batches": float(n_correct),
+                "nn_correction_batches": int(n_correct),
+                "num_batches": int(n_batches),
+                "nn_correction_fraction": float(n_correct) / float(max(1, n_batches)),
                 "lr": cur_lr,
-            })
+                "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
+                "global_step": int(self._completed_steps),
+                "logit_center": float(self.head.logit_center.item()),
+                "thresholds": dict(self.thresholds),
+                "pools": pool_stats,
+            }
+            self._train_history.append(entry)
+            self._completed_epochs = int(epoch + 1)
+            if epoch_metric_callback is not None:
+                epoch_metric_callback(self._completed_steps, entry)
             if verbose:
                 print(
                     f"[pu_bce][fit] epoch={epoch + 1}/{int(epochs)} "
-                    f"risk={avg:.5f} neg_risk={avg_neg:+.5f} "
+                    f"loss={avg:.5f} risk={avg_risk:.5f} cap={avg_cap:.5f} "
+                    f"neg_risk={avg_neg:+.5f} center={self.head.logit_center.item():+.5f} "
                     f"nn_corr_batches={n_correct}/{n_batches} "
                     f"lr={cur_lr:.2e} Np={Np} Nu={Nu} pi_p={float(pi_p):.3f}",
                     flush=True,
                 )
-
-        # ------- per-task threshold calibration on disjoint success-calib ----------
-        # success_percentile only (no failure labels available in this branch).
         self.head.eval()
-        self.thresholds = {}
-        self.calib_stats = {}
-        q = 100.0 * (1.0 - float(delta) / 100.0)
-        for task, calib_seqs in success_calib_per_task.items():
-            seqs = [t for t in calib_seqs if t.numel() > 0]
-            if not seqs:
-                raise ValueError(
-                    f"Task {task!r}: success_calib_per_task[{task!r}] is empty; "
-                    "cannot calibrate threshold."
-                )
-            calib_feats = torch.cat([s.to(torch.float32).reshape(-1, s.shape[-1]) for s in seqs], dim=0)
-            g_calib = self._logits_np(calib_feats)
-            failure_score = -g_calib  # higher = more failure
-            tau = float(np.percentile(failure_score.astype(np.float64), q=q))
-            self.thresholds[task] = tau
-            self.calib_stats[task] = PUCalibStats(
-                threshold=tau,
-                num_calib_frames=int(failure_score.size),
-                calib_score_min=float(failure_score.min()),
-                calib_score_max=float(failure_score.max()),
-                calib_score_mean=float(failure_score.mean()),
-                calib_score_std=float(failure_score.std()),
-            )
-            if verbose:
-                print(
-                    f"[pu_bce][calib] task={task} tau={tau:.5f} "
-                    f"n_calib={failure_score.size} "
-                    f"mean={failure_score.mean():.5f} std={failure_score.std():.5f}",
-                    flush=True,
-                )
 
         return dict(self.thresholds)
 
@@ -544,6 +775,12 @@ class PUBCEDiscriminator:
             "delta": None if self._delta is None else float(self._delta),
             "pi_p": None if self._pi_p is None else float(self._pi_p),
             "loss_surrogate": str(self._surrogate),
+            "threshold_normalization": str(self._threshold_normalization),
+            "quadratic_cap_c": self._quadratic_cap_c,
+            "quadratic_cap_lambda": float(self._quadratic_cap_lambda),
+            "scheduler_horizon_epochs": int(self._scheduler_horizon_epochs),
+            "completed_epochs": int(self._completed_epochs),
+            "completed_steps": int(self._completed_steps),
             "calib_stats": {
                 str(k): {
                     "threshold": float(v.threshold),
@@ -566,12 +803,28 @@ class PUBCEDiscriminator:
             self.in_dim = in_dim
             self.hidden = hidden
             self.num_layers = num_layers
-            self.head = BCEHead(in_dim=in_dim, hidden=hidden, num_layers=num_layers).to(self.device)
-        self.head.load_state_dict(state["head"])  # type: ignore[arg-type]
+            with torch.device(self.device):
+                self.head = BCEHead(in_dim=in_dim, hidden=hidden, num_layers=num_layers)
+        self.head.set_logit_center(0.0)
+        incompatible = self.head.load_state_dict(state["head"], strict=False)  # type: ignore[arg-type]
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        if missing - {"logit_center"} or unexpected:
+            raise RuntimeError(
+                "Incompatible PU-BCE head state: "
+                f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+            )
         self.thresholds = {str(k): float(v) for k, v in dict(state.get("thresholds", {})).items()}  # type: ignore[arg-type]
         self._delta = None if state.get("delta") is None else float(state["delta"])  # type: ignore[arg-type]
         self._pi_p = None if state.get("pi_p") is None else float(state["pi_p"])  # type: ignore[arg-type]
         self._surrogate = str(state.get("loss_surrogate", "sigmoid"))
+        self._threshold_normalization = str(state.get("threshold_normalization", "none"))
+        raw_cap = state.get("quadratic_cap_c")
+        self._quadratic_cap_c = None if raw_cap is None else float(raw_cap)  # type: ignore[arg-type]
+        self._quadratic_cap_lambda = float(state.get("quadratic_cap_lambda", 0.0))  # type: ignore[arg-type]
+        self._scheduler_horizon_epochs = int(state.get("scheduler_horizon_epochs", 20))  # type: ignore[arg-type]
+        self._completed_epochs = int(state.get("completed_epochs", 0))  # type: ignore[arg-type]
+        self._completed_steps = int(state.get("completed_steps", 0))  # type: ignore[arg-type]
         cs = state.get("calib_stats", {}) or {}
         self.calib_stats = {
             str(k): PUCalibStats(
