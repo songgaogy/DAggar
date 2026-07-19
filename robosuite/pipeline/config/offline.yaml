@@ -61,4 +61,4 @@ logging:
   output_root: "./outputs/dipole_offline"
   run_subfix: null
   use_tensorboard: true
-  tensorboard_dir: "tensorboard"
+  tensorboard_dir: "tensorboard/policy"

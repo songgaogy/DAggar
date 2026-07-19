@@ -26,6 +26,9 @@ def _contract_fixture(tmp_path):
         "transformer_layer": 1,
         "use_chunk": True,
         "pu_bce_detector": {"in_dim": 6},
+        "success_train_video_ids": {"Task": ["Task/success/train"]},
+        "success_calib_video_ids": {"Task": ["Task/success/calib"]},
+        "unlabeled_fail_video_ids": ["Task/failure/train"],
     }
     feature_contract = {
         "feature_source": "transformer",
@@ -48,6 +51,11 @@ def _contract_fixture(tmp_path):
             "normalizer_ckpt_sha256": sha256_file(normalizer),
         },
         "feature_contract": feature_contract,
+        "trajectory_ids": {
+            "positive_train": ["Task/success/train"],
+            "positive_calib": ["Task/success/calib"],
+            "unlabeled_train": ["Task/failure/train"],
+        },
     }
     encoder = SimpleNamespace(
         encoder_checkpoint=str(model),
@@ -68,11 +76,10 @@ def _contract_fixture(tmp_path):
 
 
 def test_finetune_contract_accepts_matching_manifest(tmp_path) -> None:
-    parent, payload, manifest, encoder = _contract_fixture(tmp_path)
+    _, payload, manifest, encoder = _contract_fixture(tmp_path)
 
     validate_finetune_contract(
         task_name="Task",
-        parent_checkpoint=parent,
         parent_payload=payload,
         pretrain_manifest=manifest,
         offline_payload={"task_name": "Task"},
@@ -80,15 +87,40 @@ def test_finetune_contract_accepts_matching_manifest(tmp_path) -> None:
     )
 
 
-def test_finetune_contract_rejects_parent_checkpoint_mismatch(tmp_path) -> None:
-    parent, payload, manifest, encoder = _contract_fixture(tmp_path)
+def test_finetune_contract_allows_parent_checksum_mismatch(tmp_path) -> None:
+    _, payload, manifest, encoder = _contract_fixture(tmp_path)
     manifest = deepcopy(manifest)
     manifest["checkpoint"]["sha256"] = "wrong"
 
-    with pytest.raises(ValueError, match="selected parent nnPU checkpoint"):
+    validate_finetune_contract(
+        task_name="Task",
+        parent_payload=payload,
+        pretrain_manifest=manifest,
+        offline_payload={"task_name": "Task"},
+        encoder=encoder,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pool_name", "replacement"),
+    [
+        ("positive_train", ["Task/success/other-train"]),
+        ("positive_calib", ["Task/success/other-calib"]),
+        ("unlabeled_train", ["Task/failure/other-train"]),
+    ],
+)
+def test_finetune_contract_rejects_trajectory_id_mismatch(
+    tmp_path,
+    pool_name: str,
+    replacement: list[str],
+) -> None:
+    _, payload, manifest, encoder = _contract_fixture(tmp_path)
+    manifest = deepcopy(manifest)
+    manifest["trajectory_ids"][pool_name] = replacement
+
+    with pytest.raises(ValueError, match=f"{pool_name} trajectory IDs differ"):
         validate_finetune_contract(
             task_name="Task",
-            parent_checkpoint=parent,
             parent_payload=payload,
             pretrain_manifest=manifest,
             offline_payload={"task_name": "Task"},
@@ -97,13 +129,12 @@ def test_finetune_contract_rejects_parent_checkpoint_mismatch(tmp_path) -> None:
 
 
 def test_finetune_contract_rejects_camera_contract_mismatch(tmp_path) -> None:
-    parent, payload, manifest, encoder = _contract_fixture(tmp_path)
+    _, payload, manifest, encoder = _contract_fixture(tmp_path)
     encoder.camera_to_view = {"robot0_eye_in_hand": "front"}
 
     with pytest.raises(ValueError, match="encoder contract differs"):
         validate_finetune_contract(
             task_name="Task",
-            parent_checkpoint=parent,
             parent_payload=payload,
             pretrain_manifest=manifest,
             offline_payload={"task_name": "Task"},

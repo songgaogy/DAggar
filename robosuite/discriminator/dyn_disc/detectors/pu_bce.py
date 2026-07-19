@@ -455,7 +455,7 @@ class PUBCEDiscriminator:
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         batch_size: int = 512,
-        delta: float = 10.0,
+        delta: float = 5.0,
         seed: int = 0,
         loss_surrogate: str = "logistic",
         nn_correction: bool = True,

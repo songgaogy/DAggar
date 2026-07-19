@@ -54,7 +54,7 @@ def _finite_float(value: Any, *, name: str) -> float:
 
 @dataclass(frozen=True)
 class QuadraticLogitCapConfig:
-    """Validated replay-only quadratic logit cap regularizer."""
+    """Validated quadratic logit cap regularizer scope and strength."""
 
     enabled: bool = True
     scope: str = "nnpu_replay"
@@ -64,9 +64,9 @@ class QuadraticLogitCapConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("quadratic_logit_cap.enabled must be bool.")
-        if self.scope != "nnpu_replay":
+        if self.scope not in {"nnpu_replay", "all_terms"}:
             raise ValueError(
-                "quadratic_logit_cap.scope must be 'nnpu_replay', "
+                "quadratic_logit_cap.scope must be 'nnpu_replay' or 'all_terms', "
                 f"got {self.scope!r}."
             )
         cap = _finite_float(self.cap, name="quadratic_logit_cap.cap")
@@ -464,9 +464,13 @@ class CompositeDiscriminatorObjective:
         self.quadratic_logit_cap = quadratic_logit_cap
         self.logit_normalizer = logit_normalizer or FixedLogitNormalizer()
         if quadratic_logit_cap is not None and quadratic_logit_cap.active:
-            if "nnpu" not in active_types:
+            if (
+                quadratic_logit_cap.scope == "nnpu_replay"
+                and "nnpu" not in active_types
+            ):
                 raise ValueError(
-                    "Active quadratic_logit_cap requires an active nnPU replay term."
+                    "quadratic_logit_cap.scope='nnpu_replay' requires an active "
+                    "nnPU replay term."
                 )
         safety_terms = [
             term for term in self.active_terms if term.type == "positive_safety_margin"
@@ -626,17 +630,40 @@ class CompositeDiscriminatorObjective:
 
         total_loss = sum(weighted_losses.values())
         if self.quadratic_logit_cap is not None and self.quadratic_logit_cap.active:
-            replay_logits = torch.cat(
-                [
-                    self._validated_logits(batch_logits, PRETRAIN_POSITIVE),
-                    self._validated_logits(batch_logits, PRETRAIN_UNLABELED),
-                ],
-                dim=0,
+            cap_terms = (
+                [term for term in self.active_terms if term.type == "nnpu"]
+                if self.quadratic_logit_cap.scope == "nnpu_replay"
+                else list(self.active_terms)
             )
-            cap_penalty = quadratic_logit_cap_penalty(
-                replay_logits,
-                cap=self.quadratic_logit_cap.cap,
-            )
+            term_penalties: list[torch.Tensor] = []
+            term_fractions: list[torch.Tensor] = []
+            for term in cap_terms:
+                logits = torch.cat(
+                    [
+                        self._validated_logits(batch_logits, pool_name).reshape(-1)
+                        for pool_name in term.pool_batch_sizes
+                    ],
+                    dim=0,
+                )
+                penalty = quadratic_logit_cap_penalty(
+                    logits,
+                    cap=self.quadratic_logit_cap.cap,
+                )
+                fraction_outside = (
+                    logits.detach().abs() > self.quadratic_logit_cap.cap
+                ).to(dtype=torch.float32).mean()
+                term_penalties.append(penalty)
+                term_fractions.append(fraction_outside)
+                metrics[
+                    f"regularization/quadratic_logit_cap/{term.name}"
+                ] = penalty.detach()
+                metrics[
+                    "regularization/quadratic_logit_cap_fraction_outside/"
+                    f"{term.name}"
+                ] = fraction_outside
+
+            cap_penalty = torch.stack(term_penalties).mean()
+            cap_fraction_outside = torch.stack(term_fractions).mean()
             weighted_cap = self.quadratic_logit_cap.weight * cap_penalty
             total_loss = total_loss + weighted_cap
             metrics.update(
@@ -644,10 +671,8 @@ class CompositeDiscriminatorObjective:
                     "regularization/quadratic_logit_cap": cap_penalty.detach(),
                     "regularization/quadratic_logit_cap_weighted": weighted_cap.detach(),
                     "regularization/quadratic_logit_cap_fraction_outside": (
-                        replay_logits.detach().abs() > self.quadratic_logit_cap.cap
-                    )
-                    .to(dtype=torch.float32)
-                    .mean(),
+                        cap_fraction_outside
+                    ),
                 }
             )
         if total_loss.ndim != 0 or total_loss.device.type != "cuda":

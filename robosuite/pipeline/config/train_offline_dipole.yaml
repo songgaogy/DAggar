@@ -5,6 +5,9 @@ defaults:
   - train_dipole_rl
   - _self_
 
+env:
+  environment: "PickPlaceCereal"
+
 offline:
   data_root: "/home/dodo/Documents/DAggar/robosuite/data"
   # Collected episodes; null -> data/<task>/offline_data/offline_episodes.pt.
@@ -32,9 +35,12 @@ offline:
   checkpoint_interval: 5000
   preencode_batch_size: 64
 
-  # Result saving: ./outputs/dipole-rl-offline/<task>_<timestamp>_<postfix>.
+  # Result saving: <pipeline_run>/dipole.
   run_root: "./outputs/dipole-rl-offline_vast"
   run_subfix: ""
+  # Explicit DIPOLE stage directory. null creates
+  # <run_root>/<task>_<timestamp>[_suffix]/dipole.
+  run_dir: null
 
   # Phase A joint VAST G+V finetune (continues from warmup_ckpt).
   skip_rl: false

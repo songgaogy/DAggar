@@ -108,8 +108,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=10.0,
-                        help="False-alarm budget %% for success_percentile calib: "
+    parser.add_argument("--delta", type=float, default=5.0,
+                        help="Success-frame false-alarm budget %% for "
+                             "success_percentile calibration (default: 5, P95): "
                              "tau = percentile(success-calib failure scores, 100 - delta).")
     parser.add_argument("--knn-chunk-size", type=int, default=2048)
     parser.add_argument("--knn-feature-source", type=str, default="transformer",

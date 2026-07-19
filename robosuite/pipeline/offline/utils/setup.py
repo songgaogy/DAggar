@@ -1,8 +1,7 @@
-"""Shared env + agent construction for the offline DIPOLE entries.
+"""Shared env + agent construction for the offline DIPOLE pipeline.
 
-Both the main offline run (``train_offline_dipole.build_offline_pipeline``) and
-the success-only SFT control (``legacy.train_success_only``) build the exact same
-thing before they diverge on data selection / critics:
+The main offline run (``train_offline_dipole.build_offline_pipeline``) uses
+these utilities to build:
 
 1. seed + CUDA matmul flags,
 2. a headless robosuite env (proprio only, no rendering) + proprio extractor,
@@ -11,10 +10,8 @@ thing before they diverge on data selection / critics:
 4. after each caller populates the replay buffer: flow normalizers (fit once) +
    a batch-size sanity check.
 
-Those steps used to be copy-pasted between the two entries; they now live here so
-the entries only contain what actually differs. The env is returned **open** —
-the caller may need the bound extractor to load HDF5 demos — and the caller owns
-closing it (typically in a ``finally``).
+The env is returned **open** because the caller may need the bound extractor to
+load HDF5 demos. The caller owns closing it (typically in a ``finally``).
 """
 
 from __future__ import annotations

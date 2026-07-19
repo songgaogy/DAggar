@@ -126,7 +126,7 @@ def test_cli_defaults_match_selected_health_config(monkeypatch: pytest.MonkeyPat
     assert args.max_success_per_task == 50
     assert args.train_max_success_per_task == 50
     assert args.train_max_fail_per_task == 50
-    assert args.delta == pytest.approx(10.0)
+    assert args.delta == pytest.approx(5.0)
     assert args.calib_fraction == pytest.approx(0.2)
     assert args.knn_transformer_layer == 1
     assert args.seed == 0
@@ -151,7 +151,7 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
     assert defaults["lr"] == pytest.approx(3e-4)
     assert defaults["weight_decay"] == pytest.approx(1e-4)
     assert defaults["batch_size"] == 512
-    assert defaults["delta"] == pytest.approx(10.0)
+    assert defaults["delta"] == pytest.approx(5.0)
     assert defaults["calib_fraction"] == pytest.approx(0.2)
     assert defaults["transformer_layer"] == 1
     assert defaults["seed"] == 0
@@ -166,6 +166,7 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
     assert fit_defaults["loss_surrogate"] == "logistic"
     assert fit_defaults["quadratic_cap_c"] == pytest.approx(2.0)
     assert fit_defaults["quadratic_cap_lambda"] == pytest.approx(1e-2)
+    assert fit_defaults["delta"] == pytest.approx(5.0)
     assert inspect.signature(pu_risk).parameters["surrogate"].default == "logistic"
 
     launcher = Path(
@@ -176,8 +177,16 @@ def test_adapter_and_launcher_defaults_match_selected_health_config() -> None:
         'SCHEDULER_HORIZON_EPOCHS="${SCHEDULER_HORIZON_EPOCHS:-20}"',
         'QUADRATIC_CAP_C="${QUADRATIC_CAP_C:-2.0}"',
         'QUADRATIC_CAP_LAMBDA="${QUADRATIC_CAP_LAMBDA:-1e-2}"',
+        'DELTA="${DELTA:-2.0}"',
     ):
         assert expected in launcher
+
+    visualizer_launcher = Path(
+        "robosuite/discriminator/dyn_disc/scripts/visualize_pu_bce_robosuite.sh"
+    ).read_text()
+    # Load-only viz reads delta/threshold from the checkpoint, not the launcher.
+    assert "DELTA=" not in visualizer_launcher
+    assert "--delta" not in visualizer_launcher
 
 
 def test_cli_accepts_explicit_chunk_mode(monkeypatch: pytest.MonkeyPatch) -> None:

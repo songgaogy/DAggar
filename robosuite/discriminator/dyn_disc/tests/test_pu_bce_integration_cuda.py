@@ -14,6 +14,9 @@ from robosuite.discriminator.dyn_disc.adapters.pu_bce import (
     PUBCEBenchmarkDiscriminator,
 )
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
+from robosuite.discriminator.dyn_disc.visualization.visualize_pu_bce import (
+    _bootstrap_from_ckpt,
+)
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
 
 
@@ -93,6 +96,26 @@ def test_adapter_saves_one_canonical_checkpoint_with_selected_config(
     assert payload["quadratic_cap_c"] == pytest.approx(2.0)
     assert payload["quadratic_cap_lambda"] == pytest.approx(1e-2)
     assert payload["scheduler_horizon_epochs"] == 20
+
+
+@pytest.mark.parametrize("checkpoint_delta", [5.0, 10.0])
+def test_load_only_bootstrap_uses_checkpoint_calibration_metadata(
+    tmp_path: Path,
+    checkpoint_delta: float,
+) -> None:
+    device = _cuda()
+    detector = _detector(device, center=0.0)
+    detector._delta = checkpoint_delta
+    adapter = _adapter_shell(tmp_path, detector, device)
+    adapter.delta = checkpoint_delta
+    checkpoint = adapter._save_checkpoint()
+
+    adapter.delta = 99.0
+    _bootstrap_from_ckpt(adapter, str(checkpoint))
+
+    assert adapter.delta == pytest.approx(checkpoint_delta)
+    assert adapter._shared_detector is not None
+    assert adapter._shared_detector.thresholds["Task"] == pytest.approx(0.25)
 
 
 def test_tensorboard_callbacks_write_train_and_benchmark_events(

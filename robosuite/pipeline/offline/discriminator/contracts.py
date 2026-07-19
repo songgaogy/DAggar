@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -54,14 +54,37 @@ def resolved_config_dict(cfg: DictConfig) -> dict[str, Any]:
     return resolved
 
 
+def _task_trajectory_ids(
+    raw: Any,
+    *,
+    task_name: str,
+    field_name: str,
+) -> list[str]:
+    values = raw.get(task_name) if isinstance(raw, Mapping) else raw
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError(
+            f"{field_name} must contain a trajectory ID sequence for task "
+            f"{task_name!r}."
+        )
+    result = [str(value) for value in values]
+    if not isinstance(raw, Mapping):
+        task_prefix = f"{task_name}/"
+        task_values = [value for value in result if value.startswith(task_prefix)]
+        if task_values:
+            result = task_values
+    if not result:
+        raise ValueError(f"{field_name} is empty for task {task_name!r}.")
+    if len(result) != len(set(result)):
+        raise ValueError(f"{field_name} contains duplicate trajectory IDs.")
+    return result
+
+
 def validate_finetune_contract(
     task_name: str,
-    parent_checkpoint: Path,
     parent_payload: Mapping[str, Any],
     pretrain_manifest: Mapping[str, Any],
     offline_payload: Mapping[str, Any],
     encoder: Any,
-    require_parent_checksum_match: bool = True,
 ) -> None:
     manifest_task = str(pretrain_manifest.get("task", ""))
     if manifest_task != task_name:
@@ -75,18 +98,42 @@ def validate_finetune_contract(
             f"Offline data task mismatch: expected {task_name!r}, got {offline_task!r}."
         )
 
-    if require_parent_checksum_match:
-        manifest_checkpoint = dict(pretrain_manifest.get("checkpoint", {}))
-        expected_sha = str(manifest_checkpoint.get("sha256", ""))
-        actual_sha = sha256_file(parent_checkpoint)
-        if not expected_sha or expected_sha != actual_sha:
+    manifest_checkpoint = dict(pretrain_manifest.get("checkpoint", {}))
+
+    manifest_ids = dict(pretrain_manifest.get("trajectory_ids", {}))
+    id_contract = (
+        (
+            "positive_train",
+            manifest_ids.get("positive_train"),
+            parent_payload.get("success_train_video_ids"),
+        ),
+        (
+            "positive_calib",
+            manifest_ids.get("positive_calib"),
+            parent_payload.get("success_calib_video_ids"),
+        ),
+        (
+            "unlabeled_train",
+            manifest_ids.get("unlabeled_train"),
+            parent_payload.get("unlabeled_fail_video_ids"),
+        ),
+    )
+    for pool_name, manifest_values, checkpoint_values in id_contract:
+        manifest_pool_ids = _task_trajectory_ids(
+            manifest_values,
+            task_name=task_name,
+            field_name=f"pretrain manifest trajectory_ids.{pool_name}",
+        )
+        checkpoint_pool_ids = _task_trajectory_ids(
+            checkpoint_values,
+            task_name=task_name,
+            field_name=f"parent checkpoint {pool_name} trajectory IDs",
+        )
+        if manifest_pool_ids != checkpoint_pool_ids:
             raise ValueError(
-                "Pretrain manifest was not extracted from the selected parent nnPU "
-                f"checkpoint: manifest_sha256={expected_sha!r}, "
-                f"checkpoint_sha256={actual_sha!r}."
+                f"Pretrain manifest {pool_name} trajectory IDs differ from the "
+                f"parent checkpoint for task {task_name!r}."
             )
-    else:
-        manifest_checkpoint = dict(pretrain_manifest.get("checkpoint", {}))
 
     expected_model_sha = str(manifest_checkpoint.get("model_ckpt_sha256", ""))
     actual_model_sha = sha256_file(encoder.encoder_checkpoint)

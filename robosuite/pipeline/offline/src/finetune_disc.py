@@ -55,7 +55,7 @@ SEPARATE_GT_FINETUNE_METHOD = "nnpu_replay_separate_gt_risks"
 LEGACY_FINETUNE_METHOD = "nnpu_replay_gt_bce"
 
 
-@hydra.main(version_base="1.2", config_path="../../config", config_name="finetune_disc")
+@hydra.main(version_base="1.2", config_path="../../config", config_name="discriminator")
 def main(cfg: DictConfig) -> None:
     """Encode named pools, warm-start the nnPU head, and recalibrate it."""
     if bool(OmegaConf.select(cfg, "logging.use_wandb", default=False)):
@@ -78,8 +78,15 @@ def main(cfg: DictConfig) -> None:
         name="algorithm.discriminator.checkpoint",
     )
     if parent_checkpoint is None:
+        parent_checkpoint = optional_file(
+            finetune_cfg.parent_checkpoint,
+            name="offline.discriminator_finetune.parent_checkpoint",
+        )
+    if parent_checkpoint is None:
         raise ValueError(
-            "algorithm.discriminator.checkpoint is required; Step 3 supports "
+            "A parent discriminator checkpoint is required via "
+            "algorithm.discriminator.checkpoint or "
+            "offline.discriminator_finetune.parent_checkpoint; Step 3 supports "
             "warm-start finetuning only."
         )
     encoder_checkpoint = optional_file(
@@ -218,12 +225,10 @@ def main(cfg: DictConfig) -> None:
         )
     validate_finetune_contract(
         task_name=task_name,
-        parent_checkpoint=parent_checkpoint,
         parent_payload=parent_payload,
         pretrain_manifest=pretrain_manifest,
         offline_payload=offline_payload,
         encoder=encoder,
-        require_parent_checksum_match=True,
     )
 
     segments, segment_stats = split_policy_segments(offline_payload)
@@ -405,16 +410,34 @@ def main(cfg: DictConfig) -> None:
     }
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = safe_run_suffix(finetune_cfg.run_subfix)
-    directory_name = (
-        f"{task_name}_{timestamp}_{suffix}" if suffix else f"{task_name}_{timestamp}"
+    explicit_run_dir = OmegaConf.select(
+        cfg, "offline.discriminator_finetune.run_dir", default=None
     )
-    run_root = Path(to_absolute_path(str(finetune_cfg.run_root))).resolve()
-    run_dir = run_root / directory_name
+    if explicit_run_dir is None or str(explicit_run_dir).strip().lower() in {
+        "",
+        "none",
+        "null",
+    }:
+        suffix = safe_run_suffix(finetune_cfg.run_subfix)
+        directory_name = (
+            f"{task_name}_{timestamp}_{suffix}" if suffix else f"{task_name}_{timestamp}"
+        )
+        run_root = Path(to_absolute_path(str(finetune_cfg.run_root))).resolve()
+        pipeline_run_dir = run_root / directory_name
+        run_dir = pipeline_run_dir / "discriminator"
+        if pipeline_run_dir.exists():
+            raise FileExistsError(
+                f"Finetune pipeline directory already exists: {pipeline_run_dir}"
+            )
+    else:
+        run_dir = Path(to_absolute_path(str(explicit_run_dir))).resolve()
+        pipeline_run_dir = run_dir.parent
     if run_dir.exists():
         raise FileExistsError(f"Finetune run directory already exists: {run_dir}")
     (run_dir / "checkpoints").mkdir(parents=True)
     run_name = f"{task_name}__discriminator_finetune__{timestamp}"
+    print(f"[robosuite][pu_bce] pipeline_run_dir={pipeline_run_dir}", flush=True)
+    print(f"[robosuite][pu_bce] stage_run_dir={run_dir}", flush=True)
     write_resolved_config(cfg, run_dir)
     metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
 
@@ -596,6 +619,8 @@ def main(cfg: DictConfig) -> None:
         run_info = {
             "run_name": run_name,
             "run_dir": str(run_dir),
+            "pipeline_run_dir": str(pipeline_run_dir),
+            "stage_run_dir": str(run_dir),
             "started_at": timestamp,
             "task_name": task_name,
             "output_checkpoint": str(output_checkpoint),

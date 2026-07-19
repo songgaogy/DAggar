@@ -18,7 +18,7 @@ from robosuite.discriminator.dyn_disc.visualization.visualize_pu_bce import (
     _parse_camera_to_view,
 )
 from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
-from robosuite.pipeline.offline.discriminator.test_finetuned import (
+from robosuite.pipeline.offline.discriminator.gt_fail_evaluation import (
     build_gt_fail_training_report,
     build_not_applicable_report,
 )
@@ -78,7 +78,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=10.0)
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=5.0,
+        help=(
+            "Fallback delta for checkpoints without calibration metadata. "
+            "Stored checkpoint delta and threshold take precedence."
+        ),
+    )
     parser.add_argument(
         "--feature-source", default="transformer", choices=["encoder", "transformer"]
     )

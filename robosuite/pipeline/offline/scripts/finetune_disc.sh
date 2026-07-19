@@ -15,7 +15,7 @@ export PYTHONFAULTHANDLER=1
 
 # -----------------------------------------------------------------------
 TASK="${TASK:-PickPlaceCereal}"
-NNPU_CKPT="${NNPU_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2/run_20260717_121451_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
+NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260719_204315_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 NNPU_ENCODER_CKPT="${NNPU_ENCODER_CKPT:-checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth}"
 NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"
 # -----------------------------------------------------------------------
@@ -23,7 +23,7 @@ NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"
 OFFLINE_EPISODES="${OFFLINE_EPISODES:-data/${TASK}/offline_data/offline_episodes.pt}"
 PRETRAIN_DIR="${PRETRAIN_DIR:-data/${TASK}/discriminator-pretrain-quadratic-c2-l1e2-v2}"
 
-RUN_ROOT="${RUN_ROOT:-./outputs/discriminator-finetune}"
+RUN_ROOT="${RUN_ROOT:-./outputs/dipole-rl-offline_vast}"
 RUN_SUBFIX="${RUN_SUBFIX:-}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-tensorboard}"
 
@@ -48,6 +48,25 @@ if [[ ! -f "${PRETRAIN_DIR}/manifest.json" ]]; then
   echo "[ERROR] PRETRAIN_DIR must contain manifest.json: ${PRETRAIN_DIR}" >&2
   exit 1
 fi
+if [[ -n "${RUN_SUBFIX}" && ! "${RUN_SUBFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  echo "[ERROR] RUN_SUBFIX may contain only letters, digits, underscore, dot, and dash." >&2
+  exit 1
+fi
+
+mkdir -p "${RUN_ROOT}"
+RUN_ROOT="$(realpath "${RUN_ROOT}")"
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+PIPELINE_NAME="${TASK}_${TIMESTAMP}"
+if [[ -n "${RUN_SUBFIX}" ]]; then
+  PIPELINE_NAME="${PIPELINE_NAME}_${RUN_SUBFIX}"
+fi
+PIPELINE_RUN_DIR="${RUN_ROOT}/${PIPELINE_NAME}"
+STAGE_RUN_DIR="${PIPELINE_RUN_DIR}/discriminator"
+if [[ -e "${PIPELINE_RUN_DIR}" ]]; then
+  echo "[ERROR] Pipeline run directory already exists: ${PIPELINE_RUN_DIR}" >&2
+  exit 1
+fi
+mkdir -p "${PIPELINE_RUN_DIR}"
 
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
@@ -60,6 +79,7 @@ HYDRA_OVERRIDES=(
   "offline.discriminator_finetune.pretrain_dir=${PRETRAIN_DIR}"
   "offline.discriminator_finetune.run_root=${RUN_ROOT}"
   "offline.discriminator_finetune.run_subfix=${RUN_SUBFIX}"
+  "offline.discriminator_finetune.run_dir=${STAGE_RUN_DIR}"
   "logging.tensorboard_dir=${TENSORBOARD_DIR}"
   "logging.use_tensorboard=true"
   "logging.use_wandb=false"
@@ -67,7 +87,7 @@ HYDRA_OVERRIDES=(
 )
 HYDRA_OVERRIDES+=("algorithm.discriminator.checkpoint=${NNPU_CKPT}")
 
-# Keep finetune_disc.yaml as the source of truth for training defaults. These
+# Keep discriminator.yaml as the source of truth for training defaults. These
 # environment variables only take effect when the caller explicitly sets them.
 append_optional_override() {
   local env_name="$1"
@@ -113,8 +133,9 @@ fi
 echo "[robosuite][pu_bce] task=${TASK} device=${DEVICE} seed=${SEED:-<yaml>}"
 echo "[robosuite][pu_bce] parent_ckpt=${NNPU_CKPT} mode=warm_start"
 echo "[robosuite][pu_bce] episodes=${OFFLINE_EPISODES} pretrain_dir=${PRETRAIN_DIR}"
-echo "[robosuite][pu_bce] training defaults=finetune_disc.yaml (explicit environment overrides are preserved)"
-echo "[robosuite][pu_bce] run_root=${RUN_ROOT} run_subfix=${RUN_SUBFIX:-<none>}"
+echo "[robosuite][pu_bce] training defaults=discriminator.yaml (explicit environment overrides are preserved)"
+echo "[robosuite][pu_bce] pipeline_run_dir=${PIPELINE_RUN_DIR}"
+echo "[robosuite][pu_bce] stage_run_dir=${STAGE_RUN_DIR}"
 
 "${PY}" -m robosuite.pipeline.offline.src.finetune_disc \
   "${HYDRA_OVERRIDES[@]}" \

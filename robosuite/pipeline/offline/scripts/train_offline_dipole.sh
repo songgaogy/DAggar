@@ -8,7 +8,6 @@ export CUDA_VISIBLE_DEVICES=1
 # -------------------------------------
 TASK="PickPlaceCereal"
 POLICY_CKPT="checkpoints/multitask_6/flow_multi_ep0100.pt"
-NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 VAST_CKPT="outputs/dipole_rl-vast/tau0p7_en5/PickPlaceCereal/vast_state.pt"
 VAST_V_MODE="indep_ensemble"
 EXPECTILE_TAU=0.7
@@ -41,6 +40,26 @@ G_LR="${G_LR:-1.0e-4}"
 V_LR="${V_LR:-1.0e-4}"
 OUTPUT_REWARD_COEF="${OUTPUT_REWARD_COEF:-1}"
 DISC_REWARD_COEF="${DISC_REWARD_COEF:-0}"
+
+if [[ -z "${PIPELINE_RUN_DIR:-}" ]]; then
+  echo "[ERROR] PIPELINE_RUN_DIR is required." >&2
+  exit 1
+fi
+if [[ ! -d "${PIPELINE_RUN_DIR}" ]]; then
+  echo "[ERROR] PIPELINE_RUN_DIR does not exist: ${PIPELINE_RUN_DIR}" >&2
+  exit 1
+fi
+PIPELINE_RUN_DIR="$(realpath "${PIPELINE_RUN_DIR}")"
+NNPU_CKPT="${PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth"
+STAGE_RUN_DIR="${PIPELINE_RUN_DIR}/dipole"
+if [[ ! -f "${NNPU_CKPT}" ]]; then
+  echo "[ERROR] Finetuned discriminator checkpoint does not exist: ${NNPU_CKPT}" >&2
+  exit 1
+fi
+if [[ -e "${STAGE_RUN_DIR}" ]]; then
+  echo "[ERROR] DIPOLE stage directory already exists: ${STAGE_RUN_DIR}" >&2
+  exit 1
+fi
 
 if [[ "${ADVANTAGE_ESTIMATOR}" != "gae" && "${ADVANTAGE_ESTIMATOR}" != "td1" ]]; then
   echo "[ERROR] ADVANTAGE_ESTIMATOR must be gae or td1, got ${ADVANTAGE_ESTIMATOR}." >&2
@@ -85,6 +104,7 @@ HYDRA_OVERRIDES=(
   "offline.branch_weight.k=${BRANCH_K}"
   "offline.use_online_success=${USE_ONLINE_SUCCESS}"  # always: pure success rollouts -> pos_only
   "offline.run_subfix=${RUN_SUBFIX}"
+  "offline.run_dir=${STAGE_RUN_DIR}"
   "offline.skip_rl=${SKIP_RL}"
 )
 if [[ "${SKIP_RL}" == "1" || "${SKIP_RL}" == "true" ]]; then
@@ -97,6 +117,8 @@ fi
 HYDRA_OVERRIDES+=("${HYDRA_DISABLE_LOG_OVERRIDES[@]}")
 
 echo "[train_offline_dipole] task=${TASK} device=${DEVICE} seed=${SEED} policy_steps=${NUM_TRAIN_STEPS} vast_finetune_steps=${VAST_FINETUNE_STEPS}"
+echo "[train_offline_dipole] pipeline_run_dir=${PIPELINE_RUN_DIR}"
+echo "[train_offline_dipole] stage_run_dir=${STAGE_RUN_DIR}"
 echo "[train_offline_dipole] vast_batch=${VAST_BATCH_SIZE} policy_batch=${POLICY_BATCH_SIZE}"
 echo "[train_offline_dipole] algorithm=vast_value_stitching_adaptation v_mode=${VAST_V_MODE} K=${VAST_MAX_K} comp_coef=${VAST_COMP_COEF} expectile_tau=${EXPECTILE_TAU} sampling_seed=${VAST_SAMPLING_SEED}"
 echo "[train_offline_dipole] reward: output_coef=${OUTPUT_REWARD_COEF} disc_coef=${DISC_REWARD_COEF}"

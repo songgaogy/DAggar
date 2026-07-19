@@ -58,7 +58,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=10.0)
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=5.0,
+        help=(
+            "Fallback delta for checkpoints without calibration metadata. "
+            "Stored checkpoint delta and threshold take precedence."
+        ),
+    )
     parser.add_argument(
         "--feature-source",
         default="transformer",

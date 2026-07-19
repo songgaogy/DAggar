@@ -39,6 +39,11 @@ pred_fail = failure_score >= tau_task
 tau_task = percentile(success_calibration_failure_scores, 100 - delta)
 ```
 
+The nnPU default is `delta=5`, so newly trained checkpoints use the P95 of
+held-out success-calibration frame scores. Load-only visualization always uses
+the threshold and delta stored in the checkpoint; legacy `delta=10` checkpoints
+therefore retain their original P90 calibration.
+
 Ground-truth failure segments may be displayed for inspection, but they are not
 used to fit the nnPU head or calibrate the threshold.
 

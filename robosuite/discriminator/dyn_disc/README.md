@@ -36,7 +36,7 @@ The sole production default is the healthy five-task selection reported in
 | Head | `512 x 3` |
 | AdamW learning rate / weight decay | `3e-4` / `1e-4` |
 | Batch size | `512` |
-| Threshold false-alarm budget `delta` | `10` |
+| Threshold false-alarm budget `delta` | `5` (success-calibration frame P95) |
 | Calibration fraction | `0.2` |
 | Feature / transformer layer | transformer / `1` |
 | Action chunk | enabled |

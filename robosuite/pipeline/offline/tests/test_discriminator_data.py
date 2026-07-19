@@ -298,7 +298,7 @@ def test_parent_nnpu_semantics_are_strictly_inherited() -> None:
         {
             "pu_bce_detector": {
                 "pi_p": 0.3,
-                "delta": 10.0,
+                "delta": 5.0,
                 "loss_surrogate": "logistic",
             },
             "nn_correction": True,
@@ -311,7 +311,7 @@ def test_parent_nnpu_semantics_are_strictly_inherited() -> None:
         "loss_surrogate": "logistic",
         "nn_correction": True,
         "beta": 0.0,
-        "delta": 10.0,
+        "delta": 5.0,
     }
 
 

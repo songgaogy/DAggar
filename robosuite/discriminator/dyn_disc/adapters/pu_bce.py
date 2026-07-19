@@ -106,7 +106,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         visual_weight: float = 1.0,
         proprio_weight: float = 2.0,
         action_weight: float = 1.0,
-        delta: float = 10.0,
+        delta: float = 5.0,
         knn_chunk_size: int = 2048,
         feature_source: str = "transformer",
         transformer_layer: int = 1,

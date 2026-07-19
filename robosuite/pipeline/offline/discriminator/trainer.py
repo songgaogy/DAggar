@@ -118,6 +118,9 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
                 "quadratic_cap_lambda": float(
                     getattr(self, "_quadratic_cap_lambda", 0.0)
                 ),
+                "quadratic_cap_scope": getattr(
+                    self, "_quadratic_cap_scope", "nnpu_replay"
+                ),
             }
         )
         return state
@@ -129,6 +132,10 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
             dict(raw_normalization)
             if isinstance(raw_normalization, Mapping)
             else {"enabled": False, "folded": False}
+        )
+        raw_cap_scope = state.get("quadratic_cap_scope", "nnpu_replay")
+        self._quadratic_cap_scope = (
+            None if raw_cap_scope is None else str(raw_cap_scope)
         )
 
     def _calibrate_success_thresholds(
@@ -278,7 +285,7 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
         scheduler_horizon_epochs: int = 20,
         lr: float = 3e-5,
         weight_decay: float = 1e-4,
-        delta: float = 10.0,
+        delta: float = 5.0,
         seed: int = 0,
         loss_surrogate: str = "logistic",
         nn_correction: bool = True,
@@ -386,9 +393,11 @@ class PUBCEDiscriminatorFT(PUBCEDiscriminator):
             self._quadratic_cap_lambda = (
                 float(cap_config.weight) if cap_config.enabled else 0.0
             )
+            self._quadratic_cap_scope = str(cap_config.scope)
         else:
             self._quadratic_cap_c = None
             self._quadratic_cap_lambda = 0.0
+            self._quadratic_cap_scope = None
         steps_per_epoch = int(objective.steps_per_epoch)
         optimizer = torch.optim.AdamW(
             self.head.parameters(),

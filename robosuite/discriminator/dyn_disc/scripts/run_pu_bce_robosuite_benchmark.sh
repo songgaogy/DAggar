@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
@@ -61,7 +61,7 @@ QUADRATIC_CAP_LAMBDA="${QUADRATIC_CAP_LAMBDA:-1e-2}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUT_DIR}/tensorboard}"
@@ -69,7 +69,7 @@ mkdir -p "${OUT_DIR}"
 
 DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
-DELTA="${DELTA:-10.0}"
+DELTA="${DELTA:-2.0}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
 

@@ -18,7 +18,7 @@ intervention (``route="neg_only"`` → negative branch). Precompute chunk-MDP
 GAE from the frozen VAST ``V/target_V`` values, then train the two flow policies
 with the existing routed branch-weight policy. TD1 remains an explicit ablation.
 
-Run dir: ``./outputs/dipole-rl-offline/<task>_<timestamp>_<postfix>`` with tensorboard.
+Run dir: ``<pipeline_run>/dipole`` with TensorBoard.
 
     python -m robosuite.pipeline.offline.src.train_offline_dipole \\
         env.environment=PickPlaceCereal \\
@@ -453,18 +453,47 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ #
     # Run directory + logging.                                           #
     # ------------------------------------------------------------------ #
-    run_root = Path(
-        to_absolute_path(
-            str(OmegaConf.select(cfg, "offline.run_root", default="./outputs/dipole-rl-offline"))
-        )
-    )
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    postfix = str(OmegaConf.select(cfg, "offline.run_subfix", default="") or "").strip()
-    dir_name = f"{task_name}_{timestamp}_{postfix}" if postfix else f"{task_name}_{timestamp}"
-    run_dir = run_root / dir_name
-    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    explicit_run_dir = OmegaConf.select(cfg, "offline.run_dir", default=None)
+    if explicit_run_dir is None or str(explicit_run_dir).strip().lower() in {
+        "",
+        "none",
+        "null",
+    }:
+        run_root = Path(
+            to_absolute_path(
+                str(
+                    OmegaConf.select(
+                        cfg,
+                        "offline.run_root",
+                        default="./outputs/dipole-rl-offline_vast",
+                    )
+                )
+            )
+        ).resolve()
+        postfix = str(
+            OmegaConf.select(cfg, "offline.run_subfix", default="") or ""
+        ).strip()
+        dir_name = (
+            f"{task_name}_{timestamp}_{postfix}"
+            if postfix
+            else f"{task_name}_{timestamp}"
+        )
+        pipeline_run_dir = run_root / dir_name
+        run_dir = pipeline_run_dir / "dipole"
+        if pipeline_run_dir.exists():
+            raise FileExistsError(
+                f"Offline DIPOLE pipeline directory already exists: {pipeline_run_dir}"
+            )
+    else:
+        run_dir = Path(to_absolute_path(str(explicit_run_dir))).resolve()
+        pipeline_run_dir = run_dir.parent
+    if run_dir.exists():
+        raise FileExistsError(f"Offline DIPOLE stage directory already exists: {run_dir}")
+    (run_dir / "checkpoints").mkdir(parents=True)
     run_name = f"{task_name}__offline_dipole__{timestamp}"
-    print(f"[offline] run_dir={run_dir}")
+    print(f"[offline] pipeline_run_dir={pipeline_run_dir}")
+    print(f"[offline] stage_run_dir={run_dir}")
 
     metric_logger = maybe_build_metric_logger(cfg, run_name=run_name, run_dir=run_dir)
     write_resolved_config(cfg, run_dir)
@@ -628,6 +657,8 @@ def main(cfg: DictConfig) -> None:
         {
             "run_name": run_name,
             "run_dir": str(run_dir),
+            "pipeline_run_dir": str(pipeline_run_dir),
+            "stage_run_dir": str(run_dir),
             "started_at": timestamp,
             "task_name": task_name,
             "policy_camera_names": camera_names,

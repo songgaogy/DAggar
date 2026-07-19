@@ -569,6 +569,8 @@ def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> N
         raise RuntimeError(
             f"PU-BCE checkpoint at {ckpt_path} has no per-task thresholds; cannot score."
         )
+    if detector._delta is not None:
+        disc.delta = float(detector._delta)
 
     disc._shared_detector = detector
     disc._detectors_per_task = {task: detector for task in detector.thresholds}
@@ -645,7 +647,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-weight", type=float, default=1.0)
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=10.0)
+    parser.add_argument(
+        "--delta",
+        type=float,
+        default=5.0,
+        help=(
+            "Fallback delta for checkpoints without calibration metadata. "
+            "Stored checkpoint delta and threshold take precedence."
+        ),
+    )
     parser.add_argument(
         "--feature-source",
         default="transformer",

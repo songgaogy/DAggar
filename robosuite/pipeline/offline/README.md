@@ -1,6 +1,6 @@
 # Offline DIPOLE with VAST Value Stitching
 
-Offline DIPOLE has three stages: collect fixed-policy episodes, finetune the VAST G/V learner, then train the existing dual-branch DIPOLE policy with GAE computed from the finetuned VAST V / target-V pair. The nnPU discriminator and shared dynamics encoder remain frozen inside Offline DIPOLE. A separate, optional nnPU warm-start workflow updates the discriminator before it is supplied to another run; it is not invoked by `train_offline_dipole.sh`.
+Offline DIPOLE has four stages: collect fixed-policy episodes, finetune the nnPU discriminator, finetune the VAST G/V learner, then train the existing dual-branch DIPOLE policy with GAE computed from the finetuned VAST V / target-V pair. The finetuned nnPU discriminator and shared dynamics encoder remain frozen inside Offline DIPOLE. The discriminator and DIPOLE stages share one pipeline run directory, while their artifacts remain isolated in stage subdirectories.
 
 ## Prerequisite: VAST warmup
 
@@ -12,7 +12,7 @@ Run `scripts/utils/init_vast.sh` before offline training. It produces a schema-v
 
 ## Independent nnPU discriminator update
 
-The discriminator update is a standalone CUDA-only workflow. It freezes the dynamics encoder, uses the checkpoint-selected transformer layer and action chunk contract, and continues optimizing the existing nnPU head weights. It never initializes a replacement head.
+The discriminator update is a CUDA-only workflow that starts a pipeline run. It freezes the dynamics encoder, uses the checkpoint-selected transformer layer and action chunk contract, and continues optimizing the existing nnPU head weights. It never initializes a replacement head.
 
 ### Extract the original pretrain pools
 
@@ -24,7 +24,7 @@ TASK=PickPlaceCereal \
 bash robosuite/discriminator/dyn_disc/scripts/extract_pretrain_data.sh
 ```
 
-The v2 default output is `data/<task>/discriminator-pretrain-quadratic-c2-l1e2-v2/{manifest.json,positive_train/,positive_calib/,unlabeled_train/}`. Each atomic `.pt` shard stores float32 latents, frame indices, and provenance; the manifest pins the parent discriminator, dynamics model, and saved normalizer by SHA-256. Existing output is rejected unless overwrite is explicitly requested.
+The v2 default output is `data/<task>/discriminator-pretrain-quadratic-c2-l1e2-v2/{manifest.json,positive_train/,positive_calib/,unlabeled_train/}`. Each atomic `.pt` shard stores float32 latents, frame indices, and provenance. Cache reuse requires exact dynamics-model and normalizer SHA-256 values, feature contract, and ordered positive-train, positive-calibration, and unlabeled trajectory IDs. The source parent discriminator SHA-256 remains recorded for provenance but is not part of cache identity, because nnPU head weights and percentile thresholds do not affect frozen dynamics latents. Existing output is rejected unless overwrite is explicitly requested.
 
 ### Warm-start finetuning
 
@@ -40,15 +40,15 @@ TASK=PickPlaceCereal \
 bash robosuite/pipeline/offline/scripts/finetune_disc.sh
 ```
 
-The standalone Hydra config is `pipeline/config/finetune_disc.yaml`. Launcher environment variables expose the parent checkpoint and optional encoder override, CUDA device, input paths, schedule, seed, run root/suffix, logging interval, `LAMBDA_PRE`, `LAMBDA_P`, `LAMBDA_N`, and the two GT batch sizes. `G_NORMALIZATION_ENABLED` toggles the fixed held-out-success normalization. Quadratic-cap controls are exposed as `QUADRATIC_CAP_ENABLED`, `QUADRATIC_CAP_C`, and `QUADRATIC_CAP_LAMBDA`. Defaults are AdamW for 10 epochs with a 20-epoch cosine horizon, learning rate `1e-5`, weight decay `1e-4`, seed `0`, normalization enabled, and weights `lambda_pre=0.5`, `lambda_P=0.1`, `lambda_N=0.00625`. TensorBoard is the only experiment logger.
+The standalone Hydra config is `pipeline/config/discriminator.yaml`. Launcher environment variables expose the parent checkpoint and optional encoder override, CUDA device, input paths, schedule, seed, run root/suffix, logging interval, `LAMBDA_PRE`, `LAMBDA_P`, `LAMBDA_N`, and the two GT batch sizes. `G_NORMALIZATION_ENABLED` toggles the fixed held-out-success normalization. Quadratic-cap controls are exposed as `QUADRATIC_CAP_ENABLED`, `QUADRATIC_CAP_C`, and `QUADRATIC_CAP_LAMBDA`. Defaults are AdamW for 20 epochs with a 20-epoch cosine horizon, learning rate `1e-5`, weight decay `1e-4`, seed `0`, normalization enabled, and weights `lambda_pre=0.1`, `lambda_P=0.2`, `lambda_N=0.01`. TensorBoard is the only experiment logger.
 
-The objective uses three independently sampled risks: `lambda_pre * L_pre-nnPU + lambda_P * softplus(-g_P) + lambda_N * softplus(g_N)`, plus the v2 quadratic replay regularizer `0.01 * mean(relu(abs(g_pre)-2)^2)`. The cap sees only concatenated pretrain positive and unlabeled logits. With normalization enabled, all three risks and the cap use `g'=(g-m)/s`, where `m=-tau_parent` and `s=(Q75-Q25)/1.349` are computed once from the held-out `positive_calib` trajectories on CUDA. The transform is fixed during optimization, folded into the head before saving, and the final threshold is recalibrated on the same held-out pool. Pretrain replay draws 256 frames from each P/U pool; the offline positive and GT-negative terms each draw 256 frames. Offline success frames never enter the replay nnPU risk. A multi-task shared head is rejected because every task requires its own held-out calibration contract.
+The objective uses three independently sampled risks: `lambda_pre * L_pre-nnPU + lambda_P * softplus(-g_P) + lambda_N * softplus(g_N)`, plus the v2 quadratic replay regularizer `0.01 * mean(relu(abs(g_pre)-2)^2)`. The cap sees only concatenated pretrain positive and unlabeled logits. With normalization enabled, all three risks and the cap use `g'=(g-m)/s`, where `m=-tau_parent` and `s=(Q75-Q25)/1.349` are computed once from the held-out `positive_calib` trajectories on CUDA. The transform is fixed during optimization, folded into the head before saving, and the final threshold is recalibrated on the same held-out pool. The pretrain replay batch contains 128 positive and 128 unlabeled frames; the offline-positive and GT-negative terms each draw 128 frames. Offline success frames never enter the replay nnPU risk. A multi-task shared head is rejected because every task requires its own held-out calibration contract.
 
 The default weights were selected from the PickPlaceCereal seed-0 sweep because they improved the main validation metrics while satisfying all three loss-stability checks. This is not a claim of cross-seed or cross-task generalization. The selected run's offline-success frame FAR was `0.01751`, above the v2 parent's `0.00246`; keep that known trade-off visible when using the defaults.
 
-Each run writes `outputs/discriminator-finetune/<task>_<timestamp>[_suffix]/` with:
+Each finetune launch creates `outputs/dipole-rl-offline_vast/<task>_<timestamp>[_suffix]/` and writes the discriminator stage under `discriminator/` with:
 
-- `checkpoints/pu_bce_head_finetuned.pth`, compatible with `FrozenNNPUDiscriminator`
+- `discriminator/checkpoints/pu_bce_head_finetuned.pth`, compatible with `FrozenNNPUDiscriminator`
 - `run_info.json` and `config_resolved.yaml`
 - TensorBoard events under `tensorboard/`
 
@@ -86,13 +86,14 @@ TASK=PickPlaceCereal \
 bash robosuite/pipeline/offline/scripts/eval_disc_finetuned.sh
 ```
 
-To regenerate only the sampled visualization bundle without rerunning the full quantitative evaluation, keep using the standalone launcher:
+To regenerate only the sampled visualization bundle without rerunning the full quantitative evaluation:
 
 ```bash
+RUN_EVAL=False \
 FINETUNED_CKPT=/path/to/pu_bce_head_finetuned.pth \
 MODEL_CKPT=/path/to/model_10.pth \
 TASK=PickPlaceCereal \
-bash robosuite/pipeline/offline/scripts/vis_disc_finetuned.sh
+bash robosuite/pipeline/offline/scripts/eval_disc_finetuned.sh
 ```
 
 ## Stage 2: offline training
@@ -116,14 +117,14 @@ w_neg   = 1 - w_pos
 
 Here `m_t=1-done_t`. The recursive future term is zero when no valid same-section `t+H` successor row exists. The recursion uses `lambda=0.6` by default. Human and negative routes keep their existing fixed branch semantics. Set the estimator explicitly to `td1` for the one-macro-step ablation. Stitched advantages remain available for VAST diagnostics but are not Phase-B weights.
 
-## Run
+## Run the DIPOLE stage
 
 ```bash
-POLICY_CKPT=/path/to/flow.pt \
-NNPU_CKPT=/path/to/pu_bce_head.pth \
-VAST_CKPT=/path/to/vast_state.pt \
+PIPELINE_RUN_DIR=/path/to/outputs/dipole-rl-offline_vast/PickPlaceCereal_<timestamp> \
 bash robosuite/pipeline/offline/scripts/train_offline_dipole.sh
 ```
+
+`PIPELINE_RUN_DIR` is required. The launcher reads only `${PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth`; it does not search for a latest run or fall back to the parent nnPU checkpoint. The DIPOLE stage writes to `${PIPELINE_RUN_DIR}/dipole/` and rejects an existing stage directory.
 
 Canonical launcher variables are `VAST_CKPT` and `VAST_FINETUNED`. Deprecated IQL-named variables are read-only aliases; providing both old and new forms is an error.
 
@@ -142,7 +143,23 @@ Key Hydra settings are:
 
 ## Outputs
 
-Each run writes:
+The complete pipeline layout is:
+
+```text
+<pipeline_run>/
+├── discriminator/
+│   ├── checkpoints/pu_bce_head_finetuned.pth
+│   ├── run_info.json
+│   ├── config_resolved.yaml
+│   └── tensorboard/
+└── dipole/
+    ├── checkpoints/
+    ├── run_info.json
+    ├── config_resolved.yaml
+    └── tensorboard/
+```
+
+The DIPOLE stage writes:
 
 - policy checkpoints under `checkpoints/`
 - `checkpoints/vast_state_finetuned.pt`
@@ -158,7 +175,7 @@ Use `offline/scripts/vis_vast_finetuned.sh` for a finetuned checkpoint. Each run
 
 Visualization is CUDA-only and accepts schema-v7/v8 checkpoints. Existing schema-v6 artifacts with legacy payload naming may be read through the explicit compatibility path, but all new outputs use VAST names.
 
-Use `offline/scripts/vis_disc_finetuned.sh` for the independent nnPU output, as described above. Both visualization launchers reject non-CUDA devices.
+Use `offline/scripts/eval_disc_finetuned.sh` with `RUN_EVAL=False` for the independent nnPU visualization bundle, as described above. Both visualization launchers reject non-CUDA devices.
 
 ## File map
 
@@ -167,8 +184,8 @@ offline/
 ├── scripts/
 │   ├── collect_data.sh
 │   ├── finetune_disc.sh
+│   ├── eval_disc_finetuned.sh
 │   ├── train_offline_dipole.sh
-│   ├── vis_disc_finetuned.sh
 │   └── vis_vast_finetuned.sh
 ├── src/
 │   ├── finetune_disc.py

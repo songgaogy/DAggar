@@ -15,7 +15,7 @@ from robosuite.pipeline.offline.src.eval_disc_checkpoint import (
     build_success_false_alarm_report,
     load_checkpoint_contract,
 )
-from robosuite.pipeline.offline.discriminator.test_finetuned import (
+from robosuite.pipeline.offline.discriminator.gt_fail_evaluation import (
     build_not_applicable_report,
 )
 from robosuite.pipeline.offline.visualization.disc_episodes import offline_trajectory

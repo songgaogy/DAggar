@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,13 +36,10 @@ from robosuite.pipeline.offline.discriminator.trainer import (
     compute_fixed_robust_normalizer,
     fold_fixed_logit_normalizer_,
 )
-from robosuite.pipeline.offline.discriminator.test_finetuned import (
+from robosuite.pipeline.offline.discriminator.gt_fail_evaluation import (
     score_summary_cuda,
     validate_rebuilt_gt_provenance,
 )
-
-
-POSITIVE_SAFETY_BOUNDARY = 1.25
 
 
 def _cuda() -> torch.device:
@@ -129,14 +127,10 @@ def _objective_config(batch_size: int = 8) -> dict[str, object]:
                 "positive_fraction": 0.5,
             },
             "gt_positive": {
-                "type": "positive_safety_margin",
+                "type": "positive_logistic",
                 "enabled": True,
                 "weight": 1.0,
                 "batch_size": batch_size // 2,
-                "safety_margin_weight": 1.0,
-                "margin_delta": 1.0,
-                "temperature": 1.0,
-                "boundary_source": "parent_checkpoint",
             },
             "gt_negative": {
                 "type": "negative_logistic",
@@ -222,6 +216,10 @@ def test_success_recalibration_uses_cuda_quantile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = _cuda()
+    default_delta = inspect.signature(PUBCEDiscriminatorFT.finetune).parameters[
+        "delta"
+    ].default
+    assert default_delta == pytest.approx(5.0)
     with torch.device(device):
         detector = PUBCEDiscriminatorFT(
             in_dim=6, hidden=8, num_layers=1, device=str(device)
@@ -240,12 +238,12 @@ def test_success_recalibration_uses_cuda_quantile(
     monkeypatch.setattr(torch, "quantile", recording_quantile)
     with torch.no_grad():
         expected = float(
-            original_quantile(-detector.head(calibration[0]), 0.9).item()
+            original_quantile(-detector.head(calibration[0]), 0.95).item()
         )
 
     thresholds = detector._calibrate_success_thresholds(  # noqa: SLF001
         {"Task": calibration},
-        delta=10.0,
+        delta=5.0,
         verbose=False,
     )
 
@@ -272,7 +270,6 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(),
-        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -290,10 +287,7 @@ def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
     assert logged[0]["data/pretrain_positive_frames"] == 24.0
     assert logged[0]["data/pretrain_unlabeled_frames"] == 24.0
     assert logged[0]["data/offline_gt_negative_frames"] == 24.0
-    assert logged[0]["safety/m_k"] == pytest.approx(POSITIVE_SAFETY_BOUNDARY)
-    assert logged[0]["safety/target_logit"] == pytest.approx(
-        POSITIVE_SAFETY_BOUNDARY + 1.0
-    )
+    assert "gt/positive_logistic" in logged[0]
 
 
 def test_log_interval_reports_running_mean() -> None:
@@ -312,7 +306,6 @@ def test_log_interval_reports_running_mean() -> None:
         feature_pools,
         {"Task": calibration},
         objective_config=config,
-        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=0.0,
@@ -347,7 +340,7 @@ def test_positive_logistic_needs_no_parent_boundary_and_uses_long_scheduler() ->
     }
     config["quadratic_logit_cap"] = {
         "enabled": True,
-        "scope": "nnpu_replay",
+        "scope": "all_terms",
         "cap": 2.0,
         "weight": 1.0e-2,
     }
@@ -402,7 +395,7 @@ def test_finetune_normalizes_all_terms_folds_once_and_round_trips_state() -> Non
     }
     config["quadratic_logit_cap"] = {
         "enabled": True,
-        "scope": "nnpu_replay",
+        "scope": "all_terms",
         "cap": 2.0,
         "weight": 1.0e-2,
     }
@@ -421,6 +414,7 @@ def test_finetune_normalizes_all_terms_folds_once_and_round_trips_state() -> Non
     )
 
     normalization = detector.state_dict()["logit_normalization"]
+    assert detector.state_dict()["quadratic_cap_scope"] == "all_terms"
     assert normalization["enabled"] is True
     assert normalization["folded"] is True
     assert normalization["center"] == pytest.approx(center)
@@ -436,8 +430,18 @@ def test_finetune_normalizes_all_terms_folds_once_and_round_trips_state() -> Non
         )
     restored.load_state_dict(detector.state_dict())
     assert restored.state_dict()["logit_normalization"] == normalization
+    assert restored.state_dict()["quadratic_cap_scope"] == "all_terms"
     with torch.no_grad():
         torch.testing.assert_close(restored.head(probe), folded)
+
+    legacy_state = detector.state_dict()
+    legacy_state.pop("quadratic_cap_scope")
+    with torch.device(device):
+        legacy_restored = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    legacy_restored.load_state_dict(legacy_state)
+    assert legacy_restored.state_dict()["quadratic_cap_scope"] == "nnpu_replay"
 
 
 def test_finetune_updates_head_and_checkpoint_remains_loadable(
@@ -469,7 +473,6 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         feature_pools,
         {"Task": calibration},
         objective_config=_objective_config(batch_size=10),
-        positive_safety_boundary=POSITIVE_SAFETY_BOUNDARY,
         pi_p=0.3,
         epochs=1,
         lr=1e-3,
@@ -504,19 +507,9 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
         parent_checkpoint=tmp_path / "parent.pth",
         task_name="Task",
         finetune_config={
-            "method": "nnpu_replay_positive_safety_margin_gt_negative",
+            "method": "nnpu_replay_separate_gt_risks",
             "epochs": 1,
             "lr": 1e-3,
-            "resolved_positive_safety_margin": {
-                "task": "Task",
-                "boundary_source": "parent_checkpoint",
-                "parent_failure_threshold": -POSITIVE_SAFETY_BOUNDARY,
-                "m_k": POSITIVE_SAFETY_BOUNDARY,
-                "margin_delta": 1.0,
-                "target_logit": POSITIVE_SAFETY_BOUNDARY + 1.0,
-                "safety_margin_weight": 1.0,
-                "temperature": 1.0,
-            },
         },
         data_provenance={
             "positive_frames": 24,
@@ -547,12 +540,7 @@ def test_finetune_updates_head_and_checkpoint_remains_loadable(
     assert payload["success_train_video_ids"] == {"Task": ["positive-train"]}
     assert payload["success_calib_video_ids"] == {"Task": ["positive-calib"]}
     assert payload["finetune_schema_version"] == 5
-    assert payload["finetune_method"] == (
-        "nnpu_replay_positive_safety_margin_gt_negative"
-    )
-    assert payload["finetune_config"]["resolved_positive_safety_margin"]["m_k"] == (
-        POSITIVE_SAFETY_BOUNDARY
-    )
+    assert payload["finetune_method"] == "nnpu_replay_separate_gt_risks"
     saved_normalization = payload["finetune_recalibration"]["logit_normalization"]
     assert saved_normalization["enabled"] is False
     assert saved_normalization["folded"] is False
