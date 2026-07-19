@@ -39,7 +39,7 @@ offline:
     weight_decay: 1.0e-4
     encode_batch_size: 32
     log_interval: 10
-    run_root: "./outputs/dipole-rl-offline_vast"
+    run_root: "./outputs/dipole-rl-offline_disc"
     run_subfix: ""
     # Explicit discriminator stage directory. null creates
     # <run_root>/<task>_<timestamp>[_suffix]/discriminator.
@@ -86,5 +86,5 @@ offline:
 
 logging:
   use_tensorboard: true
-  tensorboard_dir: "tensorboard/disc"
+  tensorboard_dir: "tensorboard"
   use_wandb: false

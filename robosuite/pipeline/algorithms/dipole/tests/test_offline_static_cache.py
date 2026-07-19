@@ -6,7 +6,9 @@ import torch
 
 from robosuite.pipeline.algorithms.dipole.replay_buffer import DipoleReplayBuffer
 from robosuite.pipeline.common.types import ReplayBufferConfig, Transition
-from robosuite.pipeline.offline.utils.advantage import OfflineAdvantageGProvider
+from robosuite.pipeline.offline.utils.discriminator_scores import (
+    OfflineDiscriminatorGProvider,
+)
 
 
 CAMERA = "agentview"
@@ -73,7 +75,7 @@ def test_static_cache_matches_replay_sample_without_augmentation() -> None:
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="Offline advantage cache lookup requires CUDA.",
+    reason="Offline discriminator cache lookup requires CUDA.",
 )
 def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
     buffer = _make_buffer()
@@ -81,24 +83,21 @@ def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
     with buffer._lock:  # noqa: SLF001 - test verifies provider's start-index contract.
         valid_starts = list(buffer._get_valid_start_indices_locked())  # noqa: SLF001
     start_to_row = {int(start): row for row, start in enumerate(valid_starts)}
-    advantage_raw = torch.arange(len(valid_starts), dtype=torch.float32, device="cuda")
-    failure_raw = torch.zeros(len(valid_starts), dtype=torch.float32, device="cuda")
-    provider = OfflineAdvantageGProvider(
-        vast_learner=None,
-        discriminator=None,
-        encoder=None,
-        alpha=2.0,
-        beta=0.0,
-        advantage_raw=advantage_raw,
-        failure_raw=failure_raw,
+    g_values = torch.arange(
+        len(valid_starts), dtype=torch.float32, device="cuda"
+    )
+    provider = OfflineDiscriminatorGProvider(
+        raw_scores=0.25 - g_values,
+        g_values=g_values,
         start_to_row=start_to_row,
+        threshold=0.25,
     )
 
     np.random.seed(7)
     batch = cache.sample(5, device="cuda", augment=False)
     g = provider.compute_g_for_batch(batch)
     expected = torch.tensor(
-        [2.0 * float(start_to_row[int(start)]) for start in batch.metadata["start_indices"]],
+        [float(start_to_row[int(start)]) for start in batch.metadata["start_indices"]],
         dtype=torch.float32,
         device="cuda",
     )

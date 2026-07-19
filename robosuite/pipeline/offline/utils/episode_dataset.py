@@ -10,14 +10,14 @@ holds parallel per-step arrays of length ``T``::
     is_intervention : (T,) bool     reward / success / done : (T,)
     episode_step : arange(T)        terminal_reason : str
 
-This module implements PROMPT.md ``[tbd] Offline DIPOLE`` §Data usage: split each
-episode on ``is_intervention`` into contiguous **policy** / **human** sections and
-emit three streams of :class:`~robosuite.pipeline.common.types.Transition`, each
-frame tagged with ``info["route"] in {"advantage", "pos_only", "neg_only"}``:
+This module splits each episode on ``is_intervention`` into contiguous
+**policy** / **human** sections and emits three streams of
+:class:`~robosuite.pipeline.common.types.Transition`, each frame tagged with
+``info["route"] in {"disc_weighted", "pos_only", "neg_only"}``:
 
-- **policy_bc** (kept policy sections): ``action = executed_action``, per-frame
-  reward by section outcome, ``route="advantage"``. Fed to BOTH the VAST buffer and
-  the policy-BC buffer.
+- **policy_bc** (kept policy sections): ``action = executed_action`` and
+  ``route="disc_weighted"``. Its two branch weights come from the frozen
+  discriminator score.
 - **human_pos** (every human section): ``action = executed_action`` (== human),
   ``route="pos_only"`` (forces ``w_pos=1, w_neg=0``). Policy-BC only.
 - **neg** (same human frames, opt-in default on): ``action = policy_action``,
@@ -27,20 +27,9 @@ Chunk-boundary handling (confirmed with the user):
 - Each section becomes its own ``episode_index`` with contiguous ``episode_step``
   so ``FlowDaggerReplayBuffer._is_valid_sequence_start_locked`` never lets a chunk
   window cross a section boundary.
-- Human / neg sections shorter than ``H`` are **padded to ``H``** (repeat the last
-  frame) — they are BC-only, so a fabricated tail never reaches VAST.
-- Policy sections shorter than ``H`` are **dropped** (avoid fabricating ``s'`` for
-  VAST).
-
-Reward / done semantics (config-overridable ``reward_success`` / ``reward_fail``):
-- **success** policy section (episode ended in ``terminal_reason=="success"``):
-  every frame gets ``reward_success`` (default 0) and carries per-frame
-  ``info["success"]``, so ``VASTReplayBuffer._build_step_batch`` takes the absorbing
-  branch at the success frame and keeps bootstrapping elsewhere.
-- any other kept policy section (ended in human-intervention / ``manual_reset``):
-  every frame gets ``reward_fail`` (default -1), no ``info["success"]`` key, and
-  ``done=True`` on the section's last frame → the VAST else-branch treats the
-  section boundary as a truncation-terminal (no bootstrap past ``-1``).
+- Human / neg sections shorter than ``H`` are **padded to ``H``** by repeating
+  the last frame so each section has a valid BC window.
+- Policy sections shorter than ``H`` are **dropped** rather than padded.
 """
 
 from __future__ import annotations
@@ -57,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Per-frame routing tag read by RoutedSigmoidBranchWeightPolicy (branch_weights.py)
 # and threaded through DipoleReplayBuffer / DipoleOfflineStaticCache metadata.
-ROUTE_ADVANTAGE = "advantage"
+ROUTE_DISC_WEIGHTED = "disc_weighted"
 ROUTE_POS_ONLY = "pos_only"
 ROUTE_NEG_ONLY = "neg_only"
 
@@ -266,7 +255,7 @@ def build_offline_transitions(
                     section=section,
                     camera_names=camera_names,
                     action_key="executed_action",
-                    route=ROUTE_ADVANTAGE,
+                    route=ROUTE_DISC_WEIGHTED,
                     reward_value=reward_value,
                     episode_index=ep_counter,
                     action_horizon=H,
@@ -346,7 +335,7 @@ def build_online_success_transitions(
     *,
     action_horizon: int,
     episode_index_base: int = 0,
-    route: str = ROUTE_ADVANTAGE,
+    route: str = ROUTE_DISC_WEIGHTED,
 ) -> tuple[list[Transition], int, dict[str, Any]]:
     """Extract entire policy-success episodes that had **zero** human intervention.
 
@@ -355,7 +344,7 @@ def build_online_success_transitions(
     on every frame (a pure on-policy success rollout — no SpaceMouse corrections
     anywhere). Each qualifying episode becomes one standalone-episode list of
     positive BC transitions (``action = executed_action`` which, with no
-    intervention, equals ``policy_action``; ``route = advantage`` by default),
+    intervention, equals ``policy_action``; ``route = disc_weighted`` by default),
     so its chunk windows never cross into other data. Callers can pass
     ``route=pos_only`` when the same pure-success rollouts should force
     ``w_pos=1, w_neg=0`` in routed DIPOLE policy training.
@@ -426,7 +415,7 @@ __all__ = [
     "Section",
     "build_offline_transitions",
     "build_online_success_transitions",
-    "ROUTE_ADVANTAGE",
+    "ROUTE_DISC_WEIGHTED",
     "ROUTE_POS_ONLY",
     "ROUTE_NEG_ONLY",
 ]

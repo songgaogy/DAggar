@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
@@ -13,6 +14,7 @@ from robosuite.pipeline.offline.discriminator.finetune_setup import (
     configured_loss_terms,
     resolved_sampler_config,
 )
+from robosuite.pipeline.offline.utils import setup as setup_utils
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -102,13 +104,13 @@ def test_finetune_launcher_creates_discriminator_stage(tmp_path: Path) -> None:
     )
 
 
-def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
+def test_train_launcher_uses_discriminator_run_and_writes_sibling_stage(
     tmp_path: Path,
 ) -> None:
     pipeline_dir = tmp_path / "PickPlaceCereal_run"
+    discriminator_dir = pipeline_dir / "discriminator"
     checkpoint = (
-        pipeline_dir
-        / "discriminator"
+        discriminator_dir
         / "checkpoints"
         / "pu_bce_head_finetuned.pth"
     )
@@ -135,18 +137,39 @@ def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
 
     invocation = invocation_log.read_text(encoding="utf-8")
     assert f"algorithm.discriminator.checkpoint={checkpoint}" in invocation
-    assert f"offline.run_dir={pipeline_dir}/dipole" in invocation
+    assert f"offline.run_dir={pipeline_dir}" in invocation
+    assert "logging.tensorboard_dir=tensorboard/dipole" in invocation
+    assert "algorithm.vast" not in invocation
+    assert "vast_" not in invocation.lower()
 
-    environment.pop("PIPELINE_RUN_DIR")
-    missing = subprocess.run(
+    (pipeline_dir / "checkpoints").mkdir()
+    duplicate = subprocess.run(
         ["bash", str(SCRIPTS / "train_offline_dipole.sh")],
         check=False,
         env=environment,
         capture_output=True,
         text=True,
     )
-    assert missing.returncode != 0
-    assert "PIPELINE_RUN_DIR is required" in missing.stderr
+    assert duplicate.returncode != 0
+    assert "DIPOLE checkpoints directory already exists" in duplicate.stderr
+
+
+def test_train_launcher_exposes_only_discriminator_run_contract() -> None:
+    launcher = (SCRIPTS / "train_offline_dipole.sh").read_text(encoding="utf-8")
+
+    assert (
+        'PIPELINE_RUN_DIR="${PIPELINE_RUN_DIR:-outputs/'
+        'dipole-rl-offline_disc/PickPlaceCereal_20260719_212234}"'
+        in launcher
+    )
+    assert 'DISCRIMINATOR_RUN_DIR="${PIPELINE_RUN_DIR}/discriminator"' in launcher
+    assert 'NNPU_CKPT="${DISCRIMINATOR_RUN_DIR}/checkpoints/pu_bce_head_finetuned.pth"' in launcher
+    assert 'STAGE_RUN_DIR="${PIPELINE_RUN_DIR}"' in launcher
+    assert 'CHECKPOINT_DIR="${STAGE_RUN_DIR}/checkpoints"' in launcher
+    assert "logging.tensorboard_dir=tensorboard/dipole" in launcher
+    assert "VAST_CKPT" not in launcher
+    assert "SKIP_RL" not in launcher
+    assert "offline.branch_weight.k" not in launcher
 
 
 def test_eval_launcher_keeps_evaluation_and_visualization_outputs_separate(
@@ -194,8 +217,8 @@ def test_eval_launcher_keeps_evaluation_and_visualization_outputs_separate(
         text=True,
     )
 
-    evaluation_dir = run_dir / "evaluation" / "val-seed0"
-    visualization_dir = run_dir / "visualization" / "val-seed0"
+    evaluation_dir = run_dir / "discriminator" / "eval-seed0"
+    visualization_dir = run_dir / "discriminator" / "vis-seed0"
     assert evaluation_dir.is_dir()
     assert visualization_dir.is_dir()
     assert evaluation_dir != visualization_dir
@@ -290,9 +313,9 @@ def test_eval_launcher_supports_visualization_only(tmp_path: Path) -> None:
         text=True,
     )
 
-    visualization_dir = run_dir / "visualization" / "val-seed0"
+    visualization_dir = run_dir / "discriminator" / "vis-seed0"
     assert visualization_dir.is_dir()
-    assert not (run_dir / "evaluation" / "val-seed0").exists()
+    assert not (run_dir / "discriminator" / "eval-seed0").exists()
 
     invocations = invocation_log.read_text(encoding="utf-8").splitlines()
     assert len(invocations) == 1
@@ -393,9 +416,51 @@ def test_train_offline_dipole_preserves_discriminator_overrides() -> None:
     cfg = _compose_config("train_offline_dipole")
 
     assert cfg.env.environment == "PickPlaceCereal"
+    assert cfg.algorithm.type == "dipole"
     assert cfg.algorithm.discriminator.task_name == "PickPlaceCereal"
     assert cfg.algorithm.discriminator.checkpoint is None
     assert cfg.algorithm.discriminator.learner_device == "cuda:0"
     assert cfg.algorithm.discriminator.inference.device == "cuda:0"
     assert cfg.algorithm.discriminator.inference.intervene_env is False
     assert cfg.algorithm.discriminator.hud.enabled is False
+    assert cfg.offline.reward_mode == "-1/0"
+    assert cfg.offline.branch_weight.beta == 2.0
+    assert cfg.algorithm.dipole.g_mode == "nnpu_frozen"
+    assert cfg.algorithm.dipole.beta == 2.0
+    assert "k" not in cfg.offline.branch_weight
+    assert "vast" not in cfg.algorithm
+    assert "advantage_g_provider" not in cfg.algorithm
+    assert "skip_rl" not in cfg.offline
+    assert "vast_finetune" not in cfg.offline
+    assert "advantage" not in cfg.offline
+    assert cfg.logging.tensorboard_dir == "tensorboard/dipole"
+
+
+def test_offline_dagger_hdf5_loader_uses_offline_reward_mode(monkeypatch) -> None:
+    cfg = _compose_config("train_offline_dipole")
+    captured: dict[str, object] = {}
+
+    def _fake_load(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return ["loaded"]
+
+    monkeypatch.setattr(
+        setup_utils,
+        "load_hdf5_demos_into_flow_transitions",
+        _fake_load,
+    )
+    ctx = SimpleNamespace(
+        policy_camera_names=["agentview"],
+        camera_aliases={},
+        img_height=128,
+        img_width=128,
+        extractor=object(),
+    )
+
+    loader = setup_utils.make_hdf5_loader(ctx, cfg)
+    loaded = loader("demo.hdf5", demo_names=["demo_0"])
+
+    assert loaded == ["loaded"]
+    assert captured["reward_mode"] == "-1/0"
+    assert captured["demo_names"] == ["demo_0"]

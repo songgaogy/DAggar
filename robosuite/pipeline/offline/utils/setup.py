@@ -204,7 +204,7 @@ def make_hdf5_loader(ctx: AgentEnvContext, cfg: DictConfig) -> Callable[..., lis
     Binds the env-derived camera / image / proprio settings and the extractor
     from ``ctx`` so callers can load expert demos without re-threading them.
     """
-    reward_mode = str(cfg.algorithm.vast.config.reward_mode)
+    reward_mode = str(cfg.offline.reward_mode)
 
     def hdf5_loader(path, demo_names=None):
         return load_hdf5_demos_into_flow_transitions(

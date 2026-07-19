@@ -28,7 +28,7 @@ RUN_SUBFIX="dagger-with_success"
 USE_ONLINE_SUCCESS=1        # add success online rollout with no human intervention
 # -------------------------------------
 
-RUN_ROOT="outputs/dipole-rl-offline"
+RUN_ROOT="outputs/dipole-rl-offline_disc"
 LOGGING_USE_TENSORBOARD="${LOGGING_USE_TENSORBOARD:-true}"
 LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
 
@@ -47,7 +47,6 @@ source "${ROOT_DIR}/robosuite/pipeline/scripts/utils/hydra_disable_outputs.sh"
 HYDRA_OVERRIDES=(
   "env.environment=${TASK}"
   "runtime.init_checkpoint=${POLICY_CKPT}"
-  "algorithm.vast.config.device=${DEVICE}"
   "algorithm.flow.device=${DEVICE}"
   "algorithm.flow.inference_device=${DEVICE}"
   "algorithm.trainer.batch_size=${BATCH_SIZE}"

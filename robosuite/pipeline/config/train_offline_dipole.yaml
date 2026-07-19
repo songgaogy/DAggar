@@ -1,8 +1,6 @@
-# Offline DIPOLE (VAST value-stitching finetune -> weighted-BC).
-# Consumes data/<task>/offline_data/offline_episodes.pt (collect_data.sh) and the
-# warmup VAST state (init_vast.sh). Inherits the full RL stack from train_dipole_rl.
+# Offline DIPOLE with frozen-discriminator branch weighting.
 defaults:
-  - train_dipole_rl
+  - train_dipole
   - _self_
 
 env:
@@ -12,80 +10,38 @@ offline:
   data_root: "/home/dodo/Documents/DAggar/robosuite/data"
   # Collected episodes; null -> data/<task>/offline_data/offline_episodes.pt.
   episodes_path: null
-  # Expert pretrain HDF5 dir/file; null -> do not add pretrain data to Phase B.
+  # Expert pretrain HDF5 dir/file; null -> do not add pretrain data.
   pretrain_data_path: null
   max_pretrain_trajectories: null
-  # Warmup transitions dir under data/<task>/ (init_vast.sh SAVE_DIR).
-  vast_warmup_transitions_dir: "offline_data-vast"
-  # Add entire pure on-policy success rollouts (terminal_reason==success AND zero
-  # human intervention) as positive BC demos. Offline DAgger appends them; main
-  # Offline DIPOLE replaces their advantage route with pos_only (w_pos=1).
+  # Shared HDF5 loading uses sparse rewards in the existing Offline DAgger mode.
+  reward_mode: "-1/0"
+  # Add pure on-policy success rollouts as positive BC demonstrations.
   use_online_success: false
-
-  # Per-frame section-outcome rewards for policy sections (config-overridable).
-  reward_success: 0.0
-  reward_fail: -1.0
   # policy_action during intervention -> negative branch (default on).
   include_policy_action_neg: true
 
-  # Phase B policy-update budget.
   num_train_steps: 15000
   log_interval: 500
   plot_log_interval: null
   checkpoint_interval: 5000
   preencode_batch_size: 64
 
-  # Result saving: <pipeline_run>/dipole.
-  run_root: "./outputs/dipole-rl-offline_vast"
+  # Result saving: <discriminator_run_parent>/dipole.
+  run_root: "./outputs/dipole-rl-offline_disc"
   run_subfix: ""
-  # Explicit DIPOLE stage directory. null creates
-  # <run_root>/<task>_<timestamp>[_suffix]/dipole.
   run_dir: null
 
-  # Phase A joint VAST G+V finetune (continues from warmup_ckpt).
-  skip_rl: false
-  vast_finetuned_path: null
-  vast_finetune:
-    num_steps: 20000
-    batch_size: 256
-    preencode_cache: true
-
-  # Phase-B advantage read-out from the frozen VAST V/target-V values.
-  advantage:
-    estimator: "gae"  # gae | td1
-    gae_lambda: 0.6
-
-  # Pluggable branch-weight policy (offline/utils/branch_weights.py).
+  # s = raw failure score; G = threshold - s; w_pos = sigmoid(beta * G).
   branch_weight:
-    type: "routed_sigmoid"    # routed_sigmoid | disc_scaled
-    # w_pos = sigmoid(beta * (G + k)). NOTE: G is NOT normalized, so beta is the
-    # post-offset slope (tracks advantage scale). k shifts the decision threshold
-    # in G-space (w_pos=0.5 at G=-k). GAE(lambda=0.6) advantages run ~2x the
-    # 1-step residual, so beta~2.0 here vs ~4.0 for estimator=td1. Tune against
-    # the branch-weight histogram (diagnostic_plots.py) so w_pos does not
-    # collapse to {0,1}.
-    beta: 1.0
-    k: -2.0
+    beta: 2.0
 
 algorithm:
-  type: "dipole_rl"
   online_buffer:
-    # Static, never-wrap buffer so precompute start indices stay valid.
+    # Static, never-wrap buffer so cached start indices remain valid.
     capacity: 5000000
   dipole:
-    g_mode: "advantage"
-    beta: 2.0        # overridden at runtime by offline.branch_weight.beta; kept in sync
-    k: 0.0
-  vast:
-    enabled: true
-    warmup_ckpt: null
-    config:
-      vast_v_mode: "single_vast"
-      vast_max_k: 10
-      vast_comp_coef: 0.5
-      vast_sampling_seed: ${seed}
-      expectile_tau: 0.9
-      device: "cuda:0"
+    g_mode: "nnpu_frozen"
+    beta: ${offline.branch_weight.beta}
   discriminator:
     checkpoint: null
     learner_device: "cuda:0"
@@ -97,10 +53,6 @@ algorithm:
   flow:
     device: "cuda:0"
     inference_device: "cuda:0"
-  # Pure TD advantage into G: G = alpha*A - beta*failure (beta=0 -> no disc mix).
-  advantage_g_provider:
-    alpha: 1.0
-    beta: 0.0
 
 runtime:
   interactive: false
@@ -110,4 +62,4 @@ runtime:
 
 logging:
   use_tensorboard: true
-  tensorboard_dir: "tensorboard"
+  tensorboard_dir: "tensorboard/dipole"

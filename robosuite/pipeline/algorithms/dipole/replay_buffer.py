@@ -65,7 +65,7 @@ class DipoleOfflineStaticCache:
                 is_intervention.append(bool(first.is_intervention))
                 episode_ids.append(int(info.get("episode_index", -1)))
                 episode_steps.append(int(info.get("episode_step", -1)))
-                routes.append(str(info.get("route", "advantage")))
+                routes.append(str(info.get("route", "disc_weighted")))
 
         self.routes = routes
         self.images = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
@@ -238,7 +238,7 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
             episode_ids.append(int(info.get("episode_index", -1)))
             episode_steps.append(int(info.get("episode_step", -1)))
             is_intervention_batch.append(bool(first.is_intervention))
-            routes.append(str(info.get("route", "advantage")))
+            routes.append(str(info.get("route", "disc_weighted")))
 
         image_tensor = torch.from_numpy(np.ascontiguousarray(np.stack(image_batch, axis=0)))
         proprio_tensor_raw = torch.from_numpy(np.ascontiguousarray(np.stack(proprio_batch, axis=0))).float()

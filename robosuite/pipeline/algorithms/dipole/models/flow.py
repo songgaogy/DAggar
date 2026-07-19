@@ -189,7 +189,7 @@ class DipoleFlowPolicy:
         """Attach a pluggable per-sample branch-weight policy (offline DIPOLE).
 
         ``policy`` is called as
-        ``policy(batch, g_provider=..., sigmoid_fn=self._g_weights_from_raw,
+        ``policy(batch, g_provider=..., sigmoid_fn=self._g_weights_from_g,
         device=self.device, want_metrics=...) -> (w_pos, w_neg, metrics)`` and,
         when set, short-circuits the built-in coupled/neg_all weighting.
         """
@@ -325,8 +325,8 @@ class DipoleFlowPolicy:
             dtype=torch.bool,
         )
 
-    def _g_weights_from_raw(
-        self, raw: torch.Tensor, *, want_metrics: bool = True
+    def _g_weights_from_g(
+        self, g_values: torch.Tensor, *, want_metrics: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         """Map provider preference ``G`` to coupled branch weights.
 
@@ -339,20 +339,20 @@ class DipoleFlowPolicy:
         ``k`` shifts the decision threshold in G-space (``w_pos=0.5`` at ``G=-k``);
         ``beta`` scales the slope after that offset. No normalize / ``g_clip``.
         """
-        g = raw
-        logit = float(self.config.beta) * (g + float(self.config.k))
+        g = g_values
+        logit = float(self.config.beta) * (
+            g + float(getattr(self.config, "k", 0.0))
+        )
         w_pos = torch.sigmoid(logit)
         w_neg = 1.0 - w_pos
         if not want_metrics:
             return w_pos, w_neg, {}
-        n = int(raw.numel())
+        n = int(g.numel())
         metrics = {
-            "raw_nnpu_score_mean": float(raw.mean().item()),
-            "raw_nnpu_score_std": float(raw.std().item() if n > 1 else 0.0),
-            "raw_nnpu_score_min": float(raw.min().item()),
-            "raw_nnpu_score_max": float(raw.max().item()),
             "G_mean": float(g.mean().item()),
             "G_std": float(g.std().item() if n > 1 else 0.0),
+            "G_min": float(g.min().item()),
+            "G_max": float(g.max().item()),
             "logit_mean": float(logit.mean().item()),
             "logit_std": float(logit.std().item() if n > 1 else 0.0),
         }
@@ -381,8 +381,8 @@ class DipoleFlowPolicy:
         if self.g_provider is None:
             w_neg = torch.ones(B, dtype=torch.float32, device=self.device)
         else:
-            raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-            w_neg = raw.clamp(0.0, 1.0)
+            membership = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
+            w_neg = membership.clamp(0.0, 1.0)
         metrics = {"neg_membership_mean": float(w_neg.mean().item())} if want_metrics else {}
         return w_pos, w_neg, metrics
 
@@ -396,7 +396,7 @@ class DipoleFlowPolicy:
 
         When ``buffer_sources`` is set (1:1 online/demo training batch):
         - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
-        - online_buffer rows: raw G and sigmoid use online rows only
+        - online_buffer rows: provider G and sigmoid use online rows only
 
         ``want_metrics=False`` skips every scalar readback so the training hot
         path incurs no GPU->CPU sync on non-logging steps.
@@ -405,7 +405,7 @@ class DipoleFlowPolicy:
             return self.branch_weight_policy(
                 batch,
                 g_provider=self.g_provider,
-                sigmoid_fn=self._g_weights_from_raw,
+                sigmoid_fn=self._g_weights_from_g,
                 device=self.device,
                 want_metrics=want_metrics,
             )
@@ -423,12 +423,10 @@ class DipoleFlowPolicy:
                 {
                     "frac_demo_buffer": float(demo_mask.float().mean().item()),
                     "w_pos_mean_demo": 1.0,
-                    "raw_nnpu_score_mean": 0.0,
-                    "raw_nnpu_score_std": 0.0,
-                    "raw_nnpu_score_min": 0.0,
-                    "raw_nnpu_score_max": 0.0,
                     "G_mean": 0.0,
                     "G_std": 0.0,
+                    "G_min": 0.0,
+                    "G_max": 0.0,
                     "logit_mean": 0.0,
                     "logit_std": 0.0,
                 }
@@ -441,12 +439,12 @@ class DipoleFlowPolicy:
             online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
             if self.g_provider is None:
                 zero_g = torch.zeros(int(online_indices.numel()), dtype=torch.float32, device=self.device)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_g(zero_g, want_metrics=want_metrics)
             else:
                 with torch.no_grad():
                     online_batch = select_dipole_batch(batch, online_indices)
-                    raw = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
+                    g_values = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
+                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_g(g_values, want_metrics=want_metrics)
 
             w_pos[online_mask] = w_online_pos
             w_neg[online_mask] = w_online_neg
@@ -459,50 +457,64 @@ class DipoleFlowPolicy:
         # Legacy path: demo-only batch without buffer_sources (full-batch G + intervention mask).
         if self.g_provider is None:
             zero_g = torch.zeros(B, dtype=torch.float32, device=self.device)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
+            w_pos, w_neg, metrics = self._g_weights_from_g(zero_g, want_metrics=want_metrics)
         else:
             with torch.no_grad():
-                raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
+                g_values = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
+            w_pos, w_neg, metrics = self._g_weights_from_g(g_values, want_metrics=want_metrics)
 
         is_int = batch.is_intervention.to(self.device).bool().reshape(-1)
         w_pos = torch.where(is_int, torch.ones_like(w_pos), w_pos)
         w_neg = torch.where(is_int, torch.zeros_like(w_neg), w_neg)
         return w_pos, w_neg, metrics
 
-    def _provider_raw_g_for_batch(self, batch: DipoleBatch) -> torch.Tensor:
+    def _provider_g_for_batch(self, batch: DipoleBatch) -> torch.Tensor:
         """Provider G per sample (before logit/sigmoid weighting)."""
         batch_size = batch.batch_size
         if self.g_provider is None:
             return torch.zeros(batch_size, dtype=torch.float32, device=self.device)
 
-        # Offline routed weighting: only "advantage"-route rows have a meaningful
-        # provider G; pos_only/neg_only rows are forced-weight and their advantage
-        # (though precomputed) must not pollute the diagnostic G histogram.
+        # Offline routed weighting: only discriminator-weighted rows have a
+        # meaningful provider G; hard-routed rows must not pollute diagnostics.
         if self.branch_weight_policy is not None:
             routes = batch.metadata.get("route")
-            raw = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            g_values = torch.zeros(
+                batch_size, dtype=torch.float32, device=self.device
+            )
             if routes is not None and len(routes) == batch_size:
-                adv_rows = [i for i, r in enumerate(routes) if str(r) == "advantage"]
-                if adv_rows:
-                    adv_idx = torch.tensor(adv_rows, device=self.device, dtype=torch.long)
-                    sub = select_dipole_batch(batch, adv_idx)
-                    raw_adv = self.g_provider.compute_g_for_batch(sub).to(self.device).reshape(-1)
-                    raw[adv_idx] = raw_adv
+                disc_rows = [
+                    i for i, route in enumerate(routes)
+                    if str(route) == "disc_weighted"
+                ]
+                if disc_rows:
+                    disc_idx = torch.tensor(
+                        disc_rows, device=self.device, dtype=torch.long
+                    )
+                    sub = select_dipole_batch(batch, disc_idx)
+                    disc_g = self.g_provider.compute_g_for_batch(sub).to(
+                        self.device
+                    ).reshape(-1)
+                    g_values[disc_idx] = disc_g
             else:
-                raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-            return raw
+                g_values = self.g_provider.compute_g_for_batch(batch).to(
+                    self.device
+                ).reshape(-1)
+            return g_values
 
         demo_mask = self._resolve_demo_sample_mask(batch, self.device)
         if demo_mask is not None:
-            raw = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+            g_values = torch.zeros(
+                batch_size, dtype=torch.float32, device=self.device
+            )
             online_mask = ~demo_mask
             if bool(online_mask.any().item()):
                 online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
                 online_batch = select_dipole_batch(batch, online_indices)
-                raw_online = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
-                raw[online_mask] = raw_online
-            return raw
+                online_g = self.g_provider.compute_g_for_batch(online_batch).to(
+                    self.device
+                ).reshape(-1)
+                g_values[online_mask] = online_g
+            return g_values
 
         return self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
 
@@ -615,9 +627,9 @@ class DipoleFlowPolicy:
         }
         if collect_diagnostics:
             with torch.no_grad():
-                g_provider_raw = self._provider_raw_g_for_batch(batch)
+                g_values = self._provider_g_for_batch(batch)
             metrics["_diag"] = {
-                "g_provider_raw": g_provider_raw.detach().cpu().numpy(),
+                "g_values": g_values.detach().cpu().numpy(),
                 "w_pos": w_pos.detach().cpu().numpy(),
                 "w_neg": w_neg.detach().cpu().numpy(),
                 "v_pos_mse": v_pos_mse.detach().cpu().numpy(),

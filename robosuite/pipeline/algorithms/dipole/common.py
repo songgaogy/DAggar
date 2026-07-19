@@ -24,7 +24,7 @@ class DipoleConfig(FlowDaggerConfig):
     beta: float = 2.0
     k: float = 0.0
     guidance_omega: float = 2.0          # eval-only: v=(1+w)v_pos - w v_neg (rollout is pos-only)
-    g_clip: float = 10.0                 # unused by current _g_weights_from_raw
+    g_clip: float = 10.0                 # unused by current _g_weights_from_g
     # Two independent, fully finetuned flow policies (positive + negative). Each is
     # trained full-tune under the base flow-policy freeze regime; there are no LoRA
     # adapters. The learning rate / weight decay come from the inherited

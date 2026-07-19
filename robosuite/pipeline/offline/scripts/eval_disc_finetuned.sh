@@ -52,7 +52,7 @@ fi
 
 RUN_DIR="$(cd "$(dirname "${FINETUNED_CKPT}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-${RUN_DIR}/discriminator/eval-seed${SEED}}"
-VIS_OUT_DIR="${VIS_OUT_DIR:-${RUN_DIR}/discrminator/vis-seed${SEED}}"
+VIS_OUT_DIR="${VIS_OUT_DIR:-${RUN_DIR}/discriminator/vis-seed${SEED}}"
 
 EXTRA_ARGS=()
 if [[ -n "${CAMERA_TO_VIEW}" ]]; then
@@ -101,7 +101,7 @@ if [[ "${RUN_EVAL_FLAG}" == "true" ]]; then
     --encode-batch-size "${ENCODE_BATCH_SIZE}" \
     --delta "${DELTA}" \
     --seed "${SEED}" \
-    "${EXTRA_ARGS[@]}" \``
+    "${EXTRA_ARGS[@]}" \
     "$@"
 
   echo "[eval_disc_finetuned] wrote ${OUT_DIR}/benchmark.json"

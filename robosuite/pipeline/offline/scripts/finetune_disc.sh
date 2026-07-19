@@ -23,7 +23,7 @@ NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"
 OFFLINE_EPISODES="${OFFLINE_EPISODES:-data/${TASK}/offline_data/offline_episodes.pt}"
 PRETRAIN_DIR="${PRETRAIN_DIR:-data/${TASK}/discriminator-pretrain-quadratic-c2-l1e2-v2}"
 
-RUN_ROOT="${RUN_ROOT:-./outputs/dipole-rl-offline_vast}"
+RUN_ROOT="${RUN_ROOT:-./outputs/dipole-rl-offline_disc}"
 RUN_SUBFIX="${RUN_SUBFIX:-}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-tensorboard}"
 

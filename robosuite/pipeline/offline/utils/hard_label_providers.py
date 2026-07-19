@@ -8,7 +8,7 @@ branch weights by fixed labels instead of a learned advantage:
   ``w_pos=1, w_neg=0``); ``fail_rollout`` frames are the only provider-scored rows.
   A large constant *negative* G drives exactly those to the negative branch
   (``w_pos = sigmoid(beta * (-BIG + k)) ~= 0`` -> ``w_neg ~= 1``; see
-  ``DipoleFlowPolicy._g_weights_from_raw`` / ``_compute_branch_weights``).
+  ``DipoleFlowPolicy._g_weights_from_g`` / ``_compute_branch_weights``).
 
 - ``offline.mode == "neg_all"`` -> :class:`NegAllGProvider`. The negative branch
   trains on ALL ``offline_data`` rows (success + fail rollouts) with weight 1,

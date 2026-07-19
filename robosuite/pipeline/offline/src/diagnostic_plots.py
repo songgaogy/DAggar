@@ -9,14 +9,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_raw_g_distribution(
-    g_raw: np.ndarray,
+def plot_g_distribution(
+    g_values: np.ndarray,
     *,
     density: bool = True,
     bins: int = 30,
 ) -> plt.Figure:
-    """Histogram of provider raw G for the current training batch."""
-    values = np.asarray(g_raw, dtype=np.float64).reshape(-1)
+    """Histogram of discriminator-derived G for the current training batch."""
+    values = np.asarray(g_values, dtype=np.float64).reshape(-1)
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.hist(
         values,
@@ -25,11 +25,11 @@ def plot_raw_g_distribution(
         alpha=0.75,
         color="steelblue",
         edgecolor="white",
-        label=f"raw G (n={values.size})",
+        label=f"G (n={values.size})",
     )
-    ax.set_xlabel("Raw G")
+    ax.set_xlabel("G")
     ax.set_ylabel("Density" if density else "Count")
-    ax.set_title("Batch raw G distribution")
+    ax.set_title("Batch G distribution")
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

@@ -4,7 +4,7 @@
 # the training run dir (<run_dir>/eval/...) by default.
 #
 # Set POLICY_CKPT to the offline-finetuned checkpoint written by
-# train_offline_dipole.sh, i.e. data/dipole-rl-offline/<task>_<ts>_<postfix>/checkpoints/latest.pt.
+# train_offline_dipole.sh, i.e. outputs/dipole-rl-offline_disc/<run>/checkpoints/latest.pt.
 
 set -euo pipefail
 
@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 # -------------------------------------
 TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole-rl-offline_vast/PickPlaceCereal_20260715_003422_vast-indep_ensemble_beta2_k0_tau0p7/checkpoints/latest.pt"
+POLICY_CKPT="outputs/dipole-rl-offline_disc/PickPlaceCereal_20260719_212234/checkpoints/latest.pt"
 # OMEGAS=(0 0.2 1)
 # OMEGAS=(0.1 0.5 2)
 OMEGAS=(0 0.1 0.2 0.5 1 2)
