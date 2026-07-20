@@ -11,25 +11,27 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 cd "$ROOT_DIR"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 # -------------------------------------
-TASK="PickPlaceCereal"
-POLICY_CKPT="outputs/dipole-rl-offline_disc/PickPlaceCereal_20260719_212234/checkpoints/latest.pt"
+TASK="${TASK:-PickPlaceCereal}"
+POLICY_CKPT="${POLICY_CKPT:-outputs/dipole-rl-offline_disc/PickPlaceCereal_20260719_212234/checkpoints/latest.pt}"
 # OMEGAS=(0 0.2 1)
 # OMEGAS=(0.1 0.5 2)
-OMEGAS=(0 0.1 0.2 0.5 1 2)
+read -r -a OMEGAS <<< "${OMEGAS:-0 0.1 0.2 0.5 1 2}"
 # OMEGAS=(0.15)
-EVAL_EPISODES=50
-EVAL_EPISODE_MAX_STEPS=500
-SAVE_VIDEO=true
+EVAL_EPISODES="${EVAL_EPISODES:-50}"
+EVAL_EPISODE_MAX_STEPS="${EVAL_EPISODE_MAX_STEPS:-500}"
+SAVE_VIDEO="${SAVE_VIDEO:-true}"
 DEVICE="${DEVICE:-cuda:0}"
-SEED=10086
+SEED="${SEED:-10086}"
 # -------------------------------------
 
 # Optional base flow checkpoint for env metadata (defaults to run_info.json).
-INIT_CHECKPOINT=""
-VIDEO_SIZE=256    # square video frame size; 256 renders 4x fewer pixels than the old 512
+INIT_CHECKPOINT="${INIT_CHECKPOINT:-}"
+VIDEO_SIZE="${VIDEO_SIZE:-256}"    # square video frame size; 256 renders 4x fewer pixels than the old 512
+MAX_VIDEOS="${MAX_VIDEOS:-0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export HYDRA_FULL_ERROR=1
@@ -45,11 +47,15 @@ for OMEGA in "${OMEGAS[@]}"; do
     --video-output "${SAVE_VIDEO}"
     --video-height "${VIDEO_SIZE}"
     --video-width "${VIDEO_SIZE}"
+    --max-videos "${MAX_VIDEOS}"
     --seed "${SEED}"
     --device "${DEVICE}"
   )
   if [[ -n "${INIT_CHECKPOINT}" ]]; then
     EVAL_ARGS+=(--init-checkpoint "${INIT_CHECKPOINT}")
+  fi
+  if [[ -n "${OUTPUT_ROOT}" ]]; then
+    EVAL_ARGS+=(--output-root "${OUTPUT_ROOT}")
   fi
 
   echo "[eval_offline_dipole] task=${TASK} ckpt=${POLICY_CKPT} omega=${OMEGA} episodes=${EVAL_EPISODES} seed=${SEED} video=${SAVE_VIDEO} video_size=${VIDEO_SIZE}"

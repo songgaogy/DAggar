@@ -6,16 +6,19 @@ import datetime
 import logging
 import queue
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
 import hydra
+import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
 from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
+from robosuite.pipeline.algorithms.dipole.replay_buffer import DipoleReplayBuffer
 from robosuite.pipeline.offline.src.diagnostic_plots import (
     plot_branch_weight_distribution,
     plot_g_distribution,
@@ -23,17 +26,31 @@ from robosuite.pipeline.offline.src.diagnostic_plots import (
 )
 from robosuite.pipeline.offline.utils import (
     OfflineDiscriminatorGProvider,
+    POLICY_TRAINING_COUPLED,
+    POLICY_TRAINING_FILTERED_BC,
     build_agent_env,
     build_branch_weight_policy,
     build_offline_transitions,
     build_online_success_transitions,
-    finalize_normalizers,
+    branch_only_update,
+    branch_seed,
+    directory_input_provenance,
+    file_provenance,
+    git_provenance,
     load_pretrain_transitions,
     make_hdf5_loader,
+    normalize_policy_training_mode,
+    parameter_distance_metrics,
     populate_replay_buffer,
     precompute_discriminator_scores,
+    sample_static_cache,
+    trainable_parameter_snapshot,
 )
-from robosuite.pipeline.offline.utils.episode_dataset import ROUTE_POS_ONLY
+from robosuite.pipeline.offline.utils.episode_dataset import (
+    ROUTE_DISC_WEIGHTED,
+    ROUTE_NEG_ONLY,
+    ROUTE_POS_ONLY,
+)
 from robosuite.pipeline.utils import (
     checkpoint_path,
     maybe_build_metric_logger,
@@ -45,6 +62,79 @@ from robosuite.pipeline.utils import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _require_pretrained_normalizers(agent: Any) -> None:
+    if not agent.has_normalizers():
+        raise RuntimeError(
+            "The positive-policy matrix requires normalizers from the shared "
+            "initial flow checkpoint; condition-specific fitting is forbidden."
+        )
+    arrays = {
+        "act_mean": agent.core.act_mean,
+        "act_std": agent.core.act_std,
+        "prop_mean": agent.core.prop_mean,
+        "prop_std": agent.core.prop_std,
+    }
+    for name, value in arrays.items():
+        array = np.asarray(value)
+        if not np.isfinite(array).all():
+            raise RuntimeError(f"Initial checkpoint normalizer {name} is not finite.")
+    if bool((np.asarray(agent.core.act_std) <= 0).any()) or bool(
+        (np.asarray(agent.core.prop_std) <= 0).any()
+    ):
+        raise RuntimeError("Initial checkpoint normalizer standard deviations must be positive.")
+
+
+def _new_policy_buffer(agent: Any, *, name: str) -> DipoleReplayBuffer:
+    return DipoleReplayBuffer(
+        agent.online_buffer.config,
+        name=name,
+        camera_names=list(agent.online_buffer.camera_names),
+        action_horizon=int(agent.online_buffer.action_horizon),
+        image_size=int(agent.online_buffer.image_size),
+        augmentation_config=agent.online_buffer.augmentation_config,
+    )
+
+
+def _route_counts(routes: list[str]) -> dict[str, int]:
+    counts = Counter(str(route) for route in routes)
+    return {
+        route: int(counts.get(route, 0))
+        for route in (ROUTE_DISC_WEIGHTED, ROUTE_POS_ONLY, ROUTE_NEG_ONLY)
+    }
+
+
+def _prefixed_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}/{key}": float(value) for key, value in metrics.items()}
+
+
+def _validate_expected_positive_counts(
+    cfg: DictConfig,
+    *,
+    human: int,
+    pretrain: int,
+    pure_success: int,
+) -> None:
+    actual = {
+        "expected_human_transitions": int(human),
+        "expected_pretrain_transitions": int(pretrain),
+        "expected_pure_success_transitions": int(pure_success),
+        "expected_total_positive_transitions": int(
+            human + pretrain + pure_success
+        ),
+    }
+    for key, value in actual.items():
+        expected = OmegaConf.select(
+            cfg,
+            f"offline.positive_training.{key}",
+            default=None,
+        )
+        if expected is not None and int(expected) != value:
+            raise RuntimeError(
+                f"Positive-data count mismatch for {key}: "
+                f"expected={int(expected)}, actual={value}."
+            )
 
 
 class _BatchPrefetcher:
@@ -152,6 +242,22 @@ def _require_shared_cuda_device(*, score_device: str, policy_device: torch.devic
 )
 def main(cfg: DictConfig) -> None:
     torch.set_float32_matmul_precision("high")
+    repo_root = Path(to_absolute_path(".")).resolve()
+    source_provenance = git_provenance(repo_root)
+    training_mode = normalize_policy_training_mode(
+        OmegaConf.select(
+            cfg,
+            "offline.positive_training.mode",
+            default=POLICY_TRAINING_COUPLED,
+        )
+    )
+    use_online_success = bool(
+        OmegaConf.select(
+            cfg,
+            "offline.positive_training.include_pure_success",
+            default=OmegaConf.select(cfg, "offline.use_online_success", default=False),
+        )
+    )
 
     ctx = build_agent_env(cfg, log_tag="offline")
     agent = ctx.agent
@@ -163,6 +269,7 @@ def main(cfg: DictConfig) -> None:
         score_device=score_device,
         policy_device=agent.core.device,
     )
+    _require_pretrained_normalizers(agent)
 
     nnpu_ckpt = _resolve_required_path(
         cfg.algorithm.discriminator.checkpoint,
@@ -226,9 +333,6 @@ def main(cfg: DictConfig) -> None:
     print(f"[offline] episodes={episodes_path}")
     print(f"[offline] streams: {streams.stats}")
 
-    use_online_success = bool(
-        OmegaConf.select(cfg, "offline.use_online_success", default=False)
-    )
     next_episode = _next_episode_index(
         streams.policy_bc,
         streams.human_pos,
@@ -263,12 +367,27 @@ def main(cfg: DictConfig) -> None:
             online_success_replaced_policy_bc = (
                 len(streams.policy_bc) - len(policy_bc_for_policy)
             )
+            remaining_source_indices = {
+                int((transition.info or {}).get("source_episode_index", -1))
+                for transition in policy_bc_for_policy
+            }
+            overlap = source_episode_indices & remaining_source_indices
+            if overlap:
+                raise RuntimeError(
+                    "Pure-success source episodes remain in the soft policy pool: "
+                    f"{sorted(overlap)}"
+                )
         print(
             f"[offline] online_success: {online_success_stats}; "
             f"replaced_policy_bc={online_success_replaced_policy_bc}"
         )
     else:
         print("[offline] online_success: disabled")
+
+    if use_online_success and not online_success_pos:
+        raise RuntimeError(
+            "include_pure_success=true but no pure-success transitions were found."
+        )
 
     pretrain_pos: list[Any] = []
     pretrain_data_path: str | None = None
@@ -298,6 +417,13 @@ def main(cfg: DictConfig) -> None:
             f"[offline] pretrain_data={pretrain_data_path} "
             f"transitions={len(pretrain_pos)}"
         )
+
+    _validate_expected_positive_counts(
+        cfg,
+        human=len(streams.human_pos),
+        pretrain=len(pretrain_pos),
+        pure_success=len(online_success_pos),
+    )
 
     try:
         ctx.env.close()
@@ -373,13 +499,12 @@ def main(cfg: DictConfig) -> None:
         f"online_success_pos={len(online_success_pos)}, "
         f"pretrain_pos={len(pretrain_pos)})"
     )
-    batch_size = finalize_normalizers(
-        agent,
-        cfg,
-        list(policy_bc_for_policy) + list(online_success_pos) + list(pretrain_pos),
-        log_tag="offline",
-        norm_desc="policy sections + online-success + pretrain positive demos",
-    )
+    batch_size = int(cfg.algorithm.trainer.batch_size)
+    if valid_windows < batch_size:
+        raise RuntimeError(
+            f"Policy buffer has only {valid_windows} valid windows "
+            f"(< batch_size={batch_size})."
+        )
 
     static_cache = agent.online_buffer.build_static_cache(pin_memory=True)
     cache_mib = float(static_cache.estimated_bytes) / (1024.0 * 1024.0)
@@ -387,6 +512,37 @@ def main(cfg: DictConfig) -> None:
         f"[offline] static_cache rows={len(static_cache)} "
         f"estimated={cache_mib:.1f} MiB"
     )
+    positive_transitions = (
+        list(streams.human_pos) + list(online_success_pos) + list(pretrain_pos)
+    )
+    positive_static_cache = None
+    positive_valid_windows: int | None = None
+    if training_mode == POLICY_TRAINING_FILTERED_BC:
+        positive_buffer = _new_policy_buffer(
+            agent,
+            name="offline_filtered_positive_buffer",
+        )
+        positive_valid_windows = populate_replay_buffer(
+            positive_buffer,
+            positive_transitions,
+        )
+        if positive_valid_windows < batch_size:
+            raise RuntimeError(
+                "Filtered positive buffer has only "
+                f"{positive_valid_windows} valid windows "
+                f"(< batch_size={batch_size})."
+            )
+        positive_static_cache = positive_buffer.build_static_cache(pin_memory=True)
+        if set(positive_static_cache.routes) != {ROUTE_POS_ONLY}:
+            raise RuntimeError(
+                "Filtered positive buffer contains a non-pos_only route."
+            )
+        print(
+            f"[offline] filtered positive buffer: transitions={len(positive_transitions)} "
+            f"valid_windows={positive_valid_windows}"
+        )
+    elif training_mode != POLICY_TRAINING_COUPLED:
+        positive_static_cache = static_cache
     raw_scores, g_values, start_to_row = (
         precompute_discriminator_scores(
             static_cache=static_cache,
@@ -449,9 +605,18 @@ def main(cfg: DictConfig) -> None:
         },
         step=0,
     )
-    write_run_info(
-        run_dir,
-        {
+    input_provenance = {
+        "git": source_provenance,
+        "initial_policy": file_provenance(ctx.init_checkpoint),
+        "finetuned_discriminator": file_provenance(nnpu_ckpt),
+        "offline_episodes": file_provenance(episodes_path),
+        "pretrain_data": (
+            None
+            if pretrain_data_path is None
+            else directory_input_provenance(pretrain_data_path)
+        ),
+    }
+    run_info = {
             "run_name": run_name,
             "run_dir": str(run_dir),
             "pipeline_run_dir": str(pipeline_run_dir),
@@ -470,7 +635,26 @@ def main(cfg: DictConfig) -> None:
                 online_success_replaced_policy_bc
             ),
             "online_success_stats": online_success_stats,
+            "online_success_replaced_policy_bc": int(
+                online_success_replaced_policy_bc
+            ),
             "algorithm": "discriminator_weighted_offline_dipole",
+            "positive_training_mode": training_mode,
+            "positive_transitions": len(positive_transitions),
+            "positive_valid_windows": positive_valid_windows,
+            "policy_buffer_route_counts": _route_counts(static_cache.routes),
+            "positive_buffer_route_counts": (
+                None
+                if positive_static_cache is None
+                else _route_counts(positive_static_cache.routes)
+            ),
+            "rng_streams": {
+                "base_seed": int(cfg.seed),
+                "derivation": (
+                    "branch_seed(base_seed, step, branch in {pos,neg}, "
+                    "phase in {sample,update})"
+                ),
+            },
             "score_semantics": "raw_score=-head_logit; higher=failure_like",
             "threshold": float(discriminator.threshold),
             "g_formula": "threshold-raw_score",
@@ -482,10 +666,15 @@ def main(cfg: DictConfig) -> None:
             "stream_stats": streams.stats,
             "replay_valid_windows": int(valid_windows),
             "score_cache_rows": len(start_to_row),
-        },
-    )
+            "provenance": input_provenance,
+            "completed_steps": 0,
+            "output_checkpoint": None,
+        }
+    write_run_info(run_dir, run_info)
 
     num_steps = int(cfg.offline.num_train_steps)
+    if num_steps <= 0:
+        raise ValueError("offline.num_train_steps must be positive.")
     log_interval = max(1, int(cfg.offline.log_interval))
     plot_interval_raw = OmegaConf.select(
         cfg,
@@ -506,42 +695,180 @@ def main(cfg: DictConfig) -> None:
         "augment": True,
     }
 
-    def save_checkpoint(tag: str, step: int) -> Path:
+    def save_checkpoint(tag: str, completed_steps: int) -> Path:
         checkpoint = agent.build_checkpoint_payload(
             include_buffers=False,
-            extra={"global_step": int(step), "run_name": run_name},
+            extra={
+                "global_step": int(completed_steps),
+                "completed_steps": int(completed_steps),
+                "run_name": run_name,
+                "positive_training_mode": training_mode,
+            },
         )
         path = checkpoint_path(run_dir, tag)
         agent.write_checkpoint_payload(path, checkpoint)
         return path
 
-    prefetcher = _BatchPrefetcher(
-        static_cache.sample,
-        batch_size=batch_size,
-        sample_kwargs=sample_kwargs,
-    )
+    parameter_snapshots = trainable_parameter_snapshot(agent.core)
+    prefetcher = None
+    if training_mode == POLICY_TRAINING_COUPLED:
+        prefetcher = _BatchPrefetcher(
+            static_cache.sample,
+            batch_size=batch_size,
+            sample_kwargs=sample_kwargs,
+        )
+    else:
+        assert positive_static_cache is not None
+        pos_numpy_rng = np.random.default_rng(
+            branch_seed(int(cfg.seed), step=0, branch="pos", phase="sample")
+        )
+        neg_numpy_rng = np.random.default_rng(
+            branch_seed(int(cfg.seed), step=0, branch="neg", phase="sample")
+        )
     print(
         f"[offline] policy training for {num_steps} steps "
-        f"(batch_size={batch_size}, prefetch=on)"
+        f"(mode={training_mode}, batch_size={batch_size}, "
+        f"prefetch={'on' if prefetcher is not None else 'off'})"
     )
+    completed_steps = 0
+    final_path: Path | None = None
     try:
         for step in range(num_steps):
-            batch = prefetcher.next()
             is_log = step % log_interval == 0 or step == num_steps - 1
             collect_diagnostics = (
                 step % plot_interval == 0 or step == num_steps - 1
             )
-            metrics = agent.core.update(
-                batch=batch,
-                want_metrics=is_log,
-                collect_diagnostics=collect_diagnostics,
-            )
-            diagnostics = metrics.pop("_diag", None)
+            if training_mode == POLICY_TRAINING_COUPLED:
+                assert prefetcher is not None
+                batch = prefetcher.next()
+                metrics = agent.core.update(
+                    batch=batch,
+                    want_metrics=is_log,
+                    collect_diagnostics=collect_diagnostics,
+                )
+                diagnostics = metrics.pop("_diag", None)
+            else:
+                pos_batch = sample_static_cache(
+                    positive_static_cache,
+                    batch_size,
+                    sample_kwargs=sample_kwargs,
+                    numpy_rng=pos_numpy_rng,
+                    torch_seed=branch_seed(
+                        int(cfg.seed), step=step, branch="pos", phase="sample"
+                    ),
+                )
+                neg_batch = sample_static_cache(
+                    static_cache,
+                    batch_size,
+                    sample_kwargs=sample_kwargs,
+                    numpy_rng=neg_numpy_rng,
+                    torch_seed=branch_seed(
+                        int(cfg.seed), step=step, branch="neg", phase="sample"
+                    ),
+                )
+                want_branch_metrics = bool(is_log or collect_diagnostics)
+                if training_mode == POLICY_TRAINING_FILTERED_BC:
+                    pos_weights = torch.ones(
+                        pos_batch.batch_size,
+                        device=agent.core.device,
+                        dtype=torch.float32,
+                    )
+                    pos_weight_metrics = {
+                        "frac_pos_only": 1.0,
+                        "frac_neg_only": 0.0,
+                        "frac_disc_weighted": 0.0,
+                        "effective_pos_mass/pos_only": 1.0,
+                    }
+                else:
+                    pos_weights, _, pos_weight_metrics = branch_policy(
+                        pos_batch,
+                        g_provider=provider,
+                        sigmoid_fn=agent.core._g_weights_from_g,  # noqa: SLF001
+                        device=agent.core.device,
+                        want_metrics=want_branch_metrics,
+                    )
+                _, neg_weights, neg_weight_metrics = branch_policy(
+                    neg_batch,
+                    g_provider=provider,
+                    sigmoid_fn=agent.core._g_weights_from_g,  # noqa: SLF001
+                    device=agent.core.device,
+                    want_metrics=want_branch_metrics,
+                )
+                pos_metrics = branch_only_update(
+                    agent.core,
+                    pos_batch,
+                    branch="pos",
+                    weights=pos_weights,
+                    torch_seed=branch_seed(
+                        int(cfg.seed), step=step, branch="pos", phase="update"
+                    ),
+                    want_metrics=want_branch_metrics,
+                )
+                neg_metrics = branch_only_update(
+                    agent.core,
+                    neg_batch,
+                    branch="neg",
+                    weights=neg_weights,
+                    torch_seed=branch_seed(
+                        int(cfg.seed), step=step, branch="neg", phase="update"
+                    ),
+                    want_metrics=want_branch_metrics,
+                )
+                pos_v_mse = pos_metrics.pop("v_pos_mse", None)
+                neg_v_mse = neg_metrics.pop("v_neg_mse", None)
+                metrics = {
+                    **pos_metrics,
+                    **neg_metrics,
+                    **_prefixed_metrics("positive_weights", pos_weight_metrics),
+                    **_prefixed_metrics("negative_weights", neg_weight_metrics),
+                }
+                if want_branch_metrics:
+                    metrics["actor_loss"] = (
+                        metrics["loss_pos"] + metrics["loss_neg"]
+                    )
+                    metrics["G_mean"] = float(
+                        pos_weight_metrics.get(
+                            "G_mean",
+                            neg_weight_metrics.get("G_mean", 0.0),
+                        )
+                    )
+                diagnostics = None
+                if collect_diagnostics:
+                    diagnostics = {
+                        "g_values": (
+                            agent.core._provider_g_for_batch(pos_batch)  # noqa: SLF001
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            if training_mode != POLICY_TRAINING_FILTERED_BC
+                            else np.zeros(pos_batch.batch_size, dtype=np.float32)
+                        ),
+                        "w_pos": pos_weights.detach().cpu().numpy(),
+                        "w_neg": neg_weights.detach().cpu().numpy(),
+                        "v_pos_mse": pos_v_mse.detach().cpu().numpy(),
+                        "v_neg_mse": neg_v_mse.detach().cpu().numpy(),
+                        "independent_batches": True,
+                    }
+            completed_steps = step + 1
             if is_log:
+                metrics.update(
+                    parameter_distance_metrics(agent.core, parameter_snapshots)
+                )
                 maybe_log(
                     metric_logger,
                     {f"train/{key}": float(value) for key, value in metrics.items()},
                     step=step,
+                )
+                raw_score_mean = metrics.get(
+                    "raw_score_mean",
+                    metrics.get(
+                        "positive_weights/raw_score_mean",
+                        metrics.get("negative_weights/raw_score_mean", 0.0),
+                    ),
+                )
+                frac_disc_weighted = metrics.get(
+                    "frac_disc_weighted",
+                    metrics.get("positive_weights/frac_disc_weighted", 0.0),
                 )
                 print(
                     f"[offline][step {step:6d}] "
@@ -549,8 +876,8 @@ def main(cfg: DictConfig) -> None:
                     f"w_pos={metrics.get('w_pos_mean', 0.0):.3f} "
                     f"w_neg={metrics.get('w_neg_mean', 0.0):.3f} "
                     f"G_mean={metrics.get('G_mean', 0.0):+.3f} "
-                    f"raw_score={metrics.get('raw_score_mean', 0.0):+.3f} "
-                    f"frac_disc={metrics.get('frac_disc_weighted', 0.0):.2f}"
+                    f"raw_score={raw_score_mean:+.3f} "
+                    f"frac_disc={frac_disc_weighted:.2f}"
                 )
             if diagnostics is not None:
                 maybe_log_figure(
@@ -575,30 +902,43 @@ def main(cfg: DictConfig) -> None:
                     ),
                     step,
                 )
-                maybe_log_figure(
-                    metric_logger,
-                    "train/v_pos_neg_mse_scatter",
-                    plot_v_pos_neg_scatter(
-                        diagnostics["v_pos_mse"],
-                        diagnostics["v_neg_mse"],
-                    ),
-                    step,
+                if not diagnostics.get("independent_batches", False):
+                    maybe_log_figure(
+                        metric_logger,
+                        "train/v_pos_neg_mse_scatter",
+                        plot_v_pos_neg_scatter(
+                            diagnostics["v_pos_mse"],
+                            diagnostics["v_neg_mse"],
+                        ),
+                        step,
+                    )
+            if completed_steps % checkpoint_interval == 0:
+                step_path = save_checkpoint(
+                    f"step_{completed_steps:08d}", completed_steps
                 )
-            if step > 0 and step % checkpoint_interval == 0:
-                step_path = save_checkpoint(f"step_{step:08d}", step)
-                save_checkpoint("latest", step)
+                save_checkpoint("latest", completed_steps)
                 print(
-                    f"[offline][ckpt] step={step} -> "
+                    f"[offline][ckpt] completed_steps={completed_steps} -> "
                     f"{step_path.name} (+latest)"
                 )
+    except Exception:
+        print(
+            f"[offline] training failed after completed_steps={completed_steps}; "
+            "no final checkpoint was written."
+        )
+        raise
+    else:
+        final_path = save_checkpoint("latest", completed_steps)
+        save_checkpoint(f"step_{completed_steps:08d}", completed_steps)
+        run_info["completed_steps"] = int(completed_steps)
+        run_info["output_checkpoint"] = file_provenance(final_path)
+        write_run_info(run_dir, run_info)
+        print(f"[offline] done. final checkpoint -> {final_path}")
     finally:
-        prefetcher.close()
-        final_step = max(0, num_steps - 1)
-        final_path = save_checkpoint("latest", final_step)
-        save_checkpoint(f"step_{final_step:08d}", final_step)
+        if prefetcher is not None:
+            prefetcher.close()
         if metric_logger is not None:
             metric_logger.close()
-        print(f"[offline] done. final checkpoint -> {final_path}")
 
 
 if __name__ == "__main__":

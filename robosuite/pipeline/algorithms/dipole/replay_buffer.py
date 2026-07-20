@@ -117,13 +117,16 @@ class DipoleOfflineStaticCache:
         proprio_std: np.ndarray | None = None,
         device: torch.device | str | None = None,
         augment: bool = True,
+        rng: np.random.Generator | None = None,
     ) -> DipoleBatch:
         if len(self) == 0:
             raise ValueError(f"{self.name} does not contain any valid sequences.")
-        row_idx = torch.as_tensor(
-            np.random.randint(0, len(self), size=int(batch_size)),
-            dtype=torch.long,
+        sampled_rows = (
+            np.random.randint(0, len(self), size=int(batch_size))
+            if rng is None
+            else rng.integers(0, len(self), size=int(batch_size))
         )
+        row_idx = torch.as_tensor(sampled_rows, dtype=torch.long)
         target_device = torch.device("cpu" if device is None else device)
         non_blocking = bool(self.pin_memory and target_device.type == "cuda")
 
@@ -203,12 +206,17 @@ class DipoleReplayBuffer(FlowDaggerReplayBuffer):
         proprio_std: np.ndarray | None = None,
         device: torch.device | str | None = None,
         augment: bool = True,
+        rng: np.random.Generator | None = None,
     ) -> DipoleBatch:
         with self._lock:
             valid_starts = self._get_valid_start_indices_locked()
             if len(valid_starts) == 0:
                 raise ValueError(f"{self.name} does not contain any valid sequences.")
-            indices = np.random.randint(0, len(valid_starts), size=int(batch_size))
+            indices = (
+                np.random.randint(0, len(valid_starts), size=int(batch_size))
+                if rng is None
+                else rng.integers(0, len(valid_starts), size=int(batch_size))
+            )
             start_indices = [valid_starts[int(i)] for i in indices]
             transitions = [self._storage[start : start + self.action_horizon] for start in start_indices]
 

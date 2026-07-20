@@ -15,8 +15,18 @@ offline:
   max_pretrain_trajectories: null
   # Shared HDF5 loading uses sparse rewards in the existing Offline DAgger mode.
   reward_mode: "-1/0"
-  # Add pure on-policy success rollouts as positive BC demonstrations.
-  use_online_success: false
+  positive_training:
+    # coupled | independent_soft | filtered_bc
+    mode: "coupled"
+    # Replace pure-success policy episodes with hard pos_only supervision.
+    include_pure_success: false
+    # Optional experiment guards; null disables the corresponding assertion.
+    expected_human_transitions: null
+    expected_pretrain_transitions: null
+    expected_pure_success_transitions: null
+    expected_total_positive_transitions: null
+  # Compatibility mirror for older resolved configs and analysis tools.
+  use_online_success: ${offline.positive_training.include_pure_success}
   # policy_action during intervention -> negative branch (default on).
   include_policy_action_neg: true
 

@@ -15,7 +15,7 @@ export PYTHONFAULTHANDLER=1
 
 # -----------------------------------------------------------------------
 TASK="${TASK:-PickPlaceCereal}"
-NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260719_204315_PickPlaceCereal/checkpoints/pu_bce_head.pth"
+NNPU_CKPT="${NNPU_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260719_204315_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
 NNPU_ENCODER_CKPT="${NNPU_ENCODER_CKPT:-checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth}"
 NNPU_CAMERA_TO_VIEW="${NNPU_CAMERA_TO_VIEW:-}"
 # -----------------------------------------------------------------------
@@ -26,6 +26,7 @@ PRETRAIN_DIR="${PRETRAIN_DIR:-data/${TASK}/discriminator-pretrain-quadratic-c2-l
 RUN_ROOT="${RUN_ROOT:-./outputs/dipole-rl-offline_disc}"
 RUN_SUBFIX="${RUN_SUBFIX:-}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-tensorboard}"
+PIPELINE_RUN_DIR="${PIPELINE_RUN_DIR:-}"
 
 
 if [[ -z "${NNPU_CKPT}" || "${NNPU_CKPT}" == "null" ]]; then
@@ -53,14 +54,18 @@ if [[ -n "${RUN_SUBFIX}" && ! "${RUN_SUBFIX}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   exit 1
 fi
 
-mkdir -p "${RUN_ROOT}"
-RUN_ROOT="$(realpath "${RUN_ROOT}")"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-PIPELINE_NAME="${TASK}_${TIMESTAMP}"
-if [[ -n "${RUN_SUBFIX}" ]]; then
-  PIPELINE_NAME="${PIPELINE_NAME}_${RUN_SUBFIX}"
+if [[ -n "${PIPELINE_RUN_DIR}" ]]; then
+  PIPELINE_RUN_DIR="$(realpath -m "${PIPELINE_RUN_DIR}")"
+else
+  mkdir -p "${RUN_ROOT}"
+  RUN_ROOT="$(realpath "${RUN_ROOT}")"
+  TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+  PIPELINE_NAME="${TASK}_${TIMESTAMP}"
+  if [[ -n "${RUN_SUBFIX}" ]]; then
+    PIPELINE_NAME="${PIPELINE_NAME}_${RUN_SUBFIX}"
+  fi
+  PIPELINE_RUN_DIR="${RUN_ROOT}/${PIPELINE_NAME}"
 fi
-PIPELINE_RUN_DIR="${RUN_ROOT}/${PIPELINE_NAME}"
 STAGE_RUN_DIR="${PIPELINE_RUN_DIR}/discriminator"
 if [[ -e "${PIPELINE_RUN_DIR}" ]]; then
   echo "[ERROR] Pipeline run directory already exists: ${PIPELINE_RUN_DIR}" >&2

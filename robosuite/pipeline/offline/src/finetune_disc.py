@@ -42,6 +42,11 @@ from robosuite.pipeline.offline.discriminator.finetune_setup import (
     resolved_sampler_config,
     trajectory_stats,
 )
+from robosuite.pipeline.offline.utils.provenance import (
+    file_provenance,
+    git_provenance,
+    manifest_shard_provenance,
+)
 from robosuite.pipeline.utils import (
     maybe_build_metric_logger,
     maybe_log,
@@ -64,6 +69,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     task_name = str(cfg.env.environment)
+    source_provenance = git_provenance(Path(to_absolute_path(".")).resolve())
     disc_cfg = cfg.algorithm.discriminator
     finetune_cfg = cfg.offline.discriminator_finetune
     device = require_cuda_device(str(disc_cfg.learner_device))
@@ -77,11 +83,13 @@ def main(cfg: DictConfig) -> None:
         disc_cfg.checkpoint,
         name="algorithm.discriminator.checkpoint",
     )
+    parent_checkpoint_source = "algorithm.discriminator.checkpoint"
     if parent_checkpoint is None:
         parent_checkpoint = optional_file(
             finetune_cfg.parent_checkpoint,
             name="offline.discriminator_finetune.parent_checkpoint",
         )
+        parent_checkpoint_source = "offline.discriminator_finetune.parent_checkpoint"
     if parent_checkpoint is None:
         raise ValueError(
             "A parent discriminator checkpoint is required via "
@@ -331,6 +339,11 @@ def main(cfg: DictConfig) -> None:
         ),
         "pretrain_manifest": pretrain_manifest,
         "offline_episodes_path": str(episodes_path),
+        "offline_episodes_sha256": sha256_file(episodes_path),
+        "pretrain_inputs": manifest_shard_provenance(
+            pretrain_path / "manifest.json" if pretrain_path.is_dir() else pretrain_path,
+            pretrain_manifest,
+        ),
         "offline_nnpu_checkpoint": offline_payload.get("nnpu_checkpoint"),
         "parent_model_checkpoint": parent_payload.get("model_ckpt"),
         "resolved_encoder_checkpoint": str(encoder.encoder_checkpoint),
@@ -624,7 +637,9 @@ def main(cfg: DictConfig) -> None:
             "started_at": timestamp,
             "task_name": task_name,
             "output_checkpoint": str(output_checkpoint),
+            "output_checkpoint_provenance": file_provenance(output_checkpoint),
             "parent_checkpoint": str(parent_checkpoint),
+            "parent_checkpoint_source": parent_checkpoint_source,
             "encoder_checkpoint": str(encoder.encoder_checkpoint),
             "from_init": False,
             "finetune_method": finetune_method,
@@ -632,6 +647,7 @@ def main(cfg: DictConfig) -> None:
             "data": data_provenance,
             "thresholds": thresholds,
             "calibration": checkpoint_payload["finetune_recalibration"],
+            "git": source_provenance,
             "resolved_config": resolved_config_dict(cfg),
         }
         write_run_info(run_dir, run_info)

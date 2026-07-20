@@ -120,6 +120,15 @@ class RoutedSigmoidBranchWeightPolicy:
             metrics["frac_disc_weighted"] = float(disc_mask.float().mean().item())
             metrics["w_pos_mean"] = float(w_pos.mean().item())
             metrics["w_neg_mean"] = float(w_neg.mean().item())
+            pos_total = w_pos.sum().clamp_min(1.0e-12)
+            neg_total = w_neg.sum().clamp_min(1.0e-12)
+            for route, mask in masks.items():
+                metrics[f"effective_pos_mass/{route}"] = float(
+                    (w_pos[mask].sum() / pos_total).item()
+                )
+                metrics[f"effective_neg_mass/{route}"] = float(
+                    (w_neg[mask].sum() / neg_total).item()
+                )
         return w_pos, w_neg, metrics
 
     @staticmethod

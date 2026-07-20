@@ -51,8 +51,8 @@ if [[ -z "${OFFLINE_EPISODES}" || ! -f "${OFFLINE_EPISODES}" ]]; then
 fi
 
 RUN_DIR="$(cd "$(dirname "${FINETUNED_CKPT}")/.." && pwd)"
-OUT_DIR="${OUT_DIR:-${RUN_DIR}/discriminator/eval-seed${SEED}}"
-VIS_OUT_DIR="${VIS_OUT_DIR:-${RUN_DIR}/discriminator/vis-seed${SEED}}"
+OUT_DIR="${OUT_DIR:-${RUN_DIR}/eval-seed${SEED}}"
+VIS_OUT_DIR="${VIS_OUT_DIR:-${RUN_DIR}/vis-seed${SEED}}"
 
 EXTRA_ARGS=()
 if [[ -n "${CAMERA_TO_VIEW}" ]]; then

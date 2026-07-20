@@ -206,3 +206,13 @@ def test_routed_branch_weights_mix_discriminator_soft_and_hard_rows() -> None:
     assert metrics["frac_neg_only"] == pytest.approx(0.25)
     assert metrics["threshold"] == pytest.approx(0.25)
     assert metrics["raw_score_mean"] == pytest.approx(0.25)
+    assert metrics[f"effective_pos_mass/{ROUTE_POS_ONLY}"] == pytest.approx(
+        1.0 / float(expected_pos.sum().item())
+    )
+    assert metrics[f"effective_neg_mass/{ROUTE_NEG_ONLY}"] == pytest.approx(
+        1.0 / float((1.0 - expected_pos).sum().item())
+    )
+    assert sum(
+        metrics[f"effective_pos_mass/{route}"]
+        for route in (ROUTE_DISC_WEIGHTED, ROUTE_POS_ONLY, ROUTE_NEG_ONLY)
+    ) == pytest.approx(1.0)

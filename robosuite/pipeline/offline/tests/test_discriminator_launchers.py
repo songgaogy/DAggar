@@ -46,8 +46,18 @@ def test_discriminator_launchers_parse_with_safe_environment_defaults() -> None:
     finetune = SCRIPTS / "finetune_disc.sh"
     evaluate = SCRIPTS / "eval_disc_finetuned.sh"
     train = SCRIPTS / "train_offline_dipole.sh"
+    matrix_train = SCRIPTS / "train_positive_matrix_condition.sh"
+    matrix_eval = SCRIPTS / "eval_positive_matrix_checkpoint.sh"
+    policy_eval = SCRIPTS / "eval_offline_dipole.sh"
 
-    for script in (finetune, evaluate, train):
+    for script in (
+        finetune,
+        evaluate,
+        train,
+        matrix_train,
+        matrix_eval,
+        policy_eval,
+    ):
         subprocess.run(["bash", "-n", str(script)], check=True)
 
     evaluate_text = evaluate.read_text(encoding="utf-8")
@@ -124,6 +134,8 @@ def test_train_launcher_uses_discriminator_run_and_writes_sibling_stage(
             "PY": str(fake_python),
             "INVOCATION_LOG": str(invocation_log),
             "PIPELINE_RUN_DIR": str(pipeline_dir),
+            "STAGE_RUN_DIR": str(pipeline_dir),
+            "NNPU_CKPT": str(checkpoint),
         }
     )
 
@@ -158,13 +170,12 @@ def test_train_launcher_exposes_only_discriminator_run_contract() -> None:
     launcher = (SCRIPTS / "train_offline_dipole.sh").read_text(encoding="utf-8")
 
     assert (
-        'PIPELINE_RUN_DIR="${PIPELINE_RUN_DIR:-outputs/'
+        'SOURCE_PIPELINE_RUN_DIR="${SOURCE_PIPELINE_RUN_DIR:-outputs/'
         'dipole-rl-offline_disc/PickPlaceCereal_20260719_212234}"'
         in launcher
     )
-    assert 'DISCRIMINATOR_RUN_DIR="${PIPELINE_RUN_DIR}/discriminator"' in launcher
-    assert 'NNPU_CKPT="${DISCRIMINATOR_RUN_DIR}/checkpoints/pu_bce_head_finetuned.pth"' in launcher
-    assert 'STAGE_RUN_DIR="${PIPELINE_RUN_DIR}"' in launcher
+    assert 'NNPU_CKPT="${NNPU_CKPT:-${SOURCE_PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth}"' in launcher
+    assert 'STAGE_RUN_DIR="${STAGE_RUN_DIR:-${PIPELINE_RUN_DIR:-${SOURCE_PIPELINE_RUN_DIR}}}"' in launcher
     assert 'CHECKPOINT_DIR="${STAGE_RUN_DIR}/checkpoints"' in launcher
     assert "logging.tensorboard_dir=tensorboard/dipole" in launcher
     assert "VAST_CKPT" not in launcher
@@ -217,8 +228,8 @@ def test_eval_launcher_keeps_evaluation_and_visualization_outputs_separate(
         text=True,
     )
 
-    evaluation_dir = run_dir / "discriminator" / "eval-seed0"
-    visualization_dir = run_dir / "discriminator" / "vis-seed0"
+    evaluation_dir = run_dir / "eval-seed0"
+    visualization_dir = run_dir / "vis-seed0"
     assert evaluation_dir.is_dir()
     assert visualization_dir.is_dir()
     assert evaluation_dir != visualization_dir
@@ -313,9 +324,9 @@ def test_eval_launcher_supports_visualization_only(tmp_path: Path) -> None:
         text=True,
     )
 
-    visualization_dir = run_dir / "discriminator" / "vis-seed0"
+    visualization_dir = run_dir / "vis-seed0"
     assert visualization_dir.is_dir()
-    assert not (run_dir / "discriminator" / "eval-seed0").exists()
+    assert not (run_dir / "eval-seed0").exists()
 
     invocations = invocation_log.read_text(encoding="utf-8").splitlines()
     assert len(invocations) == 1
