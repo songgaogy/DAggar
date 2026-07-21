@@ -59,6 +59,7 @@ def build_vast_finetune_buffer(
     image_size: int,
     action_horizon: int,
     warmup_transitions_path: str | Path | None,
+    relabel_disc_reward: bool = False,
     capacity: int = 10_000_000,
 ) -> tuple[FlowDaggerReplayBuffer, dict[str, int]]:
     """Mix collected policy sections with the warmup transitions into one buffer.
@@ -82,6 +83,7 @@ def build_vast_finetune_buffer(
     stats = {
         "policy_bc_transitions": len(policy_bc_transitions),
         "warmup_transitions": 0,
+        "discarded_cached_disc_rewards": 0,
     }
 
     if warmup_transitions_path is not None:
@@ -115,6 +117,16 @@ def build_vast_finetune_buffer(
         warmup_transitions = list(loader._storage)  # noqa: SLF001 - read-only access
         for src in warmup_transitions:
             info = dict(src.info or {})
+            if relabel_disc_reward:
+                cached_keys = (
+                    "nnpu_disc_intrinsic",
+                    "nnpu_failure_score",
+                    "nnpu_threshold",
+                )
+                if any(key in info for key in cached_keys):
+                    stats["discarded_cached_disc_rewards"] += 1
+                for key in cached_keys:
+                    info.pop(key, None)
             info["episode_index"] = base + int(info.get("episode_index", 0))
             info.setdefault("buffer_role", "offline")
             buffer.add(

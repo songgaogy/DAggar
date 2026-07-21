@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -33,6 +34,9 @@ def _fake_python(tmp_path: Path) -> tuple[Path, Path]:
     fake_python = tmp_path / "fake_python.sh"
     fake_python.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == "-c" ]]; then\n'
+        '  exec "${REAL_PYTHON}" "$@"\n'
+        "fi\n"
         'printf \'%s\\n\' "$*" >> "${INVOCATION_LOG}"\n',
         encoding="utf-8",
     )
@@ -102,31 +106,37 @@ def test_finetune_launcher_creates_discriminator_stage(tmp_path: Path) -> None:
     )
 
 
-def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
+def test_train_launcher_uses_positional_run_and_finetuned_checkpoint(
     tmp_path: Path,
 ) -> None:
     pipeline_dir = tmp_path / "PickPlaceCereal_run"
+    discriminator_dir = pipeline_dir / "discriminator"
     checkpoint = (
-        pipeline_dir
-        / "discriminator"
-        / "checkpoints"
-        / "pu_bce_head_finetuned.pth"
+        discriminator_dir / "checkpoints" / "pu_bce_head_finetuned.pth"
     )
     checkpoint.parent.mkdir(parents=True)
     checkpoint.touch()
+    vast_finetuned = pipeline_dir / "dipole" / "checkpoints" / "vast_state_finetuned.pt"
+    vast_finetuned.parent.mkdir(parents=True)
+    vast_finetuned.touch()
+    (discriminator_dir / "run_info.json").write_text(
+        '{"task_name": "PickPlaceCereal"}', encoding="utf-8"
+    )
     fake_python, invocation_log = _fake_python(tmp_path)
     environment = os.environ.copy()
     environment.update(
         {
             "ROOT_DIR": str(REPO_ROOT),
             "PY": str(fake_python),
+            "REAL_PYTHON": sys.executable,
             "INVOCATION_LOG": str(invocation_log),
-            "PIPELINE_RUN_DIR": str(pipeline_dir),
+            "PIPELINE_RUN_DIR": str(tmp_path / "ignored_pipeline"),
+            "NNPU_CKPT": str(tmp_path / "ignored_nnpu.pth"),
         }
     )
 
     subprocess.run(
-        ["bash", str(SCRIPTS / "train_offline_dipole.sh")],
+        ["bash", str(SCRIPTS / "train_offline_dipole.sh"), str(pipeline_dir)],
         check=True,
         env=environment,
         capture_output=True,
@@ -135,18 +145,126 @@ def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
 
     invocation = invocation_log.read_text(encoding="utf-8")
     assert f"algorithm.discriminator.checkpoint={checkpoint}" in invocation
-    assert f"offline.run_dir={pipeline_dir}/dipole" in invocation
+    assert f"offline.run_dir={pipeline_dir}/dipole_skip_rl" in invocation
+    assert "offline.vast_finetune.relabel_disc_reward=true" in invocation
+    assert "offline.skip_rl=true" in invocation
+    assert f"offline.vast_finetuned_path={vast_finetuned}" in invocation
+    assert environment["PIPELINE_RUN_DIR"] not in invocation
+    assert environment["NNPU_CKPT"] not in invocation
 
-    environment.pop("PIPELINE_RUN_DIR")
+
+def test_train_launcher_can_force_phase_a_mode(tmp_path: Path) -> None:
+    pipeline_dir = tmp_path / "PickPlaceCereal_run"
+    discriminator_dir = pipeline_dir / "discriminator"
+    checkpoint = (
+        discriminator_dir / "checkpoints" / "pu_bce_head_finetuned.pth"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    (discriminator_dir / "run_info.json").write_text(
+        '{"task_name": "PickPlaceCereal"}', encoding="utf-8"
+    )
+    fake_python, invocation_log = _fake_python(tmp_path)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ROOT_DIR": str(REPO_ROOT),
+            "PY": str(fake_python),
+            "REAL_PYTHON": sys.executable,
+            "INVOCATION_LOG": str(invocation_log),
+            "SKIP_RL": "false",
+        }
+    )
+
+    subprocess.run(
+        ["bash", str(SCRIPTS / "train_offline_dipole.sh"), str(pipeline_dir)],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    invocation = invocation_log.read_text(encoding="utf-8")
+    assert f"offline.run_dir={pipeline_dir}/dipole" in invocation
+    assert "offline.skip_rl=false" in invocation
+    assert "offline.vast_finetuned_path=" not in invocation
+
+
+def test_train_launcher_rejects_invalid_run_contract(tmp_path: Path) -> None:
+    fake_python, invocation_log = _fake_python(tmp_path)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ROOT_DIR": str(REPO_ROOT),
+            "PY": str(fake_python),
+            "REAL_PYTHON": sys.executable,
+            "INVOCATION_LOG": str(invocation_log),
+            "PIPELINE_RUN_DIR": str(tmp_path / "ignored_pipeline"),
+            "NNPU_CKPT": str(tmp_path / "ignored_nnpu.pth"),
+            "SKIP_RL": "false",
+        }
+    )
+    launcher = ["bash", str(SCRIPTS / "train_offline_dipole.sh")]
+
     missing = subprocess.run(
-        ["bash", str(SCRIPTS / "train_offline_dipole.sh")],
+        launcher,
         check=False,
         env=environment,
         capture_output=True,
         text=True,
     )
     assert missing.returncode != 0
-    assert "PIPELINE_RUN_DIR is required" in missing.stderr
+    assert "Usage:" in missing.stderr
+
+    multiple = subprocess.run(
+        [*launcher, str(tmp_path / "run_a"), str(tmp_path / "run_b")],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert multiple.returncode != 0
+    assert "Usage:" in multiple.stderr
+
+    pipeline_dir = tmp_path / "PickPlaceCereal_run"
+    discriminator_dir = pipeline_dir / "discriminator"
+    checkpoint = discriminator_dir / "checkpoints" / "pu_bce_head_finetuned.pth"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+
+    missing_info = subprocess.run(
+        [*launcher, str(pipeline_dir)],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_info.returncode != 0
+    assert "run_info.json" in missing_info.stderr
+
+    run_info = discriminator_dir / "run_info.json"
+    run_info.write_text('{"task_name": "Stack"}', encoding="utf-8")
+    mismatch = subprocess.run(
+        [*launcher, str(pipeline_dir)],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert mismatch.returncode != 0
+    assert "Run task mismatch" in mismatch.stderr
+
+    run_info.write_text('{"task_name": "PickPlaceCereal"}', encoding="utf-8")
+    (pipeline_dir / "dipole").mkdir()
+    existing_stage = subprocess.run(
+        [*launcher, str(pipeline_dir)],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert existing_stage.returncode != 0
+    assert "DIPOLE stage directory already exists" in existing_stage.stderr
 
 
 def test_eval_launcher_keeps_evaluation_and_visualization_outputs_separate(

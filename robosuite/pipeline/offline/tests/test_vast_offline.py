@@ -33,6 +33,53 @@ def test_offline_config_defaults_to_gae() -> None:
     estimator, gae_lambda = train_offline._resolve_advantage_config(cfg)
     assert estimator == "gae"
     assert gae_lambda == pytest.approx(0.6)
+    assert cfg.offline.vast_finetune.relabel_disc_reward is False
+
+
+def test_phase_a_explicitly_relabels_discriminator_reward_after_strict_load() -> None:
+    cfg = _cfg()
+    cfg.disc_reward_coef = 0.2
+    provenance = train_offline._resolve_vast_reward_semantics(
+        cfg,
+        {**asdict(cfg), "disc_reward_coef": 0.0},
+        skip_rl=False,
+        relabel_disc_reward=True,
+    )
+
+    assert cfg.disc_reward_coef == pytest.approx(0.0)
+    assert provenance == {
+        "enabled": True,
+        "changed": True,
+        "checkpoint_disc_reward_coef": 0.0,
+        "requested_disc_reward_coef": 0.2,
+        "effective_disc_reward_coef": 0.2,
+    }
+    train_offline._apply_vast_disc_reward_relabel(cfg, provenance)
+    assert cfg.disc_reward_coef == pytest.approx(0.2)
+
+
+def test_phase_a_without_relabel_rejects_reward_mismatch() -> None:
+    cfg = _cfg()
+    cfg.disc_reward_coef = 0.2
+    with pytest.raises(ValueError, match="relabel_disc_reward=true"):
+        train_offline._resolve_vast_reward_semantics(
+            cfg,
+            {**asdict(cfg), "disc_reward_coef": 0.0},
+            skip_rl=False,
+            relabel_disc_reward=False,
+        )
+
+
+def test_skip_rl_rejects_discriminator_reward_mismatch() -> None:
+    cfg = _cfg()
+    cfg.disc_reward_coef = 0.2
+    with pytest.raises(ValueError, match="skip_rl.*cannot be skipped"):
+        train_offline._resolve_vast_reward_semantics(
+            cfg,
+            {**asdict(cfg), "disc_reward_coef": 0.0},
+            skip_rl=True,
+            relabel_disc_reward=True,
+        )
 
 
 @pytest.mark.parametrize("estimator", ["gae", "td1"])

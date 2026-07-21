@@ -194,7 +194,23 @@ def test_frozen_nnpu_cuda_roundtrip_preserves_center_and_legacy_zero_center(
     )
     centered_expected = source.failure_score_tensor(probe)
     centered_actual = frozen.failure_score(probe)
+    intrinsic = frozen.intrinsic_reward(probe)
     assert centered_actual.is_cuda
+    assert intrinsic.is_cuda
+    assert intrinsic.shape == centered_actual.shape
+    assert torch.isfinite(intrinsic).all()
+    assert torch.all((intrinsic >= -1.0) & (intrinsic <= 0.0))
+    torch.testing.assert_close(
+        intrinsic,
+        -torch.sigmoid(centered_actual - frozen.threshold),
+    )
+    order = torch.argsort(centered_actual)
+    assert torch.all(torch.diff(intrinsic[order]) <= 0.0)
+    threshold = torch.tensor(frozen.threshold, device=device)
+    torch.testing.assert_close(
+        -torch.sigmoid(threshold - threshold),
+        torch.tensor(-0.5, device=device),
+    )
     assert float(frozen.detector.head.logit_center) == pytest.approx(1.5)
     torch.testing.assert_close(centered_actual, centered_expected)
 

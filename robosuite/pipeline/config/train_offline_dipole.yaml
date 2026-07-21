@@ -43,16 +43,19 @@ offline:
   run_dir: null
 
   # Phase A joint VAST G+V finetune (continues from warmup_ckpt).
-  skip_rl: false
+  skip_rl: true
   vast_finetuned_path: null
   vast_finetune:
     num_steps: 20000
     batch_size: 256
     preencode_cache: true
+    # Permit Phase A to relabel rewards with the runtime discriminator while
+    # using a structurally compatible VAST checkpoint as initialization.
+    relabel_disc_reward: false
 
   # Phase-B advantage read-out from the frozen VAST V/target-V values.
   advantage:
-    estimator: "gae"  # gae | td1
+    estimator: "td1"  # gae | td1
     gae_lambda: 0.6
 
   # Pluggable branch-weight policy (offline/utils/branch_weights.py).
@@ -84,7 +87,7 @@ algorithm:
       vast_max_k: 10
       vast_comp_coef: 0.5
       vast_sampling_seed: ${seed}
-      expectile_tau: 0.9
+      expectile_tau: 0.7
       device: "cuda:0"
   discriminator:
     checkpoint: null

@@ -22,14 +22,14 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 cd "$ROOT_DIR"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
 ENVIRONMENT="${ENVIRONMENT:-PickPlaceCereal}"
 SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
-SPLIT="success"      # success or fail or online
-VAST_CKPT="outputs/dipole-rl-offline_vast/PickPlaceCereal_20260714_234032_vast-indep_ensemble_beta5_k-1_tau0p7/checkpoints/vast_state_finetuned.pt"
-NNPU_CKPT="${NNPU_CKPT:-checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
+SPLIT="fail"      # success or fail or online
+VAST_CKPT="outputs/dipole-rl-offline_vast-disc_reward/PickPlaceCereal_20260719_212234/dipole/checkpoints/vast_state_finetuned.pt"
+NNPU_CKPT="outputs/dipole-rl-offline_vast-disc_reward/PickPlaceCereal_20260719_212234/discriminator/checkpoints/pu_bce_head_finetuned.pth"
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"

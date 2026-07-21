@@ -1,33 +1,3 @@
-"""Offline DIPOLE training entry (PROMPT.md ``[tbd] Offline DIPOLE``).
-
-Mimics a single online ``policy -> interaction -> policy update`` loop from a
-dataset collected by ``offline/utils/collect_data.py``
-(``data/<task>/offline_data/offline_episodes.pt``). Sequential two phases:
-
-**Phase A — VAST finetune (unfrozen).** Load the pretrained VAST G/V modules
-(``init_vast.sh`` output, via ``algorithm.vast.warmup_ckpt``) and continue
-training them on the collected policy-rollout sections mixed with the transitions
-the warmup consumed (``offline_data-vast/vast_offline_transitions.pt``). Save the
-finetuned critics to ``<run_dir>/checkpoints/vast_state_finetuned.pt``.
-
-**Phase B — weighted-BC policy update (G/V frozen).** Split each episode on
-``is_intervention`` into three routed streams (see ``offline/utils/episode_dataset``):
-policy sections (advantage-weighted, ``route="advantage"``), human sections
-(``route="pos_only"`` → positive branch), and the policy action during
-intervention (``route="neg_only"`` → negative branch). Precompute chunk-MDP
-GAE from the frozen VAST ``V/target_V`` values, then train the two flow policies
-with the existing routed branch-weight policy. TD1 remains an explicit ablation.
-
-Run dir: ``<pipeline_run>/dipole`` with TensorBoard.
-
-    python -m robosuite.pipeline.offline.src.train_offline_dipole \\
-        env.environment=PickPlaceCereal \\
-        runtime.init_checkpoint=checkpoints/.../flow.pt \\
-        algorithm.discriminator.checkpoint=.../pu_bce_head.pth \\
-        algorithm.vast.warmup_ckpt=.../vast_state.pt \\
-        offline.episodes_path=data/PickPlaceCereal/offline_data/offline_episodes.pt
-"""
-
 from __future__ import annotations
 
 import datetime
@@ -200,6 +170,75 @@ def _as_bool(value: Any) -> bool:
     return text in ("1", "true", "yes", "y", "on")
 
 
+def _resolve_vast_reward_semantics(
+    vast_cfg: VASTConfig,
+    checkpoint_cfg: dict[str, Any],
+    *,
+    skip_rl: bool,
+    relabel_disc_reward: bool,
+) -> dict[str, Any]:
+    """Prepare strict checkpoint loading and record an explicit Phase-A relabel."""
+    requested_disc_coef = float(vast_cfg.disc_reward_coef)
+    checkpoint_disc_coef = float(
+        checkpoint_cfg.get("disc_reward_coef", requested_disc_coef)
+    )
+    disc_mismatch = requested_disc_coef != checkpoint_disc_coef
+    if disc_mismatch and skip_rl:
+        raise ValueError(
+            "offline.skip_rl=true requires disc_reward_coef to match the loaded "
+            f"VAST checkpoint; checkpoint={checkpoint_disc_coef}, "
+            f"runtime={requested_disc_coef}. Phase A reward relabeling cannot be skipped."
+        )
+    if disc_mismatch and not relabel_disc_reward:
+        raise ValueError(
+            "VAST checkpoint disc_reward_coef mismatch; checkpoint="
+            f"{checkpoint_disc_coef}, runtime={requested_disc_coef}. Set "
+            "offline.vast_finetune.relabel_disc_reward=true to use the checkpoint "
+            "only as Phase A initialization."
+        )
+
+    # Only the explicitly approved discriminator-reward mismatch is temporarily
+    # aligned for strict loading. Every other semantic field remains subject to
+    # the existing checkpoint validator.
+    if disc_mismatch:
+        print(
+            "[offline][vast] aligning disc_reward_coef: "
+            f"{requested_disc_coef} -> {checkpoint_disc_coef} (for checkpoint load)"
+        )
+        vast_cfg.disc_reward_coef = type(vast_cfg.disc_reward_coef)(
+            checkpoint_disc_coef
+        )
+
+    relabel_enabled = bool(relabel_disc_reward and not skip_rl)
+    return {
+        "enabled": relabel_enabled,
+        "changed": bool(relabel_enabled and disc_mismatch),
+        "checkpoint_disc_reward_coef": checkpoint_disc_coef,
+        "requested_disc_reward_coef": requested_disc_coef,
+        "effective_disc_reward_coef": (
+            requested_disc_coef if relabel_enabled else checkpoint_disc_coef
+        ),
+    }
+
+
+def _apply_vast_disc_reward_relabel(
+    vast_cfg: VASTConfig,
+    provenance: dict[str, Any],
+) -> None:
+    """Restore the requested discriminator reward after strict checkpoint loading."""
+    if not bool(provenance["enabled"]):
+        return
+    restored = type(vast_cfg.disc_reward_coef)(
+        provenance["requested_disc_reward_coef"]
+    )
+    if vast_cfg.disc_reward_coef != restored:
+        print(
+            "[offline][vast] relabeling Phase-A discriminator reward: "
+            f"{vast_cfg.disc_reward_coef} -> {restored}"
+        )
+    vast_cfg.disc_reward_coef = restored
+
+
 def _resolve_advantage_config(cfg: DictConfig) -> tuple[str, float]:
     estimator = str(
         OmegaConf.select(cfg, "offline.advantage.estimator", default="gae")
@@ -316,32 +355,25 @@ def main(cfg: DictConfig) -> None:
         )
         initial_vast_ckpt = warmup_ckpt
     warmup_payload = torch.load(initial_vast_ckpt, map_location="cpu", weights_only=False)
+    warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
+    relabel_disc_reward = _as_bool(
+        OmegaConf.select(
+            cfg,
+            "offline.vast_finetune.relabel_disc_reward",
+            default=False,
+        )
+    )
+    reward_relabel_provenance = _resolve_vast_reward_semantics(
+        vast_cfg,
+        warmup_cfg if isinstance(warmup_cfg, dict) else {},
+        skip_rl=skip_rl,
+        relabel_disc_reward=relabel_disc_reward,
+    )
     validate_vast_checkpoint_payload(
         warmup_payload,
         vast_cfg,
         require_finetuned=bool(skip_rl),
     )
-    warmup_meta = warmup_payload.get("encoder_meta", {}) if isinstance(warmup_payload, dict) else {}
-    warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
-    # Align the value-semantics config with the loaded checkpoint so Phase-A
-    # finetune continues in the exact regime the warmup established, and the
-    # frozen-critic advantage read-out uses the same value semantics.
-    # Structural fields (v_ensemble_size, projector dims) are asserted separately
-    # by VASTLearner.load_state_dict, which raises loudly on any mismatch.
-    for field in (
-        "output_reward_coef",
-        "disc_reward_coef",
-        "expectile_tau",
-        "discount",
-    ):
-        src = warmup_cfg if field in warmup_cfg else (warmup_meta if field in warmup_meta else None)
-        if src is None:
-            continue
-        old = getattr(vast_cfg, field)
-        new = type(old)(src[field])
-        if old != new:
-            print(f"[offline][vast] aligning {field}: {old} -> {new} (from warmup ckpt)")
-        setattr(vast_cfg, field, new)
 
     H = int(vast_cfg.action_horizon)
     if int(agent.flow_config.action_horizon) != H:
@@ -364,6 +396,7 @@ def main(cfg: DictConfig) -> None:
         expected_chunk_feature_dim=int(shared_encoder.chunk_feature_dim),
         expected_action_dim=policy_action_dim,
     )
+    _apply_vast_disc_reward_relabel(vast_cfg, reward_relabel_provenance)
     print(f"[offline][vast] loaded VAST critics from {initial_vast_ckpt}")
 
     # ------------------------------------------------------------------ #
@@ -512,7 +545,11 @@ def main(cfg: DictConfig) -> None:
             discriminator=discriminator,
             vast_cfg=vast_cfg,
             nnpu_ckpt=nnpu_ckpt,
-            extra_meta={"migrated_from_checkpoint": str(vast_finetuned_override)},
+            extra_meta={
+                "migrated_from_checkpoint": str(vast_finetuned_override),
+                "discriminator_checkpoint": nnpu_ckpt,
+                "disc_reward_relabel": reward_relabel_provenance,
+            },
         )
         normalized_schema = 8 if vast_cfg.vast_v_mode == "indep_ensemble" else 7
         print(
@@ -526,6 +563,7 @@ def main(cfg: DictConfig) -> None:
             image_size=img_height,
             action_horizon=H,
             warmup_transitions_path=warmup_transitions_path,
+            relabel_disc_reward=bool(reward_relabel_provenance["enabled"]),
         )
         finetune_vast(
             vast_learner,
@@ -548,6 +586,10 @@ def main(cfg: DictConfig) -> None:
             discriminator=discriminator,
             vast_cfg=vast_cfg,
             nnpu_ckpt=nnpu_ckpt,
+            extra_meta={
+                "discriminator_checkpoint": nnpu_ckpt,
+                "disc_reward_relabel": reward_relabel_provenance,
+            },
         )
         print(f"[offline][vast] finetuned VAST -> {vast_ckpt_path}")
 
@@ -664,6 +706,10 @@ def main(cfg: DictConfig) -> None:
             "policy_camera_names": camera_names,
             "initialized_checkpoint": str(ctx.init_checkpoint),
             "nnpu_checkpoint": nnpu_ckpt,
+            "discriminator_checkpoint": nnpu_ckpt,
+            "discriminator_threshold": float(discriminator.threshold),
+            "disc_reward_coef": float(vast_cfg.disc_reward_coef),
+            "disc_reward_relabel": reward_relabel_provenance,
             "vast_warmup_checkpoint": warmup_ckpt,
             "vast_finetuned_checkpoint": str(vast_ckpt_path),
             "episodes_path": episodes_path,

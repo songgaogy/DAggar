@@ -102,7 +102,11 @@ bash robosuite/pipeline/offline/scripts/eval_disc_finetuned.sh
 
 Phase A mixes collected `policy_bc` transitions with the warmup transitions and continues the same joint G/V update used by warmup. It does not add human, negative, online-success, or pretrain streams to the VAST finetune buffer.
 
-`SKIP_RL=1` requires a compatible finetuned VAST checkpoint. Legacy schema-v5 value-only states are rejected.
+The Python entry point supports `offline.skip_rl=true` for compatible finetuned
+VAST checkpoints. The canonical launcher enables this mode by default and reads
+`<run>/dipole/checkpoints/vast_state_finetuned.pt` unless
+`VAST_FINETUNED_CKPT` is set. Use `SKIP_RL=false` to run Phase A again. Legacy
+schema-v5 value-only states are rejected.
 
 ### Phase B: routed weighted behavior cloning
 
@@ -120,13 +124,20 @@ Here `m_t=1-done_t`. The recursive future term is zero when no valid same-sectio
 ## Run the DIPOLE stage
 
 ```bash
-PIPELINE_RUN_DIR=/path/to/outputs/dipole-rl-offline_vast/PickPlaceCereal_<timestamp> \
-bash robosuite/pipeline/offline/scripts/train_offline_dipole.sh
+bash robosuite/pipeline/offline/scripts/train_offline_dipole.sh \
+  /path/to/outputs/dipole-rl-offline_vast/PickPlaceCereal_<timestamp>
 ```
 
-`PIPELINE_RUN_DIR` is required. The launcher reads only `${PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth`; it does not search for a latest run or fall back to the parent nnPU checkpoint. The DIPOLE stage writes to `${PIPELINE_RUN_DIR}/dipole/` and rejects an existing stage directory.
+The run folder is the launcher's only positional argument. It reads only
+`<run>/discriminator/checkpoints/pu_bce_head_finetuned.pth`; it does not search
+for a latest run or fall back to the parent discriminator checkpoint. With the
+default `SKIP_RL=true`, the DIPOLE stage writes to `<run>/dipole_skip_rl/` and
+loads the finetuned VAST checkpoint from `VAST_FINETUNED_CKPT`, defaulting to
+`<run>/dipole/checkpoints/vast_state_finetuned.pt`.
 
-Canonical launcher variables are `VAST_CKPT` and `VAST_FINETUNED`. Deprecated IQL-named variables are read-only aliases; providing both old and new forms is an error.
+Set `SKIP_RL=false` to run Phase A from `VAST_CKPT`; that mode writes to
+`<run>/dipole/`, rejects an existing stage directory, and explicitly relabels
+its reward with the run's discriminator before Phase B.
 
 Key Hydra settings are:
 
@@ -137,6 +148,7 @@ Key Hydra settings are:
 | `offline.vast_warmup_transitions_dir` | warmup transition directory under `data/<task>` |
 | `offline.vast_finetuned_path` | checkpoint used when Phase A is skipped |
 | `offline.vast_finetune.{num_steps,batch_size,preencode_cache}` | Phase-A schedule |
+| `offline.vast_finetune.relabel_disc_reward` | Recompute Phase-A discriminator rewards using the runtime checkpoint |
 | `offline.advantage.estimator` | `gae` by default; set `td1` for the explicit ablation |
 | `offline.advantage.gae_lambda` | GAE lambda, default `0.6` |
 | `offline.branch_weight.{beta,k}` | routed-sigmoid slope and offset |

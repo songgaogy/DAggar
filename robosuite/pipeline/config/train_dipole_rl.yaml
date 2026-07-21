@@ -49,7 +49,7 @@ algorithm:
       weight_decay: 2.0e-6
       device: "cuda:1"
       output_reward_coef: 1
-      disc_reward_coef: 0
+      disc_reward_coef: 0.1
       update_freq: 1
     # Preserve the previous total warmup budget as one joint G+V schedule.
     warmup_joint_steps: 20000
@@ -77,19 +77,7 @@ warmup:
   # re-encode every step (old behavior).
   preencode_cache: true
   preencode_batch_size: 32
-  # Where to hold the full pre-encoded chunk cache. "cpu" is the safe default:
-  # the cache holds one encoded-feature row per valid chunk (the chunk feature
-  # alone is ~14k floats), so on a 100k+ chunk dataset "learner"/"device" (cache
-  # on the VAST GPU) accumulates tens of GB of VRAM during preencode and OOMs.
-  # CPU cache costs only a per-step batch H2D copy in the warmup loops.
-  preencode_cache_device: "cpu"        # "cpu" | "learner"/"device" (cache on the VAST GPU; OOM risk)
-  # Collapse each success demo's post-success drift into one frozen absorbing
-  # anchor: every frame strictly after the first success frame is overwritten
-  # with a copy of that first-success frame (obs images + proprio + action), so
-  # all post-success chunks encode to one identical (s, a) latent. Keeps the
-  # terminal-anchor sampling density (still valid chunk starts) but drops the
-  # burden/bias of fitting G/V on many distinct meaningless drift states.
-  # No-op for demos without a success frame (e.g. fail_rollout truncations).
+  preencode_cache_device: "learner"    # "cpu" | "learner"/"device" (cache on the VAST GPU; OOM risk)
   freeze_post_success: true
   demo_splits:
     - expert

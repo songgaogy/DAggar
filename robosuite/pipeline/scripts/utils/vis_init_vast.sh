@@ -38,8 +38,8 @@ BRANCH_NAME="dipole_rl-vast"
 ENVIRONMENT="PickPlaceCereal"
 SEEDS=(1 2 3 4 5 6)               # demo-selection seeds; one run per seed
 SPLIT="fail"      # success or fail
-TARGET_PATH="tau0p7_en5"
-NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_194127_PickPlaceCereal/checkpoints/pu_bce_head.pth"
+TARGET_PATH="tau0p7_en5_disc-reward0p1"
+NNPU_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260719_204315_PickPlaceCereal/checkpoints/pu_bce_head.pth"
 # -------------------------------------
 
 DEMO_TASK_NAME="${DEMO_TASK_NAME:-${ENVIRONMENT}}"
@@ -81,7 +81,7 @@ DEVICE="${DEVICE:-cuda}"
 VIDEO_FPS="${VIDEO_FPS:-${CONTROL_FREQ:-20}}"
 DISC_VIZ_BORDER="${DISC_VIZ_BORDER:-10}"
 DISC_VIZ_IMAGE_SIZE="${DISC_VIZ_IMAGE_SIZE:-256}"
-GAE_LAMBDA="${GAE_LAMBDA:-0.6}"   # λ for the GAE advantage overlaid on the TD advantage subplot
+GAE_LAMBDA="${GAE_LAMBDA:-0.9}"   # λ for the GAE advantage overlaid on the TD advantage subplot
 VAST_SAMPLING_SEED="${VAST_SAMPLING_SEED:-}"
 
 
