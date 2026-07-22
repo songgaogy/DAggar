@@ -1,6 +1,6 @@
 # Offline DIPOLE training (README step-4).
 # Inherits the full DIPOLE-RL stack (env / flow / dipole / VAST /
-# advantage_g_provider / discriminator) from train_dipole_rl and overrides the
+# adv / discriminator) from train_dipole_rl and overrides the
 # pieces that differ for the offline, rollout-free setting.
 defaults:
   - train_dipole_rl

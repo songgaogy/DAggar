@@ -54,7 +54,7 @@ def _make_provider() -> AdvantageGProvider:
         discriminator=_FakeDisc(),
         encoder=_FakeEncoder(context_dim=4),
         alpha=1.0,
-        beta=0.0,
+        disc_weight=0.0,
     )
 
 
@@ -77,7 +77,7 @@ def test_bind_policy_cameras_proxies_to_encoder() -> None:
         discriminator=_FakeDisc(),
         encoder=encoder,
         alpha=1.0,
-        beta=0.0,
+        disc_weight=0.0,
     )
     cams = ["frontview_image", "wristview_image"]
     provider.bind_policy_cameras(cams)

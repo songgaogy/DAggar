@@ -913,15 +913,15 @@ def main(cfg: DictConfig) -> None:  # noqa: C901 — near-verbatim copy of train
             vast_learner=vast_learner,
             discriminator=discriminator,
             encoder=shared_encoder,
-            alpha=float(cfg.algorithm.advantage_g_provider.alpha),
-            beta=float(cfg.algorithm.advantage_g_provider.beta),
+            alpha=float(cfg.algorithm.adv.alpha),
+            disc_weight=float(cfg.algorithm.adv.disc_weight),
         )
         advantage_g.bind_policy_cameras(list(agent.camera_names))
         agent.attach_g_provider(advantage_g)
         print(
             f"[dipole] switched to AdvantageGProvider "
-            f"(alpha={cfg.algorithm.advantage_g_provider.alpha}, "
-            f"beta={cfg.algorithm.advantage_g_provider.beta})"
+            f"(alpha={cfg.algorithm.adv.alpha}, "
+            f"disc_weight={cfg.algorithm.adv.disc_weight})"
         )
     elif g_mode == "nnpu_frozen":
         # The frozen nnPU provider was attached before warmup.

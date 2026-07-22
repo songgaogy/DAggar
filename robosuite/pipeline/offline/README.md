@@ -111,20 +111,32 @@ Each valid policy window first receives the one-macro-step TD residual
 ```text
 delta_t = r_chunk(t) + gamma^H * m_t * V_target(s_{t+H}) - V(s_t)
 A_t     = delta_t + gamma^H * lambda * m_t * A_{t+H}
-w_pos   = sigmoid(beta * (A_t + k_offset))
+w_pos   = sigmoid(beta * (G_t + k_offset))
 w_neg   = 1 - w_pos
 ```
+
+For policy-rollout routes, the branch preference also includes the first-frame
+discriminator reward for the sampled action chunk:
+
+```text
+r_disc = -sigmoid(failure_score - threshold)
+G      = algorithm.adv.alpha * A + algorithm.adv.disc_weight * r_disc
+```
+
+`algorithm.vast.config.disc_reward_coef` remains independent: when nonzero it
+also contributes discriminator reward through the VAST reward used to compute
+`A`, while `algorithm.adv.disc_weight` controls the direct contribution to `G`.
 
 Here `m_t=1-done_t`. The recursive future term is zero when no valid same-section `t+H` successor row exists. The recursion uses `lambda=0.6` by default. Human and negative routes keep their existing fixed branch semantics. Set the estimator explicitly to `td1` for the one-macro-step ablation. Stitched advantages remain available for VAST diagnostics but are not Phase-B weights.
 
 ## Run the DIPOLE stage
 
 ```bash
-PIPELINE_RUN_DIR=/path/to/outputs/dipole-rl-offline_vast/PickPlaceCereal_<timestamp> \
-bash robosuite/pipeline/offline/scripts/train_offline_dipole.sh
+bash robosuite/pipeline/offline/scripts/train_offline_dipole.sh \
+  /path/to/outputs/dipole-rl-offline_vast/PickPlaceCereal_<timestamp>
 ```
 
-`PIPELINE_RUN_DIR` is required. The launcher reads only `${PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth`; it does not search for a latest run or fall back to the parent nnPU checkpoint. The DIPOLE stage writes to `${PIPELINE_RUN_DIR}/dipole/` and rejects an existing stage directory.
+The optional positional argument is the pipeline run directory containing the existing `discriminator/` stage. When omitted, the launcher uses the editable `INPUT` value near the top of `train_offline_dipole.sh`. The launcher reads only `<pipeline-run>/discriminator/checkpoints/pu_bce_head_finetuned.pth`; it does not search for a latest run or fall back to the parent nnPU checkpoint. The DIPOLE stage writes to `<pipeline-run>/dipole/` and rejects an existing stage directory.
 
 Canonical launcher variables are `VAST_CKPT` and `VAST_FINETUNED`. Deprecated IQL-named variables are read-only aliases; providing both old and new forms is an error.
 

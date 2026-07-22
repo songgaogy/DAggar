@@ -18,6 +18,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from robosuite.pipeline.algorithms.discriminator.offline import (
+    nnpu_intrinsic_from_failure_score,
+)
 from robosuite.pipeline.offline.utils.advantage import (
     OfflineAdvantageGProvider,
     _gae_over_episodes,
@@ -28,6 +31,15 @@ pytestmark = pytest.mark.skipif(
     reason="Offline tensor tests require CUDA and never fall back to CPU.",
 )
 DEVICE = torch.device("cuda")
+
+
+def test_discriminator_reward_is_negative_failure_probability_cuda():
+    failure_score = torch.tensor([-1.0, 0.5, 2.0], device=DEVICE)
+    expected = -torch.sigmoid(failure_score - 0.5)
+
+    reward = nnpu_intrinsic_from_failure_score(failure_score, threshold=0.5)
+
+    torch.testing.assert_close(reward, expected)
 
 
 def _brute_gae(delta, done, starts, ep, horizon, coef):
@@ -170,9 +182,9 @@ def test_offline_advantage_provider_cuda_cache_lookup_stays_on_cuda():
         discriminator=None,
         encoder=None,
         alpha=2.0,
-        beta=0.25,
+        disc_weight=0.25,
         advantage_raw=torch.tensor([1.0, -2.0, 3.0], device=DEVICE),
-        failure_raw=torch.tensor([0.5, 4.0, 1.0], device=DEVICE),
+        disc_reward_raw=torch.tensor([-0.5, -1.0, -0.25], device=DEVICE),
         start_to_row={10: 0, 20: 1, 30: 2},
     )
     batch = SimpleNamespace(
@@ -183,7 +195,28 @@ def test_offline_advantage_provider_cuda_cache_lookup_stays_on_cuda():
     g = provider.compute_g_for_batch(batch)
 
     assert provider._advantage_raw.device.type == "cuda"
-    assert provider._failure_raw.device.type == "cuda"
+    assert provider._disc_reward_raw.device.type == "cuda"
     assert g.device.type == "cuda"
-    expected = torch.tensor([5.75, 1.875], device=DEVICE)
+    expected = torch.tensor([5.9375, 1.875], device=DEVICE)
     assert torch.allclose(g, expected, atol=1e-7), g
+
+
+def test_offline_advantage_provider_disc_weight_zero_is_pure_advantage():
+    provider = OfflineAdvantageGProvider(
+        vast_learner=None,
+        discriminator=None,
+        encoder=None,
+        alpha=1.5,
+        disc_weight=0.0,
+        advantage_raw=torch.tensor([2.0], device=DEVICE),
+        disc_reward_raw=torch.tensor([-1.0], device=DEVICE),
+        start_to_row={7: 0},
+    )
+    batch = SimpleNamespace(
+        metadata={"start_indices": [7]},
+        action_sequences_raw=torch.empty(1, 1, 1, device=DEVICE),
+    )
+
+    g = provider.compute_g_for_batch(batch)
+
+    torch.testing.assert_close(g, torch.tensor([3.0], device=DEVICE))

@@ -3,7 +3,7 @@
 # Inherits the existing DIPOLE schema and adds three new sections:
 #   - algorithm.vast            (VASTConfig + warmup schedule)
 #   - algorithm.discriminator   (inherited frozen nnPU configuration)
-#   - algorithm.advantage_g_provider  (alpha, beta)
+#   - algorithm.adv  (alpha, disc_weight)
 #
 # To activate the advantage-G path:
 #   algorithm.dipole.g_mode: "advantage"
@@ -58,9 +58,9 @@ algorithm:
   discriminator:
     learner_device: ${algorithm.vast.config.device}
 
-  advantage_g_provider:
+  adv:
     alpha: 1.0
-    beta: 0
+    disc_weight: 0.0
 
 # Used only by ``python -m ...algorithms.vast.warmup`` (init_vast.sh).
 warmup:

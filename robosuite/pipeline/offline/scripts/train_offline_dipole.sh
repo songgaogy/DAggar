@@ -6,6 +6,7 @@ PY="${PY:-$HOME/miniconda3/envs/dagger/bin/python}"
 export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------
+INPUT="outputs/dipole-rl-offline_vast-disc_weighted/PickPlaceCereal_20260719_212234"
 TASK="PickPlaceCereal"
 POLICY_CKPT="checkpoints/multitask_6/flow_multi_ep0100.pt"
 VAST_CKPT="outputs/dipole_rl-vast/tau0p7_en5/PickPlaceCereal/vast_state.pt"
@@ -16,11 +17,12 @@ ADVANTAGE_ESTIMATOR="gae"
 GAE_LAMBDA=0.6
 BRANCH_BETA=2
 BRANCH_K=0   # w_pos = sigmoid(beta * (G + k)); decision boundary at G=-k.
-RUN_SUBFIX="vast-${VAST_V_MODE}_beta${BRANCH_BETA}_k${BRANCH_K}_tau0p7"
+DISC_WEIGHT=0.1
+RUN_SUBFIX="vast-${VAST_V_MODE}_beta${BRANCH_BETA}_k${BRANCH_K}_tau0p7_disc0p1"
 
 # SKIP_RL=1: skip Phase A VAST finetune and reuse VAST_FINETUNED.
-SKIP_RL=1
-VAST_FINETUNED="outputs/dipole-rl-offline_vast/PickPlaceCereal_20260714_234032_vast-indep_ensemble_beta5_k-1_tau0p7/checkpoints/vast_state_finetuned.pt"
+SKIP_RL=0
+VAST_FINETUNED=""
 USE_ONLINE_SUCCESS=0
 
 NUM_TRAIN_STEPS=15000
@@ -41,15 +43,16 @@ V_LR="${V_LR:-1.0e-4}"
 OUTPUT_REWARD_COEF="${OUTPUT_REWARD_COEF:-1}"
 DISC_REWARD_COEF="${DISC_REWARD_COEF:-0}"
 
-if [[ -z "${PIPELINE_RUN_DIR:-}" ]]; then
-  echo "[ERROR] PIPELINE_RUN_DIR is required." >&2
+if [[ "$#" -gt 1 ]]; then
+  echo "Usage: $0 [pipeline-run-dir]" >&2
   exit 1
 fi
-if [[ ! -d "${PIPELINE_RUN_DIR}" ]]; then
-  echo "[ERROR] PIPELINE_RUN_DIR does not exist: ${PIPELINE_RUN_DIR}" >&2
+PIPELINE_RUN_INPUT="${1:-${INPUT}}"
+if [[ ! -d "${PIPELINE_RUN_INPUT}" ]]; then
+  echo "[ERROR] Pipeline run directory does not exist: ${PIPELINE_RUN_INPUT}" >&2
   exit 1
 fi
-PIPELINE_RUN_DIR="$(realpath "${PIPELINE_RUN_DIR}")"
+PIPELINE_RUN_DIR="$(realpath "${PIPELINE_RUN_INPUT}")"
 NNPU_CKPT="${PIPELINE_RUN_DIR}/discriminator/checkpoints/pu_bce_head_finetuned.pth"
 STAGE_RUN_DIR="${PIPELINE_RUN_DIR}/dipole"
 if [[ ! -f "${NNPU_CKPT}" ]]; then
@@ -100,6 +103,7 @@ HYDRA_OVERRIDES=(
   "offline.vast_finetune.batch_size=${VAST_BATCH_SIZE}"
   "offline.advantage.estimator=${ADVANTAGE_ESTIMATOR}"
   "offline.advantage.gae_lambda=${GAE_LAMBDA}"
+  "algorithm.adv.disc_weight=${DISC_WEIGHT}"
   "offline.branch_weight.beta=${BRANCH_BETA}"
   "offline.branch_weight.k=${BRANCH_K}"
   "offline.use_online_success=${USE_ONLINE_SUCCESS}"  # always: pure success rollouts -> pos_only
@@ -122,7 +126,7 @@ echo "[train_offline_dipole] stage_run_dir=${STAGE_RUN_DIR}"
 echo "[train_offline_dipole] vast_batch=${VAST_BATCH_SIZE} policy_batch=${POLICY_BATCH_SIZE}"
 echo "[train_offline_dipole] algorithm=vast_value_stitching_adaptation v_mode=${VAST_V_MODE} K=${VAST_MAX_K} comp_coef=${VAST_COMP_COEF} expectile_tau=${EXPECTILE_TAU} sampling_seed=${VAST_SAMPLING_SEED}"
 echo "[train_offline_dipole] reward: output_coef=${OUTPUT_REWARD_COEF} disc_coef=${DISC_REWARD_COEF}"
-echo "[train_offline_dipole] advantage=${ADVANTAGE_ESTIMATOR} gae_lambda=${GAE_LAMBDA}"
+echo "[train_offline_dipole] advantage=${ADVANTAGE_ESTIMATOR} gae_lambda=${GAE_LAMBDA} disc_weight=${DISC_WEIGHT}"
 echo "[train_offline_dipole] run_subfix=${RUN_SUBFIX} branch_beta=${BRANCH_BETA} branch_k=${BRANCH_K}"
 echo "[train_offline_dipole] policy_ckpt=${POLICY_CKPT}"
 echo "[train_offline_dipole] nnpu_ckpt=${NNPU_CKPT}"

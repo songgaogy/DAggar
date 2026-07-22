@@ -97,10 +97,11 @@ algorithm:
   flow:
     device: "cuda:0"
     inference_device: "cuda:0"
-  # Pure TD advantage into G: G = alpha*A - beta*failure (beta=0 -> no disc mix).
-  advantage_g_provider:
+  # Signed discriminator reward enters G independently from VAST reward mixing.
+  # G = alpha*A + disc_weight*r_disc, where r_disc=-sigmoid(failure_score-tau).
+  adv:
     alpha: 1.0
-    beta: 0.0
+    disc_weight: 0.0
 
 runtime:
   interactive: false

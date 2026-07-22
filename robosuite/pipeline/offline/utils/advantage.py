@@ -1,9 +1,9 @@
 """Offline advantage precomputation for DIPOLE policy training.
 
 Online DIPOLE-RL weights the two flow branches with
-``G = alpha * A - beta * disc`` where ``A`` is the configured value signal
-(:class:`AdvantageGProvider`). The offline variant builds GAE from the VAST
-one-macro-step TD residual::
+``G = alpha * A + disc_weight * r_disc`` where ``A`` is the configured value
+signal (:class:`AdvantageGProvider`). The offline variant builds GAE from the
+VAST one-macro-step TD residual::
 
     delta_t = r + gamma^H * (1 - done_t) * V_target(s') - V(s)
     A_t = delta_t + gamma^H * lambda * (1 - done_t) * A_{t+H}
@@ -14,8 +14,8 @@ chunk-aggregated reward — a drop-in replacement for ``Q - V`` with matching
 sign: larger A (better-than-V transition) raises ``w_pos``.
 
 Because the encoder, VAST critics and nnPU head are all **frozen** in offline
-training, each valid chunk window's ``A`` and failure score are constant for the
-whole run. We therefore pre-encode every window once
+training, each valid chunk window's ``A`` and discriminator reward are constant
+for the whole run. We therefore pre-encode every window once
 (:func:`precompute_offline_advantage`) and, at training time, look the values up
 by the window start index that :meth:`DipoleReplayBuffer.sample` already returns
 in ``batch.metadata["start_indices"]`` — no per-step re-encoding, and no need to
@@ -152,8 +152,8 @@ def precompute_offline_advantage(
       on the last frame, so the recursion stops at the section boundary (no
       cross-section bootstrap).
 
-    Returns ``(advantage_raw, failure_raw, start_to_row)``:
-      - ``advantage_raw`` / ``failure_raw``: CUDA float tensors of shape ``(N,)``
+    Returns ``(advantage_raw, disc_reward_raw, start_to_row)``:
+      - ``advantage_raw`` / ``disc_reward_raw``: CUDA float tensors of shape ``(N,)``
         in ``_get_valid_start_indices_locked()`` order;
       - ``start_to_row``: maps a storage start index -> row in those tensors,
         so :class:`OfflineAdvantageGProvider` can gather by the start indices
@@ -191,7 +191,7 @@ def precompute_offline_advantage(
 
     delta_parts: list[torch.Tensor] = []
     done_parts: list[torch.Tensor] = []
-    fail_parts: list[torch.Tensor] = []
+    disc_reward_parts: list[torch.Tensor] = []
     # Bottleneck is frozen-encoder encode + V/disc forward per window batch.
     # Keep the scalar caches on CUDA so GAE and Phase-B lookups never fall back
     # to CPU tensor computation.
@@ -222,16 +222,16 @@ def precompute_offline_advantage(
             step_batch.rewards,
             step_batch.dones,
         ).reshape(-1)
-        failure = discriminator.failure_score(
+        disc_reward = discriminator.intrinsic_reward(
             chunk_feature=step_batch.chunk_feature
         ).reshape(-1)
         delta_parts.append(delta.detach())
         done_parts.append(step_batch.dones.detach().reshape(-1))
-        fail_parts.append(failure.detach())
+        disc_reward_parts.append(disc_reward.detach())
 
     delta_raw = torch.cat(delta_parts, dim=0).reshape(-1)
     done_raw = torch.cat(done_parts, dim=0).reshape(-1)
-    failure_raw = torch.cat(fail_parts, dim=0).reshape(-1)
+    disc_reward_raw = torch.cat(disc_reward_parts, dim=0).reshape(-1)
     start_to_row = {int(start): row for row, start in enumerate(valid_starts)}
 
     if estimator == "gae":
@@ -250,16 +250,17 @@ def precompute_offline_advantage(
 
     logger.info(
         "[offline] precomputed %s advantage for %d windows "
-        "(gamma^H=%.4f, lambda=%.3f, adv_mean=%.4f adv_std=%.4f, fail_mean=%.4f)",
+        "(gamma^H=%.4f, lambda=%.3f, adv_mean=%.4f adv_std=%.4f, "
+        "disc_reward_mean=%.4f)",
         estimator.upper(),
         advantage_raw.numel(),
         gamma_h,
         lam if estimator == "gae" else float("nan"),
         float(advantage_raw.mean().item()),
         float(advantage_raw.std().item()) if advantage_raw.numel() > 1 else 0.0,
-        float(failure_raw.mean().item()),
+        float(disc_reward_raw.mean().item()),
     )
-    return advantage_raw, failure_raw, start_to_row
+    return advantage_raw, disc_reward_raw, start_to_row
 
 
 @torch.no_grad()
@@ -328,7 +329,7 @@ def precompute_vast_offline_advantage(
     next_state_parts: list[torch.Tensor] = []
     reward_parts: list[torch.Tensor] = []
     done_parts: list[torch.Tensor] = []
-    failure_parts: list[torch.Tensor] = []
+    disc_reward_parts: list[torch.Tensor] = []
     for offset in tqdm(
         range(0, len(valid_starts), encode_bs),
         total=(len(valid_starts) + encode_bs - 1) // encode_bs,
@@ -349,8 +350,8 @@ def precompute_vast_offline_advantage(
         next_state_parts.append(batch.next_v_state_feature.detach().cpu())
         reward_parts.append(batch.rewards.detach().cpu().reshape(-1))
         done_parts.append(batch.dones.detach().cpu().reshape(-1))
-        failure_parts.append(
-            discriminator.failure_score(chunk_feature=batch.chunk_feature)
+        disc_reward_parts.append(
+            discriminator.intrinsic_reward(chunk_feature=batch.chunk_feature)
             .detach()
             .cpu()
             .reshape(-1)
@@ -360,7 +361,7 @@ def precompute_vast_offline_advantage(
     next_state_raw = torch.cat(next_state_parts, dim=0)
     macro_rewards = torch.cat(reward_parts, dim=0)
     macro_dones = torch.cat(done_parts, dim=0)
-    failure_raw = torch.cat(failure_parts, dim=0)
+    disc_reward_raw = torch.cat(disc_reward_parts, dim=0)
 
     # Encode only the selected future state for each row.  `_next_obs_for` on
     # the last macro chunk also handles a trajectory endpoint consistently with
@@ -497,15 +498,16 @@ def precompute_vast_offline_advantage(
     )
     logger.info(
         "[offline] precomputed VAST stitched advantage for %d windows "
-        "(K=%d seed=%d fallback=%.2f%% adv_mean=%.4f fail_mean=%.4f)",
+        "(K=%d seed=%d fallback=%.2f%% adv_mean=%.4f "
+        "disc_reward_mean=%.4f)",
         len(valid_starts),
         K,
         seed,
         100.0 * diagnostics.fallback_fraction,
         float(advantage_raw.mean().item()),
-        float(failure_raw.mean().item()),
+        float(disc_reward_raw.mean().item()),
     )
-    return advantage_raw, failure_raw, start_to_row, diagnostics
+    return advantage_raw, disc_reward_raw, start_to_row, diagnostics
 
 
 def _gae_over_episodes(
@@ -592,9 +594,9 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
         discriminator: "FrozenNNPUDiscriminator",
         encoder: "SharedDynamicsEncoder",
         alpha: float,
-        beta: float,
+        disc_weight: float,
         advantage_raw: torch.Tensor,
-        failure_raw: torch.Tensor,
+        disc_reward_raw: torch.Tensor,
         start_to_row: dict[int, int],
     ) -> None:
         super().__init__(
@@ -602,22 +604,22 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
             discriminator=discriminator,
             encoder=encoder,
             alpha=alpha,
-            beta=beta,
+            disc_weight=disc_weight,
         )
         advantage_raw = advantage_raw.detach().reshape(-1)
-        failure_raw = failure_raw.detach().reshape(-1)
-        if not advantage_raw.is_cuda or not failure_raw.is_cuda:
+        disc_reward_raw = disc_reward_raw.detach().reshape(-1)
+        if not advantage_raw.is_cuda or not disc_reward_raw.is_cuda:
             raise RuntimeError(
-                "OfflineAdvantageGProvider requires CUDA advantage/failure caches; "
+                "OfflineAdvantageGProvider requires CUDA advantage/disc-reward caches; "
                 "CPU fallback is disabled."
             )
-        if advantage_raw.device != failure_raw.device:
+        if advantage_raw.device != disc_reward_raw.device:
             raise ValueError(
-                "OfflineAdvantageGProvider advantage/failure device mismatch: "
-                f"{advantage_raw.device} vs {failure_raw.device}."
+                "OfflineAdvantageGProvider advantage/disc-reward device mismatch: "
+                f"{advantage_raw.device} vs {disc_reward_raw.device}."
             )
         self._advantage_raw = advantage_raw
-        self._failure_raw = failure_raw
+        self._disc_reward_raw = disc_reward_raw
         self._start_to_row = dict(start_to_row)
 
     @torch.no_grad()
@@ -644,9 +646,9 @@ class OfflineAdvantageGProvider(AdvantageGProvider):
             )
         row_idx = torch.tensor(rows, dtype=torch.long, device=device)
         advantage = self._advantage_raw.index_select(0, row_idx)
-        failure = self._failure_raw.index_select(0, row_idx)
+        disc_reward = self._disc_reward_raw.index_select(0, row_idx)
 
-        g = self.alpha * advantage - self.beta * failure
+        g = self.alpha * advantage + self.disc_weight * disc_reward
         return g.reshape(-1)
 
 

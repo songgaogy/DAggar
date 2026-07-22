@@ -1,11 +1,11 @@
-"""G provider that mixes the VAST TD1 fallback with frozen nnPU failure scores.
+"""G provider that mixes the VAST TD1 fallback with frozen nnPU rewards.
 
 Replaces `NNPUGProvider` when DipoleConfig.g_mode == "advantage".
 
 Online fallback math (no Q head):
     A(s, a)        = r + gamma^H * target_V(s') - V(s)      # TD residual
-    failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
-    G              = alpha * A - beta * failure
+    r_disc         = FrozenNNPUDiscriminator.intrinsic_reward(z(s, a))
+    G              = alpha * A + disc_weight * r_disc
 
 The flow policy then maps G -> w_pos = sigmoid(beta_policy * (G + k)), so a
 larger advantage raises the positive-branch weight.
@@ -35,14 +35,14 @@ if TYPE_CHECKING:
 
 
 class AdvantageGProvider:
-    """Mix advantage and discriminator logit into a single G tensor.
+    """Mix advantage and signed discriminator reward into one G tensor.
 
     Args:
         vast_learner:           the VAST learner; provides advantage.
-        discriminator:         frozen nnPU head; provides failure score.
+        discriminator:         frozen nnPU head; provides intrinsic reward.
         encoder:               shared frozen encoder; used to build features
                                from `DipoleBatch.image_obs_raw` + `proprio_raw`.
-        alpha, beta:           linear mixing coefficients.
+        alpha, disc_weight:    linear mixing coefficients.
     """
 
     def __init__(
@@ -52,13 +52,13 @@ class AdvantageGProvider:
         discriminator: "FrozenNNPUDiscriminator",
         encoder: "SharedDynamicsEncoder",
         alpha: float,
-        beta: float,
+        disc_weight: float,
     ) -> None:
         self.vast_learner = vast_learner
         self.discriminator = discriminator
         self.encoder = encoder
         self.alpha = float(alpha)
-        self.beta = float(beta)
+        self.disc_weight = float(disc_weight)
 
     # ------------------------------------------------------------------ #
     # G provider contract                                                  #

@@ -579,7 +579,7 @@ def main(cfg: DictConfig) -> None:
         norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
-    advantage_raw, failure_raw, start_to_row = _precompute_phase_b_advantage(
+    advantage_raw, disc_reward_raw, start_to_row = _precompute_phase_b_advantage(
         base_buffer=agent.online_buffer,
         vast_learner=vast_learner,
         encoder=shared_encoder,
@@ -595,7 +595,7 @@ def main(cfg: DictConfig) -> None:
     advantage_std = (
         float(advantage_raw.std().item()) if advantage_raw.numel() > 1 else 0.0
     )
-    failure_mean = float(failure_raw.mean().item())
+    disc_reward_mean = float(disc_reward_raw.mean().item())
     print(
         f"[offline] advantage estimator={adv_estimator} gamma^H={gamma_h:.6f}"
         + (f" lambda={adv_gae_lambda}" if adv_estimator == "gae" else "")
@@ -607,7 +607,7 @@ def main(cfg: DictConfig) -> None:
             "offline_advantage/is_gae": float(adv_estimator == "gae"),
             "offline_advantage/mean": advantage_mean,
             "offline_advantage/std": advantage_std,
-            "offline_advantage/failure_mean": failure_mean,
+            "offline_advantage/disc_reward_mean": disc_reward_mean,
             "offline_advantage/gamma_h": gamma_h,
             "offline_advantage/gae_lambda": (
                 adv_gae_lambda if adv_estimator == "gae" else 0.0
@@ -619,10 +619,10 @@ def main(cfg: DictConfig) -> None:
         vast_learner=vast_learner,
         discriminator=discriminator,
         encoder=shared_encoder,
-        alpha=float(cfg.algorithm.advantage_g_provider.alpha),
-        beta=float(cfg.algorithm.advantage_g_provider.beta),
+        alpha=float(cfg.algorithm.adv.alpha),
+        disc_weight=float(cfg.algorithm.adv.disc_weight),
         advantage_raw=advantage_raw,
-        failure_raw=failure_raw,
+        disc_reward_raw=disc_reward_raw,
         start_to_row=start_to_row,
     )
     provider.bind_policy_cameras(camera_names)
@@ -639,8 +639,8 @@ def main(cfg: DictConfig) -> None:
     agent.core.set_branch_weight_policy(branch_policy)
     print(
         f"[offline] branch_weight={type(branch_policy).__name__} beta={agent.core.config.beta} "
-        f"k={agent.core.config.k}; provider alpha={cfg.algorithm.advantage_g_provider.alpha} "
-        f"beta={cfg.algorithm.advantage_g_provider.beta}"
+        f"k={agent.core.config.k}; adv alpha={cfg.algorithm.adv.alpha} "
+        f"disc_weight={cfg.algorithm.adv.disc_weight}"
     )
 
     static_cache = agent.online_buffer.build_static_cache(pin_memory=True)
@@ -684,7 +684,11 @@ def main(cfg: DictConfig) -> None:
             "advantage_gamma_h": gamma_h,
             "advantage_mean": advantage_mean,
             "advantage_std": advantage_std,
-            "failure_mean": failure_mean,
+            "disc_reward_mean": disc_reward_mean,
+            "adv_alpha": float(cfg.algorithm.adv.alpha),
+            "adv_disc_weight": float(cfg.algorithm.adv.disc_weight),
+            "vast_output_reward_coef": float(vast_cfg.output_reward_coef),
+            "vast_disc_reward_coef": float(vast_cfg.disc_reward_coef),
             "vast_v_mode": str(vast_cfg.vast_v_mode),
             "vast_max_k": int(vast_cfg.vast_max_k),
             "vast_macro_horizon": int(H),

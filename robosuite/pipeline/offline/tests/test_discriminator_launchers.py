@@ -17,6 +17,7 @@ from robosuite.pipeline.offline.discriminator.finetune_setup import (
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPTS = REPO_ROOT / "robosuite" / "pipeline" / "offline" / "scripts"
+PIPELINE_SCRIPTS = REPO_ROOT / "robosuite" / "pipeline" / "scripts"
 CONFIG_DIR = REPO_ROOT / "robosuite" / "pipeline" / "config"
 CONFIG = CONFIG_DIR / "discriminator.yaml"
 
@@ -102,7 +103,7 @@ def test_finetune_launcher_creates_discriminator_stage(tmp_path: Path) -> None:
     )
 
 
-def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
+def test_train_launcher_uses_positional_pipeline_and_finetuned_checkpoint(
     tmp_path: Path,
 ) -> None:
     pipeline_dir = tmp_path / "PickPlaceCereal_run"
@@ -121,12 +122,57 @@ def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
             "ROOT_DIR": str(REPO_ROOT),
             "PY": str(fake_python),
             "INVOCATION_LOG": str(invocation_log),
-            "PIPELINE_RUN_DIR": str(pipeline_dir),
+            "PIPELINE_RUN_DIR": str(tmp_path / "ignored_pipeline"),
         }
     )
 
     subprocess.run(
-        ["bash", str(SCRIPTS / "train_offline_dipole.sh")],
+        ["bash", str(SCRIPTS / "train_offline_dipole.sh"), str(pipeline_dir)],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    invocation = invocation_log.read_text(encoding="utf-8")
+    assert f"algorithm.discriminator.checkpoint={checkpoint}" in invocation
+    assert "algorithm.adv.disc_weight=1" in invocation
+    assert "algorithm.advantage_g_provider" not in invocation
+    assert f"offline.run_dir={pipeline_dir}/dipole" in invocation
+    assert environment["PIPELINE_RUN_DIR"] not in invocation
+
+
+def test_train_launcher_uses_default_input(tmp_path: Path) -> None:
+    pipeline_dir = tmp_path / "PickPlaceCereal_default"
+    checkpoint = (
+        pipeline_dir
+        / "discriminator"
+        / "checkpoints"
+        / "pu_bce_head_finetuned.pth"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    fake_python, invocation_log = _fake_python(tmp_path)
+    launcher = tmp_path / "train_offline_dipole.sh"
+    launcher_text = (SCRIPTS / "train_offline_dipole.sh").read_text(encoding="utf-8")
+    launcher_text = launcher_text.replace(
+        'INPUT="outputs/dipole-rl-offline_vast-disc_weighted/'
+        'PickPlaceCereal_20260719_212234"',
+        f'INPUT="{pipeline_dir}"',
+        1,
+    )
+    launcher.write_text(launcher_text, encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ROOT_DIR": str(REPO_ROOT),
+            "PY": str(fake_python),
+            "INVOCATION_LOG": str(invocation_log),
+        }
+    )
+
+    subprocess.run(
+        ["bash", str(launcher)],
         check=True,
         env=environment,
         capture_output=True,
@@ -137,16 +183,106 @@ def test_train_launcher_requires_pipeline_and_uses_finetuned_checkpoint(
     assert f"algorithm.discriminator.checkpoint={checkpoint}" in invocation
     assert f"offline.run_dir={pipeline_dir}/dipole" in invocation
 
-    environment.pop("PIPELINE_RUN_DIR")
-    missing = subprocess.run(
-        ["bash", str(SCRIPTS / "train_offline_dipole.sh")],
+
+def test_train_launcher_rejects_invalid_pipeline_run(tmp_path: Path) -> None:
+    fake_python, invocation_log = _fake_python(tmp_path)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ROOT_DIR": str(REPO_ROOT),
+            "PY": str(fake_python),
+            "INVOCATION_LOG": str(invocation_log),
+        }
+    )
+    launcher = ["bash", str(SCRIPTS / "train_offline_dipole.sh")]
+
+    multiple = subprocess.run(
+        [*launcher, str(tmp_path / "run_a"), str(tmp_path / "run_b")],
         check=False,
         env=environment,
         capture_output=True,
         text=True,
     )
-    assert missing.returncode != 0
-    assert "PIPELINE_RUN_DIR is required" in missing.stderr
+    assert multiple.returncode != 0
+    assert "Usage:" in multiple.stderr
+
+    missing_dir = subprocess.run(
+        [*launcher, str(tmp_path / "missing")],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_dir.returncode != 0
+    assert "Pipeline run directory does not exist" in missing_dir.stderr
+
+    pipeline_dir = tmp_path / "PickPlaceCereal_run"
+    pipeline_dir.mkdir()
+    missing_checkpoint = subprocess.run(
+        [*launcher, str(pipeline_dir)],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert missing_checkpoint.returncode != 0
+    assert (
+        "Finetuned discriminator checkpoint does not exist"
+        in missing_checkpoint.stderr
+    )
+
+    checkpoint = (
+        pipeline_dir
+        / "discriminator"
+        / "checkpoints"
+        / "pu_bce_head_finetuned.pth"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    (pipeline_dir / "dipole").mkdir()
+    existing_stage = subprocess.run(
+        [*launcher, str(pipeline_dir)],
+        check=False,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert existing_stage.returncode != 0
+    assert "DIPOLE stage directory already exists" in existing_stage.stderr
+
+
+def test_online_train_launcher_uses_adv_config_and_disc_weight(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "pu_bce_head.pth"
+    checkpoint.touch()
+    fake_python, invocation_log = _fake_python(tmp_path)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ROOT_DIR": str(REPO_ROOT),
+            "PY": str(fake_python),
+            "INVOCATION_LOG": str(invocation_log),
+            "INIT_CHECKPOINT": str(tmp_path / "flow.pt"),
+            "NNPU_CKPT": str(checkpoint),
+            "INTERACTIVE": "false",
+            "ALPHA": "0.75",
+            "DISC_WEIGHT": "1.25",
+            "BETA": "99",
+        }
+    )
+
+    subprocess.run(
+        ["bash", str(PIPELINE_SCRIPTS / "train_dipole_rl.sh")],
+        check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    invocation = invocation_log.read_text(encoding="utf-8")
+    assert "algorithm.adv.alpha=0.75" in invocation
+    assert "algorithm.adv.disc_weight=1.25" in invocation
+    assert "algorithm.adv.disc_weight=99" not in invocation
+    assert "algorithm.advantage_g_provider" not in invocation
 
 
 def test_eval_launcher_keeps_evaluation_and_visualization_outputs_separate(
@@ -387,6 +523,9 @@ def test_train_dipole_rl_keeps_discriminator_on_vast_device() -> None:
 
     assert cfg.algorithm.vast.config.device == "cuda:1"
     assert cfg.algorithm.discriminator.learner_device == "cuda:1"
+    assert cfg.algorithm.adv.alpha == 1.0
+    assert cfg.algorithm.adv.disc_weight == 0.0
+    assert "advantage_g_provider" not in cfg.algorithm
 
 
 def test_train_offline_dipole_preserves_discriminator_overrides() -> None:
@@ -399,3 +538,6 @@ def test_train_offline_dipole_preserves_discriminator_overrides() -> None:
     assert cfg.algorithm.discriminator.inference.device == "cuda:0"
     assert cfg.algorithm.discriminator.inference.intervene_env is False
     assert cfg.algorithm.discriminator.hud.enabled is False
+    assert cfg.algorithm.adv.alpha == 1.0
+    assert cfg.algorithm.adv.disc_weight == 0.0
+    assert "advantage_g_provider" not in cfg.algorithm

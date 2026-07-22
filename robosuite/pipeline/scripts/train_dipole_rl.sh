@@ -9,7 +9,7 @@
 #   NNPU_CKPT        — task-calibrated pu_bce_head.pth
 #   VAST_WARMUP_CKPT — overrides algorithm.vast.warmup_ckpt
 #   IQL_WARMUP_CKPT  — deprecated read-only alias for VAST_WARMUP_CKPT
-#   ALPHA, BETA      — overrides algorithm.advantage_g_provider.{alpha,beta}
+#   ALPHA, DISC_WEIGHT — overrides algorithm.adv.{alpha,disc_weight}
 #   G_MODE           — "advantage" | "nnpu_frozen"
 #   LOGGING_USE_TENSORBOARD / LOGGING_USE_WANDB          — logging backends
 #   INTERACTIVE / VIEWER_ENABLED / INTERVENTION_ENABLED  — same semantics
@@ -61,8 +61,8 @@ if [[ -n "${IQL_WARMUP_CKPT:-}" ]]; then
 fi
 [[ -n "${NNPU_ENCODER_CKPT:-}" ]]     && HYDRA_ARGS+=("algorithm.discriminator.encoder_ckpt=${NNPU_ENCODER_CKPT}")
 [[ -n "${VAST_WARMUP_CKPT:-}" ]]      && HYDRA_ARGS+=("algorithm.vast.warmup_ckpt=${VAST_WARMUP_CKPT}")
-[[ -n "${ALPHA:-}" ]]                 && HYDRA_ARGS+=("algorithm.advantage_g_provider.alpha=${ALPHA}")
-[[ -n "${BETA:-}" ]]                  && HYDRA_ARGS+=("algorithm.advantage_g_provider.beta=${BETA}")
+[[ -n "${ALPHA:-}" ]]                 && HYDRA_ARGS+=("algorithm.adv.alpha=${ALPHA}")
+[[ -n "${DISC_WEIGHT:-}" ]]           && HYDRA_ARGS+=("algorithm.adv.disc_weight=${DISC_WEIGHT}")
 [[ -n "${G_MODE:-}" ]]                && HYDRA_ARGS+=("algorithm.dipole.g_mode=${G_MODE}")
 [[ -n "${INTERACTIVE:-}" ]]           && HYDRA_ARGS+=("runtime.interactive=${INTERACTIVE}")
 [[ -n "${VIEWER_ENABLED:-}" ]]        && HYDRA_ARGS+=("runtime.viewer_enabled=${VIEWER_ENABLED}")
