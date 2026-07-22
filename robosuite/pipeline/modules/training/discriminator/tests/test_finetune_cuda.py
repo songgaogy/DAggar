@@ -1,0 +1,901 @@
+"""CUDA-only tests for warm-start nnPU finetuning."""
+
+from __future__ import annotations
+
+import inspect
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
+from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
+import robosuite.pipeline.modules.training.discriminator.objectives as objectives_module
+from robosuite.pipeline.modules.training.discriminator import (
+    PUBCEDiscriminatorFT,
+    build_finetuned_checkpoint_payload,
+    encode_policy_segments,
+    load_pretrain_pools,
+    load_warmstart_detector,
+    require_cuda_device,
+    save_finetuned_checkpoint,
+    split_policy_segments,
+    validate_offline_payload,
+)
+from robosuite.pipeline.modules.training.discriminator.episodes import build_gt_negative_windows
+from robosuite.pipeline.modules.training.discriminator.features import (
+    encode_gt_negative_windows,
+    exclude_gt_frames_from_unlabeled,
+)
+from robosuite.pipeline.modules.training.discriminator.pools import LatentTrajectory
+from robosuite.pipeline.modules.training.discriminator.objectives import FixedLogitNormalizer
+from robosuite.pipeline.modules.training.discriminator.trainer import (
+    compute_fixed_robust_normalizer,
+    fold_fixed_logit_normalizer_,
+)
+from robosuite.pipeline.modules.evaluation.discriminator_gt_fail import (
+    score_summary_cuda,
+    validate_rebuilt_gt_provenance,
+)
+
+
+def _cuda() -> torch.device:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for nnPU finetune tests.")
+    return torch.device("cuda:0")
+
+
+def test_gt_fail_summary_uses_inclusive_threshold_and_cuda_quantiles() -> None:
+    device = _cuda()
+    scores = torch.tensor([-1.0, 0.0, 1.0, 3.0], device=device)
+
+    summary = score_summary_cuda(scores, 0.0)
+
+    assert summary["n_frames"] == 4
+    assert summary["n_fail"] == 3
+    assert summary["n_missed"] == 1
+    assert summary["detection_rate"] == pytest.approx(0.75)
+    assert summary["miss_rate"] == pytest.approx(0.25)
+    assert summary["score_median"] == pytest.approx(0.5)
+    assert summary["margin_min"] == pytest.approx(-1.0)
+
+
+def test_gt_fail_summary_handles_empty_groups_and_rejects_invalid_scores() -> None:
+    device = _cuda()
+    empty = score_summary_cuda(torch.empty((0,), device=device), 0.0)
+    assert empty["n_frames"] == 0
+    assert empty["detection_rate"] is None
+    assert empty["score_q01"] is None
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        score_summary_cuda(torch.tensor([0.0, float("nan")], device=device), 0.0)
+    with pytest.raises(ValueError, match="require CUDA"):
+        score_summary_cuda(torch.tensor([0.0]), 0.0)
+
+
+def test_gt_fail_rebuilt_provenance_requires_exact_training_frames() -> None:
+    expected = {
+        "intervention_events": 2,
+        "gt_negative_windows": 2,
+        "gt_negative_frames": 4,
+        "pre_frames": 2,
+        "post_frames": 2,
+        "pre_end_windows": 0,
+        "pre_end_frames": 0,
+        "deduplicated_frames": 0,
+        "selected_frame_keys": [[0, 1], [0, 2], [1, 3], [1, 4]],
+    }
+    validate_rebuilt_gt_provenance(dict(expected), expected)
+
+    changed = dict(expected)
+    changed["selected_frame_keys"] = [[0, 1], [0, 2], [1, 3], [1, 5]]
+    with pytest.raises(ValueError, match="selected_frame_keys differ"):
+        validate_rebuilt_gt_provenance(changed, expected)
+
+    changed = dict(expected)
+    changed["gt_negative_frames"] = 3
+    with pytest.raises(ValueError, match="gt_negative_frames"):
+        validate_rebuilt_gt_provenance(changed, expected)
+
+
+def _feature_pools(
+    device: torch.device,
+) -> tuple[dict[str, list[torch.Tensor]], list[torch.Tensor]]:
+    positive = torch.randn((24, 6), device=device) + 1.0
+    unlabeled = torch.randn((24, 6), device=device) - 0.5
+    calibration = [torch.randn((12, 6), device=device) + 1.0]
+    return {
+        "pretrain_positive": [positive],
+        "pretrain_unlabeled": [unlabeled],
+        "offline_positive": [positive.clone()],
+        "offline_gt_negative": [unlabeled.clone()],
+    }, calibration
+
+
+def _objective_config(batch_size: int = 8) -> dict[str, object]:
+    return {
+        "steps_per_epoch": 1,
+        "terms": {
+            "nnpu_replay": {
+                "type": "nnpu",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size,
+                "positive_fraction": 0.5,
+            },
+            "gt_positive": {
+                "type": "positive_logistic",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size // 2,
+            },
+            "gt_negative": {
+                "type": "negative_logistic",
+                "enabled": True,
+                "weight": 1.0,
+                "batch_size": batch_size // 2,
+            },
+        },
+    }
+
+
+def test_fixed_robust_normalizer_uses_cuda_held_out_logits() -> None:
+    device = _cuda()
+    head = torch.nn.Linear(1, 1, device=device)
+    with torch.no_grad():
+        head.weight.fill_(2.0)
+        head.bias.fill_(-1.0)
+    calibration = [
+        torch.tensor([[0.0], [1.0], [2.0], [3.0], [4.0]], device=device)
+    ]
+    center = 0.75
+
+    normalizer = compute_fixed_robust_normalizer(
+        head,
+        calibration,
+        center=center,
+        device=device,
+        batch_size=2,
+    )
+
+    logits = head(calibration[0]).reshape(-1)
+    quartiles = torch.quantile(
+        logits,
+        torch.tensor([0.25, 0.75], device=device, dtype=logits.dtype),
+    )
+    assert normalizer.enabled is True
+    assert normalizer.center == pytest.approx(center)
+    assert normalizer.scale == pytest.approx(
+        float(((quartiles[1] - quartiles[0]) / 1.349).item())
+    )
+    assert head.training is True
+
+
+def test_fixed_robust_normalizer_rejects_degenerate_success_logits() -> None:
+    device = _cuda()
+    head = torch.nn.Linear(2, 1, device=device)
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.fill_(3.0)
+
+    with pytest.raises(ValueError, match="non-positive or non-finite robust scale"):
+        compute_fixed_robust_normalizer(
+            head,
+            [torch.randn((8, 2), device=device)],
+            center=0.0,
+            device=device,
+        )
+
+
+def test_folding_fixed_normalizer_is_exact_for_standard_head() -> None:
+    device = _cuda()
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    detector.head.set_logit_center(0.4)
+    probe = torch.randn((17, 6), device=device)
+    normalizer = FixedLogitNormalizer(enabled=True, center=1.25, scale=0.625)
+    with torch.no_grad():
+        expected = normalizer(detector.head(probe)).clone()
+
+    fold_fixed_logit_normalizer_(detector.head, normalizer)
+
+    with torch.no_grad():
+        actual = detector.head(probe)
+    torch.testing.assert_close(actual, expected, rtol=1.0e-6, atol=1.0e-6)
+    assert detector.head.logit_center.item() == pytest.approx(
+        (0.4 + 1.25) / 0.625
+    )
+
+
+def test_success_recalibration_uses_cuda_quantile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _cuda()
+    default_delta = inspect.signature(PUBCEDiscriminatorFT.finetune).parameters[
+        "delta"
+    ].default
+    assert default_delta == pytest.approx(5.0)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    calibration = [torch.randn((19, 6), device=device)]
+    original_quantile = torch.quantile
+    seen_devices: list[torch.device] = []
+
+    def recording_quantile(values: torch.Tensor, q: torch.Tensor | float, *args, **kwargs):
+        seen_devices.append(values.device)
+        assert values.device.type == "cuda"
+        if torch.is_tensor(q):
+            assert q.device.type == "cuda"
+        return original_quantile(values, q, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "quantile", recording_quantile)
+    with torch.no_grad():
+        expected = float(
+            original_quantile(-detector.head(calibration[0]), 0.95).item()
+        )
+
+    thresholds = detector._calibrate_success_thresholds(  # noqa: SLF001
+        {"Task": calibration},
+        delta=5.0,
+        verbose=False,
+    )
+
+    assert seen_devices == [device]
+    assert thresholds["Task"] == pytest.approx(expected)
+    assert detector.calib_stats["Task"].num_calib_frames == 19
+
+
+def test_finetune_keeps_loaded_head_when_lr_is_zero() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    detector.thresholds = {"Task": 1.0e9}
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in detector.head.state_dict().items()
+    }
+    logged: list[dict[str, float]] = []
+
+    thresholds = detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=_objective_config(),
+        pi_p=0.3,
+        epochs=1,
+        lr=0.0,
+        seed=7,
+        loss_surrogate="logistic",
+        metric_callback=logged.append,
+        verbose=False,
+    )
+
+    for name, parameter in detector.head.state_dict().items():
+        torch.testing.assert_close(parameter, before[name])
+    assert "Task" in thresholds
+    assert thresholds["Task"] != 1.0e9
+    assert len(logged) == 1
+    assert logged[0]["data/pretrain_positive_frames"] == 24.0
+    assert logged[0]["data/pretrain_unlabeled_frames"] == 24.0
+    assert logged[0]["data/offline_gt_negative_frames"] == 24.0
+    assert "gt/positive_logistic" in logged[0]
+
+
+def test_log_interval_reports_running_mean() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    config = _objective_config()
+    config["steps_per_epoch"] = 2
+    interval_logs: list[dict[str, float]] = []
+    epoch_logs: list[dict[str, float]] = []
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        pi_p=0.3,
+        epochs=1,
+        lr=0.0,
+        seed=3,
+        loss_surrogate="logistic",
+        log_interval=2,
+        metric_callback=epoch_logs.append,
+        step_metric_callback=interval_logs.append,
+        verbose=False,
+    )
+
+    assert len(interval_logs) == 1
+    assert len(epoch_logs) == 1
+    assert interval_logs[0]["loss/total"] == pytest.approx(
+        epoch_logs[0]["loss/total"]
+    )
+
+
+def test_positive_logistic_needs_no_parent_boundary_and_uses_long_scheduler() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    config = _objective_config()
+    config["terms"]["gt_positive"] = {
+        "type": "positive_logistic",
+        "enabled": True,
+        "weight": 0.025,
+        "batch_size": 4,
+    }
+    config["quadratic_logit_cap"] = {
+        "enabled": True,
+        "scope": "all_terms",
+        "cap": 2.0,
+        "weight": 1.0e-2,
+    }
+    logged: list[dict[str, float]] = []
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        positive_safety_boundary=None,
+        pi_p=0.3,
+        epochs=2,
+        scheduler_horizon_epochs=20,
+        lr=3.0e-5,
+        seed=0,
+        loss_surrogate="logistic",
+        metric_callback=logged.append,
+        verbose=False,
+    )
+
+    assert len(logged) == 2
+    assert logged[-1]["scheduler/horizon_epochs"] == 20.0
+    assert logged[-1]["lr"] > 0.0
+    assert "gt/positive_logistic" in logged[-1]
+    assert "safety/m_k" not in logged[-1]
+    assert logged[-1]["regularization/quadratic_logit_cap"] >= 0.0
+    assert detector._scheduler_horizon_epochs == 20  # noqa: SLF001
+    assert detector._completed_epochs == 2  # noqa: SLF001
+
+
+def test_finetune_normalizes_all_terms_folds_once_and_round_trips_state() -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    probe = torch.randn((11, 6), device=device)
+    center = 0.35
+    with torch.no_grad():
+        before = detector.head(probe).clone()
+    config = _objective_config()
+    config["terms"]["gt_positive"] = {
+        "type": "positive_logistic",
+        "enabled": True,
+        "weight": 0.025,
+        "batch_size": 4,
+    }
+    config["logit_normalization"] = {
+        "enabled": True,
+        "method": "fixed_robust_iqr",
+    }
+    config["quadratic_logit_cap"] = {
+        "enabled": True,
+        "scope": "all_terms",
+        "cap": 2.0,
+        "weight": 1.0e-2,
+    }
+
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=config,
+        logit_normalization_center=center,
+        pi_p=0.3,
+        epochs=1,
+        lr=0.0,
+        seed=0,
+        loss_surrogate="logistic",
+        verbose=False,
+    )
+
+    normalization = detector.state_dict()["logit_normalization"]
+    assert detector.state_dict()["quadratic_cap_scope"] == "all_terms"
+    assert normalization["enabled"] is True
+    assert normalization["folded"] is True
+    assert normalization["center"] == pytest.approx(center)
+    assert normalization["scale"] > 0.0
+    with torch.no_grad():
+        expected = (before - center) / normalization["scale"]
+        folded = detector.head(probe)
+    torch.testing.assert_close(folded, expected, rtol=1.0e-5, atol=1.0e-5)
+
+    with torch.device(device):
+        restored = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    restored.load_state_dict(detector.state_dict())
+    assert restored.state_dict()["logit_normalization"] == normalization
+    assert restored.state_dict()["quadratic_cap_scope"] == "all_terms"
+    with torch.no_grad():
+        torch.testing.assert_close(restored.head(probe), folded)
+
+    legacy_state = detector.state_dict()
+    legacy_state.pop("quadratic_cap_scope")
+    with torch.device(device):
+        legacy_restored = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    legacy_restored.load_state_dict(legacy_state)
+    assert legacy_restored.state_dict()["quadratic_cap_scope"] == "nnpu_replay"
+
+
+def test_finetune_updates_head_and_checkpoint_remains_loadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _cuda()
+    feature_pools, calibration = _feature_pools(device)
+    with torch.device(device):
+        detector = PUBCEDiscriminatorFT(
+            in_dim=6, hidden=8, num_layers=1, device=str(device)
+        )
+    detector.thresholds = {"Task": 0.0}
+    parent_state = detector.state_dict()
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in detector.head.state_dict().items()
+    }
+
+    sampled_sizes: list[tuple[int, int]] = []
+    original_pu_risk = objectives_module.pu_risk
+
+    def recording_pu_risk(g_p: torch.Tensor, g_u: torch.Tensor, **kwargs):
+        sampled_sizes.append((int(g_p.shape[0]), int(g_u.shape[0])))
+        return original_pu_risk(g_p, g_u, **kwargs)
+
+    monkeypatch.setattr(objectives_module, "pu_risk", recording_pu_risk)
+    detector.finetune(
+        feature_pools,
+        {"Task": calibration},
+        objective_config=_objective_config(batch_size=10),
+        pi_p=0.3,
+        epochs=1,
+        lr=1e-3,
+        seed=11,
+        loss_surrogate="logistic",
+        verbose=False,
+    )
+    assert any(
+        not torch.equal(parameter, before[name])
+        for name, parameter in detector.head.state_dict().items()
+    )
+    assert sampled_sizes
+    assert set(sampled_sizes) == {(5, 5)}
+
+    parent_payload = {
+        "in_dim": 6,
+        "hidden": 8,
+        "num_layers": 1,
+        "pu_bce_detector": parent_state,
+        "feature_source": "transformer",
+        "transformer_layer": 1,
+        "use_chunk": True,
+        "model_ckpt": "unused.pth",
+        "pi_p": 0.3,
+        "loss_surrogate": "logistic",
+        "nn_correction": True,
+        "beta": 0.0,
+    }
+    payload = build_finetuned_checkpoint_payload(
+        detector,
+        parent_payload=parent_payload,
+        parent_checkpoint=tmp_path / "parent.pth",
+        task_name="Task",
+        finetune_config={
+            "method": "nnpu_replay_separate_gt_risks",
+            "epochs": 1,
+            "lr": 1e-3,
+        },
+        data_provenance={
+            "positive_frames": 24,
+            "unlabeled_frames": 24,
+            "pretrain_manifest": {
+                "checkpoint": {
+                    "model_ckpt_sha256": "model-sha",
+                    "normalizer_ckpt": "/tmp/normalizer.pth",
+                    "normalizer_ckpt_sha256": "normalizer-sha",
+                },
+                "feature_contract": {
+                    "camera_to_view": {"camera": "view"},
+                    "proprio_indices": [1, 2],
+                },
+                "split_config": {"seed": 0, "calibration_fraction": 0.2},
+                "trajectory_ids": {
+                    "positive_train": ["positive-train"],
+                    "positive_calib": ["positive-calib"],
+                    "unlabeled_train": ["unlabeled"],
+                },
+            },
+        },
+    )
+    assert payload["model_ckpt_sha256"] == "model-sha"
+    assert payload["normalizer_ckpt_sha256"] == "normalizer-sha"
+    assert payload["camera_to_view"] == {"camera": "view"}
+    assert payload["proprio_indices"] == [1, 2]
+    assert payload["success_train_video_ids"] == {"Task": ["positive-train"]}
+    assert payload["success_calib_video_ids"] == {"Task": ["positive-calib"]}
+    assert payload["finetune_schema_version"] == 5
+    assert payload["finetune_method"] == "nnpu_replay_separate_gt_risks"
+    saved_normalization = payload["finetune_recalibration"]["logit_normalization"]
+    assert saved_normalization["enabled"] is False
+    assert saved_normalization["folded"] is False
+    assert saved_normalization["center"] == pytest.approx(0.0)
+    assert saved_normalization["scale"] == pytest.approx(1.0)
+    checkpoint = save_finetuned_checkpoint(
+        payload,
+        tmp_path / "pu_bce_head_finetuned.pth",
+    )
+    restored, restored_payload = load_warmstart_detector(
+        checkpoint,
+        device=device,
+        expected_task="Task",
+    )
+    assert isinstance(restored, PUBCEDiscriminatorFT)
+    assert restored_payload["finetuned_offline"] is True
+    assert restored.thresholds["Task"] == pytest.approx(detector.thresholds["Task"])
+    probe = torch.randn((5, 6), device=device)
+    torch.testing.assert_close(
+        restored.failure_score_tensor(probe),
+        detector.failure_score_tensor(probe),
+    )
+    frozen = FrozenNNPUDiscriminator(
+        nnpu_ckpt_path=checkpoint,
+        task_name="Task",
+        device=device,
+    )
+    torch.testing.assert_close(
+        frozen.failure_score(probe),
+        detector.failure_score_tensor(probe),
+    )
+
+    legacy_payload = dict(payload)
+    legacy_payload["finetune_schema_version"] = 2
+    legacy_payload["finetune_method"] = "nnpu_replay_gt_bce"
+    legacy_checkpoint = save_finetuned_checkpoint(
+        legacy_payload,
+        tmp_path / "pu_bce_head_finetuned_v2.pth",
+    )
+    legacy_detector, legacy_restored_payload = load_warmstart_detector(
+        legacy_checkpoint,
+        device=device,
+        expected_task="Task",
+    )
+    assert legacy_restored_payload["finetune_schema_version"] == 2
+    torch.testing.assert_close(
+        legacy_detector.failure_score_tensor(probe),
+        detector.failure_score_tensor(probe),
+    )
+
+
+def test_finetune_rejects_cpu_before_touching_features() -> None:
+    detector = object.__new__(PUBCEDiscriminatorFT)
+    detector.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        detector.finetune({}, {}, objective_config={}, pi_p=0.3)
+
+
+def test_public_device_guards_reject_cpu() -> None:
+    with pytest.raises(ValueError, match="requires CUDA"):
+        require_cuda_device("cpu")
+
+
+class _FakeFrozenEncoder:
+    def __init__(self, device: torch.device) -> None:
+        model = torch.nn.Linear(1, 1, bias=False, device=device)
+        model.requires_grad_(False)
+        self.device = device
+        self.feature_source = "transformer"
+        self.transformer_layer = 1
+        self.use_chunk = True
+        self.inner_encoder = SimpleNamespace(
+            model=model,
+            frameskip=3,
+            action_dim_per_step=2,
+            action_input_dim=6,
+        )
+        self.bound_cameras: list[str] | None = None
+        self.seen_actions: list[torch.Tensor] = []
+
+    @staticmethod
+    def prepare_proprio(states: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(states, dtype=np.float32)
+
+    def bind_policy_cameras(self, cameras: list[str]) -> None:
+        self.bound_cameras = list(cameras)
+
+    def encode_chunk(
+        self,
+        *,
+        image_obs_raw: torch.Tensor,
+        proprio_raw: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        assert image_obs_raw.device.type == "cuda"
+        assert proprio_raw.device.type == "cuda"
+        assert action_chunk.device.type == "cuda"
+        self.seen_actions.append(action_chunk.detach().clone())
+        return action_chunk
+
+
+def _encoding_payload() -> dict[str, object]:
+    length = 4
+    actions = np.asarray(
+        [[1.0, 2.0], [3.0, 4.0], [50.0, 60.0], [7.0, 8.0]],
+        dtype=np.float32,
+    )
+    policy = actions.copy()
+    policy[2] = [5.0, 6.0]
+    interventions = np.asarray([False, False, True, False], dtype=np.bool_)
+    success = np.asarray([False, False, False, True], dtype=np.bool_)
+    done = np.asarray([False, False, False, True], dtype=np.bool_)
+    state = np.zeros((length, 3), dtype=np.float32)
+    image = np.zeros((length, 4, 5, 3), dtype=np.uint8)
+    episode = {
+        "obs": {"state": state, "agentview": image},
+        "next_obs": {"state": state, "agentview": image},
+        "executed_action": actions,
+        "policy_action": policy,
+        "is_intervention": interventions,
+        "success": success,
+        "done": done,
+        "terminal_reason": "success",
+    }
+    return {
+        "schema_version": 1,
+        "task_name": "Task",
+        "camera_names": ["agentview"],
+        "episodes": [episode],
+    }
+
+
+def test_cuda_encoding_freezes_encoder_and_never_crosses_segment_boundaries() -> None:
+    device = _cuda()
+    payload = validate_offline_payload(_encoding_payload())
+    segments, _ = split_policy_segments(payload)
+    encoder = _FakeFrozenEncoder(device)
+    before = encoder.inner_encoder.model.weight.detach().clone()
+
+    pools = encode_policy_segments(
+        segments,
+        encoder=encoder,
+        camera_names=["agentview"],
+        batch_size=16,
+    )
+
+    assert encoder.bound_cameras == ["agentview"]
+    assert len(pools.unlabeled) == 1
+    assert len(pools.positive) == 1
+    assert pools.unlabeled[0].source == "offline"
+    assert pools.positive[0].source == "offline"
+    torch.testing.assert_close(encoder.inner_encoder.model.weight, before)
+    assert encoder.inner_encoder.model.weight.grad is None
+    assert all(
+        not parameter.requires_grad
+        for parameter in encoder.inner_encoder.model.parameters()
+    )
+    expected_first = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 3.0, 4.0],
+            [3.0, 4.0, 3.0, 4.0, 3.0, 4.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    expected_second = torch.tensor(
+        [[7.0, 8.0, 7.0, 8.0, 7.0, 8.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    torch.testing.assert_close(encoder.seen_actions[0], expected_first)
+    torch.testing.assert_close(encoder.seen_actions[1], expected_second)
+
+
+def test_cuda_gt_negative_encoding_uses_policy_actions_across_onset() -> None:
+    device = _cuda()
+    payload = validate_offline_payload(_encoding_payload())
+    windows, _ = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=3,
+    )
+    encoder = _FakeFrozenEncoder(device)
+
+    trajectories = encode_gt_negative_windows(
+        windows,
+        encoder=encoder,
+        camera_names=["agentview"],
+        batch_size=16,
+    )
+
+    assert len(trajectories) == 1
+    assert trajectories[0].pool == "offline_gt_negative"
+    assert trajectories[0].source == "offline"
+    assert trajectories[0].metadata["action_source"] == "policy_action"
+    expected = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [3.0, 4.0, 5.0, 6.0, 5.0, 6.0],
+            [5.0, 6.0, 5.0, 6.0, 5.0, 6.0],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    torch.testing.assert_close(encoder.seen_actions[0], expected)
+    torch.testing.assert_close(trajectories[0].features.to(device), expected)
+    assert not torch.any(encoder.seen_actions[0] == 50.0)
+
+
+def test_cuda_reserved_unlabeled_excludes_selected_pre_onset_frames() -> None:
+    device = _cuda()
+    payload = validate_offline_payload(
+        {
+            **_encoding_payload(),
+            "episodes": [
+                {
+                    **_encoding_payload()["episodes"][0],  # type: ignore[index]
+                    "is_intervention": np.asarray(
+                        [False, False, True, True], dtype=np.bool_
+                    ),
+                    "success": np.asarray([False] * 4, dtype=np.bool_),
+                    "terminal_reason": "manual_reset",
+                }
+            ],
+        }
+    )
+    windows, _ = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=1,
+        post_intervention_chunks=1,
+        frameskip=1,
+    )
+    features = torch.arange(12, dtype=torch.float32, device=device).reshape(2, 6)
+    trajectory = LatentTrajectory(
+        features=features,
+        pool="unlabeled",
+        source="offline",
+        identifier="episode-0-policy-prefix",
+        metadata={
+            "source_episode_index": 0,
+            "frame_start": 0,
+            "frame_end": 2,
+        },
+    )
+
+    reserved = exclude_gt_frames_from_unlabeled([trajectory], windows)
+
+    assert len(reserved) == 1
+    assert reserved[0].pool == "offline_unlabeled_reserved"
+    assert reserved[0].metadata["frame_start"] == 0
+    assert reserved[0].metadata["frame_end"] == 1
+    assert reserved[0].features.device.type == "cuda"
+    torch.testing.assert_close(reserved[0].features, features[:1])
+
+
+def test_pretrain_manifest_and_shards_round_trip_from_cuda(tmp_path: Path) -> None:
+    device = _cuda()
+    splits: dict[str, list[dict[str, object]]] = {}
+    for split_name in ("positive_train", "positive_calib", "unlabeled_train"):
+        split_dir = tmp_path / split_name
+        split_dir.mkdir()
+        latent = torch.arange(12, dtype=torch.float32, device=device).reshape(3, 4)
+        shard_path = split_dir / "trajectory.pt"
+        torch.save(
+            {
+                "schema_version": 1,
+                "latent": latent,
+                "frame_indices": np.arange(3, dtype=np.int64),
+                "provenance": {"split": split_name},
+            },
+            shard_path,
+        )
+        splits[split_name] = [
+            {
+                "path": f"{split_name}/trajectory.pt",
+                "video_id": f"{split_name}-id",
+                "num_frames": 3,
+                "latent_dim": 4,
+                "provenance": {"split": split_name},
+            }
+        ]
+    manifest = {
+        "schema_version": 1,
+        "task": "Task",
+        "splits": splits,
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    pools, restored_manifest = load_pretrain_pools(tmp_path)
+
+    assert restored_manifest == manifest
+    assert pools.stats == {
+        "positive_trajectories": 1,
+        "positive_frames": 3,
+        "unlabeled_trajectories": 1,
+        "unlabeled_frames": 3,
+        "calibration_trajectories": 1,
+        "calibration_frames": 3,
+        "latent_dim": 4,
+    }
+    assert pools.positive[0].features.device.type == "cpu"
+
+
+def test_legacy_checkpoint_without_new_provenance_remains_loadable(tmp_path: Path) -> None:
+    device = _cuda()
+    with torch.device(device):
+        detector = PUBCEDiscriminator(in_dim=4, hidden=8, num_layers=1, device=str(device))
+    detector.thresholds = {"Task": 0.25}
+    legacy_payload = {
+        "in_dim": 4,
+        "hidden": 8,
+        "num_layers": 1,
+        "feature_source": "transformer",
+        "transformer_layer": 1,
+        "model_ckpt": "model.pth",
+        "pi_p": 0.3,
+        "loss_surrogate": "logistic",
+        "nn_correction": True,
+        "beta": 0.0,
+        "pu_bce_detector": detector.state_dict(),
+    }
+    checkpoint = tmp_path / "legacy.pth"
+    torch.save(legacy_payload, checkpoint)
+
+    restored, payload = load_warmstart_detector(
+        checkpoint,
+        device=device,
+        expected_task="Task",
+    )
+
+    assert "finetune_schema_version" not in payload
+    assert restored.thresholds == {"Task": pytest.approx(0.25)}
+
+
+def test_single_task_finetune_rejects_multi_task_parent(tmp_path: Path) -> None:
+    device = _cuda()
+    with torch.device(device):
+        detector = PUBCEDiscriminator(in_dim=4, hidden=8, num_layers=1, device=str(device))
+    detector.thresholds = {"Task": 0.25, "OtherTask": 0.5}
+    checkpoint = tmp_path / "multi-task.pth"
+    torch.save(
+        {
+            "in_dim": 4,
+            "hidden": 8,
+            "num_layers": 1,
+            "feature_source": "transformer",
+            "transformer_layer": 1,
+            "model_ckpt": "model.pth",
+            "pi_p": 0.3,
+            "pu_bce_detector": detector.state_dict(),
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="single-task"):
+        load_warmstart_detector(checkpoint, device=device, expected_task="Task")
+

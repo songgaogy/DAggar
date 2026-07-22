@@ -8,17 +8,12 @@ from .common import (
     TrainerConfig,
     Transition,
 )
-from .g_provider import NNPUGProvider
-from .trainer import DipoleTrainer
-
 __all__ = [
     "DipoleAgent",
     "DipoleBatch",
     "DipoleConfig",
-    "DipoleTrainer",
     "EncoderConfig",
     "FlowAugmentationConfig",
-    "NNPUGProvider",
     "ReplayBufferConfig",
     "TrainerConfig",
     "Transition",

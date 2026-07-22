@@ -1,0 +1,95 @@
+# Batch-online DIPOLE configuration shared by all tasks.
+defaults:
+  - task: ???
+  - _self_
+
+seed: 42
+
+environment:
+  name: ${task.name}
+  robots: ["Panda"]
+  configuration: "default"
+  controller: null
+  renderer: "mjviewer"
+  render_camera: "agentview"
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
+  proprio_keys: []
+  image_height: 128
+  image_width: 128
+  control_frequency: 20
+  horizon: null
+
+cuda:
+  required: true
+  collection:
+    policy_device: "cuda:1"
+    discriminator_device: "cuda:0"
+  training_device: "cuda:0"
+
+storage:
+  output_root: "./outputs/dipole"
+  input_copy:
+    prefer_reflink: true
+    verify_sha256: true
+  state_filename: "state.json"
+  manifest_filename: "manifest.json"
+  resolved_config_filename: "config_resolved.yaml"
+
+collection:
+  num_episodes: 50
+  episode_max_steps: 500
+  deterministic: false
+  interactive: true
+  viewer_enabled: true
+  intervention_enabled: true
+  image_obs_fps: 20
+  policy_fps: 20
+  spacemouse_fps: 20
+  discriminator_fps: -1
+  discriminator_intervene_env: true
+  save_every_episode: true
+  viewer_backend: "auto"
+  viewer_async: false
+  viewer_startup_delay: 0.0
+  viewer_reset_warmup_frames: 2
+  visualize_gripper_markers: true
+  fps_log_interval: 1.0
+  episode_pause_seconds: 1.0
+  intervention:
+    device: "spacemouse"
+    position_sensitivity: 1.0
+    rotation_sensitivity: 1.0
+    reverse_xy: false
+    goal_update_mode: "target"
+    device_reset_as_episode_reset: true
+
+tensorboard:
+  enabled: true
+  directory: "tensorboard"
+
+evaluation:
+  discriminator:
+    seed: 0
+    device: ${cuda.training_device}
+    encode_batch_size: ${task.discriminator.encode_batch_size}
+    max_fail_per_task: null
+    max_success_per_task: null
+
+visualization:
+  discriminator:
+    split: "both"
+    num_trajectories: 10
+    fps: ${environment.control_frequency}
+    camera_name: ${environment.render_camera}
+    offline_video_size: 256
+    border_thickness: 10
+  vast:
+    seeds: [1, 2, 3, 4, 5, 6]
+    split: "fail_rollout"
+    gae_lambda: 0.9
+    device: ${cuda.training_device}
+    video_fps: ${environment.control_frequency}
+    discriminator_image_size: 256
+    discriminator_border_thickness: 10
+    max_windows: null
+    sampling_seed: null

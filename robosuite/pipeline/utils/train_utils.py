@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
 import random
-import sys
-import threading
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +13,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from robosuite.wrappers import VisualizationWrapper
 
-from robosuite.pipeline.envs import (
+from robosuite.pipeline.common.environment import (
     RobosuiteObservationAdapter,
     RobosuiteRuntimeConfig,
 )
@@ -110,48 +106,6 @@ def plt_close(fig) -> None:
         pass
 
 
-class CompositeMetricLogger:
-    """TensorBoard + optional WandB logging with a shared interface."""
-
-    def __init__(self, tensorboard_logger: TensorBoardMetricLogger | None, wandb_module: Any) -> None:
-        self._tensorboard = tensorboard_logger
-        self._wandb = wandb_module
-
-    def log(self, payload: dict[str, Any], step: int) -> None:
-        if self._tensorboard is not None:
-            self._tensorboard.log(payload, step=step)
-        if self._wandb is not None:
-            self._wandb.log(payload, step=int(step))
-
-    def log_text(self, tag: str, text: str, step: int = 0) -> None:
-        if self._tensorboard is not None:
-            self._tensorboard.log_text(tag, text, step=step)
-
-    def log_figure(self, tag: str, fig, step: int) -> None:
-        if self._wandb is not None and fig is not None:
-            self._wandb.log({tag: self._wandb.Image(fig)}, step=int(step))
-        if self._tensorboard is not None:
-            self._tensorboard.log_figure(tag, fig, step)
-        elif fig is not None:
-            plt_close(fig)
-
-    def log_histogram(self, tag: str, values: Any, step: int, *, bins: int = 30) -> None:
-        if self._tensorboard is not None:
-            self._tensorboard.log_histogram(tag, values, step, bins=bins)
-        if self._wandb is not None:
-            self._wandb.log({tag: self._wandb.Histogram(np.asarray(values))}, step=int(step))
-
-    def flush(self) -> None:
-        if self._tensorboard is not None:
-            self._tensorboard.flush()
-
-    def close(self) -> None:
-        if self._tensorboard is not None:
-            self._tensorboard.close()
-        if self._wandb is not None:
-            self._wandb.finish()
-
-
 class TensorBoardMetricLogger:
     def __init__(self, writer, log_dir: Path) -> None:
         self.writer = writer
@@ -204,40 +158,6 @@ def maybe_build_tensorboard(cfg: DictConfig, run_name: str | None = None, run_di
     return logger
 
 
-def maybe_init_wandb(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
-    if not bool(getattr(cfg.logging, "use_wandb", False)):
-        return None
-    try:
-        import wandb
-    except ImportError:
-        print("wandb is not installed, skipping wandb logging.")
-        return None
-
-    entity = getattr(cfg.logging, "entity", None)
-    wandb.init(
-        project=str(getattr(cfg.logging, "project", "DIPOLE_AIR")),
-        entity=None if entity is None or str(entity).strip() == "" else str(entity),
-        name=run_name,
-        mode=str(getattr(cfg.logging, "wandb_mode", "offline")),
-        config=OmegaConf.to_container(cfg, resolve=True),
-        dir=None if run_dir is None else str(run_dir),
-    )
-    print(f"[wandb] mode={getattr(cfg.logging, 'wandb_mode', 'offline')} project={cfg.logging.project}")
-    return wandb
-
-
-def maybe_build_metric_logger(cfg: DictConfig, run_name: str | None = None, run_dir: Path | None = None):
-    tensorboard_logger = maybe_build_tensorboard(cfg, run_name=run_name, run_dir=run_dir)
-    wandb_module = maybe_init_wandb(cfg, run_name=run_name, run_dir=run_dir)
-    if tensorboard_logger is None and wandb_module is None:
-        return None
-    if wandb_module is None:
-        return tensorboard_logger
-    if tensorboard_logger is None:
-        return CompositeMetricLogger(None, wandb_module)
-    return CompositeMetricLogger(tensorboard_logger, wandb_module)
-
-
 def resolve_checkpoint_reference(reference: Any) -> Path | None:
     if reference is None:
         return None
@@ -252,48 +172,6 @@ def resolve_checkpoint_reference(reference: Any) -> Path | None:
             return latest_inside_checkpoints
         raise FileNotFoundError(f"Could not find latest checkpoint under directory: {candidate}")
     return candidate
-
-
-def resolve_checkpoint_run_dir(checkpoint: Path | None) -> Path | None:
-    if checkpoint is None:
-        return None
-    if checkpoint.parent.name == "checkpoints":
-        return checkpoint.parent.parent
-    return None
-
-
-def resolve_buffer_snapshot_paths(checkpoint: Path | None) -> tuple[Path | None, Path | None, Path | None]:
-    run_dir = resolve_checkpoint_run_dir(checkpoint)
-    if run_dir is None:
-        return None, None, None
-    latest_dir = run_dir / "buffers" / "latest"
-    online_path = latest_dir / "online_buffer.pt"
-    demo_path = latest_dir / "demo_buffer.pt"
-    metadata_path = latest_dir / "metadata.json"
-    if not online_path.exists() or not demo_path.exists():
-        return None, None, metadata_path if metadata_path.exists() else None
-    return online_path, demo_path, metadata_path if metadata_path.exists() else None
-
-
-def resolve_buffer_chunk_dirs(checkpoint: Path | None) -> tuple[Path | None, Path | None]:
-    run_dir = resolve_checkpoint_run_dir(checkpoint)
-    if run_dir is None:
-        return None, None
-    online_dir = run_dir / "buffers" / "online_chunks"
-    demo_dir = run_dir / "buffers" / "demo_chunks"
-    return online_dir if online_dir.exists() else None, demo_dir if demo_dir.exists() else None
-
-
-def load_transition_chunks(buffer, chunk_dir: Path) -> int:
-    total_loaded = 0
-    for chunk_path in sorted(chunk_dir.glob("chunk_*.pt")):
-        payload = torch.load(chunk_path, map_location="cpu", weights_only=False)
-        transitions = payload.get("transitions", [])
-        if len(transitions) == 0:
-            continue
-        buffer.extend(list(transitions))
-        total_loaded += int(len(transitions))
-    return total_loaded
 
 
 def build_runtime_cfg(
@@ -345,13 +223,6 @@ def maybe_log_figure(logger, tag: str, fig, step: int) -> None:
 
 def checkpoint_path(checkpoint_dir: Path, tag: str) -> Path:
     return checkpoint_dir / "checkpoints" / f"{tag}.pt"
-
-
-def checkpoint_step_path(checkpoint_dir: Path, *, step: int, learner_updates: int, episode_index: int) -> Path:
-    return checkpoint_path(
-        checkpoint_dir,
-        f"step_{int(step):08d}_updates_{int(learner_updates):08d}_ep_{int(episode_index):05d}",
-    )
 
 
 class FixedRateLimiter:
@@ -424,29 +295,29 @@ def resolve_runtime_fps(cfg: DictConfig, key: str, default_value: float) -> floa
 
 
 def resolve_requested_device(requested: Any, *, fallback: str) -> str:
-    if requested is None:
-        return fallback
-    normalized = str(requested).strip()
-    if normalized == "":
-        return fallback
+    selected = fallback if requested is None else str(requested).strip()
+    if selected == "":
+        selected = fallback
+    normalized = str(selected).strip().lower()
     if not normalized.startswith("cuda"):
-        return normalized
+        raise RuntimeError(
+            f"Pipeline tensor computation requires CUDA, got device {selected!r}."
+        )
     if not torch.cuda.is_available():
-        print(f"[WARN] Requested CUDA device '{normalized}' but CUDA is unavailable. Falling back to cpu.")
-        return "cpu"
+        raise RuntimeError(
+            f"Requested CUDA device {normalized!r}, but CUDA is unavailable."
+        )
     if normalized == "cuda":
-        return "cuda:0"
+        normalized = "cuda:0"
     try:
         device_index = int(normalized.split(":", 1)[1])
     except (IndexError, ValueError):
-        print(f"[WARN] Invalid CUDA device '{normalized}'. Falling back to {fallback}.")
-        return fallback
-    if device_index >= torch.cuda.device_count():
-        print(
-            f"[WARN] Requested CUDA device '{normalized}' but only {torch.cuda.device_count()} visible GPU(s) exist. "
-            f"Falling back to {fallback}."
+        raise RuntimeError(f"Invalid CUDA device {normalized!r}.") from None
+    if device_index < 0 or device_index >= torch.cuda.device_count():
+        raise RuntimeError(
+            f"Requested CUDA device {normalized!r}, but only "
+            f"{torch.cuda.device_count()} GPU(s) are visible."
         )
-        return fallback
     return normalized
 
 
@@ -506,374 +377,10 @@ def write_resolved_config(cfg: DictConfig, run_dir: Path) -> None:
 
 def write_run_info(run_dir: Path, payload: dict[str, Any]) -> None:
     (run_dir / "run_info.json").write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-
-class TeeStream:
-    def __init__(self, *streams) -> None:
-        self._streams = streams
-
-    def write(self, data: str) -> int:
-        for stream in self._streams:
-            stream.write(data)
-        if data and ("\n" in data or "\r" in data):
-            for stream in self._streams:
-                stream.flush()
-        return len(data)
-
-    def flush(self) -> None:
-        for stream in self._streams:
-            stream.flush()
-
-    def isatty(self) -> bool:
-        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
-
-
-class ConsoleLogCapture:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file = None
-        self._stdout = None
-        self._stderr = None
-
-    def start(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("a", encoding="utf-8", buffering=1)
-        self._stdout = sys.stdout
-        self._stderr = sys.stderr
-        sys.stdout = TeeStream(self._stdout, self._file)
-        sys.stderr = TeeStream(self._stderr, self._file)
-
-    def stop(self) -> None:
-        if self._stdout is not None:
-            sys.stdout = self._stdout
-        if self._stderr is not None:
-            sys.stderr = self._stderr
-        if self._file is not None:
-            self._file.flush()
-            self._file.close()
-            self._file = None
-
-
-class AsyncTransitionChunkWriter:
-    def __init__(
-        self,
-        output_dir: Path,
-        *,
-        chunk_size: int,
-        event_logger: callable | None = None,
-    ) -> None:
-        self.output_dir = output_dir
-        self.chunk_size = max(1, int(chunk_size))
-        self.event_logger = event_logger
-        self._condition = threading.Condition()
-        self._pending_online: deque[Any] = deque()
-        self._pending_demo: deque[Any] = deque()
-        self._thread: threading.Thread | None = None
-        self._stop_requested = False
-        self._error: BaseException | None = None
-        self._busy = False
-        self._flush_requested = False
-        self._online_chunk_index = 0
-        self._demo_chunk_index = 0
-
-    def start(self) -> None:
-        with self._condition:
-            if self._thread is not None:
-                return
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            (self.output_dir / "online_chunks").mkdir(parents=True, exist_ok=True)
-            (self.output_dir / "demo_chunks").mkdir(parents=True, exist_ok=True)
-            self._thread = threading.Thread(target=self._worker_loop, name="dipole_buffer_writer", daemon=True)
-            self._thread.start()
-
-    def request_transition(
-        self,
-        *,
-        online_transition,
-        demo_transition=None,
-    ) -> None:
-        self._raise_error()
-        with self._condition:
-            self._pending_online.append(online_transition)
-            if demo_transition is not None:
-                self._pending_demo.append(demo_transition)
-            self._condition.notify_all()
-
-    def flush(self, timeout: float | None = None) -> None:
-        self._raise_error()
-        with self._condition:
-            if self._thread is None:
-                return
-            self._flush_requested = True
-            self._condition.notify_all()
-            end_time = None if timeout is None else time.monotonic() + float(timeout)
-            while self._pending_online or self._pending_demo or self._busy or self._flush_requested:
-                self._raise_error()
-                remaining = None if end_time is None else max(0.0, end_time - time.monotonic())
-                if remaining is not None and remaining <= 0.0:
-                    raise TimeoutError("Timed out while waiting for transition chunk writer.")
-                self._condition.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
-        self._raise_error()
-
-    def close(self) -> None:
-        with self._condition:
-            thread = self._thread
-            if thread is None:
-                return
-            self._stop_requested = True
-            self._condition.notify_all()
-        thread.join(timeout=10.0)
-        with self._condition:
-            self._thread = None
-        self._raise_error()
-
-    def latest_metadata_path(self) -> Path:
-        return self.output_dir / "latest" / "metadata.json"
-
-    def online_buffer_path(self) -> Path:
-        return self.output_dir / "online_chunks"
-
-    def demo_buffer_path(self) -> Path:
-        return self.output_dir / "demo_chunks"
-
-    def _worker_loop(self) -> None:
-        online_batch: list[Any] = []
-        demo_batch: list[Any] = []
-        while True:
-            with self._condition:
-                while (
-                    len(self._pending_online) == 0
-                    and len(self._pending_demo) == 0
-                    and not self._flush_requested
-                    and not self._stop_requested
-                ):
-                    self._condition.wait(timeout=0.1)
-                while self._pending_online:
-                    online_batch.append(self._pending_online.popleft())
-                while self._pending_demo:
-                    demo_batch.append(self._pending_demo.popleft())
-                should_flush = self._flush_requested or self._stop_requested
-                if self._stop_requested and len(online_batch) == 0 and len(demo_batch) == 0:
-                    return
-                should_write = (
-                    len(online_batch) >= self.chunk_size
-                    or len(demo_batch) >= self.chunk_size
-                    or (should_flush and (len(online_batch) > 0 or len(demo_batch) > 0))
-                )
-                if not should_write:
-                    continue
-                self._busy = True
-                self._condition.notify_all()
-            try:
-                while len(online_batch) >= self.chunk_size or (should_flush and len(online_batch) > 0):
-                    chunk = online_batch[: self.chunk_size]
-                    del online_batch[: len(chunk)]
-                    self._write_chunk("online_chunks", self._online_chunk_index, chunk)
-                    self._online_chunk_index += 1
-                    if not should_flush:
-                        break
-                while len(demo_batch) >= self.chunk_size or (should_flush and len(demo_batch) > 0):
-                    chunk = demo_batch[: self.chunk_size]
-                    del demo_batch[: len(chunk)]
-                    self._write_chunk("demo_chunks", self._demo_chunk_index, chunk)
-                    self._demo_chunk_index += 1
-                    if not should_flush:
-                        break
-            except BaseException as exc:
-                with self._condition:
-                    self._error = exc
-                    self._busy = False
-                    self._stop_requested = True
-                    self._condition.notify_all()
-                return
-            finally:
-                with self._condition:
-                    if should_flush and len(online_batch) == 0 and len(demo_batch) == 0:
-                        self._flush_requested = False
-                    self._busy = False
-                    self._condition.notify_all()
-
-    def _write_chunk(self, directory_name: str, chunk_index: int, transitions: list[Any]) -> None:
-        chunk_dir = self.output_dir / directory_name
-        chunk_path = chunk_dir / f"chunk_{int(chunk_index):08d}.pt"
-        payload = {
-            "chunk_index": int(chunk_index),
-            "transition_count": int(len(transitions)),
-            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "transitions": list(transitions),
-        }
-        _atomic_torch_save(payload, chunk_path)
-        if self.event_logger is not None:
-            self.event_logger(
-                {
-                    "event": "buffer_chunk_written",
-                    "stream": directory_name,
-                    "chunk_index": int(chunk_index),
-                    "transition_count": int(len(transitions)),
-                    "wall_time": datetime.datetime.now().isoformat(timespec="milliseconds"),
-                }
-            )
-
-    def _raise_error(self) -> None:
-        with self._condition:
-            error = self._error
-        if error is not None:
-            raise RuntimeError(f"Transition chunk writer failed: {error}") from error
-
-
-class JsonlEventLogger:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file = None
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("a", encoding="utf-8", buffering=1)
-
-    def log(self, payload: dict[str, Any]) -> None:
-        if self._file is None:
-            return
-        with self._lock:
-            self._file.write(json.dumps(payload, sort_keys=True) + "\n")
-
-    def close(self) -> None:
-        with self._lock:
-            if self._file is None:
-                return
-            self._file.flush()
-            self._file.close()
-            self._file = None
-
-
-class AsyncCheckpointWriter:
-    def __init__(self, agent, checkpoint_dir: Path) -> None:
-        self.agent = agent
-        self.checkpoint_dir = checkpoint_dir
-        self._condition = threading.Condition()
-        self._pending_requests: deque[dict[str, Any]] = deque()
-        self._thread: threading.Thread | None = None
-        self._stop_requested = False
-        self._busy = False
-        self._error: BaseException | None = None
-
-    def start(self) -> None:
-        with self._condition:
-            if self._thread is not None:
-                return
-            (self.checkpoint_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
-            self._thread = threading.Thread(target=self._worker_loop, name="dipole_checkpoint_writer", daemon=True)
-            self._thread.start()
-
-    def request_save(
-        self,
-        *,
-        paths: list[Path],
-        include_buffers: bool,
-        extra: dict[str, Any] | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        self._raise_error()
-        with self._condition:
-            self._pending_requests.append(
-                {
-                    "paths": list(paths),
-                    "include_buffers": bool(include_buffers),
-                    "extra": None if extra is None else dict(extra),
-                    "metadata": {} if metadata is None else dict(metadata),
-                }
-            )
-            self._condition.notify_all()
-
-    def flush(self, timeout: float | None = None) -> None:
-        self._raise_error()
-        with self._condition:
-            if self._thread is None:
-                return
-            end_time = None if timeout is None else time.monotonic() + float(timeout)
-            while self._pending_requests or self._busy:
-                self._raise_error()
-                remaining = None if end_time is None else max(0.0, end_time - time.monotonic())
-                if remaining is not None and remaining <= 0.0:
-                    raise TimeoutError("Timed out while waiting for checkpoint writer.")
-                self._condition.wait(timeout=0.1 if remaining is None else min(0.1, remaining))
-        self._raise_error()
-
-    def close(self) -> None:
-        with self._condition:
-            thread = self._thread
-            if thread is None:
-                return
-            self._stop_requested = True
-            self._condition.notify_all()
-        thread.join(timeout=10.0)
-        with self._condition:
-            self._thread = None
-        self._raise_error()
-
-    def _worker_loop(self) -> None:
-        while True:
-            with self._condition:
-                while not self._pending_requests and not self._stop_requested:
-                    self._condition.wait(timeout=0.1)
-                if self._stop_requested and not self._pending_requests:
-                    return
-                request = self._pending_requests.popleft()
-                self._busy = True
-                self._condition.notify_all()
-            try:
-                payload = self.agent.build_checkpoint_payload(
-                    include_buffers=bool(request["include_buffers"]),
-                    extra=request["extra"],
-                )
-                for path in request["paths"]:
-                    self.agent.write_checkpoint_payload(path, payload)
-            except BaseException as exc:
-                with self._condition:
-                    self._error = exc
-                    self._busy = False
-                    self._stop_requested = True
-                    self._condition.notify_all()
-                return
-            finally:
-                with self._condition:
-                    self._busy = False
-                    self._condition.notify_all()
-
-    def _raise_error(self) -> None:
-        with self._condition:
-            error = self._error
-        if error is not None:
-            raise RuntimeError(f"Checkpoint writer failed: {error}") from error
-
-
-def _atomic_torch_save(payload: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
-
-
-def _atomic_json_write(payload: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
-def format_episode_line(
-    *,
-    step: int,
-    episode_index: int,
-    episode_return: float,
-    episode_length: int,
-    success: bool,
-    online_buffer_size: int,
-    demo_buffer_size: int,
-) -> str:
-    status = "success" if success else "done"
-    return (
-        f"[episode] ep={episode_index} step={step} {status} "
-        f"return={episode_return:.2f} len={episode_length} "
-        f"buffers(on/demo)={online_buffer_size}/{demo_buffer_size}"
-    )
+def maybe_build_metric_logger(
+    cfg: DictConfig,
+    run_name: str | None = None,
+    run_dir: Path | None = None,
+):
+    """Build the pipeline's sole supported training logger: TensorBoard."""
+    return maybe_build_tensorboard(cfg, run_name=run_name, run_dir=run_dir)

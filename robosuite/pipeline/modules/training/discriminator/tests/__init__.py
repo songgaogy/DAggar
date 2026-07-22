@@ -1,0 +1,1 @@
+"""Discriminator training tests."""

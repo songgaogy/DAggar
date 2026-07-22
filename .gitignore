@@ -127,6 +127,8 @@ MUJOCO_LOG.TXT
 # private demonstration files
 robosuite/models/assets/demonstrations_private
 
+robosuite/scripts/RL
+
 *.zarr
 robosuite/armada/outputs
 .vscode/

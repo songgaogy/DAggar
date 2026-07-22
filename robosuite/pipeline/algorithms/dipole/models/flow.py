@@ -113,6 +113,13 @@ class DipoleFlowPolicy:
         self.camera_names = [str(name) for name in camera_names]
         self.device = torch.device(config.device)
         self.inference_device = torch.device(config.inference_device or config.device)
+        if self.device.type != "cuda" or self.inference_device.type != "cuda":
+            raise RuntimeError(
+                "DIPOLE policy training and inference require CUDA devices; "
+                f"got training={self.device}, inference={self.inference_device}."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("DIPOLE policy requires CUDA, but CUDA is unavailable.")
         self.language_instruction = str(config.language_instruction or config.task_name or "perform the task")
 
         def _build() -> MultiModalFlowPolicy:
@@ -177,7 +184,7 @@ class DipoleFlowPolicy:
         # Optional G provider, injected after construction.
         self.g_provider: Any = None
         # Optional pluggable branch-weight policy (offline DIPOLE). When set it
-        # fully overrides _compute_branch_weights; see offline/utils/branch_weights.py.
+        # fully overrides _compute_branch_weights; see modules/training/dipole/branch_weights.py.
         self.branch_weight_policy: Any = None
 
         self.sync_inference_policy()
@@ -313,18 +320,6 @@ class DipoleFlowPolicy:
             action_seq = action_seq * self.act_std + self.act_mean
         return action_seq
 
-    @staticmethod
-    def _resolve_demo_sample_mask(batch: DipoleBatch, device: torch.device) -> torch.Tensor | None:
-        """True for rows sampled from demo_buffer (see ``buffer_sources`` metadata)."""
-        sources = batch.metadata.get("buffer_sources")
-        if sources is None or len(sources) != batch.batch_size:
-            return None
-        return torch.tensor(
-            [str(source) == "demo_buffer" for source in sources],
-            device=device,
-            dtype=torch.bool,
-        )
-
     def _g_weights_from_raw(
         self, raw: torch.Tensor, *, want_metrics: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
@@ -392,11 +387,7 @@ class DipoleFlowPolicy:
         *,
         want_metrics: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-        """Return (w_pos, w_neg, metrics) tensors of shape (B,).
-
-        When ``buffer_sources`` is set (1:1 online/demo training batch):
-        - demo_buffer rows: ``w_pos=1``, ``w_neg=0``; G is not computed
-        - online_buffer rows: raw G and sigmoid use online rows only
+        """Return routed branch weights and metrics with shape ``(B,)``.
 
         ``want_metrics=False`` skips every scalar readback so the training hot
         path incurs no GPU->CPU sync on non-logging steps.
@@ -412,63 +403,12 @@ class DipoleFlowPolicy:
         if getattr(self.config, "branch_weight_mode", "coupled") == "neg_all":
             return self._neg_all_branch_weights(batch, want_metrics=want_metrics)
 
-        B = batch.batch_size
-        demo_mask = self._resolve_demo_sample_mask(batch, self.device)
-
-        if demo_mask is not None:
-            w_pos = torch.ones(B, dtype=torch.float32, device=self.device)
-            w_neg = torch.zeros(B, dtype=torch.float32, device=self.device)
-            online_mask = ~demo_mask
-            metrics: dict[str, float] = (
-                {
-                    "frac_demo_buffer": float(demo_mask.float().mean().item()),
-                    "w_pos_mean_demo": 1.0,
-                    "raw_nnpu_score_mean": 0.0,
-                    "raw_nnpu_score_std": 0.0,
-                    "raw_nnpu_score_min": 0.0,
-                    "raw_nnpu_score_max": 0.0,
-                    "G_mean": 0.0,
-                    "G_std": 0.0,
-                    "logit_mean": 0.0,
-                    "logit_std": 0.0,
-                }
-                if want_metrics
-                else {}
-            )
-            if not bool(online_mask.any().item()):
-                return w_pos, w_neg, metrics
-
-            online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
-            if self.g_provider is None:
-                zero_g = torch.zeros(int(online_indices.numel()), dtype=torch.float32, device=self.device)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
-            else:
-                with torch.no_grad():
-                    online_batch = select_dipole_batch(batch, online_indices)
-                    raw = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
-                w_online_pos, w_online_neg, g_metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
-
-            w_pos[online_mask] = w_online_pos
-            w_neg[online_mask] = w_online_neg
-            if want_metrics:
-                metrics.update(g_metrics)
-                metrics["w_pos_mean_online"] = float(w_online_pos.mean().item())
-                metrics["w_neg_mean_online"] = float(w_online_neg.mean().item())
-            return w_pos, w_neg, metrics
-
-        # Legacy path: demo-only batch without buffer_sources (full-batch G + intervention mask).
         if self.g_provider is None:
-            zero_g = torch.zeros(B, dtype=torch.float32, device=self.device)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(zero_g, want_metrics=want_metrics)
+            raw = torch.zeros(batch.batch_size, dtype=torch.float32, device=self.device)
         else:
             with torch.no_grad():
                 raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
-            w_pos, w_neg, metrics = self._g_weights_from_raw(raw, want_metrics=want_metrics)
-
-        is_int = batch.is_intervention.to(self.device).bool().reshape(-1)
-        w_pos = torch.where(is_int, torch.ones_like(w_pos), w_pos)
-        w_neg = torch.where(is_int, torch.zeros_like(w_neg), w_neg)
-        return w_pos, w_neg, metrics
+        return self._g_weights_from_raw(raw, want_metrics=want_metrics)
 
     def _provider_raw_g_for_batch(self, batch: DipoleBatch) -> torch.Tensor:
         """Provider G per sample (before logit/sigmoid weighting)."""
@@ -492,18 +432,6 @@ class DipoleFlowPolicy:
             else:
                 raw = self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
             return raw
-
-        demo_mask = self._resolve_demo_sample_mask(batch, self.device)
-        if demo_mask is not None:
-            raw = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
-            online_mask = ~demo_mask
-            if bool(online_mask.any().item()):
-                online_indices = torch.nonzero(online_mask, as_tuple=False).squeeze(1)
-                online_batch = select_dipole_batch(batch, online_indices)
-                raw_online = self.g_provider.compute_g_for_batch(online_batch).to(self.device).reshape(-1)
-                raw[online_mask] = raw_online
-            return raw
-
         return self.g_provider.compute_g_for_batch(batch).to(self.device).reshape(-1)
 
     def update(
@@ -671,18 +599,13 @@ class DipoleFlowPolicy:
         self.sync_inference_policy()
         self.reset_action_chunk()
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+    def load_dual_model_state(self, state_dict: dict[str, Any]) -> None:
+        """Load trained positive/negative policies without optimizer state."""
         with self._state_lock:
             core_pos = state_dict["core_pos"]
             core_neg = state_dict["core_neg"]
             self.model_pos.load_state_dict(core_pos["model"])
             self.model_neg.load_state_dict(core_neg["model"])
-            opt_pos_state = core_pos.get("optimizer")
-            if opt_pos_state is not None:
-                self.optimizer_pos.load_state_dict(opt_pos_state)
-            opt_neg_state = core_neg.get("optimizer")
-            if opt_neg_state is not None:
-                self.optimizer_neg.load_state_dict(opt_neg_state)
             self.set_normalizers(
                 action_mean=state_dict.get("act_mean"),
                 action_std=state_dict.get("act_std"),

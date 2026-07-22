@@ -6,7 +6,7 @@ import torch
 
 from robosuite.pipeline.algorithms.dipole.replay_buffer import DipoleReplayBuffer
 from robosuite.pipeline.common.types import ReplayBufferConfig, Transition
-from robosuite.pipeline.offline.utils.advantage import OfflineAdvantageGProvider
+from robosuite.pipeline.modules.training.dipole.advantage import OfflineAdvantageGProvider
 
 
 CAMERA = "agentview"

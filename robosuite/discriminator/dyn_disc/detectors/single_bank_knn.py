@@ -175,6 +175,11 @@ class DynEncoder:
             )
 
         self.cfg = OmegaConf.load(cfg_path)
+        bundled_backbone = cfg_path.parent / "backbone"
+        if bundled_backbone.is_dir() and OmegaConf.select(
+            self.cfg, "encoder.model_path", default=None
+        ) is not None:
+            self.cfg.encoder.model_path = str(bundled_backbone.resolve())
 
         # Normalizer: prefer a saved `normalizer.pth` next to the run dir; if missing,
         # rebuild it from the dataset specified in the saved config.

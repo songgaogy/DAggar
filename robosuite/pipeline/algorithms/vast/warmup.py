@@ -5,13 +5,12 @@ encodes them with the SharedDynamicsEncoder, then runs the joint G/V loop
 (no Q head). Dumps `vast_state.pt` for the online phase to pick up via
 `algorithm.vast.warmup_ckpt`.
 
-Run as a Hydra module (CLI overrides land on `train_dipole_rl.yaml`):
+Run as a Hydra module using the public batch-online configuration:
     python -m robosuite.pipeline.algorithms.vast.warmup \
-        env.environment=PickPlaceBread \
-        runtime.init_checkpoint=checkpoints/.../flow.pt \
-        algorithm.vast.warmup_joint_steps=30000 \
-        algorithm.vast.config.device=cuda:1 \
-        +warmup.output_path=outputs/dipole_rl-vast/baseline/PickPlaceBread/vast_state.pt
+        task.inputs.base_policy_checkpoint=checkpoints/.../flow.pt \
+        task.vast.num_steps=30000 \
+        cuda.training_device=cuda:1 \
+        +warmup.output_path=outputs/vast-warmup/PickPlaceCereal/vast_state.pt
 
 `+warmup.output_path` is required (use `+` to add the key — it lives only
 in the warmup namespace).
@@ -49,9 +48,8 @@ from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerRe
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
 from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
-from robosuite.pipeline.envs import build_robosuite_env
-from robosuite.pipeline.envs.robosuite import RobosuiteRuntimeConfig
-from robosuite.pipeline.train_dipole import (
+from robosuite.pipeline.common.environment import RobosuiteRuntimeConfig, build_robosuite_env
+from robosuite.pipeline.common.flow import (
     bind_flow_proprio_extractor,
     build_flow_runtime_cfg,
     load_hdf5_demos_into_flow_transitions,
@@ -542,8 +540,7 @@ def _resolve_policy_action_dim(init_payload: dict[str, Any] | None, env) -> int:
     return int(np.asarray(action_low).shape[-1])
 
 
-@hydra.main(version_base="1.2", config_path="../../config", config_name="train_dipole_rl")
-def main(cfg: DictConfig) -> None:
+def run_vast_warmup(cfg: DictConfig) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError(
             "VAST/VAST warmup requires CUDA; torch.cuda.is_available() is False."
@@ -598,7 +595,7 @@ def main(cfg: DictConfig) -> None:
     task_data_name = resolve_demo_task_name(cfg)
     data_root = to_absolute_path(str(cfg.data.demo_root))
 
-    # Resolve camera layout the way train_dipole.py does: prefer init_checkpoint.
+    # Resolve camera layout from the immutable initial policy checkpoint.
     requested_camera_names = resolve_camera_names(cfg)
     if bool(getattr(cfg.runtime, "use_init_checkpoint_camera_names", True)) and init_payload is not None:
         policy_camera_names = [str(name) for name in init_payload.get("camera_names", [])]
@@ -612,7 +609,7 @@ def main(cfg: DictConfig) -> None:
     }
 
     # Build env so we can extract proprio from HDF5 states using the same
-    # extractor train_dipole.py uses (the dynamics encoder was trained against
+    # extractor used by collection (the dynamics encoder was trained against
     # that exact proprio format).
     flow_env_metadata = resolve_flow_task_metadata(init_payload, task_name)
     # Offline warmup reads images from HDF5 and proprio from flattened states;
@@ -645,13 +642,7 @@ def main(cfg: DictConfig) -> None:
             to_absolute_path(str(encoder_ckpt_raw)) if encoder_ckpt_raw else None
         )
         requested_device = str(vast_cfg_block.config.device)
-        default_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        device = resolve_requested_device(requested_device, fallback=default_device)
-        if str(requested_device).startswith("cuda") and device == "cpu":
-            raise RuntimeError(
-                f"Requested device '{requested_device}' but torch.cuda.is_available() is False. "
-                "Run `nvidia-smi` and fix any driver/library mismatch (reboot after a driver update)."
-            )
+        device = resolve_requested_device(requested_device, fallback="cuda:0")
         camera_to_view: dict[str, str] = {
             str(k): str(v)
             for k, v in dict(OmegaConf.select(cfg, "algorithm.discriminator.camera_to_view", default={}) or {}).items()
@@ -675,7 +666,7 @@ def main(cfg: DictConfig) -> None:
         vast_cfg_dict["device"] = device
         vast_cfg = VASTConfig(**vast_cfg_dict)
 
-        capacity = int(getattr(cfg.runtime, "demo_buffer_capacity", 200_000))
+        capacity = int(getattr(cfg.runtime, "replay_capacity", 200_000))
         buffer = FlowDaggerReplayBuffer(
             config=ReplayBufferConfig(capacity=capacity, batch_size=batch_size),
             name="vast_warmup_offline",
@@ -785,7 +776,7 @@ def main(cfg: DictConfig) -> None:
 
     # Optionally persist the assembled offline transitions (raw images + proprio +
     # actions + rewards + dones + metadata) so they can be reloaded verbatim into a
-    # replay buffer later (e.g. offline DIPOLE under pipeline/offline). Reuses
+    # replay buffer later (e.g. batch-online DIPOLE under pipeline/modules/training). Reuses
     # FlowDaggerReplayBuffer.save() (torch.save of the full storage state_dict).
     save_data = bool(OmegaConf.select(cfg, "warmup.num_trajectories.save_data", default=False))
     if save_data:
@@ -1019,6 +1010,12 @@ def main(cfg: DictConfig) -> None:
         tb_logger.flush()
         tb_logger.close()
 
+
+@hydra.main(version_base="1.2", config_path="../../config", config_name="overall")
+def main(cfg: DictConfig) -> None:
+    from robosuite.pipeline.config.adapters import vast_warmup_stage_config
+
+    run_vast_warmup(vast_warmup_stage_config(cfg))
 
 
 if __name__ == "__main__":  # pragma: no cover

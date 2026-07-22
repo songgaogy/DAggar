@@ -66,8 +66,14 @@ class SharedDynamicsEncoder:
             )
 
         requested_device = torch.device(device)
-        if requested_device.type == "cuda" and not torch.cuda.is_available():
-            requested_device = torch.device("cpu")
+        if requested_device.type != "cuda":
+            raise RuntimeError(
+                f"SharedDynamicsEncoder requires CUDA, got {requested_device}."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "SharedDynamicsEncoder requires CUDA, but CUDA is unavailable."
+            )
         self.device = requested_device
         self.camera_to_view = dict(camera_to_view or {})
         self.feature_source = str(payload["feature_source"])

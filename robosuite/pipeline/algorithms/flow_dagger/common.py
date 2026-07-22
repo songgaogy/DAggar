@@ -31,7 +31,7 @@ class FlowDaggerConfig:
     lambda_endpoint: float = 0.5
     lambda_smooth: float = 0.05
     n_ode_steps: int = 8
-    device: str = "cpu"
+    device: str = "cuda:0"
     inference_device: Optional[str] = None
     task_name: Optional[str] = None
     language_instruction: Optional[str] = None

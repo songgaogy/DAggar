@@ -1,6 +1,6 @@
 """G provider that mixes the VAST TD1 fallback with frozen nnPU failure scores.
 
-Replaces `NNPUGProvider` when DipoleConfig.g_mode == "advantage".
+Provides frozen VAST/discriminator advantages for batch policy training.
 
 Online fallback math (no Q head):
     A(s, a)        = r + gamma^H * target_V(s') - V(s)      # TD residual
@@ -14,7 +14,7 @@ STATUS: the online ``compute_g_for_batch`` is a stub. Computing the TD residual
 requires the next state ``s'`` and the chunk reward ``r`` for each sampled
 window, which the online :class:`DipoleBatch` does not currently carry (the
 offline path precomputes the residual by start index instead — see
-``offline/utils/advantage.py``, which can accumulate GAE from those residuals).
+``modules/training/dipole/advantage.py``, which can accumulate GAE from those residuals).
 Wiring next-state/reward through the online
 sampler is deferred; until then this provider raises ``NotImplementedError``.
 
@@ -95,7 +95,7 @@ class AdvantageGProvider:
 
     def bind_policy_cameras(self, policy_cameras: list[str]) -> None:
         """Pass-through to the encoder (so the existing wiring in
-        train_dipole.py:689-696 keeps working)."""
+        existing runtime diagnostics keep working)."""
         self.encoder.bind_policy_cameras(policy_cameras)
 
 

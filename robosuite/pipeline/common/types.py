@@ -114,22 +114,3 @@ class SACConfig:
     log_std_max: float = 2.0
     device: str = "cpu"
     inference_device: Optional[str] = None
-
-
-@dataclass
-class TrainerConfig:
-    batch_size: int = 256
-    cta_ratio: int = 2
-    warmup_steps: int = 100
-    updates_per_step: int = 1
-    steps_per_update: int = 50
-    online_fraction: float = 0.5
-    # Hard cap on async learner queue. When the learner falls behind, extra
-    # update requests are dropped instead of accumulating an unbounded backlog.
-    max_pending_updates: int = 4
-
-    def split_batch_sizes(self) -> tuple[int, int]:
-        online_batch = int(round(self.batch_size * self.online_fraction))
-        online_batch = min(max(1, online_batch), self.batch_size - 1)
-        demo_batch = self.batch_size - online_batch
-        return online_batch, demo_batch

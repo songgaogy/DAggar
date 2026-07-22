@@ -29,8 +29,7 @@ class DipoleConfig(FlowDaggerConfig):
     # trained full-tune under the base flow-policy freeze regime; there are no LoRA
     # adapters. The learning rate / weight decay come from the inherited
     # ``learning_rate`` / ``weight_decay`` (FlowDaggerConfig).
-    # DIPOLE-RL: which frozen nnPU-backed G provider the trainer attaches.
-    # Read by train_dipole*.py; DipoleFlowPolicy itself does not consume it.
+    # Selects the frozen advantage provider attached during the policy stage.
     g_mode: str = "nnpu_frozen"
     # Branch-weight scheme consumed by DipoleFlowPolicy._compute_branch_weights:
     #   "coupled" (default) -> w_neg = 1 - w_pos with the intervention override
@@ -45,11 +44,6 @@ class DipoleConfig(FlowDaggerConfig):
 @dataclass
 class TrainerConfig:
     batch_size: int = 64
-    warmup_steps: int = 0
-    updates_per_step: int = 1
-    steps_per_update: int = 50
-    pretrain_steps: int = 20_000
-    max_pending_updates: int = 1
 
 
 @dataclass
@@ -81,13 +75,13 @@ class DipoleBatch:
 
 
 def select_dipole_batch(batch: DipoleBatch, indices: torch.Tensor) -> DipoleBatch:
-    """Row subset along batch dim (for online-only G computation)."""
+    """Select routed rows along the batch dimension."""
     if indices.numel() == 0:
         raise ValueError("select_dipole_batch requires at least one index.")
     idx = indices.to(device=batch.image_obs.device, dtype=torch.long).reshape(-1)
     index_list = idx.detach().cpu().tolist()
     metadata: dict[str, Any] = {}
-    for key in ("start_indices", "episode_ids", "episode_steps", "buffer_sources", "route"):
+    for key in ("start_indices", "episode_ids", "episode_steps", "route"):
         values = batch.metadata.get(key)
         if values is None:
             continue
@@ -104,52 +98,9 @@ def select_dipole_batch(batch: DipoleBatch, indices: torch.Tensor) -> DipoleBatc
     )
 
 
-def concat_dipole_batches(*batches: DipoleBatch) -> DipoleBatch:
-    """Concatenate batches along dim=0 (e.g. online + demo halves)."""
-    if len(batches) == 0:
-        raise ValueError("concat_dipole_batches requires at least one batch.")
-    if len(batches) == 1:
-        return batches[0]
-
-    def _merge_meta(key: str) -> list[Any]:
-        merged: list[Any] = []
-        for batch in batches:
-            values = batch.metadata.get(key)
-            if values is None:
-                continue
-            merged.extend(list(values))
-        return merged
-
-    buffer_sources: list[str] = []
-    for batch in batches:
-        sources = batch.metadata.get("buffer_sources")
-        if sources is not None:
-            buffer_sources.extend(list(sources))
-        else:
-            buffer_sources.extend(["unknown"] * batch.batch_size)
-
-    return DipoleBatch(
-        image_obs=torch.cat([b.image_obs for b in batches], dim=0),
-        image_obs_raw=torch.cat([b.image_obs_raw for b in batches], dim=0),
-        proprio=torch.cat([b.proprio for b in batches], dim=0),
-        proprio_raw=torch.cat([b.proprio_raw for b in batches], dim=0),
-        action_sequences=torch.cat([b.action_sequences for b in batches], dim=0),
-        action_sequences_raw=torch.cat([b.action_sequences_raw for b in batches], dim=0),
-        is_intervention=torch.cat([b.is_intervention for b in batches], dim=0),
-        metadata={
-            "start_indices": _merge_meta("start_indices"),
-            "episode_ids": _merge_meta("episode_ids"),
-            "episode_steps": _merge_meta("episode_steps"),
-            "buffer_sources": buffer_sources,
-            "route": _merge_meta("route"),
-        },
-    )
-
-
 __all__ = [
     "DipoleBatch",
     "select_dipole_batch",
-    "concat_dipole_batches",
     "DipoleConfig",
     "EncoderConfig",
     "FlowAugmentationConfig",

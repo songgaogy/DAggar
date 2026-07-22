@@ -19,7 +19,6 @@ def register_algorithm(name: str):
 
 
 @register_algorithm("dipole")
-@register_algorithm("dipole_rl")
 def _build_dipole_algorithm(
     cfg: Any,
     observation_space=None,
@@ -30,14 +29,7 @@ def _build_dipole_algorithm(
     action_high=None,
     device: str | None = None,
 ) -> DipoleAgent:
-    """Builder for both `dipole` and `dipole_rl` algorithm types.
-
-    The same `DipoleAgent` is used in both modes — the RL additions
-    (VAST learner, frozen nnPU discriminator, AdvantageGProvider) are owned by the
-    trainer in `train_dipole_rl.py`, not the agent. `agent.from_config`
-    reads `algorithm.dipole.g_mode` to decide whether to expect an
-    AdvantageGProvider attachment later.
-    """
+    """Build the DIPOLE policy agent from a stage-adapted configuration."""
     return DipoleAgent.from_config(
         cfg=cfg,
         observation_space=observation_space,

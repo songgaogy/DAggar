@@ -17,13 +17,7 @@ from robosuite.pipeline.common.utils import (
 )
 from robosuite.policy.flow_multi_update.utils.datasets import DEFAULT_TASK_PROMPTS
 
-from .common import (
-    DipoleBatch,
-    DipoleConfig,
-    FlowAugmentationConfig,
-    TrainerConfig,
-    concat_dipole_batches,
-)
+from .common import DipoleConfig, FlowAugmentationConfig, TrainerConfig
 from .models import DipoleFlowPolicy
 from .replay_buffer import DipoleReplayBuffer
 
@@ -60,8 +54,7 @@ class DipoleAgent:
         flow_config: DipoleConfig,
         model_cfg: dict[str, Any],
         camera_names: list[str],
-        online_buffer_config: ReplayBufferConfig | None = None,
-        demo_buffer_config: ReplayBufferConfig | None = None,
+        replay_buffer_config: ReplayBufferConfig | None = None,
         trainer_config: TrainerConfig | None = None,
     ) -> None:
         self.encoder_config = encoder_config
@@ -71,19 +64,11 @@ class DipoleAgent:
         self.task_name = str(flow_config.task_name or "task")
         self.language_instruction = str(flow_config.language_instruction or self.task_name)
         self.trainer_config = trainer_config or TrainerConfig(
-            batch_size=online_buffer_config.batch_size if online_buffer_config else 64
+            batch_size=replay_buffer_config.batch_size if replay_buffer_config else 64
         )
-        self.online_buffer = DipoleReplayBuffer(
-            online_buffer_config or ReplayBufferConfig(batch_size=self.trainer_config.batch_size),
-            name="online_buffer",
-            camera_names=self.camera_names,
-            action_horizon=int(flow_config.action_horizon),
-            image_size=int(flow_config.image_size),
-            augmentation_config=flow_config.augmentation,
-        )
-        self.demo_buffer = DipoleReplayBuffer(
-            demo_buffer_config or ReplayBufferConfig(batch_size=self.trainer_config.batch_size),
-            name="demo_buffer",
+        self.replay_buffer = DipoleReplayBuffer(
+            replay_buffer_config or ReplayBufferConfig(batch_size=self.trainer_config.batch_size),
+            name="policy_training_buffer",
             camera_names=self.camera_names,
             action_horizon=int(flow_config.action_horizon),
             image_size=int(flow_config.image_size),
@@ -124,8 +109,7 @@ class DipoleAgent:
         encoder_cfg = cfg_get(cfg, "encoder", None)
         flow_cfg = cfg_get(cfg, "flow", None)
         dipole_cfg = cfg_get(cfg, "dipole", None)
-        online_buffer_cfg = cfg_get(cfg, "online_buffer", None)
-        demo_buffer_cfg = cfg_get(cfg, "demo_buffer", None)
+        replay_buffer_cfg = cfg_get(cfg, "replay_buffer", None)
         trainer_cfg = cfg_get(cfg, "trainer", None)
 
         encoder_config = EncoderConfig(
@@ -156,7 +140,7 @@ class DipoleAgent:
             lambda_endpoint=float(cfg_get(flow_cfg, "lambda_endpoint", 0.5)),
             lambda_smooth=float(cfg_get(flow_cfg, "lambda_smooth", 0.05)),
             n_ode_steps=int(cfg_get(flow_cfg, "n_ode_steps", 8)),
-            device=str(device or cfg_get(flow_cfg, "device", cfg_get(cfg, "device", "cpu"))),
+            device=str(device or cfg_get(flow_cfg, "device", cfg_get(cfg, "device", "cuda:0"))),
             inference_device=inference_device,
             task_name=task_name,
             language_instruction=_resolve_language_instruction(task_name, task_prompt_map),
@@ -170,21 +154,12 @@ class DipoleAgent:
             g_clip=float(cfg_get(dipole_cfg, "g_clip", 10.0)),
             g_mode=_validate_g_mode(cfg_get(dipole_cfg, "g_mode", "nnpu_frozen")),
         )
-        online_buffer_config = ReplayBufferConfig(
-            capacity=int(cfg_get(online_buffer_cfg, "capacity", cfg_get(cfg, "online_buffer_capacity", 200_000))),
-            batch_size=batch_size,
-        )
-        demo_buffer_config = ReplayBufferConfig(
-            capacity=int(cfg_get(demo_buffer_cfg, "capacity", cfg_get(cfg, "demo_buffer_capacity", 200_000))),
+        replay_buffer_config = ReplayBufferConfig(
+            capacity=int(cfg_get(replay_buffer_cfg, "capacity", 200_000)),
             batch_size=batch_size,
         )
         trainer_config = TrainerConfig(
             batch_size=batch_size,
-            warmup_steps=int(cfg_get(trainer_cfg, "warmup_steps", cfg_get(cfg, "warmup_steps", 0))),
-            updates_per_step=int(cfg_get(trainer_cfg, "updates_per_step", 1)),
-            steps_per_update=int(cfg_get(trainer_cfg, "steps_per_update", 50)),
-            pretrain_steps=int(cfg_get(trainer_cfg, "pretrain_steps", 20_000)),
-            max_pending_updates=int(cfg_get(trainer_cfg, "max_pending_updates", 1)),
         )
         return cls(
             observation_example=observation_example,
@@ -192,8 +167,7 @@ class DipoleAgent:
             flow_config=flow_config,
             model_cfg=model_cfg,
             camera_names=[str(name) for name in cfg_get(cfg, "camera_names", ())],
-            online_buffer_config=online_buffer_config,
-            demo_buffer_config=demo_buffer_config,
+            replay_buffer_config=replay_buffer_config,
             trainer_config=trainer_config,
         )
 
@@ -273,74 +247,11 @@ class DipoleAgent:
             proprio_std=proprio_array.std(axis=0) + 1e-6,
         )
 
-    def store_online_transition(self, transition: Transition) -> None:
-        self.online_buffer.add(transition)
-
-    def store_demo_transition(self, transition: Transition) -> None:
-        self.demo_buffer.add(transition)
-
-    def store_transition(self, transition: Transition) -> None:
-        self.store_online_transition(transition)
-        if transition.is_intervention:
-            self.store_demo_transition(transition)
-
-    def _flow_sample_kwargs(self) -> dict[str, Any]:
-        return {
-            "action_mean": self.core.act_mean,
-            "action_std": self.core.act_std,
-            "proprio_mean": self.core.prop_mean,
-            "proprio_std": self.core.prop_std,
-            "device": self.core.device,
-            "augment": True,
-        }
-
-    def _sample_buffer_batch(self, buffer: DipoleReplayBuffer, batch_size: int) -> DipoleBatch:
-        batch = buffer.sample(batch_size=int(batch_size), **self._flow_sample_kwargs())
-        source = str(buffer.name)
-        batch.metadata = dict(batch.metadata)
-        batch.metadata["buffer_sources"] = [source] * int(batch.batch_size)
-        return batch
-
-    def sample_demo_batch(self, batch_size: int | None = None) -> DipoleBatch:
-        batch_size = int(batch_size or self.trainer_config.batch_size)
-        return self._sample_buffer_batch(self.demo_buffer, batch_size)
-
-    def sample_training_batch(self, batch_size: int | None = None) -> DipoleBatch:
-        """Sample half from online_buffer and half from demo_buffer (1:1)."""
-        batch_size = int(batch_size or self.trainer_config.batch_size)
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0.")
-        n_online = batch_size // 2
-        n_demo = batch_size - n_online
-        online_batch = self._sample_buffer_batch(self.online_buffer, n_online)
-        demo_batch = self._sample_buffer_batch(self.demo_buffer, n_demo)
-        return concat_dipole_batches(online_batch, demo_batch)
-
-    def ready_for_update(self, batch_size: int | None = None) -> bool:
-        batch_size = int(batch_size or self.trainer_config.batch_size)
-        if batch_size <= 0:
-            return False
-        n_online = batch_size // 2
-        n_demo = batch_size - n_online
-        return (
-            self.online_buffer.num_valid_sequences() >= n_online
-            and self.demo_buffer.num_valid_sequences() >= n_demo
-            and self.has_normalizers()
-        )
-
-    def update(self, *, batch=None, batch_size: int | None = None) -> dict[str, float]:
-        batch = batch or self.sample_training_batch(batch_size=batch_size)
-        return self.core.update(batch=batch)
-
-    def save_checkpoint(self, path: str | Path, include_buffers: bool = True, extra: dict[str, Any] | None = None) -> None:
-        payload = self.build_checkpoint_payload(include_buffers=include_buffers, extra=extra)
-        self.write_checkpoint_payload(path, payload)
-
     def build_checkpoint_payload(
         self,
         *,
-        include_buffers: bool = True,
         extra: dict[str, Any] | None = None,
+        parent_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "encoder_config": asdict(self.encoder_config),
@@ -352,20 +263,18 @@ class DipoleAgent:
             "language_instruction": self.language_instruction,
             "core": self.core.state_dict(),
         }
-        # Debug snapshot of the RL companions (VAST G/V + online disc head).
-        # Absence is fine (legacy DIPOLE run / regression mode) — these are
-        # for offline analysis, not resume.
+        # Optional frozen companions are analysis metadata, never resume state.
         vast_learner = getattr(self.core, "vast_learner", None)
         if vast_learner is not None and hasattr(vast_learner, "state_dict"):
             payload["vast_state"] = vast_learner.state_dict()
         discriminator = getattr(self.core, "discriminator", None)
         if discriminator is not None and hasattr(discriminator, "state_dict"):
             payload["discriminator_state"] = discriminator.state_dict()
-        if include_buffers:
-            payload["online_buffer"] = self.online_buffer.state_dict()
-            payload["demo_buffer"] = self.demo_buffer.state_dict()
         if extra is not None:
             payload["extra"] = extra
+        for key in ("task_metadata_map", "env_metadata", "task_prompt_map"):
+            if parent_payload is not None and key in parent_payload:
+                payload[key] = copy.deepcopy(parent_payload[key])
         return payload
 
     def write_checkpoint_payload(self, path: str | Path, payload: dict[str, Any]) -> None:
@@ -402,21 +311,27 @@ class DipoleAgent:
         self.reset_policy_state()
         return payload
 
-    def load_checkpoint(self, path: str | Path, load_buffers: bool = True) -> dict[str, Any]:
+    def load_policy_checkpoint(self, path: str | Path, *, task_name: str | None = None) -> dict[str, Any]:
+        """Load base-flow or DIPOLE policy weights without optimizer state."""
         path = Path(path)
         try:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except Exception as exc:
-            raise RuntimeError(f"Failed to load checkpoint from {path}: {exc}") from exc
+            raise RuntimeError(f"Failed to load policy checkpoint from {path}: {exc}") from exc
+
+        if "core" not in payload:
+            return self.load_flow_policy_checkpoint(path, task_name=task_name)
+
         self.model_cfg = copy.deepcopy(payload.get("model_cfg", self.model_cfg))
         self.camera_names = [str(name) for name in payload.get("camera_names", self.camera_names)]
-        self.task_name = str(payload.get("task_name", self.task_name))
-        self.language_instruction = str(payload.get("language_instruction", self.language_instruction))
+        self.task_name = str(task_name or payload.get("task_name", self.task_name))
+        self.language_instruction = str(
+            payload.get(
+                "language_instruction",
+                _resolve_language_instruction(self.task_name),
+            )
+        )
         self.core.set_language_instruction(self.language_instruction)
-        self.core.load_state_dict(payload["core"])
-        if load_buffers:
-            if "online_buffer" in payload:
-                self.online_buffer.load_state_dict(payload["online_buffer"])
-            if "demo_buffer" in payload:
-                self.demo_buffer.load_state_dict(payload["demo_buffer"])
-        return payload.get("extra", {})
+        self.core.load_dual_model_state(payload["core"])
+        self.reset_policy_state()
+        return payload

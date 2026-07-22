@@ -1,3 +1,10 @@
+from .episodes import (
+    OFFLINE_EPISODE_SCHEMA_VERSION,
+    load_offline_episodes,
+    load_round_episode_payloads,
+    merge_episode_payloads,
+    validate_offline_payload,
+)
 from .types import (
     BatchAugmentationFn,
     EncoderConfig,
@@ -6,7 +13,6 @@ from .types import (
     RewardProvider,
     SACConfig,
     TensorObservation,
-    TrainerConfig,
     Transition,
 )
 from .utils import (
@@ -28,6 +34,7 @@ from .utils import (
 )
 
 __all__ = [
+    "OFFLINE_EPISODE_SCHEMA_VERSION",
     "assert_same_structure",
     "BatchAugmentationFn",
     "cfg_get",
@@ -38,6 +45,9 @@ __all__ = [
     "infer_action_bounds",
     "infer_action_dim",
     "infer_observation_example",
+    "load_offline_episodes",
+    "load_round_episode_payloads",
+    "merge_episode_payloads",
     "nested_to_torch",
     "ReplayBatch",
     "ReplayBufferConfig",
@@ -49,7 +59,7 @@ __all__ = [
     "standardize_image_tensor",
     "TensorObservation",
     "to_numpy",
-    "TrainerConfig",
     "Transition",
     "tree_shapes",
+    "validate_offline_payload",
 ]

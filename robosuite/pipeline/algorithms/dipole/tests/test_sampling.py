@@ -13,7 +13,7 @@ from robosuite.pipeline.algorithms.dipole.models.flow import (
     DipoleFlowPolicy,
     _sample_guided_action_sequence,
 )
-from robosuite.pipeline.offline.src.eval_offline_dipole import (
+from robosuite.pipeline.modules.evaluation.policy import (
     _resolve_execute_horizon,
 )
 

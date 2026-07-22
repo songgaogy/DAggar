@@ -76,7 +76,7 @@ class VASTConfig:
     reward_mode: str = "-1/0"   # "0/1" | "-1/0"
     output_reward_coef: float = 1.0
     disc_reward_coef: float = 1.0
-    # Gradient steps per learner tick inside DipoleTrainer.train_step (each resamples).
+    # Gradient steps per learner update (each resamples).
     update_freq: int = 1
 
     def __post_init__(self) -> None:
