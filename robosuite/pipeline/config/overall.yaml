@@ -1,0 +1,228 @@
+# AWR configuration shared by all supported robosuite tasks.
+defaults:
+  - task: ???
+  - _self_
+
+seed: 42
+
+env:
+  environment: ${task.environment}
+  robots: ["Panda"]
+  config: "default"
+  controller: null
+  renderer: "mjviewer"
+  render_camera: "agentview"
+  camera_names: ["agentview", "robot0_robotview", "robot0_eye_in_hand"]
+  proprio_keys: []
+  img_height: 128
+  img_width: 128
+  control_freq: 20
+  horizon: ${task.horizon}
+
+encoder:
+  encoder_type: "flow-multi"
+  image_keys: ${env.camera_names}
+  proprio_keys: ["state"]
+  image_size: ${env.img_height}
+
+awr:
+  action_horizon: 8
+  execute_horizon: ${awr.action_horizon}
+  image_size: ${env.img_height}
+  actor_learning_rate: 1.0e-4
+  critic_learning_rate: 3.0e-4
+  weight_decay: 1.0e-6
+  grad_clip_norm: 1.0
+  lambda_endpoint: 0.5
+  lambda_smooth: 0.05
+  beta: 3.0
+  max_adv_weight: 100.0
+  discount: ${task.discount}
+  expectile: 0.7
+  critic_hidden_dims: [512, 256, 32]
+  margin_scale_floor: 0.1
+  success_reward_scale: 1.0
+  n_ode_steps: 10
+  device: ${runtime.learner_device}
+  inference_device: ${runtime.inference_device}
+  task_name: ${task.name}
+  camera_names: ${env.camera_names}
+
+  augmentation:
+    minimal_shift_pad: 2
+    eye_in_hand_crop_scale: 0.88
+
+  model:
+    image_encoder:
+      type: "shared_resnet18_spatial_softmax"
+      feature_dim: 256
+      pretrained_path: "./robosuite/RL/models/resnet18-f37072fd.pth"
+      freeze_backbone: true
+      trainable_stages: ["layer3", "layer4"]
+      train_token_projections: true
+      include_spatial_softmax: true
+      layer3_pool_size: 2
+      layer4_pool_size: 2
+
+    proprio_encoder:
+      type: "mlp"
+      hidden_dim: 256
+      num_tokens: 2
+
+    language_encoder:
+      type: "clip_text"
+      pretrained_name: "./data/pretrained/clip-vit-base-patch32"
+      max_length: 77
+      freeze_backbone: true
+      local_files_only: true
+
+    modulation:
+      type: "film"
+      hidden_dim: 512
+      modulate_visual: true
+      modulate_proprio: false
+
+    fusion:
+      type: "transformer"
+      feature_dim: 256
+      max_language_tokens: 77
+      num_heads: 8
+      depth: 3
+      dropout: 0.1
+      use_language_adaln: false
+
+    aggregator:
+      type: "attention_pool"
+      hidden_dim: 512
+      output_dim: 256
+
+    head:
+      type: "unet_1d"
+      hidden_dim: 128
+      time_dim: 128
+      cond_dim: 256
+      channel_mults: [1, 2, 2, 2]
+      dropout: 0.05
+      cross_attention:
+        enabled: true
+        attn_dim: 256
+        num_heads: 4
+        dropout: 0.05
+        mid: true
+        down_layers: []
+        up_layers: [0, 1]
+      action_step_embedding:
+        enabled: true
+        embedding_dim: 64
+
+buffers:
+  online_capacity: 500000
+  demo_capacity: 500000
+
+trainer:
+  batch_size: 64
+  value_warmup_steps: 20000
+  updates_per_episode: 100
+  inference_sync_interval: 50
+
+grasp_penalty:
+  penalty: ${task.grasp_penalty.penalty}
+  command_threshold: ${task.grasp_penalty.command_threshold}
+  open_threshold: ${task.grasp_penalty.open_threshold}
+  closed_threshold: ${task.grasp_penalty.closed_threshold}
+
+intervention:
+  enabled: true
+  device: "spacemouse"
+  pos_sensitivity: 1.0
+  rot_sensitivity: 1.0
+  reverse_xy: false
+  goal_update_mode: "target"
+  device_reset_as_episode_reset: true
+
+data:
+  demo_root: "./data"
+  task_name: ${task.demo_task}
+  expert_dir: "${data.demo_root}/${data.task_name}/expert"
+  success_dir: "${data.demo_root}/${data.task_name}/success_rollout"
+  fail_dir: "${data.demo_root}/${data.task_name}/fail_rollout"
+  expert_num_trajectories: 20
+  success_num_trajectories: 20
+  fail_num_trajectories: 20
+
+runtime:
+  learner_device: "cuda:0"
+  inference_device: "cuda:1"
+  max_env_steps: 100000
+  interactive: true
+  viewer_enabled: true
+  visualize_gripper_markers: true
+  control_fps: ${env.control_freq}
+  spacemouse_fps: ${runtime.control_fps}
+  policy_fps: ${runtime.control_fps}
+  episode_pause_sec: 1.0
+
+checkpoint:
+  resume: false
+  path: null
+  load_buffers: true
+  init_path: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  use_init_camera_names: true
+  use_init_model: true
+  directory: "checkpoints"
+  interval_env_steps: 1000
+  buffer_directory: "buffer_chunks"
+  buffer_interval_env_steps: 200
+
+qv_cache:
+  enabled: true
+  directory: "qv_cache"
+  path: null
+  save: true
+  strict_metadata: true
+  force_rebuild: false
+  direct_load: false
+  require_existing: false
+
+logging:
+  output_root: "./outputs/baseline/awr"
+  run_name: null
+  resolved_config_filename: "config_resolved.yaml"
+  metadata_filename: "run_metadata.json"
+  metrics_filename: "metrics.jsonl"
+  console_filename: "console.log"
+  log_interval_updates: 10
+  runtime_log_interval_seconds: 1.0
+
+tensorboard:
+  enabled: true
+  directory: "tensorboard"
+  flush_secs: 10
+
+evaluation:
+  checkpoint: null
+  seed: 42
+  num_episodes: 20
+  deterministic: true
+  max_episode_steps: ${task.horizon}
+  viewer_enabled: false
+  save_video: false
+  video_camera: "agentview"
+  video_fps: ${env.control_freq}
+  output_filename: "eval_results.json"
+
+visualization:
+  checkpoint: null
+  success_rollout_dir: ${data.success_dir}
+  output_directory: "qv_visualization"
+  seed: 0
+  max_steps: null
+  mc_action_samples: 32
+  video_fps: ${env.control_freq}
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

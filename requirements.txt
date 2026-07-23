@@ -1,1 +1,29 @@
 -e .
+
+# required for GymWrapper
+gymnasium
+
+# macOS only
+hidapi
+
+# required for demonstration utils
+h5py
+
+# required for pretrained language encoder in flow_multi
+transformers
+
+# required for pipeline configuration and logging
+hydra-core
+omegaconf
+tensorboard
+
+# required for pipeline evaluation videos
+imageio
+imageio-ffmpeg
+matplotlib
+
+# for extra robosuite_models
+robosuite-models==1.0.0
+
+# for USD export and rendering
+usd-core

@@ -131,8 +131,7 @@ robosuite/models/assets/demonstrations_private
 robosuite/armada/outputs
 .vscode/
 outputs/
-data/
-data2/
+/data
 out/
 video/
 checkpoints/
