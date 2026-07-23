@@ -1,0 +1,140 @@
+# HIL-SERL configuration shared by all robosuite tasks.
+defaults:
+  - task: ???
+  - _self_
+
+seed: 42
+
+env:
+  environment: ${task.environment}
+  robots: ["Panda"]
+  config: "default"
+  controller: null
+  renderer: "mjviewer"
+  render_camera: "agentview"
+  camera_names: ["agentview", "robot0_eye_in_hand"]
+  proprio_keys: []
+  img_height: 128
+  img_width: 128
+  control_freq: 20
+  horizon: ${task.horizon}
+
+algorithm:
+  encoder:
+    encoder_type: "resnet-pretrained"
+    image_keys: ${env.camera_names}
+    proprio_keys: ["state"]
+    image_size: ${env.img_height}
+    feature_dim: 256
+    proprio_feature_dim: 64
+    resnet_name: "resnet10"
+    pretrained_path: "./data/pretrained/resnet10_params.pkl"
+    pretrained: true
+    freeze_backbone: true
+    share_image_encoder: false
+    use_layer_norm: true
+    num_spatial_blocks: 8
+
+  sac:
+    actor_hidden_dims: [256, 256]
+    critic_hidden_dims: [256, 256]
+    discount: ${task.discount}
+    tau: 0.005
+    actor_lr: 3.0e-4
+    critic_lr: 3.0e-4
+    alpha_lr: 3.0e-4
+    init_temperature: 1.0e-2
+    # Null selects the upstream default: -full_action_dim / 2.
+    target_entropy: null
+    auto_entropy_tuning: true
+    backup_entropy: false
+    reward_bias: 0.0
+    critic_ensemble_size: 2
+    std_min: 1.0e-5
+    std_max: 5.0
+    augmentation_padding: 4
+
+  online_buffer:
+    capacity: 200000
+
+  demo_buffer:
+    capacity: 200000
+
+  trainer:
+    batch_size: 256
+    cta_ratio: 2
+    training_starts: 100
+    random_steps: 0
+    online_fraction: 0.5
+    policy_publish_interval: 50
+
+  grasp_penalty: ${task.grasp_penalty}
+
+intervention:
+  enabled: true
+  device: "spacemouse"
+  pos_sensitivity: 1.0
+  rot_sensitivity: 1.0
+  reverse_xy: false
+  goal_update_mode: "target"
+  device_reset_as_episode_reset: true
+
+data:
+  demo_root: "./data"
+  demo_task: ${task.demo_task}
+  demo_path: "${data.demo_root}/${data.demo_task}/expert"
+  num_trajectories: null
+
+runtime:
+  learner_device: "cuda:0"
+  inference_device: "cuda:1"
+  max_env_steps: 1000000
+  max_learner_steps: 1000000
+  interactive: true
+  viewer_enabled: true
+  visualize_gripper_markers: true
+  control_fps: ${env.control_freq}
+  image_obs_fps: 10.0
+  spacemouse_fps: ${runtime.control_fps}
+  policy_fps: ${runtime.control_fps}
+  episode_pause_sec: 1.0
+
+checkpoint:
+  resume: false
+  path: null
+  load_buffers: true
+  directory: "checkpoints"
+  interval_learner_steps: 5000
+  buffer_directory: "buffer_chunks"
+  buffer_interval_env_steps: 200
+
+logging:
+  output_root: "./outputs/baseline/hil-serl"
+  run_name: null
+  resolved_config_filename: "config_resolved.yaml"
+  metadata_filename: "run_metadata.json"
+  metrics_filename: "metrics.jsonl"
+  console_filename: "console.log"
+  log_interval_learner_steps: 10
+  runtime_log_interval_seconds: 1.0
+
+tensorboard:
+  enabled: true
+  directory: "tensorboard"
+  flush_secs: 10
+
+evaluation:
+  checkpoint: null
+  seed: 42
+  num_episodes: 5
+  deterministic: false
+  max_episode_steps: ${task.horizon}
+  viewer_enabled: false
+  output_filename: "eval_results.json"
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

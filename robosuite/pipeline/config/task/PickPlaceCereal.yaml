@@ -1,0 +1,11 @@
+name: "PickPlaceCereal"
+environment: "PickPlaceCereal"
+demo_task: "PickPlaceCereal"
+discount: 0.97
+horizon: 500
+
+grasp_penalty:
+  penalty: -0.02
+  command_threshold: 0.5
+  open_threshold: 0.9
+  closed_threshold: 0.1
