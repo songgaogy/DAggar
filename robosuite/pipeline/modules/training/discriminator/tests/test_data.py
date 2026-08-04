@@ -127,6 +127,31 @@ def test_gt_negative_window_uses_chunk_scaled_contiguous_pre_and_post_frames() -
     assert stats["stored_gt_fail_ignored"] is True
 
 
+def test_gt_negative_window_allows_zero_post_intervention_chunks() -> None:
+    episode = _episode(
+        [False] * 10 + [True] * 9 + [False] * 2,
+        terminal_reason="manual_reset",
+    )
+    payload = validate_offline_payload(_payload(episode))
+
+    windows, stats = build_gt_negative_windows(
+        payload,
+        pre_intervention_chunks=2,
+        post_intervention_chunks=0,
+        frameskip=3,
+    )
+
+    assert len(windows) == 1
+    window = windows[0]
+    assert (window.lo, window.onset, window.hi) == (4, 10, 10)
+    assert window.frame_indices == tuple(range(4, 10))
+    assert window.num_pre_frames == 6
+    assert window.num_post_frames == 0
+    assert stats["gt_negative_frames"] == 6
+    assert stats["post_frames"] == 0
+    assert stats["post_truncated_events"] == 0
+
+
 @pytest.mark.parametrize(
     ("flags", "expected"),
     [

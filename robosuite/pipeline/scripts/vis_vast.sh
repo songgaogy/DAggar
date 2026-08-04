@@ -2,10 +2,11 @@
 # Visualize one round's published VAST and discriminator checkpoints.
 set -euo pipefail
 
-RUN_ROOT=""
-ROUND_INDEX=""
+export CUDA_VISIBLE_DEVICES=0
+RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260804_132203"
+ROUND_INDEX="000"
 SEEDS=(1 2 3 4 5 6)
-SPLIT="fail_rollout"
+SPLIT="online"  # success_rollout, fail_rollout, or online
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"

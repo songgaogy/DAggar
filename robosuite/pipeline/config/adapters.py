@@ -201,6 +201,7 @@ def vast_warmup_stage_config(cfg: DictConfig) -> DictConfig:
 def collection_stage_config(
     cfg: DictConfig,
     *,
+    round_index: int,
     policy_checkpoint: str | None = None,
     discriminator_checkpoint: str | None = None,
     encoder_checkpoint: str | None = None,
@@ -222,10 +223,11 @@ def collection_stage_config(
         encoder_checkpoint=encoder_checkpoint,
     )
     collection = cfg.collection
+    collection_seed = int(cfg.seed) + int(round_index) * int(collection.num_episodes)
     output = output_path or "offline_episodes.pt"
     return OmegaConf.create(
         {
-            "seed": int(cfg.seed),
+            "seed": collection_seed,
             "env": _environment_config(cfg),
             "algorithm": algorithm,
             "runtime": {

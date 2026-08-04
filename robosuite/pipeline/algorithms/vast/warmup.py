@@ -46,6 +46,7 @@ from robosuite.pipeline.algorithms.flow_dagger.common import (
 )
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.data_util import freeze_post_success_tail
 from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
 from robosuite.pipeline.common.environment import RobosuiteRuntimeConfig, build_robosuite_env
@@ -251,62 +252,6 @@ def _tag_transitions_with_hdf5_path(
         info = dict(trans.info or {})
         info["source_hdf5_path"] = resolved
         trans.info = info
-
-
-def _freeze_post_success_tail(transitions: list[Any]) -> int:
-    """Collapse each demo's post-success drift into one frozen absorbing anchor.
-
-    Within every demo (delimited by ``Transition.done``), find the first frame
-    whose ``info["success"]`` is True (``t_s``) and overwrite every *later* frame
-    with a frozen copy of that ``t_s`` frame: ``obs`` (images + proprio),
-    ``next_obs`` and ``action`` all become the ``t_s`` values,
-    ``info["success"]`` is pinned True, and ``reward`` is set to ``0.0`` so
-    every frozen tail chunk matches the absorbing terminal target. ``done`` is
-    left untouched (only the demo's last frame keeps ``done=True``).
-
-    Rationale: the recorded success rollouts keep running the live policy after
-    success, so the post-success tail is real *drift* (moving state, non-zero
-    actions). Fitting VAST on those many distinct meaningless states is the
-    "task burden" we want to drop, while the terminal-value anchor (V≈0 at
-    success) is what stabilizes offline VAST TD. Freezing the tail to a single
-    ``(s_{t_s}, a_{t_s})`` keeps every frozen frame a valid chunk start (so the
-    anchor *sampling density* is preserved) but makes all those chunks encode to
-    one identical latent — a clean, dense, unbiased absorbing anchor.
-
-    No-op for demos with no success frame (e.g. ``fail_rollout`` truncations).
-    The anchor ``obs`` / ``action`` are shared *by reference* across the tail
-    (read-only downstream) to avoid copying hundreds of image frames per demo.
-    Returns the number of frozen frames.
-    """
-    if not transitions:
-        return 0
-    frozen = 0
-    n = len(transitions)
-    demo_start = 0
-    for idx in range(n):
-        if not (bool(transitions[idx].done) or idx == n - 1):
-            continue
-        demo = transitions[demo_start : idx + 1]
-        first_success = next(
-            (j for j, t in enumerate(demo) if bool((t.info or {}).get("success", False))),
-            None,
-        )
-        if first_success is not None:
-            anchor = demo[first_success]
-            anchor_obs = anchor.obs
-            anchor_action = anchor.action
-            for tail in demo[first_success + 1 :]:
-                tail.obs = anchor_obs
-                tail.next_obs = anchor_obs
-                tail.action = anchor_action
-                tail.reward = 0.0
-                info = dict(tail.info or {})
-                info["success"] = True
-                info["frozen_post_success"] = True
-                tail.info = info
-                frozen += 1
-        demo_start = idx + 1
-    return frozen
 
 
 def _select_split_demo_jobs(
@@ -801,6 +746,7 @@ def run_vast_warmup(cfg: DictConfig) -> None:
             "renderer": str(cfg.env.renderer),
             "control_freq": int(cfg.env.control_freq),
             "reward_mode": reward_mode,
+            "freeze_post_success": bool(freeze_post_success),
             **_summarize_gt_fail_labels(buffer._storage),  # noqa: SLF001
             "source": "vast.warmup",
         }
@@ -821,7 +767,7 @@ def run_vast_warmup(cfg: DictConfig) -> None:
     # identical latent. No-op for fail/no-success demos.
     if freeze_post_success:
         with buffer._lock:  # noqa: SLF001 — intentional in-place storage edit
-            n_frozen = _freeze_post_success_tail(buffer._storage)  # noqa: SLF001
+            n_frozen = freeze_post_success_tail(buffer._storage)  # noqa: SLF001
         print(
             f"[warmup] freeze_post_success: collapsed {n_frozen} post-success "
             f"frames into absorbing anchors (offline_data save kept raw)"
@@ -982,6 +928,7 @@ def run_vast_warmup(cfg: DictConfig) -> None:
             "threshold_source": "checkpoint",
             "disc_reward_coef": float(vast_cfg.disc_reward_coef),
             "output_reward_coef": float(vast_cfg.output_reward_coef),
+            "freeze_post_success": bool(freeze_post_success),
             "disc_reward_source": "FrozenNNPUDiscriminator(-sigmoid(failure_score - threshold))",
             # V-side Token/Group dim-reduction projector layout.
             "n_tokens": int(n_tokens),

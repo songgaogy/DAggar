@@ -5,9 +5,12 @@ from pathlib import Path
 
 import pytest
 
+import robosuite.pipeline.workflow.state as workflow_state
 from robosuite.pipeline.workflow import (
+    InputReference,
     InputSnapshot,
     RunLayout,
+    clone_run_for_retrain,
     complete_stage,
     create_run,
     fail_stage,
@@ -19,6 +22,68 @@ from robosuite.pipeline.workflow import (
     start_stage,
     write_json_atomic,
 )
+
+
+def _completed_two_round_run(tmp_path: Path) -> RunLayout:
+    layout = RunLayout(tmp_path / "trial_20260101_000000")
+    create_run(layout, task_name="PickPlaceCereal")
+    layout.config_path.write_text(
+        f"run_root: {layout.root}\n",
+        encoding="utf-8",
+    )
+    (layout.inputs_dir / "metadata.json").write_text(
+        json.dumps({"immutable_source": str(layout.root)}),
+        encoding="utf-8",
+    )
+
+    for round_index in range(2):
+        for stage in ("collection", "disc", "vast", "policy"):
+            start_stage(
+                layout,
+                round_index,
+                stage,
+                inputs={"run_root": str(layout.root)},
+            )
+            if stage == "collection":
+                artifact = layout.round_data_dir(round_index) / "episodes.pt"
+                output_name = "episodes"
+            else:
+                artifact = layout.stage_dir(round_index, stage) / "checkpoints" / f"{stage}.pt"
+                output_name = "checkpoint"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(f"{round_index}:{stage}".encode())
+            record_artifact(
+                layout,
+                artifact,
+                round_index=round_index,
+                stage=stage,
+            )
+            complete_stage(
+                layout,
+                round_index,
+                stage,
+                outputs={output_name: artifact.relative_to(layout.root).as_posix()},
+                parent_checkpoint=str(layout.root / "inputs" / "parent.pt"),
+            )
+        if round_index == 0:
+            open_next_round(layout)
+
+    for index in range(3):
+        cache = layout.cache_dir / "discriminator_features" / f"round_{index:03d}.pt"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(b"cache")
+    for stage in ("disc", "vast"):
+        marker = layout.eval_vis_dir(1) / stage / "summary.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"run_root": str(layout.root)}), encoding="utf-8")
+    for stage in ("disc", "vast"):
+        metadata = layout.stage_dir(1, stage) / "run_info.json"
+        metadata.write_text(json.dumps({"run_root": str(layout.root)}), encoding="utf-8")
+    (layout.round_data_dir(1) / "episodes.meta.json").write_text(
+        json.dumps({"run_root": str(layout.root)}),
+        encoding="utf-8",
+    )
+    return layout
 
 
 def test_create_run_has_canonical_layout(tmp_path: Path) -> None:
@@ -34,6 +99,136 @@ def test_create_run_has_canonical_layout(tmp_path: Path) -> None:
     assert layout.stage_dir(0, "disc").is_dir()
     assert layout.stage_dir(0, "vast").is_dir()
     assert layout.stage_dir(0, "policy").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("stage", "retained_stages", "keep_disc_eval", "keep_vast_eval", "keep_round_cache"),
+    [
+        ("disc", ("collection",), False, False, False),
+        ("vast", ("collection", "disc"), True, False, True),
+        ("policy", ("collection", "disc", "vast"), True, True, True),
+    ],
+)
+def test_clone_run_for_retrain_retains_strict_prefix(
+    tmp_path: Path,
+    stage: str,
+    retained_stages: tuple[str, ...],
+    keep_disc_eval: bool,
+    keep_vast_eval: bool,
+    keep_round_cache: bool,
+) -> None:
+    source = _completed_two_round_run(tmp_path)
+    source_state = source.state_path.read_bytes()
+    source_manifest = source.manifest_path.read_bytes()
+    immutable_metadata = (source.inputs_dir / "metadata.json").read_bytes()
+
+    cloned = clone_run_for_retrain(source, round_index=1, stage=stage)
+
+    assert cloned.root != source.root
+    assert cloned.root.name.startswith("trial_")
+    state = load_json(cloned.state_path)
+    assert state["active_round"] == 1
+    assert state["active_stage"] == stage
+    assert state["forked_from"] == {
+        "run_root": str(source.root),
+        "round_index": 1,
+        "stage": stage,
+    }
+    assert set(state["rounds"]) == {"000", "001"}
+    assert state["rounds"]["001"]["stages"]["collection"]["inputs"][
+        "run_root"
+    ] == str(cloned.root)
+    for stage_name in retained_stages:
+        assert state["rounds"]["001"]["stages"][stage_name]["status"] == "completed"
+    for stage_name in ("disc", "vast", "policy"):
+        if stage_name not in retained_stages:
+            stage_state = state["rounds"]["001"]["stages"][stage_name]
+            assert stage_state == {
+                "status": "pending",
+                "attempts": [],
+                "inputs": {},
+                "outputs": {},
+                "parent_checkpoint": None,
+                "sampling_weights": {},
+                "effective_losses": {},
+                "cache_keys": {},
+            }
+            assert list(cloned.stage_dir(1, stage_name).iterdir()) == []
+
+    assert cloned.disc_eval_vis_dir(1).exists() is keep_disc_eval
+    assert cloned.vast_eval_vis_dir(1).exists() is keep_vast_eval
+    assert (
+        cloned.cache_dir / "discriminator_features" / "round_001.pt"
+    ).exists() is keep_round_cache
+    assert not (cloned.cache_dir / "discriminator_features" / "round_002.pt").exists()
+    assert str(source.root) not in cloned.config_path.read_text(encoding="utf-8")
+    assert str(cloned.root) in cloned.config_path.read_text(encoding="utf-8")
+    episodes_meta = (cloned.round_data_dir(1) / "episodes.meta.json").read_text(
+        encoding="utf-8"
+    )
+    assert str(source.root) not in episodes_meta
+    assert str(cloned.root) in episodes_meta
+    assert (cloned.inputs_dir / "metadata.json").read_bytes() == immutable_metadata
+    assert str(source.root) in (cloned.inputs_dir / "metadata.json").read_text(
+        encoding="utf-8"
+    )
+
+    manifest = load_json(cloned.manifest_path)
+    assert manifest["forked_from"]["run_root"] == str(source.root)
+    assert all(
+        int(record["round"]) < 1
+        or record["stage"] in retained_stages
+        for record in manifest["artifacts"]
+    )
+    assert source.state_path.read_bytes() == source_state
+    assert source.manifest_path.read_bytes() == source_manifest
+
+
+def test_clone_run_for_retrain_rejects_running_source(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path / "trial_20260101_000000")
+    create_run(layout, task_name="PickPlaceCereal")
+    layout.config_path.write_text("task: PickPlaceCereal\n", encoding="utf-8")
+    start_stage(layout, 0, "collection")
+
+    with pytest.raises(RuntimeError, match="running stage"):
+        clone_run_for_retrain(layout, round_index=0, stage="disc")
+
+
+def test_clone_run_for_retrain_rejects_missing_round(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path / "trial_20260101_000000")
+    create_run(layout, task_name="PickPlaceCereal")
+    layout.config_path.write_text("task: PickPlaceCereal\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Round 001 does not exist"):
+        clone_run_for_retrain(layout, round_index=1, stage="disc")
+
+
+def test_clone_run_for_retrain_cleans_failed_temporary_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _completed_two_round_run(tmp_path)
+    destination = tmp_path / "trial_20260802_235959"
+
+    def fail_prune(*_args, **_kwargs) -> None:
+        raise RuntimeError("prune failed")
+
+    monkeypatch.setattr(
+        workflow_state,
+        "_retrain_destination",
+        lambda _source_root: destination,
+    )
+    monkeypatch.setattr(
+        workflow_state,
+        "_prune_retrain_clone",
+        fail_prune,
+    )
+
+    with pytest.raises(RuntimeError, match="prune failed"):
+        clone_run_for_retrain(source, round_index=1, stage="policy")
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(f".{destination.name}.copy-*"))
+    assert source.state_path.is_file()
 
 
 def test_eval_vis_paths_are_read_only_and_round_scoped(tmp_path: Path) -> None:
@@ -151,6 +346,73 @@ def test_snapshot_inputs_copies_files_and_records_per_file_hashes(tmp_path: Path
     assert (layout.data_dir / "expert" / "shard.bin").is_file()
 
 
+def test_snapshot_inputs_records_external_input_without_copying(
+    tmp_path: Path,
+) -> None:
+    source_checkpoint = tmp_path / "source" / "policy.pt"
+    source_checkpoint.parent.mkdir()
+    source_checkpoint.write_bytes(b"checkpoint")
+    external_warmup = tmp_path / "source" / "warmup.pt"
+    external_warmup.write_bytes(b"warmup-data")
+    layout = RunLayout(tmp_path / "run")
+    create_run(layout, task_name="PickPlaceCereal")
+
+    records = snapshot_inputs(
+        layout,
+        [InputSnapshot("base_policy", source_checkpoint, "checkpoints/base_policy.pt")],
+        external_inputs=[InputReference("vast_warmup_transitions", external_warmup)],
+        prefer_reflink=False,
+    )
+
+    snapshot_record, external_record = records
+    assert snapshot_record["storage_mode"] == "snapshot"
+    assert external_record["storage_mode"] == "external"
+    assert external_record["source"] == str(external_warmup.resolve())
+    assert external_record["snapshot_path"] is None
+    assert external_record["size_bytes"] == len(b"warmup-data")
+    assert len(external_record["sha256"]) == 64
+    assert not (layout.data_dir / "vast_warmup").exists()
+
+
+def test_snapshot_inputs_reports_copy_and_hash_byte_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_checkpoint = tmp_path / "source.pt"
+    source_checkpoint.write_bytes(b"checkpoint")
+    external_warmup = tmp_path / "warmup.pt"
+    external_warmup.write_bytes(b"warmup")
+    layout = RunLayout(tmp_path / "run")
+    create_run(layout, task_name="PickPlaceCereal")
+    progress_calls: dict[str, object] = {"updates": []}
+
+    class FakeProgress:
+        def __init__(self, **kwargs) -> None:
+            progress_calls["total"] = kwargs["total"]
+
+        def update(self, amount: int) -> None:
+            progress_calls["updates"].append(amount)
+
+        def close(self) -> None:
+            progress_calls["closed"] = True
+
+    monkeypatch.setattr(
+        "robosuite.pipeline.workflow.state.tqdm",
+        lambda **kwargs: FakeProgress(**kwargs),
+    )
+
+    snapshot_inputs(
+        layout,
+        [InputSnapshot("checkpoint", source_checkpoint, "checkpoints/checkpoint.pt")],
+        external_inputs=[InputReference("warmup", external_warmup)],
+        prefer_reflink=False,
+    )
+
+    expected_total = 3 * source_checkpoint.stat().st_size + external_warmup.stat().st_size
+    assert progress_calls["total"] == expected_total
+    assert sum(progress_calls["updates"]) == expected_total
+    assert progress_calls["closed"] is True
+
+
 def test_snapshot_inputs_falls_back_when_reflink_is_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -174,6 +436,60 @@ def test_snapshot_inputs_falls_back_when_reflink_is_unavailable(
 
     assert records[0]["files"][0]["copy_mode"] == "copy"
     assert (layout.checkpoints_dir / "checkpoint.pt").read_bytes() == b"checkpoint"
+
+
+def test_snapshot_hash_mismatch_removes_created_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    source.write_bytes(b"checkpoint")
+    layout = RunLayout(tmp_path / "run")
+    create_run(layout, task_name="PickPlaceCereal")
+
+    monkeypatch.setattr(
+        "robosuite.pipeline.workflow.state.sha256_file",
+        lambda path, **_kwargs: "source" if Path(path) == source else "destination",
+    )
+
+    with pytest.raises(OSError, match="SHA-256 mismatch"):
+        snapshot_inputs(
+            layout,
+            [InputSnapshot("checkpoint", source, "checkpoints/checkpoint.pt")],
+            prefer_reflink=False,
+        )
+
+    assert not (layout.checkpoints_dir / "checkpoint.pt").exists()
+    assert load_json(layout.manifest_path)["inputs"] == []
+
+
+def test_external_hash_failure_preserves_source_and_removes_created_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source.pt"
+    source.write_bytes(b"checkpoint")
+    external = tmp_path / "warmup.pt"
+    external.write_bytes(b"warmup")
+    layout = RunLayout(tmp_path / "run")
+    create_run(layout, task_name="PickPlaceCereal")
+
+    def fail_external_hash(*_args, **_kwargs):
+        raise OSError("external hash failed")
+
+    monkeypatch.setattr(
+        "robosuite.pipeline.workflow.state._hash_input", fail_external_hash
+    )
+
+    with pytest.raises(OSError, match="external hash failed"):
+        snapshot_inputs(
+            layout,
+            [InputSnapshot("checkpoint", source, "checkpoints/checkpoint.pt")],
+            external_inputs=[InputReference("warmup", external)],
+            prefer_reflink=False,
+        )
+
+    assert external.read_bytes() == b"warmup"
+    assert not (layout.checkpoints_dir / "checkpoint.pt").exists()
+    assert load_json(layout.manifest_path)["inputs"] == []
 
 
 def test_atomic_json_never_leaves_temporary_file(tmp_path: Path) -> None:

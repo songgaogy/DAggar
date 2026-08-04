@@ -2,8 +2,10 @@
 
 from .state import (
     ROUND_STAGES,
+    InputReference,
     InputSnapshot,
     RunLayout,
+    clone_run_for_retrain,
     complete_stage,
     create_run,
     fail_stage,
@@ -19,8 +21,10 @@ from .state import (
 
 __all__ = [
     "ROUND_STAGES",
+    "InputReference",
     "InputSnapshot",
     "RunLayout",
+    "clone_run_for_retrain",
     "complete_stage",
     "create_run",
     "fail_stage",

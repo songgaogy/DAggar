@@ -5,12 +5,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT=""
-ROUND=""
+RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260804_132203"
+ROUND="000"
 CHECKPOINT="${RUN_ROOT}/rounds/${ROUND}/policy/checkpoints/latest.pt"
 INIT_CHECKPOINT="${RUN_ROOT}/inputs/checkpoints/base_policy.pt"
 TASK="PickPlaceCereal"
-OMEGA=0.85
+OMEGA=(0 0.1 0.2 0.5 1.0 2.0)
 EPISODES=50
 MAX_STEPS=500
 SAVE_VIDEO=true
@@ -19,13 +19,17 @@ DEVICE="cuda:0"
 cd "$ROOT_DIR"
 export MUJOCO_GL="egl"
 
-"$PY" -m robosuite.pipeline.modules.evaluation.policy \
-  --checkpoint "$CHECKPOINT" \
-  --init-checkpoint "$INIT_CHECKPOINT" \
-  --env-name "$TASK" \
-  --task-name "$TASK" \
-  --omega "$OMEGA" \
-  --episodes "$EPISODES" \
-  --episode-max-steps "$MAX_STEPS" \
-  --video-output "$SAVE_VIDEO" \
-  --device "$DEVICE"
+for OMEGA in "${OMEGA[@]}"; do
+    echo ">>> Evaluating policy with omega = $OMEGA"
+    "$PY" -m robosuite.pipeline.modules.evaluation.policy \
+      --checkpoint "$CHECKPOINT" \
+      --init-checkpoint "$INIT_CHECKPOINT" \
+      --env-name "$TASK" \
+      --task-name "$TASK" \
+      --omega "$OMEGA" \
+      --episodes "$EPISODES" \
+      --episode-max-steps "$MAX_STEPS" \
+      --video-output "$SAVE_VIDEO" \
+      --device "$DEVICE"
+    echo
+done

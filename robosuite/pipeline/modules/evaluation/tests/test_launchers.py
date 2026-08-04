@@ -150,6 +150,52 @@ def test_vast_commands_support_seed_and_split_overrides(tmp_path: Path) -> None:
     )
 
 
+def test_vast_online_commands_use_cumulative_round_episodes(tmp_path: Path) -> None:
+    layout, _ = _run_fixture(tmp_path)
+    cfg = OmegaConf.load(layout.config_path)
+    cfg.task.policy = {
+        "advantage": {"estimator": "td1", "gae_lambda": 0.6},
+        "reward_success": 0.0,
+        "reward_failure": -1.0,
+    }
+    OmegaConf.save(cfg, layout.config_path, resolve=True)
+    episode_paths = [
+        _touch(layout.round_data_dir(index) / "episodes.pt") for index in range(2)
+    ]
+    layout.state_path.write_text(
+        json.dumps(
+            {
+                "rounds": {
+                    f"{index:03d}": {
+                        "stages": {
+                            "collection": {
+                                "outputs": {
+                                    "episodes": path.relative_to(layout.root).as_posix()
+                                }
+                            }
+                        }
+                    }
+                    for index, path in enumerate(episode_paths)
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _touch(layout.round_dir(1) / "disc" / "checkpoints" / "pu_bce_head_finetuned.pth")
+    _touch(layout.round_dir(1) / "vast" / "checkpoints" / "vast_state_finetuned.pt")
+
+    commands = build_vast_commands(layout.root, 1, seeds=[3], split="ONLINE")
+
+    command = commands[0]
+    assert command[2] == "robosuite.pipeline.modules.visualization.vast.online"
+    assert "--offline-buffer" not in command
+    start = command.index("--online-episodes") + 1
+    end = command.index("--advantage-estimator")
+    assert command[start:end] == [str(path) for path in episode_paths]
+    assert _value(command, "--advantage-estimator") == "td1"
+    assert _value(command, "--gae-lambda") == "0.6"
+
+
 def test_bash_entrypoints_validate_round_and_forward_two_arguments(tmp_path: Path) -> None:
     repository = Path(__file__).resolve().parents[5]
     run_root = tmp_path / "run"

@@ -27,6 +27,7 @@ from robosuite.pipeline.config.adapters import (
     offline_stage_config,
 )
 from .state import (
+    InputReference,
     InputSnapshot,
     RunLayout,
     complete_stage,
@@ -39,7 +40,21 @@ from .state import (
     snapshot_inputs,
     start_stage,
     write_json_atomic,
+    write_text_atomic,
 )
+
+
+_RUN_BOUND_CONFIG_PATHS = {
+    "base_policy": "task.inputs.base_policy_checkpoint",
+    "parent_discriminator": "task.inputs.parent_discriminator_checkpoint",
+    "dynamics_encoder": "task.inputs.dynamics_encoder_checkpoint",
+    "initial_vast": "task.inputs.initial_vast_checkpoint",
+    "expert_data": "task.inputs.expert_data",
+    "discriminator_pretrain": "task.inputs.discriminator_pretrain_data",
+    "vast_warmup_transitions": "task.inputs.vast_warmup_transitions",
+    "flow_image_encoder": "task.policy.flow.model.image_encoder.pretrained_path",
+    "language_encoder": "task.policy.flow.model.language_encoder.pretrained_name",
+}
 
 
 def load_default_config(*, task: str) -> DictConfig:
@@ -52,6 +67,81 @@ def load_run_config(layout: RunLayout) -> DictConfig:
     if not layout.config_path.is_file():
         raise FileNotFoundError(f"Run configuration does not exist: {layout.config_path}")
     return OmegaConf.load(layout.config_path)
+
+
+def refresh_run_config(layout: RunLayout) -> DictConfig:
+    """Refresh mutable settings while preserving run-bound input locations."""
+
+    state = load_json(layout.state_path)
+    task_name = str(state.get("task_name", "")).strip()
+    if not task_name:
+        raise ValueError(f"Run state has no task_name: {layout.state_path}")
+    cfg = load_default_config(task=task_name)
+    configured_task = str(cfg.task.name)
+    if configured_task != task_name:
+        raise ValueError(
+            f"Latest task config resolved to {configured_task!r}, expected {task_name!r}."
+        )
+
+    manifest = load_json(layout.manifest_path)
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, list):
+        raise ValueError(f"Run manifest has malformed inputs: {layout.manifest_path}")
+    records: dict[str, dict[str, Any]] = {}
+    for record in inputs:
+        if not isinstance(record, dict) or not record.get("name"):
+            raise ValueError(f"Run manifest contains a malformed input record: {record!r}")
+        name = str(record["name"])
+        if name in records:
+            raise ValueError(f"Run manifest contains duplicate input {name!r}")
+        records[name] = record
+    missing = sorted(set(_RUN_BOUND_CONFIG_PATHS) - set(records))
+    if missing:
+        raise ValueError(f"Run manifest is missing bound inputs: {', '.join(missing)}")
+
+    for name, config_path in _RUN_BOUND_CONFIG_PATHS.items():
+        record = records[name]
+        snapshot_path = record.get("snapshot_path")
+        if snapshot_path not in (None, ""):
+            if record.get("storage_mode") not in (None, "snapshot"):
+                raise ValueError(f"Input {name!r} has inconsistent snapshot metadata")
+            value = (layout.root / str(snapshot_path)).resolve()
+            try:
+                value.relative_to(layout.root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Input {name!r} snapshot escapes the run: {snapshot_path}"
+                ) from exc
+            if not value.exists():
+                raise FileNotFoundError(f"Run-bound input does not exist: {value}")
+        else:
+            if record.get("storage_mode") not in (None, "external"):
+                raise ValueError(f"Input {name!r} has inconsistent external metadata")
+            source = record.get("source")
+            if source in (None, ""):
+                raise ValueError(f"External input {name!r} has no source path")
+            value = Path(str(source)).expanduser().resolve()
+            if not value.exists():
+                raise FileNotFoundError(f"External input does not exist: {value}")
+        OmegaConf.update(cfg, config_path, str(value), merge=False)
+
+    evaluation_data_root = OmegaConf.select(
+        cfg,
+        "task.evaluation.data_root",
+        default=None,
+    )
+    if evaluation_data_root not in (None, ""):
+        evaluation_path = Path(str(evaluation_data_root)).expanduser()
+        if not evaluation_path.is_absolute():
+            evaluation_path = Path(__file__).resolve().parents[3] / evaluation_path
+        cfg.task.evaluation.data_root = str(evaluation_path.resolve())
+
+    resolved_yaml = OmegaConf.to_yaml(cfg, resolve=True)
+    write_text_atomic(
+        layout.config_path,
+        resolved_yaml if resolved_yaml.endswith("\n") else f"{resolved_yaml}\n",
+    )
+    return cfg
 
 
 def initialize_run(
@@ -97,6 +187,7 @@ def initialize_run(
         )
     dynamics_backbone_source = source(dynamics_backbone_path)
     normalizer_source = resolve_saved_normalizer_checkpoint(encoder_source)
+    vast_warmup_source = source(inputs.vast_warmup_transitions)
     snapshots = [
         InputSnapshot("base_policy", source(inputs.base_policy_checkpoint), "checkpoints/base_policy.pt"),
         InputSnapshot(
@@ -124,11 +215,6 @@ def initialize_run(
             "data/discriminator_pretrain",
         ),
         InputSnapshot(
-            "vast_warmup_transitions",
-            source(inputs.vast_warmup_transitions),
-            "data/vast_warmup",
-        ),
-        InputSnapshot(
             "flow_image_encoder",
             source(cfg.task.policy.flow.model.image_encoder.pretrained_path),
             "checkpoints/flow_image_encoder.pth",
@@ -144,6 +230,9 @@ def initialize_run(
         snapshot_inputs(
             layout,
             snapshots,
+            external_inputs=[
+                InputReference("vast_warmup_transitions", vast_warmup_source)
+            ],
             prefer_reflink=bool(cfg.storage.input_copy.prefer_reflink),
         )
         cfg.task.inputs.base_policy_checkpoint = str(layout.checkpoints_dir / "base_policy.pt")
@@ -160,7 +249,7 @@ def initialize_run(
         cfg.task.inputs.discriminator_pretrain_data = str(
             layout.data_dir / "discriminator_pretrain"
         )
-        cfg.task.inputs.vast_warmup_transitions = str(layout.data_dir / "vast_warmup")
+        cfg.task.inputs.vast_warmup_transitions = str(vast_warmup_source)
         cfg.task.policy.flow.model.image_encoder.pretrained_path = str(
             layout.checkpoints_dir / "flow_image_encoder.pth"
         )
@@ -186,7 +275,6 @@ def initialize_run(
 
 def run_online(layout: RunLayout) -> Path:
     recover_interrupted_stage(layout)
-    cfg = load_run_config(layout)
     state = load_json(layout.state_path)
     if state.get("active_stage") is None:
         open_next_round(layout)
@@ -195,6 +283,7 @@ def run_online(layout: RunLayout) -> Path:
         raise RuntimeError(
             f"run_online requires collection as the active stage, got {state.get('active_stage')!r}."
         )
+    cfg = refresh_run_config(layout)
     round_index = int(state["active_round"])
     if round_index == 0:
         policy_checkpoint = str(cfg.task.inputs.base_policy_checkpoint)
@@ -206,6 +295,14 @@ def run_online(layout: RunLayout) -> Path:
 
     partial_path = layout.round_data_dir(round_index) / "episodes.partial.pt"
     final_path = layout.round_data_dir(round_index) / "episodes.pt"
+    stage_cfg = collection_stage_config(
+        cfg,
+        round_index=round_index,
+        policy_checkpoint=policy_checkpoint,
+        discriminator_checkpoint=discriminator_checkpoint,
+        encoder_checkpoint=str(cfg.task.inputs.dynamics_encoder_checkpoint),
+        output_path=str(partial_path),
+    )
     start_stage(
         layout,
         round_index,
@@ -213,19 +310,13 @@ def run_online(layout: RunLayout) -> Path:
         inputs={
             "policy_checkpoint": policy_checkpoint,
             "discriminator_checkpoint": discriminator_checkpoint,
+            "collection_seed": int(stage_cfg.seed),
         },
     )
     try:
         if final_path.is_file():
             payload = torch.load(final_path, map_location="cpu", weights_only=False)
         else:
-            stage_cfg = collection_stage_config(
-                cfg,
-                policy_checkpoint=policy_checkpoint,
-                discriminator_checkpoint=discriminator_checkpoint,
-                encoder_checkpoint=str(cfg.task.inputs.dynamics_encoder_checkpoint),
-                output_path=str(partial_path),
-            )
             run_collection(stage_cfg)
             payload = torch.load(partial_path, map_location="cpu", weights_only=False)
         if not bool(payload.get("final", False)):
@@ -276,7 +367,7 @@ def train(layout: RunLayout, *, requested_stage: str = "all") -> None:
 
 
 def _run_training_stage(layout: RunLayout, *, stage: str) -> None:
-    cfg = load_run_config(layout)
+    cfg = refresh_run_config(layout)
     state = load_json(layout.state_path)
     round_index = int(state["active_round"])
     episodes_paths = [
@@ -503,6 +594,7 @@ __all__ = [
     "initialize_run",
     "load_default_config",
     "load_run_config",
+    "refresh_run_config",
     "run_online",
     "train",
 ]

@@ -254,10 +254,10 @@ def run_discriminator_finetune(cfg: DictConfig) -> None:
             )
     pre_intervention_chunks = int(gt_config.get("pre_intervention_chunks", -1))
     post_intervention_chunks = int(gt_config.get("post_intervention_chunks", -1))
-    if pre_intervention_chunks < 0 or post_intervention_chunks <= 0:
+    if pre_intervention_chunks < 0 or post_intervention_chunks < 0:
         raise ValueError(
-            "gt_negative pre_intervention_chunks must be non-negative and "
-            "post_intervention_chunks must be positive."
+            "gt_negative pre_intervention_chunks and post_intervention_chunks "
+            "must be non-negative."
         )
     pre_end_chunks = int(gt_config.get("pre_end_chunk", 0))
     if pre_end_chunks < 0:

@@ -151,7 +151,8 @@ def build_gt_negative_windows(
 
     Each intervention window joins the contiguous policy-only prefix immediately
     before an intervention onset with the beginning of that same intervention
-    block. When ``pre_end_chunks > 0``, the final ``pre_end_chunks * frameskip``
+    block. ``post_intervention_chunks=0`` keeps only the pre-onset policy prefix.
+    When ``pre_end_chunks > 0``, the final ``pre_end_chunks * frameskip``
     frames of every episode that terminates for a non-``success`` reason are also
     routed to GT-negative, capturing policy behavior that drove the episode into a
     failed/aborted end. ``frame_indices`` is globally de-duplicated by
@@ -162,9 +163,9 @@ def build_gt_negative_windows(
             "pre_intervention_chunks must be non-negative, got "
             f"{pre_intervention_chunks}."
         )
-    if int(post_intervention_chunks) <= 0:
+    if int(post_intervention_chunks) < 0:
         raise ValueError(
-            "post_intervention_chunks must be positive, got "
+            "post_intervention_chunks must be non-negative, got "
             f"{post_intervention_chunks}."
         )
     if int(frameskip) <= 0:

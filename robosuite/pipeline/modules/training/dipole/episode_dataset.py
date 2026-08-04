@@ -16,7 +16,7 @@ emit three streams of :class:`~robosuite.pipeline.common.types.Transition`, each
 frame tagged with ``info["route"] in {"advantage", "pos_only", "neg_only"}``:
 
 - **policy_bc** (kept policy sections): ``action = executed_action``, per-frame
-  reward by section outcome, ``route="advantage"``. Fed to BOTH the VAST buffer and
+  sparse success reward, ``route="advantage"``. Fed to BOTH the VAST buffer and
   the policy-BC buffer.
 - **human_pos** (every human section): ``action = executed_action`` (== human),
   ``route="pos_only"`` (forces ``w_pos=1, w_neg=0``). Policy-BC only.
@@ -33,14 +33,13 @@ Chunk-boundary handling (confirmed with the user):
   VAST).
 
 Reward / done semantics (config-overridable ``reward_success`` / ``reward_fail``):
-- **success** policy section (episode ended in ``terminal_reason=="success"``):
-  every frame gets ``reward_success`` (default 0) and carries per-frame
-  ``info["success"]``, so ``VASTReplayBuffer._build_step_batch`` takes the absorbing
-  branch at the success frame and keeps bootstrapping elsewhere.
-- any other kept policy section (ended in human-intervention / ``manual_reset``):
-  every frame gets ``reward_fail`` (default -1), no ``info["success"]`` key, and
-  ``done=True`` on the section's last frame → the VAST else-branch treats the
-  section boundary as a truncation-terminal (no bootstrap past ``-1``).
+- Every policy frame gets ``reward_success`` only when its source ``success`` flag
+  is true; all other policy frames get ``reward_fail``. Every policy transition
+  carries that source flag in ``info["success"]``.
+- ``done=True`` still marks the section's final frame so replay windows cannot
+  cross policy / human boundaries. VAST ignores that structural boundary for its
+  terminal mask and bootstraps from the final policy transition's ``next_obs``;
+  only a true task-success frame is absorbing.
 """
 
 from __future__ import annotations
@@ -144,11 +143,13 @@ def _materialize_section(
     camera_names: list[str],
     action_key: str,
     route: str,
-    reward_value: float,
+    reward_value: float | None,
     episode_index: int,
     action_horizon: int,
     pad_to_h: bool,
     mark_success: bool,
+    reward_success: float | None = None,
+    reward_fail: float | None = None,
     source_episode_index: int | None = None,
 ) -> tuple[list[Transition], bool]:
     """Turn one section into a standalone-episode list of transitions.
@@ -194,8 +195,18 @@ def _materialize_section(
             info["source_round"] = int(episode["source_round"])
         if "source_episode_index" in episode:
             info["round_episode_index"] = int(episode["source_episode_index"])
+        frame_success = bool(success_arr[src_i])
         if mark_success:
-            info["success"] = bool(success_arr[src_i])
+            if reward_success is None or reward_fail is None:
+                raise ValueError(
+                    "reward_success and reward_fail are required when mark_success=true."
+                )
+            info["success"] = frame_success
+            frame_reward = reward_success if frame_success else reward_fail
+        else:
+            if reward_value is None:
+                raise ValueError("reward_value is required when mark_success=false.")
+            frame_reward = reward_value
         grasp_penalty = None
         if grasp is not None:
             gp = float(np.asarray(grasp)[src_i])
@@ -204,7 +215,7 @@ def _materialize_section(
             Transition(
                 obs=_frame_obs(obs_arrays, src_i, camera_names),
                 action=np.asarray(actions[src_i], dtype=np.float32).copy(),
-                reward=float(reward_value),
+                reward=float(frame_reward),
                 next_obs=_frame_obs(next_obs_arrays, src_i, camera_names),
                 done=bool(step == n - 1),
                 grasp_penalty=grasp_penalty,
@@ -246,6 +257,8 @@ def build_offline_transitions(
         "human_pos_transitions": 0,
         "neg_transitions": 0,
         "padded_human_sections": 0,
+        "policy_success_reward_frames": 0,
+        "policy_failure_reward_frames": 0,
         "drop_reasons": {},
         "keep_reasons": {},
     }
@@ -263,19 +276,19 @@ def build_offline_transitions(
                     stats["policy_sections_dropped"] += 1
                     stats["drop_reasons"][reason_tag] = stats["drop_reasons"].get(reason_tag, 0) + 1
                     continue
-                is_success = reason_tag == "success"
-                reward_value = reward_success if is_success else reward_fail
                 transitions, _ = _materialize_section(
                     episode=episode,
                     section=section,
                     camera_names=camera_names,
                     action_key="executed_action",
                     route=ROUTE_ADVANTAGE,
-                    reward_value=reward_value,
+                    reward_value=None,
                     episode_index=ep_counter,
                     action_horizon=H,
                     pad_to_h=False,
-                    mark_success=is_success,
+                    mark_success=True,
+                    reward_success=reward_success,
+                    reward_fail=reward_fail,
                     source_episode_index=source_episode_index,
                 )
                 if not transitions:
@@ -287,6 +300,12 @@ def build_offline_transitions(
                 stats["keep_reasons"][reason_tag] = stats["keep_reasons"].get(reason_tag, 0) + 1
                 streams.policy_bc.extend(transitions)
                 stats["policy_bc_transitions"] += len(transitions)
+                success_frames = sum(
+                    bool((transition.info or {}).get("success", False))
+                    for transition in transitions
+                )
+                stats["policy_success_reward_frames"] += success_frames
+                stats["policy_failure_reward_frames"] += len(transitions) - success_frames
                 ep_counter += 1
             else:  # human section
                 stats["human_sections_total"] += 1

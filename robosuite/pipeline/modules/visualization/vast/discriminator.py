@@ -180,6 +180,7 @@ def _write_video(
     fps: int,
     border_thickness: int,
     flip_vertical: bool,
+    annotation_mask: np.ndarray | None = None,
 ) -> None:
     """Render an MP4 with a per-frame HUD and a red border on predicted failures."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,19 +203,25 @@ def _write_video(
             frame = np.asarray(frames[idx], dtype=np.uint8)
             if flip_vertical:
                 frame = np.flipud(frame)
-            pred = bool(predictions[idx])
+            annotate = (
+                bool(annotation_mask[idx])
+                if annotation_mask is not None
+                else bool(np.isfinite(scores[idx]))
+            )
+            pred = annotate and bool(predictions[idx] > 0.5)
             if pred:
                 frame = _draw_red_border(frame, border_thickness * scale)
-            frame = _overlay_hud(
-                frame,
-                score=float(scores[idx]),
-                threshold=float(threshold),
-                pred_failure=pred,
-                intrinsic_reward=float(intrinsic[idx]),
-                frame_idx=idx,
-                total=total,
-                font=font,
-            )
+            if annotate:
+                frame = _overlay_hud(
+                    frame,
+                    score=float(scores[idx]),
+                    threshold=float(threshold),
+                    pred_failure=pred,
+                    intrinsic_reward=float(intrinsic[idx]),
+                    frame_idx=idx,
+                    total=total,
+                    font=font,
+                )
             writer.append_data(frame)
 
 
@@ -233,13 +240,23 @@ def _plot_disc_scores(
     fig.suptitle(title)
 
     axes[0].plot(steps, scores, label="nnPU failure score", color="tab:blue")
-    axes[0].axhline(float(threshold), color="tab:red", linestyle="--", label=f"tau={float(threshold):.3f}")
-    if bool(predictions.any()):
+    threshold_trace = np.full(scores.shape, float(threshold), dtype=np.float32)
+    threshold_trace[~np.isfinite(scores)] = np.nan
+    axes[0].plot(
+        steps,
+        threshold_trace,
+        color="tab:red",
+        linestyle="--",
+        label=f"tau={float(threshold):.3f}",
+    )
+    predicted = np.isfinite(predictions) & (predictions > 0.5)
+    finite_scores = scores[np.isfinite(scores)]
+    if bool(predicted.any()) and finite_scores.size:
         axes[0].fill_between(
             steps,
-            scores.min(),
-            scores.max(),
-            where=predictions.astype(bool),
+            float(finite_scores.min()),
+            float(finite_scores.max()),
+            where=predicted,
             color="tab:red",
             alpha=0.12,
             label="pred failure",
@@ -255,6 +272,8 @@ def _plot_disc_scores(
     axes[1].set_xlabel("step")
     axes[1].legend(loc="best")
     axes[1].grid(True, alpha=0.3)
+    if steps.size:
+        axes[1].set_xlim(float(steps[0]), float(steps[-1]))
 
     fig.tight_layout()
     path_base.parent.mkdir(parents=True, exist_ok=True)
@@ -279,13 +298,18 @@ def _write_scores_csv(
         writer = csv.writer(handle)
         writer.writerow(["step", "failure_score", "intrinsic_reward", "threshold", "pred_failure"])
         for step in range(int(scores.shape[0])):
+            visible = bool(
+                np.isfinite(scores[step])
+                and np.isfinite(intrinsic[step])
+                and np.isfinite(predictions[step])
+            )
             writer.writerow(
                 [
                     step,
-                    float(scores[step]),
-                    float(intrinsic[step]),
-                    float(threshold),
-                    int(predictions[step]),
+                    float(scores[step]) if visible else "",
+                    float(intrinsic[step]) if visible else "",
+                    float(threshold) if visible else "",
+                    int(predictions[step] > 0.5) if visible else "",
                 ]
             )
 
@@ -337,6 +361,7 @@ def visualize_selected_trajectory_discriminator_nnpu(
     camera_name: str | None = None,
     border_thickness: int = 10,
     flip_vertical: bool = True,
+    annotation_mask: np.ndarray | None = None,
 ) -> DiscriminatorVizResult:
     """Render per-frame nnPU failure CSV + plot + HUD video for one trajectory.
 
@@ -348,13 +373,21 @@ def visualize_selected_trajectory_discriminator_nnpu(
         raise RuntimeError("Cannot visualize discriminator on an empty trajectory.")
     scores = np.asarray(failure_score, dtype=np.float32).reshape(-1)
     intrinsic = np.asarray(intrinsic_reward, dtype=np.float32).reshape(-1)
-    predictions = np.asarray(pred_failure).reshape(-1).astype(np.int64)
+    predictions = np.asarray(pred_failure, dtype=np.float32).reshape(-1)
     length = int(scores.shape[0])
     if not (intrinsic.shape[0] == length and predictions.shape[0] == length):
         raise ValueError(
             "failure_score, intrinsic_reward, pred_failure must share length; got "
             f"{scores.shape[0]}, {intrinsic.shape[0]}, {predictions.shape[0]}"
         )
+    if annotation_mask is not None:
+        annotations = np.asarray(annotation_mask, dtype=np.bool_).reshape(-1)
+        if int(annotations.shape[0]) != length:
+            raise ValueError(
+                f"annotation_mask length={annotations.shape[0]} does not match scores={length}"
+            )
+    else:
+        annotations = np.isfinite(scores) & np.isfinite(intrinsic)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -366,7 +399,17 @@ def visualize_selected_trajectory_discriminator_nnpu(
         scores = scores[: int(frames.shape[0])]
         intrinsic = intrinsic[: int(frames.shape[0])]
         predictions = predictions[: int(frames.shape[0])]
+        annotations = annotations[: int(frames.shape[0])]
         length = int(frames.shape[0])
+    annotations &= (
+        np.isfinite(scores) & np.isfinite(intrinsic) & np.isfinite(predictions)
+    )
+    scores = scores.copy()
+    intrinsic = intrinsic.copy()
+    predictions = predictions.copy()
+    scores[~annotations] = np.nan
+    intrinsic[~annotations] = np.nan
+    predictions[~annotations] = np.nan
 
     scores_csv = out_dir / "bce_scores.csv"
     plot_base = out_dir / "discriminator_timeseries"
@@ -398,9 +441,12 @@ def visualize_selected_trajectory_discriminator_nnpu(
         fps=int(video_fps),
         border_thickness=int(border_thickness),
         flip_vertical=bool(flip_vertical),
+        annotation_mask=annotations,
     )
 
-    first_pred = np.where(predictions.astype(bool))[0]
+    predicted = annotations & (predictions > 0.5)
+    first_pred = np.where(predicted)[0]
+    finite_scores = scores[np.isfinite(scores)]
     summary = {
         "nnpu_checkpoint": str(ckpt_path),
         "task_name": str(task_name),
@@ -408,11 +454,13 @@ def visualize_selected_trajectory_discriminator_nnpu(
         "threshold_source": "checkpoint",
         "camera_name": selected_camera,
         "num_frames": int(length),
-        "predicted_failure_frames": int(predictions.sum()),
+        "annotated_frames": int(annotations.sum()),
+        "blank_frames": int(length - annotations.sum()),
+        "predicted_failure_frames": int(predicted.sum()),
         "first_pred_failure_frame": None if first_pred.size == 0 else int(first_pred[0]),
-        "score_min": float(np.min(scores)) if length else None,
-        "score_mean": float(np.mean(scores)) if length else None,
-        "score_max": float(np.max(scores)) if length else None,
+        "score_min": float(np.min(finite_scores)) if finite_scores.size else None,
+        "score_mean": float(np.mean(finite_scores)) if finite_scores.size else None,
+        "score_max": float(np.max(finite_scores)) if finite_scores.size else None,
         "outputs": {
             "scores_csv": str(scores_csv),
             "plot_png": str(plot_png),

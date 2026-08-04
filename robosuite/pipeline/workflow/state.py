@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -12,10 +13,13 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
+
+from tqdm import tqdm
 
 ROUND_STAGES = ("collection", "disc", "vast", "policy")
 _STAGE_STATUSES = {"pending", "running", "completed", "failed"}
+_RUN_TIMESTAMP_RE = re.compile(r"^(?P<prefix>.+)_\d{8}_\d{6}$")
 
 
 def _utc_now() -> str:
@@ -24,7 +28,7 @@ def _utc_now() -> str:
 
 @dataclass(frozen=True)
 class RunLayout:
-    """Canonical paths rooted at one self-contained run directory."""
+    """Canonical paths rooted at one batch-online run directory."""
 
     root: Path
 
@@ -128,6 +132,19 @@ class InputSnapshot:
             raise ValueError("snapshot destination must be under checkpoints/ or data/")
 
 
+@dataclass(frozen=True)
+class InputReference:
+    """One immutable input retained at its external source path."""
+
+    name: str
+    source: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", Path(self.source))
+        if not self.name or not self.name.strip():
+            raise ValueError("reference name must not be empty")
+
+
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     """Atomically replace a JSON file and fsync its containing directory."""
 
@@ -160,11 +177,41 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+def write_text_atomic(path: Path, text: str) -> None:
+    """Atomically replace a UTF-8 text file and fsync its containing directory."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def sha256_file(
+    path: Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+    progress: Callable[[int], None] | None = None,
+) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
+            if progress is not None:
+                progress(len(chunk))
     return digest.hexdigest()
 
 
@@ -197,6 +244,55 @@ def create_run(layout: RunLayout, *, task_name: str) -> dict[str, Any]:
     write_json_atomic(layout.manifest_path, manifest)
     write_json_atomic(layout.state_path, state)
     return state
+
+
+def clone_run_for_retrain(
+    source: RunLayout,
+    *,
+    round_index: int,
+    stage: str,
+) -> RunLayout:
+    """Clone a run and retain only the strict prefix before ``round_index/stage``."""
+
+    _validate_round_index(round_index)
+    _validate_training_stage(stage)
+    _validate_retrain_source(source, round_index=round_index, stage=stage)
+    destination = RunLayout(_retrain_destination(source.root))
+    if destination.root.exists():
+        raise FileExistsError(f"Retrain run already exists: {destination.root}")
+
+    temporary_parent = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.root.name}.copy-",
+            dir=destination.root.parent,
+        )
+    )
+    temporary = RunLayout(temporary_parent / destination.root.name)
+    try:
+        subprocess.run(
+            [
+                "cp",
+                "--archive",
+                "--reflink=auto",
+                "--",
+                str(source.root),
+                str(temporary.root),
+            ],
+            check=True,
+        )
+        _prune_retrain_clone(
+            temporary,
+            source_root=source.root,
+            destination_root=destination.root,
+            round_index=round_index,
+            stage=stage,
+        )
+        os.replace(temporary.root, destination.root)
+        shutil.rmtree(temporary_parent, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(temporary_parent, ignore_errors=True)
+        raise
+    return destination
 
 
 def start_stage(
@@ -353,35 +449,84 @@ def snapshot_inputs(
     layout: RunLayout,
     snapshots: Iterable[InputSnapshot],
     *,
+    external_inputs: Iterable[InputReference] = (),
     prefer_reflink: bool = True,
 ) -> list[dict[str, Any]]:
-    """Copy immutable inputs into the run and append verified hashes to manifest."""
+    """Prepare copied and external inputs and record verified hashes in the manifest."""
 
     manifest = load_json(layout.manifest_path)
     if manifest.get("inputs"):
         raise RuntimeError("Run inputs have already been snapshotted")
+    resolved_snapshots: list[tuple[InputSnapshot, Path, list[Path]]] = []
+    resolved_external: list[tuple[InputReference, Path, list[Path]]] = []
     records: list[dict[str, Any]] = []
     destinations: set[str] = set()
     names: set[str] = set()
     created_destinations: list[Path] = []
+    total_bytes = 0
+
+    for snapshot in snapshots:
+        if snapshot.name in names:
+            raise ValueError(f"Duplicate input name: {snapshot.name}")
+        names.add(snapshot.name)
+        source = snapshot.source.resolve(strict=True)
+        source_files = _input_files(source)
+        destination = layout.inputs_dir / snapshot.destination
+        destination_relative = destination.relative_to(layout.root).as_posix()
+        if destination_relative in destinations or destination.exists():
+            raise FileExistsError(f"Duplicate snapshot destination: {destination_relative}")
+        destinations.add(destination_relative)
+        resolved_snapshots.append((snapshot, source, source_files))
+        total_bytes += 3 * sum(path.stat().st_size for path in source_files)
+
+    for reference in external_inputs:
+        if reference.name in names:
+            raise ValueError(f"Duplicate input name: {reference.name}")
+        names.add(reference.name)
+        source = reference.source.resolve(strict=True)
+        source_files = _input_files(source)
+        resolved_external.append((reference, source, source_files))
+        total_bytes += sum(path.stat().st_size for path in source_files)
+
+    progress_bar = tqdm(
+        total=total_bytes,
+        desc="Preparing run inputs",
+        unit="B",
+        unit_scale=True,
+        dynamic_ncols=True,
+    )
     try:
-        for snapshot in snapshots:
-            if snapshot.name in names:
-                raise ValueError(f"Duplicate snapshot name: {snapshot.name}")
-            names.add(snapshot.name)
-            source = snapshot.source.resolve(strict=True)
+        for snapshot, source, source_files in resolved_snapshots:
             destination = layout.inputs_dir / snapshot.destination
             destination_relative = destination.relative_to(layout.root).as_posix()
-            if destination_relative in destinations or destination.exists():
-                raise FileExistsError(f"Duplicate snapshot destination: {destination_relative}")
-            destinations.add(destination_relative)
             created_destinations.append(destination)
-            files = _copy_and_hash(source, destination, prefer_reflink=prefer_reflink)
+            files = _copy_and_hash(
+                source,
+                destination,
+                source_files=source_files,
+                prefer_reflink=prefer_reflink,
+                progress=progress_bar.update,
+            )
             records.append(
                 {
                     "name": snapshot.name,
                     "source": str(source),
                     "snapshot_path": destination_relative,
+                    "storage_mode": "snapshot",
+                    "kind": "directory" if source.is_dir() else "file",
+                    "sha256": _tree_digest(files),
+                    "size_bytes": sum(int(item["size_bytes"]) for item in files),
+                    "files": files,
+                }
+            )
+        for reference, source, source_files in resolved_external:
+            files = _hash_input(source, source_files, progress=progress_bar.update)
+            records.append(
+                {
+                    "name": reference.name,
+                    "source": str(source),
+                    "snapshot_path": None,
+                    "storage_mode": "external",
                     "kind": "directory" if source.is_dir() else "file",
                     "sha256": _tree_digest(files),
                     "size_bytes": sum(int(item["size_bytes"]) for item in files),
@@ -395,6 +540,8 @@ def snapshot_inputs(
             else:
                 destination.unlink(missing_ok=True)
         raise
+    finally:
+        progress_bar.close()
     manifest["inputs"] = records
     manifest["updated_at"] = _utc_now()
     write_json_atomic(layout.manifest_path, manifest)
@@ -449,13 +596,11 @@ def _copy_and_hash(
     source: Path,
     destination: Path,
     *,
+    source_files: list[Path] | None = None,
     prefer_reflink: bool,
+    progress: Callable[[int], None] | None = None,
 ) -> list[dict[str, Any]]:
-    if not source.is_file() and not source.is_dir():
-        raise ValueError(f"Input must be a regular file or directory: {source}")
-    source_files = [source] if source.is_file() else sorted(
-        path for path in source.rglob("*") if path.is_file()
-    )
+    source_files = _input_files(source) if source_files is None else source_files
     if source.is_dir():
         destination.mkdir(parents=True, exist_ok=False)
     records: list[dict[str, Any]] = []
@@ -463,9 +608,14 @@ def _copy_and_hash(
         relative = Path(source_file.name) if source.is_file() else source_file.relative_to(source)
         destination_file = destination if source.is_file() else destination / relative
         destination_file.parent.mkdir(parents=True, exist_ok=True)
-        mode = _copy_file(source_file, destination_file, prefer_reflink=prefer_reflink)
-        source_hash = sha256_file(source_file)
-        destination_hash = sha256_file(destination_file)
+        mode = _copy_file(
+            source_file,
+            destination_file,
+            prefer_reflink=prefer_reflink,
+            progress=progress,
+        )
+        source_hash = sha256_file(source_file, progress=progress)
+        destination_hash = sha256_file(destination_file, progress=progress)
         if source_hash != destination_hash:
             raise OSError(f"SHA-256 mismatch after copying {source_file}")
         records.append(
@@ -479,7 +629,42 @@ def _copy_and_hash(
     return records
 
 
-def _copy_file(source: Path, destination: Path, *, prefer_reflink: bool) -> str:
+def _input_files(source: Path) -> list[Path]:
+    if not source.is_file() and not source.is_dir():
+        raise ValueError(f"Input must be a regular file or directory: {source}")
+    if source.is_file():
+        return [source]
+    return sorted(path for path in source.rglob("*") if path.is_file())
+
+
+def _hash_input(
+    source: Path,
+    source_files: list[Path],
+    *,
+    progress: Callable[[int], None] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for source_file in source_files:
+        relative = Path(source_file.name) if source.is_file() else source_file.relative_to(source)
+        records.append(
+            {
+                "path": relative.as_posix(),
+                "size_bytes": source_file.stat().st_size,
+                "sha256": sha256_file(source_file, progress=progress),
+            }
+        )
+    return records
+
+
+def _copy_file(
+    source: Path,
+    destination: Path,
+    *,
+    prefer_reflink: bool,
+    progress: Callable[[int], None] | None = None,
+    chunk_size: int = 1024 * 1024,
+) -> str:
+    size_bytes = source.stat().st_size
     if prefer_reflink:
         result = subprocess.run(
             ["cp", "--reflink=always", "--preserve=mode,timestamps", str(source), str(destination)],
@@ -488,9 +673,16 @@ def _copy_file(source: Path, destination: Path, *, prefer_reflink: bool) -> str:
             text=True,
         )
         if result.returncode == 0:
+            if progress is not None:
+                progress(size_bytes)
             return "reflink"
         destination.unlink(missing_ok=True)
-    shutil.copy2(source, destination)
+    with source.open("rb") as source_handle, destination.open("wb") as destination_handle:
+        for chunk in iter(lambda: source_handle.read(chunk_size), b""):
+            destination_handle.write(chunk)
+            if progress is not None:
+                progress(len(chunk))
+    shutil.copystat(source, destination)
     return "copy"
 
 
@@ -502,6 +694,213 @@ def _tree_digest(files: list[dict[str, Any]]) -> str:
         digest.update(str(record["sha256"]).encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _validate_retrain_source(
+    layout: RunLayout,
+    *,
+    round_index: int,
+    stage: str,
+) -> None:
+    for path in (layout.config_path, layout.manifest_path, layout.state_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Run metadata does not exist: {path}")
+    state = load_json(layout.state_path)
+    manifest = load_json(layout.manifest_path)
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError(f"Run manifest has malformed artifacts: {layout.manifest_path}")
+    artifact_records = {
+        str(record.get("path")): record
+        for record in artifacts
+        if isinstance(record, dict) and record.get("path")
+    }
+    if len(artifact_records) != len(artifacts):
+        raise ValueError("Run manifest contains malformed or duplicate artifacts")
+    rounds = state.get("rounds")
+    if not isinstance(rounds, dict) or f"{round_index:03d}" not in rounds:
+        raise ValueError(f"Round {round_index:03d} does not exist in {layout.root}")
+    expected_keys = {f"{index:03d}" for index in range(round_index + 1)}
+    if not expected_keys.issubset(rounds):
+        raise ValueError("Run state has non-contiguous rounds before retrain target")
+
+    for round_key, round_state in rounds.items():
+        stages = round_state.get("stages") if isinstance(round_state, dict) else None
+        if not isinstance(stages, dict):
+            raise ValueError(f"Malformed stage state for round {round_key}")
+        if round_state.get("index") != int(round_key):
+            raise ValueError(f"Round {round_key} has a mismatched index")
+        for stage_name in ROUND_STAGES:
+            stage_state = stages.get(stage_name)
+            if not isinstance(stage_state, dict):
+                raise ValueError(f"Missing round {round_key} stage {stage_name}")
+            if stage_state.get("status") == "running":
+                raise RuntimeError(
+                    f"Cannot clone a run with a running stage: round {round_key} "
+                    f"stage {stage_name}"
+                )
+
+    target_stage_index = ROUND_STAGES.index(stage)
+    for retained_round in range(round_index + 1):
+        last_stage_index = (
+            len(ROUND_STAGES) if retained_round < round_index else target_stage_index
+        )
+        retained_stages = rounds[f"{retained_round:03d}"]["stages"]
+        for retained_stage in ROUND_STAGES[:last_stage_index]:
+            stage_state = retained_stages[retained_stage]
+            if stage_state.get("status") != "completed":
+                raise RuntimeError(
+                    f"Cannot retrain round {round_index:03d} stage {stage!r}: "
+                    f"retained round {retained_round:03d} stage {retained_stage!r} "
+                    "is not completed."
+                )
+            output_name = "episodes" if retained_stage == "collection" else "checkpoint"
+            output = stage_state.get("outputs", {}).get(output_name)
+            if not output:
+                raise ValueError(
+                    f"Retained round {retained_round:03d} stage {retained_stage!r} "
+                    f"has no {output_name} output."
+                )
+            output_path = Path(str(output))
+            resolved = output_path if output_path.is_absolute() else layout.root / output_path
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"Retained stage artifact does not exist: {resolved}"
+                )
+            try:
+                relative = resolved.resolve().relative_to(layout.root).as_posix()
+            except ValueError as exc:
+                raise ValueError(
+                    f"Retained stage artifact is outside the run: {resolved}"
+                ) from exc
+            record = artifact_records.get(relative)
+            if record is None:
+                raise ValueError(f"Retained artifact is missing from manifest: {relative}")
+            if (
+                int(record.get("round", -1)) != retained_round
+                or record.get("stage") != retained_stage
+            ):
+                raise ValueError(f"Retained artifact has incorrect ownership: {relative}")
+
+
+def _retrain_destination(source_root: Path) -> Path:
+    match = _RUN_TIMESTAMP_RE.fullmatch(source_root.name)
+    prefix = match.group("prefix") if match is not None else source_root.name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return source_root.parent / f"{prefix}_{timestamp}"
+
+
+def _prune_retrain_clone(
+    layout: RunLayout,
+    *,
+    source_root: Path,
+    destination_root: Path,
+    round_index: int,
+    stage: str,
+) -> None:
+    stage_index = ROUND_STAGES.index(stage)
+    old_root = str(source_root)
+    new_root = str(destination_root)
+    state = load_json(layout.state_path)
+    rounds = state["rounds"]
+    for round_key in list(rounds):
+        if int(round_key) > round_index:
+            del rounds[round_key]
+            shutil.rmtree(layout.rounds_dir / round_key, ignore_errors=True)
+    for round_dir in layout.rounds_dir.iterdir():
+        if (
+            round_dir.is_dir()
+            and round_dir.name.isdigit()
+            and int(round_dir.name) > round_index
+        ):
+            shutil.rmtree(round_dir)
+
+    target_round = rounds[f"{round_index:03d}"]
+    pending = _new_round_state(round_index)["stages"]
+    for stage_name in ROUND_STAGES[stage_index:]:
+        target_round["stages"][stage_name] = pending[stage_name]
+        if stage_name != "collection":
+            shutil.rmtree(layout.stage_dir(round_index, stage_name), ignore_errors=True)
+            layout.stage_dir(round_index, stage_name).mkdir(parents=True)
+
+    eval_vis = layout.eval_vis_dir(round_index)
+    if stage_index <= ROUND_STAGES.index("disc"):
+        shutil.rmtree(eval_vis, ignore_errors=True)
+    elif stage_index == ROUND_STAGES.index("vast"):
+        shutil.rmtree(layout.vast_eval_vis_dir(round_index), ignore_errors=True)
+        if eval_vis.is_dir() and not any(eval_vis.iterdir()):
+            eval_vis.rmdir()
+
+    cache_start = round_index if stage == "disc" else round_index + 1
+    feature_cache = layout.cache_dir / "discriminator_features"
+    for cache_path in feature_cache.glob("round_*.pt"):
+        match = re.fullmatch(r"round_(\d+)\.pt", cache_path.name)
+        if match is not None and int(match.group(1)) >= cache_start:
+            cache_path.unlink()
+
+    now = _utc_now()
+    forked_from = {
+        "run_root": str(source_root),
+        "round_index": round_index,
+        "stage": stage,
+    }
+    state = _rebase_value(state, old_root=old_root, new_root=new_root)
+    state.update(
+        {
+            "created_at": now,
+            "updated_at": now,
+            "active_round": round_index,
+            "active_stage": stage,
+            "forked_from": forked_from,
+        }
+    )
+    write_json_atomic(layout.state_path, state)
+
+    manifest = load_json(layout.manifest_path)
+    manifest["artifacts"] = [
+        artifact
+        for artifact in manifest.get("artifacts", [])
+        if int(artifact.get("round", -1)) < round_index
+        or (
+            int(artifact.get("round", -1)) == round_index
+            and artifact.get("stage") in ROUND_STAGES[:stage_index]
+        )
+    ]
+    manifest.update(
+        {
+            "created_at": now,
+            "updated_at": now,
+            "forked_from": forked_from,
+        }
+    )
+    write_json_atomic(layout.manifest_path, manifest)
+
+    for pattern in ("*.json", "*.yaml", "*.yml"):
+        for path in layout.root.rglob(pattern):
+            if path in {layout.state_path, layout.manifest_path}:
+                continue
+            if path.relative_to(layout.root).parts[0] == "inputs":
+                continue
+            text = path.read_text(encoding="utf-8")
+            updated = text.replace(old_root, new_root)
+            if updated != text:
+                write_text_atomic(path, updated)
+
+
+def _rebase_value(value: Any, *, old_root: str, new_root: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old_root, new_root)
+    if isinstance(value, list):
+        return [
+            _rebase_value(item, old_root=old_root, new_root=new_root)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _rebase_value(item, old_root=old_root, new_root=new_root)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _new_round_state(round_index: int) -> dict[str, Any]:

@@ -93,7 +93,7 @@ def _resolve_training_contract(
     }
     if (
         resolved["pre_intervention_chunks"] < 0
-        or resolved["post_intervention_chunks"] <= 0
+        or resolved["post_intervention_chunks"] < 0
         or resolved["pre_end_chunks"] < 0
     ):
         raise ValueError(f"Invalid checkpoint GT-negative window config: {resolved}.")

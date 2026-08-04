@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
 import pytest
 import torch
 
+from robosuite.pipeline.algorithms.flow_dagger.common import ReplayBufferConfig
+from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
 from robosuite.pipeline.algorithms.vast.checkpoint import load_vast_payload
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
+from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.modules.visualization.vast.renderer import load_vast_payload as load_vis_payload
 from robosuite.pipeline.modules.training.dipole import runner as train_offline
 from robosuite.pipeline.modules.training.dipole.advantage import sample_vast_macro_horizons
-from robosuite.pipeline.modules.training.dipole.vast_finetune import validate_vast_checkpoint_payload
+from robosuite.pipeline.modules.training.dipole.vast_finetune import (
+    build_vast_finetune_buffer,
+    validate_vast_checkpoint_payload,
+)
 from robosuite.pipeline.config.adapters import offline_stage_config
 from robosuite.pipeline.workflow.runner import load_default_config
 
@@ -58,6 +68,189 @@ def test_phase_a_explicitly_relabels_discriminator_reward_after_strict_load() ->
     }
     train_offline._apply_vast_disc_reward_relabel(cfg, provenance)
     assert cfg.disc_reward_coef == pytest.approx(0.2)
+
+
+def test_vast_finetune_freezes_only_loaded_warmup_copy(tmp_path: Path) -> None:
+    source = FlowDaggerReplayBuffer(
+        config=ReplayBufferConfig(capacity=16, batch_size=1),
+        name="warmup-source",
+        camera_names=["agentview"],
+        action_horizon=2,
+        image_size=4,
+    )
+    for step in range(4):
+        obs = {
+            "state": np.full(3, step, dtype=np.float32),
+            "agentview": np.full((4, 4, 3), step, dtype=np.uint8),
+        }
+        next_obs = {
+            "state": np.full(3, step + 1, dtype=np.float32),
+            "agentview": np.full((4, 4, 3), step + 1, dtype=np.uint8),
+        }
+        source.add(
+            Transition(
+                obs=obs,
+                action=np.full(2, step, dtype=np.float32),
+                reward=0.0 if step >= 1 else -1.0,
+                next_obs=next_obs,
+                done=step == 3,
+                info={
+                    "episode_index": 0,
+                    "episode_step": step,
+                    "success": step >= 1,
+                    "nnpu_disc_intrinsic": -0.25,
+                },
+            )
+        )
+    warmup_path = tmp_path / "vast_offline_transitions.pt"
+    source.save(warmup_path)
+
+    finetune, stats = build_vast_finetune_buffer(
+        [],
+        camera_names=["agentview"],
+        image_size=4,
+        action_horizon=2,
+        warmup_transitions_path=warmup_path,
+        relabel_disc_reward=True,
+        freeze_warmup_post_success=True,
+        capacity=16,
+    )
+
+    assert stats["frozen_warmup_post_success_transitions"] == 2
+    assert stats["discarded_cached_disc_rewards"] == 4
+    assert np.all(np.asarray(finetune._storage[2].obs["state"]) == 1)  # noqa: SLF001
+    assert np.all(np.asarray(finetune._storage[3].obs["state"]) == 1)  # noqa: SLF001
+    assert "nnpu_disc_intrinsic" not in (finetune._storage[2].info or {})  # noqa: SLF001
+
+    reloaded = FlowDaggerReplayBuffer(
+        config=ReplayBufferConfig(capacity=16, batch_size=1),
+        name="warmup-reloaded",
+        camera_names=["agentview"],
+        action_horizon=2,
+        image_size=4,
+    )
+    reloaded.load(warmup_path)
+    assert np.all(np.asarray(source._storage[2].obs["state"]) == 2)  # noqa: SLF001
+    assert np.all(np.asarray(reloaded._storage[2].obs["state"]) == 2)  # noqa: SLF001
+    assert np.all(np.asarray(reloaded._storage[3].obs["state"]) == 3)  # noqa: SLF001
+
+    unfrozen, unfrozen_stats = build_vast_finetune_buffer(
+        [],
+        camera_names=["agentview"],
+        image_size=4,
+        action_horizon=2,
+        warmup_transitions_path=warmup_path,
+        freeze_warmup_post_success=False,
+        capacity=16,
+    )
+    assert unfrozen_stats["frozen_warmup_post_success_transitions"] == 0
+    assert np.all(np.asarray(unfrozen._storage[2].obs["state"]) == 2)  # noqa: SLF001
+    assert np.all(np.asarray(unfrozen._storage[3].obs["state"]) == 3)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("length", [4, 11])
+def test_vast_policy_success_tail_anchors_every_chunk_phase(length: int) -> None:
+    horizon = 4
+    policy: list[Transition] = []
+    for step in range(length):
+        policy.append(
+            Transition(
+                obs={
+                    "state": np.asarray([step], dtype=np.float32),
+                    "agentview": np.full((4, 4, 3), step, dtype=np.uint8),
+                },
+                action=np.asarray([step], dtype=np.float32),
+                reward=0.0 if step == length - 1 else -1.0,
+                next_obs={
+                    "state": np.asarray([step + 1], dtype=np.float32),
+                    "agentview": np.full((4, 4, 3), step + 1, dtype=np.uint8),
+                },
+                done=step == length - 1,
+                info={
+                    "episode_index": 0,
+                    "episode_step": step,
+                    "success": step == length - 1,
+                },
+            )
+        )
+    source_final_info = dict(policy[-1].info or {})
+
+    buffer, stats = build_vast_finetune_buffer(
+        policy,
+        camera_names=["agentview"],
+        image_size=4,
+        action_horizon=horizon,
+        warmup_transitions_path=None,
+        capacity=64,
+    )
+
+    assert len(policy) == length
+    assert policy[-1].done is True
+    assert policy[-1].info == source_final_info
+    assert not any(
+        bool((transition.info or {}).get("synthetic_vast_success_tail", False))
+        for transition in policy
+    )
+    assert len(buffer) == length + horizon - 1
+    assert stats["policy_source_transitions"] == length
+    assert stats["policy_vast_transitions"] == length + horizon - 1
+    assert stats["synthetic_success_tail_transitions"] == horizon - 1
+    assert stats["padded_success_sections"] == 1
+    assert stats["absorbing_reward_mask_transitions"] == horizon - 1
+    assert [index for index, item in enumerate(buffer._storage) if item.done] == [  # noqa: SLF001
+        length + horizon - 2
+    ]
+    valid_starts = buffer._get_valid_start_indices_locked()  # noqa: SLF001
+    assert valid_starts == list(range(length))
+
+    cfg = VASTConfig(action_horizon=horizon, vast_max_k=1, disc_reward_coef=0.0)
+    replay = VASTReplayBuffer(base_buffer=buffer, cfg=cfg)
+    terminal_starts = valid_starts[-horizon:]
+    assert {start % horizon for start in terminal_starts} == set(range(horizon))
+    assert all(replay._raw_chunk_done_locked(start) for start in terminal_starts)  # noqa: SLF001
+    assert not any(
+        replay._raw_chunk_done_locked(start)  # noqa: SLF001
+        for start in valid_starts[:-horizon]
+    )
+
+
+def test_vast_policy_truncation_does_not_add_absorbing_tail() -> None:
+    horizon = 4
+    policy = [
+        Transition(
+            obs={
+                "state": np.asarray([step], dtype=np.float32),
+                "agentview": np.full((4, 4, 3), step, dtype=np.uint8),
+            },
+            action=np.asarray([step], dtype=np.float32),
+            reward=-1.0,
+            next_obs={
+                "state": np.asarray([step + 1], dtype=np.float32),
+                "agentview": np.full((4, 4, 3), step + 1, dtype=np.uint8),
+            },
+            done=step == 5,
+            info={"episode_index": 0, "episode_step": step, "success": False},
+        )
+        for step in range(6)
+    ]
+
+    buffer, stats = build_vast_finetune_buffer(
+        policy,
+        camera_names=["agentview"],
+        image_size=4,
+        action_horizon=horizon,
+        warmup_transitions_path=None,
+        capacity=32,
+    )
+
+    assert len(buffer) == len(policy)
+    assert stats["synthetic_success_tail_transitions"] == 0
+    assert buffer._get_valid_start_indices_locked() == [0, 1, 2]  # noqa: SLF001
+    replay = VASTReplayBuffer(
+        base_buffer=buffer,
+        cfg=VASTConfig(action_horizon=horizon, vast_max_k=1, disc_reward_coef=0.0),
+    )
+    assert replay._raw_chunk_done_locked(2) is False  # noqa: SLF001
 
 
 def test_phase_a_without_relabel_rejects_reward_mismatch() -> None:

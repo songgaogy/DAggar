@@ -31,6 +31,10 @@ from robosuite.pipeline.algorithms.vast.checkpoint import (
     normalize_vast_payload,
 )
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
+from robosuite.pipeline.algorithms.vast.data_util import (
+    clone_with_absorbing_success_tail,
+    freeze_post_success_tail,
+)
 from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
 from robosuite.pipeline.common.types import Transition
 
@@ -60,14 +64,19 @@ def build_vast_finetune_buffer(
     action_horizon: int,
     warmup_transitions_path: str | Path | None,
     relabel_disc_reward: bool = False,
+    freeze_warmup_post_success: bool = True,
     capacity: int = 10_000_000,
 ) -> tuple[FlowDaggerReplayBuffer, dict[str, int]]:
     """Mix collected policy sections with the warmup transitions into one buffer.
 
+    Policy transitions are copied before successful sections receive a VAST-only
+    absorbing tail, so the policy-BC stream remains unchanged.
     ``warmup_transitions_path`` points at the ``vast_offline_transitions.pt`` the
     VAST warmup exported (``FlowDaggerReplayBuffer``-serialized). Its transitions
-    are reloaded verbatim and their ``episode_index`` re-stamped into a disjoint
-    range so chunk windows stay bounded to temporally-adjacent frames.
+    are copied and re-stamped into a disjoint episode range. When the source
+    checkpoint used post-success freezing, the same transform is applied to the
+    copies. The saved raw replay remains unchanged for consumers that need the
+    original rollout frames.
     """
     buffer = FlowDaggerReplayBuffer(
         config=ReplayBufferConfig(capacity=int(capacity), batch_size=1),
@@ -77,12 +86,24 @@ def build_vast_finetune_buffer(
         image_size=int(image_size),
         augmentation_config=FlowAugmentationConfig(),
     )
-    for t in policy_bc_transitions:
-        buffer.add(t)
+    policy_vast_transitions, synthetic_tail_count, padded_success_sections = (
+        clone_with_absorbing_success_tail(
+            policy_bc_transitions,
+            int(action_horizon),
+        )
+    )
+    for transition in policy_vast_transitions:
+        buffer.add(transition)
 
     stats = {
         "policy_bc_transitions": len(policy_bc_transitions),
+        "policy_source_transitions": len(policy_bc_transitions),
+        "policy_vast_transitions": len(policy_vast_transitions),
+        "synthetic_success_tail_transitions": int(synthetic_tail_count),
+        "padded_success_sections": int(padded_success_sections),
         "warmup_transitions": 0,
+        "frozen_warmup_post_success_transitions": 0,
+        "absorbing_reward_mask_transitions": 0,
         "discarded_cached_disc_rewards": 0,
     }
 
@@ -113,8 +134,9 @@ def build_vast_finetune_buffer(
             augmentation_config=FlowAugmentationConfig(),
         )
         loader.load(path)
-        base = _max_episode_index(policy_bc_transitions) + 1
+        base = _max_episode_index(policy_vast_transitions) + 1
         warmup_transitions = list(loader._storage)  # noqa: SLF001 - read-only access
+        warmup_copies: list[Transition] = []
         for src in warmup_transitions:
             info = dict(src.info or {})
             if relabel_disc_reward:
@@ -129,7 +151,7 @@ def build_vast_finetune_buffer(
                     info.pop(key, None)
             info["episode_index"] = base + int(info.get("episode_index", 0))
             info.setdefault("buffer_role", "offline")
-            buffer.add(
+            warmup_copies.append(
                 Transition(
                     obs=src.obs,
                     action=src.action,
@@ -143,13 +165,31 @@ def build_vast_finetune_buffer(
                     demo_source=src.demo_source,
                 )
             )
+        if freeze_warmup_post_success:
+            stats["frozen_warmup_post_success_transitions"] = freeze_post_success_tail(
+                warmup_copies
+            )
+        for transition in warmup_copies:
+            buffer.add(transition)
         stats["warmup_transitions"] = len(warmup_transitions)
 
+    stats["absorbing_reward_mask_transitions"] = sum(
+        bool((transition.info or {}).get("frozen_post_success", False))
+        or bool((transition.info or {}).get("synthetic_vast_success_tail", False))
+        for transition in buffer._storage  # noqa: SLF001 - audit-only count
+    )
     stats["valid_windows"] = int(buffer.num_valid_sequences())
     logger.info(
-        "[offline][vast] finetune buffer: policy_bc=%d + warmup=%d transitions -> %d valid windows",
-        stats["policy_bc_transitions"],
+        "[offline][vast] finetune buffer: policy_source=%d -> policy_vast=%d "
+        "(synthetic_success_tail=%d, padded_success_sections=%d) + warmup=%d "
+        "(frozen_post_success=%d, reward_mask=%d) -> %d valid windows",
+        stats["policy_source_transitions"],
+        stats["policy_vast_transitions"],
+        stats["synthetic_success_tail_transitions"],
+        stats["padded_success_sections"],
         stats["warmup_transitions"],
+        stats["frozen_warmup_post_success_transitions"],
+        stats["absorbing_reward_mask_transitions"],
         stats["valid_windows"],
     )
     return buffer, stats

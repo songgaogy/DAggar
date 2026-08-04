@@ -392,6 +392,14 @@ def run_offline_training(cfg: DictConfig) -> None:
         initial_vast_ckpt = warmup_ckpt
     warmup_payload = torch.load(initial_vast_ckpt, map_location="cpu", weights_only=False)
     warmup_cfg = warmup_payload.get("cfg", {}) if isinstance(warmup_payload, dict) else {}
+    warmup_meta = (
+        warmup_payload.get("encoder_meta", {}) if isinstance(warmup_payload, dict) else {}
+    )
+    freeze_warmup_post_success = _as_bool(
+        warmup_meta.get("freeze_post_success", True)
+        if isinstance(warmup_meta, dict)
+        else True
+    )
     relabel_disc_reward = _as_bool(
         OmegaConf.select(
             cfg,
@@ -576,6 +584,7 @@ def run_offline_training(cfg: DictConfig) -> None:
             action_horizon=H,
             warmup_transitions_path=warmup_transitions_path,
             relabel_disc_reward=bool(reward_relabel_provenance["enabled"]),
+            freeze_warmup_post_success=freeze_warmup_post_success,
         )
         finetune_vast(
             vast_learner,
@@ -601,6 +610,7 @@ def run_offline_training(cfg: DictConfig) -> None:
             extra_meta={
                 "discriminator_checkpoint": nnpu_ckpt,
                 "disc_reward_relabel": reward_relabel_provenance,
+                "freeze_post_success": freeze_warmup_post_success,
             },
         )
         print(f"[offline][vast] finetuned VAST -> {vast_ckpt_path}")

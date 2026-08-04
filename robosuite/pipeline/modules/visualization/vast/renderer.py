@@ -45,6 +45,7 @@ from robosuite.pipeline.algorithms.vast.common import VASTConfig
 from robosuite.pipeline.algorithms.vast.data_util import (
     aggregate_chunk_reward,
     chunk_done_mask,
+    mask_absorbing_tail_rewards,
 )
 from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 from robosuite.pipeline.modules.visualization.vast.discriminator import (
@@ -702,6 +703,7 @@ def compute_metrics(
     use_disc_reward: bool,
     gae_lambda: float,
     vast_sampling_seed: int | None = None,
+    boundary_semantics: str = "benchmark",
 ) -> tuple[list[dict[str, float]], PerStepNNPUDisc]:
     """Compute per-window V/TD metrics and a per-frame nnPU failure series.
 
@@ -709,6 +711,11 @@ def compute_metrics(
     are already encoded for every sliding window, so it costs no extra encoder
     passes — only additional frozen-head evaluations.
     """
+    if boundary_semantics not in {"benchmark", "policy_update"}:
+        raise ValueError(
+            "boundary_semantics must be 'benchmark' or 'policy_update', "
+            f"got {boundary_semantics!r}"
+        )
     horizon = int(cfg.action_horizon)
     threshold = float(discriminator.threshold)
     starts = list(range(max(0, len(transitions) - horizon + 1)))
@@ -739,10 +746,51 @@ def compute_metrics(
     rewards_cpu = torch.tensor(
         [[float(item.reward or 0.0) for item in seq] for seq in sequences], dtype=torch.float32
     )
-    dones_cpu = torch.tensor(
-        [[float(bool((item.info or {}).get("success", False))) for item in seq] for seq in sequences],
+    success_cpu = torch.tensor(
+        [
+            [float(bool((item.info or {}).get("success", False))) for item in seq]
+            for seq in sequences
+        ],
         dtype=torch.float32,
     )
+    post_success_cpu = torch.tensor(
+        [
+            [
+                float(
+                    bool((item.info or {}).get("frozen_post_success", False))
+                    or bool(
+                        (item.info or {}).get("synthetic_vast_success_tail", False)
+                    )
+                )
+                for item in seq
+            ]
+            for seq in sequences
+        ],
+        dtype=torch.float32,
+    )
+    if boundary_semantics == "policy_update":
+        dones_cpu = torch.tensor(
+            [
+                [
+                    float(
+                        bool((item.info or {}).get("success", False))
+                        if "success" in (seq[0].info or {})
+                        else bool(item.done)
+                    )
+                    for item in seq
+                ]
+                for seq in sequences
+            ],
+            dtype=torch.float32,
+        )
+    else:
+        dones_cpu = torch.tensor(
+            [
+                [float(bool((item.info or {}).get("success", False))) for item in seq]
+                for seq in sequences
+            ],
+            dtype=torch.float32,
+        )
     # Per-frame nnPU traces for every window: (W, H).
     disc_failure_wh = np.zeros((num_windows, horizon), dtype=np.float32)
     disc_intrinsic_wh = np.zeros((num_windows, horizon), dtype=np.float32)
@@ -761,10 +809,11 @@ def compute_metrics(
         proprio = proprio_cpu[offset : offset + len(batch_starts)]
         actions = actions_cpu[offset : offset + len(batch_starts)]
         rewards = rewards_cpu[offset : offset + len(batch_starts)]
-        # Bootstrap terminal mask, mirroring VAST training (replay._build_step_batch):
-        # only a task-success frame is a true terminal. A truncated (e.g.
-        # fail_rollout) trajectory end keeps the γ^H·V(s') bootstrap, so the tail
-        # chunks' TD target stays on the same scale as the interior windows.
+        success = success_cpu[offset : offset + len(batch_starts)]
+        post_success = post_success_cpu[offset : offset + len(batch_starts)]
+        # Bootstrap terminal mask, mirroring VAST training
+        # (replay._build_step_batch). Benchmark truncations keep their bootstrap;
+        # policy sections use their materialized done boundary.
         dones = dones_cpu[offset : offset + len(batch_starts)]
         batch, _, views, channels, height, width = batch_images_np.shape
         images = _image_tensor(batch_images_np.reshape(batch * horizon, views, channels, height, width))
@@ -794,9 +843,14 @@ def compute_metrics(
             if use_disc_reward
             else torch.zeros_like(rewards)
         )
-        env_aggregated = aggregate_chunk_reward(rewards, float(cfg.discount))
+        env_steps = mask_absorbing_tail_rewards(rewards, success, post_success)
+        disc_steps = mask_absorbing_tail_rewards(disc_steps, success, post_success)
+        env_aggregated = aggregate_chunk_reward(env_steps, float(cfg.discount))
         disc_aggregated = aggregate_chunk_reward(disc_steps, float(cfg.discount))
-        total_steps = float(cfg.output_reward_coef) * rewards + float(cfg.disc_reward_coef) * disc_steps
+        total_steps = (
+            float(cfg.output_reward_coef) * env_steps
+            + float(cfg.disc_reward_coef) * disc_steps
+        )
         aggregated = aggregate_chunk_reward(total_steps, float(cfg.discount)).to(learner.cfg.device)
         done = chunk_done_mask(dones).to(learner.cfg.device)
         v_all = learner.v(state_features[:, 0])          # (B, N) per-head
@@ -810,12 +864,18 @@ def compute_metrics(
             td_target_val = float(td_target[index].item())
             done_flag = float(done[index].item()) > 0.5
             next_idx = int(start) + horizon
-            # Valid continuing s' only when bootstrap is used and s' is still a
-            # pre-success in-buffer frame. Otherwise V(s') is terminal/OOD and
-            # must not be plotted (raw values still stored for CSV).
+            # Valid continuing s' only when bootstrap is used and s' is not a
+            # post-success frame. In policy-update data, the transition carrying
+            # success starts from the final pre-success state, so next_idx equal
+            # to first_success_idx remains a valid bootstrap state.
             if done_flag:
                 has_valid_next = False
-            elif first_success_idx is not None and next_idx >= int(first_success_idx):
+            elif (
+                first_success_idx is not None
+                and next_idx
+                >= int(first_success_idx)
+                + (1 if boundary_semantics == "policy_update" else 0)
+            ):
                 has_valid_next = False
             elif next_idx >= len(transitions):
                 # Traj-end fallback next_obs: keep for fail (matches training
@@ -894,16 +954,30 @@ def compute_metrics(
     rng = np.random.default_rng(sampling_seed)
     max_k_cfg = int(getattr(cfg, "vast_max_k", 10))
     selections: list[tuple[int, int, int, bool]] = []
+    available_starts = set(starts)
+    rows_by_start = {int(row["window_start"]): row for row in rows}
+
+    def is_terminal(index: int) -> bool:
+        transition = transitions[index]
+        if boundary_semantics == "policy_update":
+            if "success" in (transitions[0].info or {}):
+                return bool((transition.info or {}).get("success", False))
+            return bool(transition.done)
+        return bool((transition.info or {}).get("success", False))
+
     for start in starts:
         max_k = 1
         for candidate_k in range(2, max_k_cfg + 1):
             previous_start = int(start) + (candidate_k - 2) * horizon
             previous_done = any(
-                bool((transitions[idx].info or {}).get("success", False))
-                for idx in range(previous_start, min(previous_start + horizon, len(transitions)))
+                is_terminal(idx)
+                for idx in range(
+                    previous_start,
+                    min(previous_start + horizon, len(transitions)),
+                )
             )
             last_macro_start = int(start) + (candidate_k - 1) * horizon
-            if previous_done or last_macro_start > len(transitions) - horizon:
+            if previous_done or last_macro_start not in available_starts:
                 break
             max_k = candidate_k
         fallback = max_k < 2
@@ -943,7 +1017,7 @@ def compute_metrics(
             row = rows[offset + local]
             k, j, future_idx, fallback = batch_select[local]
             done_span = any(
-                bool((transitions[idx].info or {}).get("success", False))
+                is_terminal(idx)
                 for idx in range(int(start), min(future_idx, len(transitions)))
             )
             gamma_kh = float(cfg.discount) ** (k * horizon)
@@ -952,21 +1026,15 @@ def compute_metrics(
             stitched_target = g_val + bootstrap
             stitched_advantage = stitched_target - float(current_v[local].item())
 
-            raw_return = 0.0
-            for step_offset, transition_idx in enumerate(
-                range(int(start), min(future_idx, len(transitions)))
-            ):
-                env_reward = float(transitions[transition_idx].reward or 0.0)
-                disc_reward = (
-                    float(per_step_disc.intrinsic_reward[transition_idx])
-                    if use_disc_reward and transition_idx < per_step_disc.num_frames
-                    else 0.0
+            raw_return = sum(
+                (float(cfg.discount) ** (macro_offset * horizon))
+                * float(
+                    rows_by_start[int(start) + macro_offset * horizon][
+                        "total_reward_horizon"
+                    ]
                 )
-                total_reward = (
-                    float(cfg.output_reward_coef) * env_reward
-                    + float(cfg.disc_reward_coef) * disc_reward
-                )
-                raw_return += (float(cfg.discount) ** step_offset) * total_reward
+                for macro_offset in range(k)
+            )
 
             composition_residual = float("nan")
             if not fallback:
@@ -1044,7 +1112,34 @@ def filter_nonoverlap_chunk_metrics(
     stride = int(action_horizon)
     if stride <= 0:
         raise ValueError(f"action_horizon must be positive, got {action_horizon}")
-    return [row for row in metrics if int(row["step"]) % stride == 0]
+    if not any("section_step" in row for row in metrics):
+        return [row for row in metrics if int(row["step"]) % stride == 0]
+
+    coordinate_keys = {
+        "step",
+        "window_start",
+        "source_round",
+        "source_episode_index",
+        "episode_index",
+        "section_index",
+        "section_step",
+        "is_intervention",
+        "valid_window",
+    }
+    filtered: list[dict[str, float]] = []
+    for row in metrics:
+        section_step = float(row.get("section_step", float("nan")))
+        valid = float(row.get("valid_window", 0.0)) > 0.5
+        if valid and np.isfinite(section_step) and int(section_step) % stride == 0:
+            filtered.append(row)
+            continue
+        placeholder = dict(row)
+        for key in placeholder:
+            if key not in coordinate_keys:
+                placeholder[key] = float("nan")
+        placeholder["valid_window"] = 0.0
+        filtered.append(placeholder)
+    return filtered
 
 
 def _save_value_diagnostics_png(
@@ -1076,6 +1171,14 @@ def _save_value_diagnostics_png(
         if has_gae
         else None
     )
+    advantage_policy = (
+        np.asarray(
+            [row.get("advantage_policy", np.nan) for row in metrics],
+            dtype=np.float32,
+        )
+        if any("advantage_policy" in row for row in metrics)
+        else None
+    )
     bootstrap_v = np.asarray([row["bootstrap_v"] for row in metrics], dtype=np.float32)
     env_rewards = np.asarray([row["env_reward_horizon"] for row in metrics], dtype=np.float32)
     total_rewards = np.asarray([row["total_reward_horizon"] for row in metrics], dtype=np.float32)
@@ -1097,13 +1200,14 @@ def _save_value_diagnostics_png(
     if bool(no_s_prime.any()):
         next_v = next_v.copy()
         td_target = td_target.copy()
-        advantage_td1 = advantage_td1.copy()
         bootstrap_v = bootstrap_v.copy()
         next_v[no_s_prime] = np.nan
         td_target[no_s_prime] = np.nan
-        advantage_td1[no_s_prime] = np.nan
         bootstrap_v[no_s_prime] = np.nan
-        if advantage_gae is not None:
+        if advantage_policy is None:
+            advantage_td1 = advantage_td1.copy()
+            advantage_td1[no_s_prime] = np.nan
+        if advantage_gae is not None and advantage_policy is None:
             advantage_gae = advantage_gae.copy()
             advantage_gae[no_s_prime] = np.nan
 
@@ -1151,6 +1255,14 @@ def _save_value_diagnostics_png(
         color="tab:red",
         alpha=0.85,
     )
+    if advantage_policy is not None:
+        axes[2].plot(
+            steps,
+            advantage_policy,
+            label="policy-update advantage",
+            color="black",
+            linewidth=1.5,
+        )
     if advantage_gae is not None:
         gae_label = (
             "advantage GAE(λ)"
@@ -1200,6 +1312,8 @@ def _save_value_diagnostics_png(
     axes[3].set_xlabel("step (window start)")
     axes[3].legend(loc="best")
     axes[3].grid(True, alpha=0.3)
+    if any("section_step" in row for row in metrics):
+        axes[3].set_xlim(float(np.nanmin(steps)), float(np.nanmax(steps)))
 
     fig.tight_layout()
     path_base.parent.mkdir(parents=True, exist_ok=True)
@@ -1246,10 +1360,15 @@ def _save_vast_stitching_png(
     axes[0].plot(steps, values["stitched_target"], label="stitched target", color="tab:orange")
     axes[0].set_ylabel("Stitched value")
 
+    stitched_label = (
+        "stitched advantage (diagnostic)"
+        if any("section_step" in row for row in metrics)
+        else "stitched advantage (Phase B)"
+    )
     axes[1].plot(
         steps,
         values["advantage_stitched"],
-        label="stitched advantage (Phase B)",
+        label=stitched_label,
         color="tab:blue",
     )
     axes[1].plot(steps, values["advantage_td1"], label="legacy TD1 / fallback", color="tab:red", alpha=0.7)
@@ -1289,6 +1408,8 @@ def _save_vast_stitching_png(
     for axis in axes:
         axis.legend(loc="best", fontsize=8)
         axis.grid(True, alpha=0.3)
+    if any("section_step" in row for row in metrics):
+        axes[3].set_xlim(float(np.nanmin(steps)), float(np.nanmax(steps)))
     fig.tight_layout()
     out_path = path_base.with_suffix(".png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1354,7 +1475,14 @@ def write_vast_current_future_video(
     flip_vertical: bool,
 ) -> Path | None:
     """Write side-by-side current and sampled future frames for VAST rows."""
-    if not rows or not any("future_frame_index" in row for row in rows):
+    rows = [
+        row
+        for row in rows
+        if "future_frame_index" in row
+        and np.isfinite(float(row["future_frame_index"]))
+        and np.isfinite(float(row.get("sampled_k", float("nan"))))
+    ]
+    if not rows:
         return None
     camera = str(camera_name or ("agentview" if "agentview" in camera_names else camera_names[0]))
     if camera not in camera_names:

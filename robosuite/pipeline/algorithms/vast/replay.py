@@ -10,7 +10,11 @@ import torch
 from tqdm import tqdm
 
 from .common import VASTActorBatch, VASTConfig, VASTStepBatch
-from .data_util import aggregate_chunk_reward, chunk_done_mask
+from .data_util import (
+    aggregate_chunk_reward,
+    chunk_done_mask,
+    mask_absorbing_tail_rewards,
+)
 
 # Opt-in timing instrumentation for the offline warmup preencode sweep. Enable
 # with WARMUP_PROFILE=1 to print a per-stage breakdown (gather / assemble /
@@ -318,6 +322,8 @@ class VASTReplayBuffer:
         actions: list[np.ndarray] = []          # each (H, D_a)
         rewards_per_step: list[np.ndarray] = []
         dones_per_step: list[np.ndarray] = []
+        success_per_step: list[np.ndarray] = []
+        post_success_per_step: list[np.ndarray] = []
         is_online: list[float] = []
         is_intervention: list[float] = []
         episode_ids: list[int] = []
@@ -369,6 +375,24 @@ class VASTReplayBuffer:
                     step_dones[-1] = 1.0
             rewards_per_step.append(step_rewards)
             dones_per_step.append(step_dones)
+            success_per_step.append(
+                np.asarray(
+                    [bool((item.info or {}).get("success", False)) for item in sequence],
+                    dtype=np.float32,
+                )
+            )
+            post_success_per_step.append(
+                np.asarray(
+                    [
+                        bool((item.info or {}).get("frozen_post_success", False))
+                        or bool(
+                            (item.info or {}).get("synthetic_vast_success_tail", False)
+                        )
+                        for item in sequence
+                    ],
+                    dtype=np.float32,
+                )
+            )
             info = first.info or {}
             episode_ids.append(int(info.get("episode_index", -1)))
             episode_steps.append(int(info.get("episode_step", -1)))
@@ -384,6 +408,8 @@ class VASTReplayBuffer:
         action_np = np.stack(actions, axis=0)                       # (B, H, D_a)
         rewards_np = np.stack(rewards_per_step, axis=0)             # (B, H)
         dones_np = np.stack(dones_per_step, axis=0)                 # (B, H)
+        success_np = np.stack(success_per_step, axis=0)             # (B, H)
+        post_success_np = np.stack(post_success_per_step, axis=0)   # (B, H)
 
         V, C, Hi, Wi = chunk_images_np.shape[2:]
         chunk_images_tensor = _to_image_tensor(
@@ -402,6 +428,12 @@ class VASTReplayBuffer:
         done_tensor = torch.from_numpy(np.ascontiguousarray(dones_np)).to(
             device=device, dtype=torch.float32
         )
+        success_tensor = torch.from_numpy(np.ascontiguousarray(success_np)).to(
+            device=device, dtype=torch.float32
+        )
+        post_success_tensor = torch.from_numpy(
+            np.ascontiguousarray(post_success_np)
+        ).to(device=device, dtype=torch.float32)
         is_online_tensor = torch.tensor(
             is_online, device=device, dtype=torch.float32
         ).unsqueeze(-1)
@@ -489,13 +521,27 @@ class VASTReplayBuffer:
             _t0 = time.perf_counter()
 
         r_total_chunk = effective_output_coef * reward_tensor + effective_disc_coef * r_disc_per_step
+        r_total_chunk = mask_absorbing_tail_rewards(
+            r_total_chunk,
+            success_tensor,
+            post_success_tensor,
+        )
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
         dones = chunk_done_mask(done_tensor)
 
         disc_meta: dict[str, float] = {}
         if effective_disc_coef != 0.0 and (use_precomputed_disc or discriminator is not None):
-            disc_meta["disc_reward_first_frame_mean"] = float(r_disc_per_step[:, 0].mean().item())
-            disc_meta["disc_reward_chunk_mean"] = float(r_disc_per_step.mean().item())
+            effective_disc_reward = mask_absorbing_tail_rewards(
+                r_disc_per_step,
+                success_tensor,
+                post_success_tensor,
+            )
+            disc_meta["disc_reward_first_frame_mean"] = float(
+                effective_disc_reward[:, 0].mean().item()
+            )
+            disc_meta["disc_reward_chunk_mean"] = float(
+                effective_disc_reward.mean().item()
+            )
 
         batch = VASTStepBatch(
             chunk_feature=chunk_feature,

@@ -11,6 +11,7 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.workflow import RunLayout
+from robosuite.pipeline.workflow.state import load_json
 
 
 def _select(cfg: DictConfig, key: str, default: Any) -> Any:
@@ -28,6 +29,29 @@ def _resolve_warmup_path(value: str | Path) -> Path:
     if path.is_dir():
         path = path / "vast_offline_transitions.pt"
     return _require_file(path, label="VAST warmup replay")
+
+
+def _resolve_online_episode_paths(
+    layout: RunLayout,
+    round_index: int,
+) -> list[Path]:
+    state = load_json(_require_file(layout.state_path, label="Run state"))
+    rounds = state.get("rounds", {})
+    paths: list[Path] = []
+    for index in range(int(round_index) + 1):
+        key = f"{index:03d}"
+        try:
+            collection = rounds[key]["stages"]["collection"]
+            relative = collection["outputs"]["episodes"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Round {key} has no completed collection episodes in {layout.state_path}."
+            ) from exc
+        path = Path(str(relative))
+        if not path.is_absolute():
+            path = layout.root / path
+        paths.append(_require_file(path, label=f"Round {key} online episodes"))
+    return paths
 
 
 def build_commands(
@@ -52,7 +76,6 @@ def build_commands(
         round_dir / "disc" / "checkpoints" / "pu_bce_head_finetuned.pth",
         label="Discriminator checkpoint",
     )
-    warmup = _resolve_warmup_path(str(cfg.task.inputs.vast_warmup_transitions))
     seeds = (
         [int(seed) for seed in seeds]
         if seeds is not None
@@ -72,27 +95,80 @@ def build_commands(
         if split is not None
         else _select(cfg, "visualization.vast.split", "fail_rollout")
     )
-    gae_lambda = float(_select(cfg, "visualization.vast.gae_lambda", 0.9))
+    is_online = split.strip().lower() == "online"
+    warmup = (
+        None
+        if is_online
+        else _resolve_warmup_path(str(cfg.task.inputs.vast_warmup_transitions))
+    )
+    online_episodes = (
+        _resolve_online_episode_paths(layout, round_index) if is_online else []
+    )
+    gae_lambda = float(
+        _select(
+            cfg,
+            "task.policy.advantage.gae_lambda"
+            if is_online
+            else "visualization.vast.gae_lambda",
+            0.6 if is_online else 0.9,
+        )
+    )
     output_root = layout.vast_eval_vis_dir(round_index)
     commands: list[list[str]] = []
     for seed in seeds:
         command = [
             sys.executable,
             "-m",
-            "robosuite.pipeline.modules.visualization.vast.cli",
+            (
+                "robosuite.pipeline.modules.visualization.vast.online"
+                if is_online
+                else "robosuite.pipeline.modules.visualization.vast.cli"
+            ),
             "--vast-ckpt", str(vast_checkpoint),
             "--disc-ckpt", str(disc_checkpoint),
-            "--offline-buffer", str(warmup),
             "--task-data-name", str(cfg.task.name),
             "--split", split,
             "--seed", str(seed),
             "--device", device,
             "--output-root", str(output_root),
             "--gae-lambda", str(gae_lambda),
-            "--video-fps", str(_select(cfg, "visualization.vast.video_fps", cfg.environment.control_frequency)),
-            "--disc-viz-image-size", str(_select(cfg, "visualization.vast.discriminator_image_size", 256)),
-            "--disc-viz-border-thickness", str(_select(cfg, "visualization.vast.discriminator_border_thickness", 10)),
+            "--video-fps",
+            str(
+                _select(
+                    cfg,
+                    "visualization.vast.video_fps",
+                    cfg.environment.control_frequency,
+                )
+            ),
+            "--disc-viz-image-size",
+            str(_select(cfg, "visualization.vast.discriminator_image_size", 256)),
+            "--disc-viz-border-thickness",
+            str(
+                _select(
+                    cfg,
+                    "visualization.vast.discriminator_border_thickness",
+                    10,
+                )
+            ),
         ]
+        if is_online:
+            command.extend(
+                [
+                    "--online-episodes",
+                    *[str(path) for path in online_episodes],
+                    "--advantage-estimator",
+                    str(
+                        _select(cfg, "task.policy.advantage.estimator", "td1")
+                    ).strip().lower(),
+                    "--reward-success",
+                    str(_select(cfg, "task.policy.reward_success", 0.0)),
+                    "--reward-fail",
+                    str(_select(cfg, "task.policy.reward_failure", -1.0)),
+                ]
+            )
+        else:
+            assert warmup is not None
+            command.extend(["--offline-buffer", str(warmup)])
         max_windows = _select(cfg, "visualization.vast.max_windows", None)
         if max_windows is not None:
             command.extend(["--max-windows", str(max_windows)])
