@@ -572,7 +572,7 @@ def run_offline_training(cfg: DictConfig) -> None:
     # Phase A: VAST finetune (unfrozen).                                  #
     # ------------------------------------------------------------------ #
     warmup_transitions_path = _warmup_transitions_path(cfg, task_name)
-    vast_buffer_stats: dict[str, int] = {}
+    vast_buffer_stats: dict[str, Any] = {}
     if skip_rl:
         vast_ckpt_path = Path(initial_vast_ckpt)
         print(f"[offline][vast] using frozen finetuned VAST checkpoint {vast_ckpt_path}")
@@ -583,6 +583,9 @@ def run_offline_training(cfg: DictConfig) -> None:
             image_size=img_height,
             action_horizon=H,
             warmup_transitions_path=warmup_transitions_path,
+            reward_failure=float(
+                OmegaConf.select(cfg, "offline.reward_fail", default=-1.0)
+            ),
             relabel_disc_reward=bool(reward_relabel_provenance["enabled"]),
             freeze_warmup_post_success=freeze_warmup_post_success,
         )

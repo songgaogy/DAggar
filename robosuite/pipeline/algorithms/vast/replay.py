@@ -287,7 +287,7 @@ class VASTReplayBuffer:
             k=k_tensor,
             j=j_tensor,
             k_step_returns=torch.stack(returns, dim=0),
-            mc_mask=(k_tensor >= 2).to(flat.rewards.dtype),
+            mc_mask=torch.ones_like(k_tensor),
             future_dones=torch.stack(path_dones, dim=0),
         ).to(device)
 
@@ -520,27 +520,30 @@ class VASTReplayBuffer:
             _PROFILE_TIMES["disc"] += time.perf_counter() - _t0
             _t0 = time.perf_counter()
 
-        r_total_chunk = effective_output_coef * reward_tensor + effective_disc_coef * r_disc_per_step
-        r_total_chunk = mask_absorbing_tail_rewards(
-            r_total_chunk,
+        r_env_per_step = mask_absorbing_tail_rewards(
+            reward_tensor,
             success_tensor,
             post_success_tensor,
+        )
+        r_disc_per_step = mask_absorbing_tail_rewards(
+            r_disc_per_step,
+            success_tensor,
+            post_success_tensor,
+        )
+        r_total_chunk = (
+            effective_output_coef * r_env_per_step
+            + effective_disc_coef * r_disc_per_step
         )
         rewards = aggregate_chunk_reward(r_total_chunk, float(self.cfg.discount))
         dones = chunk_done_mask(done_tensor)
 
         disc_meta: dict[str, float] = {}
         if effective_disc_coef != 0.0 and (use_precomputed_disc or discriminator is not None):
-            effective_disc_reward = mask_absorbing_tail_rewards(
-                r_disc_per_step,
-                success_tensor,
-                post_success_tensor,
-            )
             disc_meta["disc_reward_first_frame_mean"] = float(
-                effective_disc_reward[:, 0].mean().item()
+                r_disc_per_step[:, 0].mean().item()
             )
             disc_meta["disc_reward_chunk_mean"] = float(
-                effective_disc_reward.mean().item()
+                r_disc_per_step.mean().item()
             )
 
         batch = VASTStepBatch(
@@ -955,7 +958,7 @@ class VASTPreencodedReplayCache:
             k=k_tensor,
             j=j_tensor,
             k_step_returns=returns,
-            mc_mask=(k_tensor >= 2).to(self.rewards.dtype),
+            mc_mask=torch.ones_like(k_tensor),
             future_dones=future_dones,
         )
         return batch.to(device)

@@ -945,6 +945,8 @@ def run_vast_warmup(cfg: DictConfig) -> None:
             "vast_v_mode": str(vast_cfg.vast_v_mode),
             "vast_max_k": int(vast_cfg.vast_max_k),
             "vast_comp_coef": float(vast_cfg.vast_comp_coef),
+            "g_mc_min_k": 1,
+            "g_comp_min_k": 2,
             "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
             "action_horizon": int(vast_cfg.action_horizon),
         },

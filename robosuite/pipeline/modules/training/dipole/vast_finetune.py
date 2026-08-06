@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,7 +33,7 @@ from robosuite.pipeline.algorithms.vast.checkpoint import (
 )
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
 from robosuite.pipeline.algorithms.vast.data_util import (
-    clone_with_absorbing_success_tail,
+    clone_with_vast_absorbing_tails,
     freeze_post_success_tail,
 )
 from robosuite.pipeline.algorithms.vast.replay import VASTReplayBuffer
@@ -63,14 +64,16 @@ def build_vast_finetune_buffer(
     image_size: int,
     action_horizon: int,
     warmup_transitions_path: str | Path | None,
+    reward_failure: float = -1.0,
     relabel_disc_reward: bool = False,
     freeze_warmup_post_success: bool = True,
     capacity: int = 10_000_000,
-) -> tuple[FlowDaggerReplayBuffer, dict[str, int]]:
+) -> tuple[FlowDaggerReplayBuffer, dict[str, Any]]:
     """Mix collected policy sections with the warmup transitions into one buffer.
 
     Policy transitions are copied before successful sections receive a VAST-only
-    absorbing tail, so the policy-BC stream remains unchanged.
+    terminal tail and all non-success endings receive a continuing failure tail,
+    so the policy-BC stream remains unchanged.
     ``warmup_transitions_path`` points at the ``vast_offline_transitions.pt`` the
     VAST warmup exported (``FlowDaggerReplayBuffer``-serialized). Its transitions
     are copied and re-stamped into a disjoint episode range. When the source
@@ -86,14 +89,25 @@ def build_vast_finetune_buffer(
         image_size=int(image_size),
         augmentation_config=FlowAugmentationConfig(),
     )
-    policy_vast_transitions, synthetic_tail_count, padded_success_sections = (
-        clone_with_absorbing_success_tail(
-            policy_bc_transitions,
-            int(action_horizon),
-        )
+    (
+        policy_vast_transitions,
+        synthetic_tail_count,
+        padded_success_sections,
+        synthetic_failure_count,
+        padded_failure_sections,
+    ) = clone_with_vast_absorbing_tails(
+        policy_bc_transitions,
+        int(action_horizon),
+        reward_failure=float(reward_failure),
     )
     for transition in policy_vast_transitions:
         buffer.add(transition)
+    failure_sections_by_reason = Counter(
+        str((transition.info or {}).get("policy_section_end_reason", "unknown"))
+        for transition in policy_vast_transitions
+        if bool((transition.info or {}).get("synthetic_vast_failure_tail", False))
+        and bool(transition.done)
+    )
 
     stats = {
         "policy_bc_transitions": len(policy_bc_transitions),
@@ -101,6 +115,11 @@ def build_vast_finetune_buffer(
         "policy_vast_transitions": len(policy_vast_transitions),
         "synthetic_success_tail_transitions": int(synthetic_tail_count),
         "padded_success_sections": int(padded_success_sections),
+        "synthetic_failure_tail_transitions": int(synthetic_failure_count),
+        "padded_failure_sections": int(padded_failure_sections),
+        "failure_absorbing_boundary_windows": int(padded_failure_sections),
+        "synthetic_failure_disc_reward_transitions": int(synthetic_failure_count),
+        "padded_failure_sections_by_reason": dict(failure_sections_by_reason),
         "warmup_transitions": 0,
         "frozen_warmup_post_success_transitions": 0,
         "absorbing_reward_mask_transitions": 0,
@@ -181,17 +200,25 @@ def build_vast_finetune_buffer(
     stats["valid_windows"] = int(buffer.num_valid_sequences())
     logger.info(
         "[offline][vast] finetune buffer: policy_source=%d -> policy_vast=%d "
-        "(synthetic_success_tail=%d, padded_success_sections=%d) + warmup=%d "
+        "(synthetic_success_tail=%d, padded_success_sections=%d, "
+        "synthetic_failure_tail=%d, padded_failure_sections=%d) + warmup=%d "
         "(frozen_post_success=%d, reward_mask=%d) -> %d valid windows",
         stats["policy_source_transitions"],
         stats["policy_vast_transitions"],
         stats["synthetic_success_tail_transitions"],
         stats["padded_success_sections"],
+        stats["synthetic_failure_tail_transitions"],
+        stats["padded_failure_sections"],
         stats["warmup_transitions"],
         stats["frozen_warmup_post_success_transitions"],
         stats["absorbing_reward_mask_transitions"],
         stats["valid_windows"],
     )
+    if failure_sections_by_reason:
+        logger.info(
+            "[offline][vast] padded failure sections by reason: %s",
+            dict(failure_sections_by_reason),
+        )
     return buffer, stats
 
 
@@ -294,6 +321,8 @@ def save_finetuned_vast(
         "vast_v_mode": str(vast_cfg.vast_v_mode),
         "vast_max_k": int(vast_cfg.vast_max_k),
         "vast_comp_coef": float(vast_cfg.vast_comp_coef),
+        "g_mc_min_k": 1,
+        "g_comp_min_k": 2,
         "vast_sampling_seed": int(vast_cfg.vast_sampling_seed),
         "action_horizon": int(vast_cfg.action_horizon),
         "v_ensemble_size": int(vast_learner.ensemble_size),

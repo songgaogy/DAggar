@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from robosuite.pipeline.algorithms.vast.data_util import (
-    clone_with_absorbing_success_tail,
+    clone_with_vast_absorbing_tails,
 )
 from robosuite.pipeline.common.episodes import load_round_episode_payloads
 from robosuite.pipeline.common.types import Transition
@@ -186,9 +187,10 @@ def materialize_policy_sections(
         grouped.setdefault(section_index, []).append(transition)
     sections: list[list[Transition]] = []
     for index in sorted(grouped):
-        section, _, _ = clone_with_absorbing_success_tail(
+        section, _, _, _, _ = clone_with_vast_absorbing_tails(
             grouped[index],
             int(action_horizon),
+            reward_failure=float(reward_fail),
         )
         sections.append(section)
     return sections
@@ -248,18 +250,22 @@ def assemble_online_metrics(
     ):
         local_rows, _ = result
         for section_step, transition in enumerate(section):
-            if bool(
-                (transition.info or {}).get("synthetic_vast_success_tail", False)
+            info = transition.info or {}
+            if bool(info.get("synthetic_vast_success_tail", False)) or bool(
+                info.get("synthetic_vast_failure_tail", False)
             ):
                 continue
-            source_step = int((transition.info or {})["source_frame_index"])
+            source_step = int(info["source_frame_index"])
             rows[source_step]["section_index"] = float(section_index)
             rows[source_step]["section_step"] = float(section_step)
         for local_row in local_rows:
             section_step = int(local_row["step"])
-            source_step = int(
-                (section[section_step].info or {})["source_frame_index"]
-            )
+            start_info = section[section_step].info or {}
+            if bool(start_info.get("synthetic_vast_success_tail", False)) or bool(
+                start_info.get("synthetic_vast_failure_tail", False)
+            ):
+                continue
+            source_step = int(start_info["source_frame_index"])
             mapped = dict(rows[source_step])
             mapped.update(local_row)
             mapped["step"] = float(source_step)
@@ -277,11 +283,10 @@ def assemble_online_metrics(
             future_local = float(local_row.get("future_frame_index", np.nan))
             if np.isfinite(future_local) and int(future_local) < len(section):
                 future_transition = section[int(future_local)]
+                future_info = future_transition.info or {}
                 if bool(
-                    (future_transition.info or {}).get(
-                        "synthetic_vast_success_tail", False
-                    )
-                ):
+                    future_info.get("synthetic_vast_success_tail", False)
+                ) or bool(future_info.get("synthetic_vast_failure_tail", False)):
                     mapped["future_frame_index"] = float("nan")
                 else:
                     mapped["future_frame_index"] = float(
@@ -524,6 +529,13 @@ def main() -> None:
         "blank_score_frames": int(len(original) - assembly.annotation_mask.sum()),
         "policy_section_count": int(len(sections)),
         "computed_windows": int(assembly.computed_windows),
+        "internal_computed_windows": int(
+            sum(len(local_rows) for local_rows, _ in section_results)
+        ),
+        "excluded_synthetic_window_starts": int(
+            sum(len(local_rows) for local_rows, _ in section_results)
+            - assembly.computed_windows
+        ),
         "synthetic_success_tail_transitions": int(
             sum(
                 bool(
@@ -546,6 +558,72 @@ def main() -> None:
                     for transition in section
                 )
                 for section in sections
+            )
+        ),
+        "synthetic_failure_tail_transitions": int(
+            sum(
+                bool(
+                    (transition.info or {}).get(
+                        "synthetic_vast_failure_tail", False
+                    )
+                )
+                for section in sections
+                for transition in section
+            )
+        ),
+        "padded_failure_sections": int(
+            sum(
+                any(
+                    bool(
+                        (transition.info or {}).get(
+                            "synthetic_vast_failure_tail", False
+                        )
+                    )
+                    for transition in section
+                )
+                for section in sections
+            )
+        ),
+        "failure_absorbing_boundary_windows": int(
+            sum(
+                any(
+                    bool(
+                        (transition.info or {}).get(
+                            "synthetic_vast_failure_tail", False
+                        )
+                    )
+                    for transition in section
+                )
+                for section in sections
+            )
+        ),
+        "synthetic_failure_disc_reward_transitions": int(
+            sum(
+                bool(
+                    (transition.info or {}).get(
+                        "synthetic_vast_failure_tail", False
+                    )
+                )
+                for section in sections
+                for transition in section
+            )
+        ),
+        "padded_failure_sections_by_reason": dict(
+            Counter(
+                str(
+                    (section[-1].info or {}).get(
+                        "policy_section_end_reason", "unknown"
+                    )
+                )
+                for section in sections
+                if any(
+                    bool(
+                        (transition.info or {}).get(
+                            "synthetic_vast_failure_tail", False
+                        )
+                    )
+                    for transition in section
+                )
             )
         ),
         "absorbing_reward_mask_transitions": int(

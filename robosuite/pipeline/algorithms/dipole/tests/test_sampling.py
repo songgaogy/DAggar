@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from robosuite.pipeline.algorithms.dipole.agent import DipoleAgent
 from robosuite.pipeline.algorithms.dipole.common import DipoleBatch
 from robosuite.pipeline.algorithms.dipole.models.flow import (
     DipoleFlowPolicy,
@@ -170,6 +171,30 @@ def test_zero_omega_uses_only_positive_policy() -> None:
     # omega=0 => positive policy only; the negative policy is never touched.
     assert model_pos.flow_head.calls == 6
     assert model_neg.flow_head.calls == 0
+
+
+def test_agent_online_actions_enable_configured_guidance() -> None:
+    class _Core:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def select_action(self, **kwargs):
+            self.calls.append(("select", kwargs))
+            return "action"
+
+        def plan_action_chunk(self, **kwargs):
+            self.calls.append(("plan", kwargs))
+            return "chunk"
+
+    agent = DipoleAgent.__new__(DipoleAgent)
+    agent.core = _Core()
+
+    assert agent.select_action("obs", deterministic=True) == "action"
+    assert agent.plan_action_chunk("obs", deterministic=False) == "chunk"
+    assert agent.core.calls == [
+        ("select", {"obs": "obs", "deterministic": True, "guided": True}),
+        ("plan", {"obs": "obs", "deterministic": False, "guided": True}),
+    ]
 
 
 class _FakeUpdateModel(nn.Module):

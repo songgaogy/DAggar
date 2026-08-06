@@ -222,6 +222,7 @@ def collection_stage_config(
         discriminator_checkpoint=discriminator_checkpoint,
         encoder_checkpoint=encoder_checkpoint,
     )
+    algorithm["dipole"]["guidance_omega"] = float(cfg.collection.omega)
     collection = cfg.collection
     collection_seed = int(cfg.seed) + int(round_index) * int(collection.num_episodes)
     output = output_path or "offline_episodes.pt"

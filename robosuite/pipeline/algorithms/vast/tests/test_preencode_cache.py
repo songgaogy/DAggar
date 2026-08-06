@@ -18,6 +18,7 @@ import torch
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
 from robosuite.pipeline.algorithms.vast.data_util import (
     clone_with_absorbing_success_tail,
+    clone_with_vast_absorbing_tails,
     mask_absorbing_tail_rewards,
 )
 from robosuite.pipeline.algorithms.vast.replay import (
@@ -140,8 +141,16 @@ def _assert_batches_equal(a, b) -> None:
         "dones",
         "is_online",
         "is_intervention",
+        "future_v_state_feature",
+        "intermediate_v_state_feature",
+        "k",
+        "j",
+        "k_step_returns",
+        "mc_mask",
+        "future_dones",
     ):
         ta, tb = getattr(a, name), getattr(b, name)
+        assert ta is not None and tb is not None
         assert torch.equal(ta, tb), f"field '{name}' differs:\n{ta}\nvs\n{tb}"
 
 
@@ -300,11 +309,12 @@ def test_absorbing_success_tail_masks_env_and_live_disc_rewards() -> None:
     replay = VASTReplayBuffer(base_buffer=base, cfg=cfg)
     starts = list(range(5))
     sequences = [base._storage[start : start + horizon] for start in starts]
+    discriminator = ConstantDiscriminator()
     batch = replay._build_step_batch(
         sequences,
         starts,
         encoder=_FakeEncoder(),
-        discriminator=ConstantDiscriminator(),
+        discriminator=discriminator,
         device=DEVICE,
     )
 
@@ -344,3 +354,92 @@ def test_absorbing_success_tail_masks_env_and_live_disc_rewards() -> None:
         torch.tensor([[1.0, 1.0]], device=DEVICE),
     )
     torch.testing.assert_close(masked, torch.zeros_like(masked))
+
+
+def test_absorbing_failure_tail_pads_env_and_disc_rewards() -> None:
+    horizon = 2
+    base = _FakeBase(n=3)
+    base.action_horizon = horizon
+    for step, transition in enumerate(base._storage):
+        transition.reward = -1.0
+        transition.done = step == 2
+        transition.info = {
+            "episode_index": 0,
+            "episode_step": step,
+            "success": False,
+            "policy_section_end_reason": "ended_human_intervention",
+        }
+    expanded, _, _, synthetic_count, padded_count = (
+        clone_with_vast_absorbing_tails(base._storage, horizon)
+    )
+    base._storage = expanded
+
+    class ConstantDiscriminator:
+        @staticmethod
+        def intrinsic_reward(*, chunk_feature):
+            return torch.full(
+                chunk_feature.shape[:2],
+                -2.0,
+                device=chunk_feature.device,
+                dtype=chunk_feature.dtype,
+            )
+
+    cfg = VASTConfig(
+        action_horizon=horizon,
+        discount=0.5,
+        output_reward_coef=1.0,
+        disc_reward_coef=0.5,
+        vast_max_k=1,
+        device=DEVICE,
+    )
+    replay = VASTReplayBuffer(base_buffer=base, cfg=cfg)
+    starts = [1, 2, 3]
+    sequences = [base._storage[start : start + horizon] for start in starts]
+    batch = replay._build_step_batch(
+        sequences,
+        starts,
+        encoder=_FakeEncoder(),
+        discriminator=ConstantDiscriminator(),
+        device=DEVICE,
+    )
+
+    assert synthetic_count == horizon
+    assert padded_count == 1
+    torch.testing.assert_close(batch.dones, torch.zeros_like(batch.dones))
+    torch.testing.assert_close(
+        batch.rewards[:, 0],
+        torch.full((3,), -3.0, device=DEVICE),
+    )
+    failure_value = (-1.0 + cfg.disc_reward_coef * -2.0) / (
+        1.0 - cfg.discount
+    )
+    boundary_target = batch.rewards[-1, 0] + (cfg.discount**horizon) * failure_value
+    assert boundary_target.item() == pytest.approx(failure_value)
+    assert torch.equal(
+        batch.next_v_state_feature[1],
+        batch.next_v_state_feature[2],
+    )
+
+    for transition in base._storage:
+        info = dict(transition.info or {})
+        info["nnpu_disc_intrinsic"] = -2.0
+        transition.info = info
+    cached = replay._build_step_batch(
+        sequences,
+        starts,
+        encoder=_FakeEncoder(),
+        device=DEVICE,
+    )
+    torch.testing.assert_close(cached.rewards, batch.rewards)
+
+    base._get_valid_start_indices_locked = lambda: [0, 1, 2, 3]
+    cache = replay.preencode_step_cache(
+        encoder=_FakeEncoder(),
+        device=DEVICE,
+        encode_batch_size=4,
+        cache_device=DEVICE,
+    )
+    torch.testing.assert_close(
+        cache.rewards[1:, 0],
+        torch.full((3,), -3.0, device=DEVICE),
+    )

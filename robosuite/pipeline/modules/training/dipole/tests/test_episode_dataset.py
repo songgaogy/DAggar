@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from robosuite.pipeline.modules.training.dipole.episode_dataset import (
     build_offline_transitions,
 )
 
 
-def _episode(interventions: list[bool]) -> dict:
+def _episode(
+    interventions: list[bool],
+    *,
+    terminal_reason: str = "success",
+) -> dict:
     length = len(interventions)
     obs = {
         "state": np.zeros((length, 3), dtype=np.float32),
         "agentview": np.zeros((length, 4, 4, 3), dtype=np.uint8),
     }
     success = np.zeros(length, dtype=np.bool_)
-    success[-1] = True
+    success[-1] = terminal_reason == "success"
     actions = np.zeros((length, 2), dtype=np.float32)
     done = np.zeros(length, dtype=np.bool_)
     done[-1] = True
@@ -26,7 +31,7 @@ def _episode(interventions: list[bool]) -> dict:
         "is_intervention": np.asarray(interventions, dtype=np.bool_),
         "success": success,
         "done": done,
-        "terminal_reason": "success",
+        "terminal_reason": terminal_reason,
     }
 
 
@@ -75,6 +80,11 @@ def test_intervention_boundary_keeps_success_metadata_for_truncation() -> None:
     ]
     assert [transition.reward for transition in before] == [-1.0, -1.0, -1.0]
     assert all((transition.info or {})["success"] is False for transition in before)
+    assert all(
+        (transition.info or {})["policy_section_end_reason"]
+        == "ended_human_intervention"
+        for transition in before
+    )
     assert [transition.done for transition in before] == [False, False, True]
 
     assert [int((transition.info or {})["source_frame_index"]) for transition in after] == [
@@ -88,3 +98,38 @@ def test_intervention_boundary_keeps_success_metadata_for_truncation() -> None:
         False,
         True,
     ]
+    assert all(
+        (transition.info or {})["policy_section_end_reason"] == "success"
+        for transition in after
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_reason",
+    ["env_done", "max_steps", "manual_reset", "worker_exception"],
+)
+def test_non_success_final_policy_section_is_kept_as_failure(
+    terminal_reason: str,
+) -> None:
+    streams = _build(
+        _episode([False, False, False], terminal_reason=terminal_reason)
+    )
+
+    assert len(streams.policy_bc) == 3
+    assert [transition.reward for transition in streams.policy_bc] == [-1.0] * 3
+    assert all(
+        (transition.info or {})["success"] is False
+        for transition in streams.policy_bc
+    )
+    assert all(
+        (transition.info or {})["policy_section_end_reason"] == terminal_reason
+        for transition in streams.policy_bc
+    )
+    assert streams.stats["keep_reasons"][terminal_reason] == 1
+
+
+def test_short_non_success_policy_section_is_still_dropped() -> None:
+    streams = _build(_episode([False], terminal_reason="env_done"))
+
+    assert streams.policy_bc == []
+    assert streams.stats["policy_sections_dropped_short"] == 1

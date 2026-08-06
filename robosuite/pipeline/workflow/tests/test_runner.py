@@ -189,6 +189,16 @@ def test_refresh_run_config_uses_latest_settings_and_manifest_inputs(
     )
 
 
+def test_collection_omega_defaults_to_zero_and_reaches_stage_config() -> None:
+    cfg = runner.load_default_config(task="PickPlaceCereal")
+    assert float(cfg.collection.omega) == 0.0
+
+    cfg.collection.omega = 0.75
+    stage_cfg = runner.collection_stage_config(cfg, round_index=0)
+
+    assert float(stage_cfg.algorithm.dipole.guidance_omega) == 0.75
+
+
 def test_all_training_stages_refresh_latest_config(tmp_path, monkeypatch) -> None:
     layout = _layout(tmp_path)
     base = runner.load_default_config(task="PickPlaceCereal")

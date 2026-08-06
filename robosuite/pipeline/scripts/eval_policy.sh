@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260804_132203"
+RUN_ROOT="outputs/dipole/PickPlaceCereal/w0_explore_20260804_233553"
 ROUND="000"
 CHECKPOINT="${RUN_ROOT}/rounds/${ROUND}/policy/checkpoints/latest.pt"
 INIT_CHECKPOINT="${RUN_ROOT}/inputs/checkpoints/base_policy.pt"
@@ -18,6 +18,7 @@ DEVICE="cuda:0"
 
 cd "$ROOT_DIR"
 export MUJOCO_GL="egl"
+export CUDA_VISIBLE_DEVICES=0
 
 for OMEGA in "${OMEGA[@]}"; do
     echo ">>> Evaluating policy with omega = $OMEGA"

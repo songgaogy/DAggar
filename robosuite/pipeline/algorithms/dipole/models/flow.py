@@ -36,9 +36,9 @@ def _sample_guided_action_sequence(
 ) -> torch.Tensor:
     """CFG-style guided sampling over two independent flow policies.
 
-    ``v = (1 + omega) * v_pos - omega * v_neg``. With ``omega == 0`` (online
-    rollout / ``guided=False``) only the positive policy runs -- the negative
-    policy is never encoded or forwarded, halving the per-ODE-step cost.
+    ``v = (1 + omega) * v_pos - omega * v_neg``. With ``omega == 0`` only the
+    positive policy runs -- the negative policy is never encoded or forwarded,
+    halving the per-ODE-step cost.
     """
     batch_size = proprio.shape[0]
     if deterministic:
@@ -97,8 +97,7 @@ class DipoleFlowPolicy:
     to this via :meth:`_compute_branch_weights`.
 
     Evaluation combines the two policies with CFG-style guidance
-    ``v=(1+omega)v_pos-omega v_neg``; online rollout uses the positive policy
-    only (``omega=0``).
+    ``v=(1+omega)v_pos-omega v_neg``; ``omega=0`` uses the positive policy only.
     """
 
     def __init__(
@@ -299,7 +298,7 @@ class DipoleFlowPolicy:
         Mirrors the inference path inside :meth:`select_action` but returns the full
         un-normalized ``(horizon, action_dim)`` chunk, so callers (e.g. the live
         discriminator display) can feed it to a G provider. ``guided=False`` plans
-        with the positive policy only, matching online rollout.
+        with the positive policy only.
         """
         omega = float(self.config.guidance_omega) if guided else 0.0
         image_tensor, proprio_tensor = self._prepare_inference_inputs(obs)

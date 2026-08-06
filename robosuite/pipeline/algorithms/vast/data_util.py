@@ -7,9 +7,8 @@ Contents:
       episode; used to mask the bootstrap term γ^H · V(s').
     - `freeze_post_success_tail(transitions)`: collapse recorded post-success
       drift into one absorbing success anchor without changing episode layout.
-    - `clone_with_absorbing_success_tail(transitions, horizon)`: build a
-      VAST-only copy whose successful episodes have enough absorbing tail for
-      every chunk phase to receive terminal supervision.
+    - `clone_with_vast_absorbing_tails(transitions, horizon)`: build a VAST-only
+      copy with terminal success tails and continuing non-success self-loops.
     - `mask_absorbing_tail_rewards(...)`: zero mixed rewards after success.
 """
 
@@ -21,27 +20,37 @@ from typing import Any
 import torch
 
 
-def clone_with_absorbing_success_tail(
+def clone_with_vast_absorbing_tails(
     transitions: list[Any],
     horizon: int,
-) -> tuple[list[Any], int, int]:
-    """Clone transitions and complete successful episodes with absorbing tail.
+    *,
+    reward_failure: float = -1.0,
+    include_failure: bool = True,
+) -> tuple[list[Any], int, int, int, int]:
+    """Clone transitions and complete success / failure sections.
 
-    A successful episode receives enough synthetic frames to leave at least
-    ``horizon - 1`` frames after its first success. This makes every stride-1
-    chunk phase reach a terminal window. Inputs and their ``info`` dicts are
-    never mutated. Returns ``(copies, synthetic_count, padded_episode_count)``.
+    Successful episodes retain the existing ``H - 1`` zero-reward terminal
+    tail. Policy sections with any non-``success`` end reason receive ``H``
+    copies of a continuing failure boundary state with reward
+    ``reward_failure``. The extra failure frame beyond source coverage trains
+    the boundary self-loop itself. Inputs and their ``info`` dicts are never
+    mutated.
+
+    Returns ``(copies, success_frames, success_sections, failure_frames,
+    failure_sections)``.
     """
     horizon = int(horizon)
     if horizon < 1:
         raise ValueError(f"horizon must be positive, got {horizon}")
     if not transitions:
-        return [], 0, 0
+        return [], 0, 0, 0, 0
 
     copies = [replace(item, info=dict(item.info or {})) for item in transitions]
     expanded: list[Any] = []
-    synthetic_count = 0
-    padded_episode_count = 0
+    success_count = 0
+    success_sections = 0
+    failure_count = 0
+    failure_sections = 0
     episode_start = 0
     for index, transition in enumerate(copies):
         if not (bool(transition.done) or index == len(copies) - 1):
@@ -62,7 +71,11 @@ def clone_with_absorbing_success_tail(
                 episode[-1].done = False
                 anchor = episode[first_success]
                 anchor_info = dict(anchor.info or {})
-                last_step = int((episode[-1].info or {}).get("episode_step", len(episode) - 1))
+                last_step = int(
+                    (episode[-1].info or {}).get(
+                        "episode_step", len(episode) - 1
+                    )
+                )
                 for offset in range(missing_tail):
                     info = dict(anchor_info)
                     info["episode_step"] = last_step + offset + 1
@@ -82,12 +95,71 @@ def clone_with_absorbing_success_tail(
                             reward_source="vast_absorbing_success_tail",
                         )
                     )
-                synthetic_count += missing_tail
-                padded_episode_count += 1
+                success_count += missing_tail
+                success_sections += 1
+        elif include_failure and str(
+            (episode[-1].info or {}).get("policy_section_end_reason", "")
+        ) != "success":
+            episode[-1].done = False
+            anchor = episode[-1]
+            boundary_obs = anchor.next_obs
+            anchor_info = dict(anchor.info or {})
+            last_step = int(anchor_info.get("episode_step", len(episode) - 1))
+            for offset in range(horizon):
+                info = dict(anchor_info)
+                info.pop("nnpu_disc_intrinsic", None)
+                info.pop("nnpu_failure_score", None)
+                info.pop("nnpu_threshold", None)
+                info["episode_step"] = last_step + offset + 1
+                info["success"] = False
+                info["absorbing_failure"] = True
+                info["synthetic_vast_failure_tail"] = True
+                episode.append(
+                    replace(
+                        anchor,
+                        obs=boundary_obs,
+                        next_obs=boundary_obs,
+                        action=anchor.action,
+                        reward=float(reward_failure),
+                        done=offset == horizon - 1,
+                        is_intervention=False,
+                        info=info,
+                        reward_source="vast_absorbing_failure_tail",
+                    )
+                )
+            failure_count += horizon
+            failure_sections += 1
         expanded.extend(episode)
         episode_start = index + 1
 
     freeze_post_success_tail(expanded)
+    return (
+        expanded,
+        success_count,
+        success_sections,
+        failure_count,
+        failure_sections,
+    )
+
+
+def clone_with_absorbing_success_tail(
+    transitions: list[Any],
+    horizon: int,
+) -> tuple[list[Any], int, int]:
+    """Clone transitions and complete successful episodes with absorbing tail.
+
+    A successful episode receives enough synthetic frames to leave at least
+    ``horizon - 1`` frames after its first success. This makes every stride-1
+    chunk phase reach a terminal window. Inputs and their ``info`` dicts are
+    never mutated. Returns ``(copies, synthetic_count, padded_episode_count)``.
+    """
+    expanded, synthetic_count, padded_episode_count, _, _ = (
+        clone_with_vast_absorbing_tails(
+            transitions,
+            horizon,
+            include_failure=False,
+        )
+    )
     return expanded, synthetic_count, padded_episode_count
 
 

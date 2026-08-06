@@ -37,9 +37,9 @@ Reward / done semantics (config-overridable ``reward_success`` / ``reward_fail``
   is true; all other policy frames get ``reward_fail``. Every policy transition
   carries that source flag in ``info["success"]``.
 - ``done=True`` still marks the section's final frame so replay windows cannot
-  cross policy / human boundaries. VAST ignores that structural boundary for its
-  terminal mask and bootstraps from the final policy transition's ``next_obs``;
-  only a true task-success frame is absorbing.
+  cross policy / human boundaries. The VAST-only copy turns every non-success
+  policy ending into a continuing failure self-loop; only true task success is
+  an episodic terminal.
 """
 
 from __future__ import annotations
@@ -59,10 +59,6 @@ logger = logging.getLogger(__name__)
 ROUTE_ADVANTAGE = "advantage"
 ROUTE_POS_ONLY = "pos_only"
 ROUTE_NEG_ONLY = "neg_only"
-
-# terminal_reason values that make the *last* policy section a keepable one.
-_KEEP_LAST_POLICY_REASONS = frozenset({"success", "manual_reset"})
-
 
 @dataclass
 class Section:
@@ -112,19 +108,16 @@ def _keep_policy_section(
 ) -> tuple[bool, str]:
     """Return ``(keep, reason_tag)`` for the policy section at ``sections[idx]``.
 
-    Keep if it is immediately followed by a human section (ended in
-    human-intervention) or, when it is the last section, if the episode ended in
-    ``success`` / ``manual_reset``. ``reason_tag`` is used for both the outcome
-    reward and the drop-stats histogram.
+    A policy section followed by a human section ends in intervention. The last
+    policy section inherits the serialized terminal reason; every non-success
+    reason is retained as failure data. ``reason_tag`` is used for both outcome
+    semantics and the stats histogram.
     """
     if idx + 1 < len(sections):
         # Next section is human by construction -> policy handed over to a human.
         return True, "ended_human_intervention"
     # Last section.
-    reason = str(terminal_reason)
-    if reason in _KEEP_LAST_POLICY_REASONS:
-        return True, reason
-    return False, f"dropped_{reason or 'unknown'}"
+    return True, str(terminal_reason) or "unknown"
 
 
 def _frame_obs(obs_arrays: dict[str, Any], i: int, camera_names: list[str]) -> dict[str, np.ndarray]:
@@ -296,6 +289,10 @@ def build_offline_transitions(
                     stats["policy_sections_dropped_short"] += 1
                     stats["drop_reasons"]["short_lt_H"] = stats["drop_reasons"].get("short_lt_H", 0) + 1
                     continue
+                for transition in transitions:
+                    info = dict(transition.info or {})
+                    info["policy_section_end_reason"] = str(reason_tag)
+                    transition.info = info
                 stats["policy_sections_kept"] += 1
                 stats["keep_reasons"][reason_tag] = stats["keep_reasons"].get(reason_tag, 0) + 1
                 streams.policy_bc.extend(transitions)

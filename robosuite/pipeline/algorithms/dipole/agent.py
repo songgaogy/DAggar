@@ -181,12 +181,11 @@ class DipoleAgent:
         self.core.discriminator = discriminator
 
     def select_action(self, obs, deterministic: bool = False):
-        # Online rollout uses the positive policy only (base + pos_LoRA); the two-branch
-        # omega guidance is an eval-only path (see DipoleFlowPolicy.select_action).
-        return self.core.select_action(obs=obs, deterministic=deterministic, guided=False)
+        # The sampler skips the negative policy when the configured omega is zero.
+        return self.core.select_action(obs=obs, deterministic=deterministic, guided=True)
 
     def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
-        return self.core.plan_action_chunk(obs=obs, deterministic=deterministic, guided=False)
+        return self.core.plan_action_chunk(obs=obs, deterministic=deterministic, guided=True)
 
     def needs_action_chunk(self) -> bool:
         return self.core.needs_action_chunk()

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime
 import json
+import shutil
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,9 @@ from robosuite.pipeline.utils import (
     resolve_render_camera,
     resolve_runtime_fps,
 )
+
+
+_EPISODE_SHARD_FORMAT = "episode_shards_v1"
 
 
 def _require_cuda_device(device: Any, *, name: str) -> str:
@@ -204,7 +209,31 @@ def _terminal_reason(*, success: bool, env_done: bool, max_steps: bool) -> str |
     return None
 
 
-def _metadata_from_episodes(
+@dataclass
+class _EpisodeStats:
+    num_episodes: int = 0
+    num_transitions: int = 0
+    num_interventions: int = 0
+    terminal_reasons: dict[str, int] = field(default_factory=dict)
+
+    def add(self, episode: dict[str, Any]) -> None:
+        self.num_episodes += 1
+        self.num_transitions += int(len(episode["executed_action"]))
+        self.num_interventions += int(
+            np.asarray(episode["is_intervention"], dtype=np.bool_).sum()
+        )
+        reason = str(episode["terminal_reason"])
+        self.terminal_reasons[reason] = self.terminal_reasons.get(reason, 0) + 1
+
+    @classmethod
+    def from_episodes(cls, episodes: list[dict[str, Any]]) -> "_EpisodeStats":
+        stats = cls()
+        for episode in episodes:
+            stats.add(episode)
+        return stats
+
+
+def _metadata_from_stats(
     *,
     payload_path: Path,
     task_name: str,
@@ -214,17 +243,11 @@ def _metadata_from_episodes(
     img_height: int,
     img_width: int,
     action_dim: int,
-    episodes: list[dict[str, Any]],
+    stats: _EpisodeStats,
     started_at: str,
     finished_at: str,
     seed: int | None,
 ) -> dict[str, Any]:
-    num_transitions = int(sum(len(ep["executed_action"]) for ep in episodes))
-    num_interventions = int(sum(np.asarray(ep["is_intervention"], dtype=np.bool_).sum() for ep in episodes))
-    terminal_reasons: dict[str, int] = {}
-    for episode in episodes:
-        reason = str(episode["terminal_reason"])
-        terminal_reasons[reason] = terminal_reasons.get(reason, 0) + 1
     return {
         "schema_version": 1,
         "path": str(payload_path),
@@ -235,15 +258,157 @@ def _metadata_from_episodes(
         "img_height": int(img_height),
         "img_width": int(img_width),
         "action_dim": int(action_dim),
-        "num_episodes": int(len(episodes)),
-        "num_transitions": int(num_transitions),
-        "num_intervention_transitions": int(num_interventions),
-        "intervention_ratio": float(num_interventions / num_transitions) if num_transitions > 0 else 0.0,
-        "terminal_reasons": terminal_reasons,
+        "num_episodes": int(stats.num_episodes),
+        "num_transitions": int(stats.num_transitions),
+        "num_intervention_transitions": int(stats.num_interventions),
+        "intervention_ratio": (
+            float(stats.num_interventions / stats.num_transitions)
+            if stats.num_transitions > 0
+            else 0.0
+        ),
+        "terminal_reasons": dict(stats.terminal_reasons),
         "started_at": str(started_at),
         "finished_at": str(finished_at),
         "seed": seed,
     }
+
+
+def _episode_shard_dir(output_path: Path) -> Path:
+    return output_path.with_suffix(".shards")
+
+
+def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def _atomic_json_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _save_episode_shard(
+    output_path: Path,
+    *,
+    shard_index: int,
+    episode: dict[str, Any],
+) -> tuple[Path, float]:
+    shard_path = _episode_shard_dir(output_path) / f"episode_{shard_index:06d}.pt"
+    started = time.monotonic()
+    _atomic_torch_save(
+        {
+            "checkpoint_format": _EPISODE_SHARD_FORMAT,
+            "shard_index": int(shard_index),
+            "episode": episode,
+        },
+        shard_path,
+    )
+    return shard_path, time.monotonic() - started
+
+
+def _load_episode_shards(output_path: Path, *, manifest_count: int) -> list[dict[str, Any]]:
+    shard_dir = _episode_shard_dir(output_path)
+    shard_paths = sorted(shard_dir.glob("episode_*.pt")) if shard_dir.is_dir() else []
+    if len(shard_paths) < manifest_count:
+        raise RuntimeError(
+            f"Episode shard checkpoint is incomplete: manifest records {manifest_count} "
+            f"episodes but only {len(shard_paths)} shards exist in {shard_dir}."
+        )
+
+    episodes: list[dict[str, Any]] = []
+    for shard_index, shard_path in enumerate(shard_paths):
+        expected_path = shard_dir / f"episode_{shard_index:06d}.pt"
+        if shard_path != expected_path:
+            raise RuntimeError(
+                f"Episode shards must be contiguous; expected {expected_path}, got {shard_path}."
+            )
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
+        if shard.get("checkpoint_format") != _EPISODE_SHARD_FORMAT:
+            raise RuntimeError(f"Unsupported episode shard format in {shard_path}.")
+        if int(shard.get("shard_index", -1)) != shard_index:
+            raise RuntimeError(f"Episode shard index mismatch in {shard_path}.")
+        episode = shard.get("episode")
+        if not isinstance(episode, dict):
+            raise RuntimeError(f"Episode shard does not contain an episode mapping: {shard_path}.")
+        episodes.append(episode)
+    return episodes
+
+
+def _load_collection_checkpoint(
+    output_path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    shard_dir = _episode_shard_dir(output_path)
+    if not output_path.is_file():
+        if shard_dir.is_dir():
+            raise RuntimeError(
+                f"Episode shard directory exists without its manifest: {shard_dir}."
+            )
+        return {}, [], False
+
+    checkpoint = torch.load(output_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("checkpoint_format") == _EPISODE_SHARD_FORMAT:
+        manifest_count = int(checkpoint.get("num_episodes", 0))
+        if int(checkpoint.get("num_shards", -1)) != manifest_count:
+            raise RuntimeError(
+                "Episode shard manifest has inconsistent num_shards and num_episodes."
+            )
+        episodes = _load_episode_shards(
+            output_path,
+            manifest_count=manifest_count,
+        )
+        return checkpoint, episodes, False
+    if bool(checkpoint.get("final", False)):
+        return checkpoint, list(checkpoint.get("episodes", [])), True
+    raise RuntimeError(
+        "Legacy monolithic partial collection checkpoints cannot be resumed. "
+        f"Remove {output_path} and restart the collection round."
+    )
+
+
+def _cleanup_episode_shards(output_path: Path) -> None:
+    shard_dir = _episode_shard_dir(output_path)
+    try:
+        shutil.rmtree(shard_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[WARN] Failed to remove completed episode shards at {shard_dir}: {exc}")
+
+
+def _write_collection_manifest(
+    output_path: Path,
+    *,
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    num_shards: int,
+) -> None:
+    manifest = {
+        **payload,
+        "checkpoint_format": _EPISODE_SHARD_FORMAT,
+        "num_shards": int(num_shards),
+    }
+    _atomic_torch_save(manifest, output_path)
+    _atomic_json_save(metadata, output_path.with_suffix(".meta.json"))
+
+
+def _finalize_collection_checkpoint(
+    output_path: Path,
+    *,
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    episodes: list[dict[str, Any]],
+) -> tuple[float, int]:
+    started = time.monotonic()
+    _atomic_torch_save({**payload, "episodes": episodes}, output_path)
+    _atomic_json_save(metadata, output_path.with_suffix(".meta.json"))
+    elapsed = time.monotonic() - started
+    output_bytes = output_path.stat().st_size
+    _cleanup_episode_shards(output_path)
+    return elapsed, output_bytes
 
 
 def run_collection(cfg: DictConfig) -> None:
@@ -490,8 +655,9 @@ def run_collection(cfg: DictConfig) -> None:
     )
     episodes: list[dict[str, Any]] = []
     started_at = datetime.datetime.now().isoformat(timespec="seconds")
+    resumed_final_checkpoint = False
     if resume_collection and output_path.is_file():
-        existing = torch.load(output_path, map_location="cpu", weights_only=False)
+        existing, episodes, resumed_final_checkpoint = _load_collection_checkpoint(output_path)
         if str(existing.get("task_name")) != task_name:
             raise ValueError(
                 f"Collection task mismatch: file={existing.get('task_name')!r}, runtime={task_name!r}."
@@ -500,13 +666,20 @@ def run_collection(cfg: DictConfig) -> None:
             raise ValueError("Cannot resume collection with a different policy checkpoint.")
         if Path(str(existing.get("nnpu_checkpoint"))).resolve() != nnpu_checkpoint:
             raise ValueError("Cannot resume collection with a different discriminator checkpoint.")
-        episodes = list(existing.get("episodes", []))
         started_at = str(existing.get("started_at", started_at))
         if len(episodes) > num_episodes:
             raise ValueError(
                 f"Partial collection has {len(episodes)} episodes, above target {num_episodes}."
             )
+        if resumed_final_checkpoint and len(episodes) != num_episodes:
+            raise ValueError(
+                f"Final collection has {len(episodes)} episodes, expected {num_episodes}."
+            )
         print(f"[collect] resuming with {len(episodes)}/{num_episodes} completed episodes")
+    elif resume_collection and _episode_shard_dir(output_path).is_dir():
+        _load_collection_checkpoint(output_path)
+    episode_stats = _EpisodeStats.from_episodes(episodes)
+    persisted_episode_count = len(episodes)
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
     cached_override_action: np.ndarray | None = None
     cached_is_intervention = False
@@ -569,6 +742,7 @@ def run_collection(cfg: DictConfig) -> None:
         current.mark_terminal()
         payload = current.to_payload(reason)
         episodes.append(payload)
+        episode_stats.add(payload)
         n_interventions = int(np.asarray(payload["is_intervention"], dtype=np.bool_).sum())
         print(
             f"[collect][episode {payload['episode_index']}] "
@@ -582,8 +756,21 @@ def run_collection(cfg: DictConfig) -> None:
             save_payload(final=False)
 
     def save_payload(*, final: bool) -> None:
+        nonlocal persisted_episode_count
+        for shard_index in range(persisted_episode_count, len(episodes)):
+            shard_path, save_seconds = _save_episode_shard(
+                output_path,
+                shard_index=shard_index,
+                episode=episodes[shard_index],
+            )
+            persisted_episode_count = shard_index + 1
+            print(
+                f"[collect][checkpoint {shard_index}] seconds={save_seconds:.3f} "
+                f"bytes={shard_path.stat().st_size} path={shard_path}"
+            )
+
         finished_at = datetime.datetime.now().isoformat(timespec="seconds")
-        metadata = _metadata_from_episodes(
+        metadata = _metadata_from_stats(
             payload_path=output_path,
             task_name=task_name,
             policy_checkpoint=policy_checkpoint,
@@ -592,7 +779,7 @@ def run_collection(cfg: DictConfig) -> None:
             img_height=int(cfg.env.img_height),
             img_width=int(cfg.env.img_width),
             action_dim=int(action_low.reshape(-1).shape[0]),
-            episodes=episodes,
+            stats=episode_stats,
             started_at=started_at,
             finished_at=finished_at,
             seed=serialize_seed(getattr(cfg, "seed", None)),
@@ -604,17 +791,31 @@ def run_collection(cfg: DictConfig) -> None:
             "disc_device": disc_device,
             "deterministic": bool(deterministic),
             "final": bool(final),
-            "episodes": episodes,
         }
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = output_path.with_name(f".{output_path.name}.tmp")
-        torch.save(payload, tmp_path)
-        tmp_path.replace(output_path)
-        meta_path = output_path.with_suffix(".meta.json")
-        meta_path.write_text(json.dumps(metadata, indent=2))
+        if final:
+            finalization_seconds, output_bytes = _finalize_collection_checkpoint(
+                output_path,
+                payload=payload,
+                metadata=metadata,
+                episodes=episodes,
+            )
+            print(
+                f"[collect][finalize] seconds={finalization_seconds:.3f} "
+                f"bytes={output_bytes} episodes={len(episodes)}"
+            )
+            return
+
+        _write_collection_manifest(
+            output_path,
+            payload=payload,
+            metadata=metadata,
+            num_shards=persisted_episode_count,
+        )
 
     collection_complete = False
     try:
+        if not resumed_final_checkpoint:
+            save_payload(final=False)
         while len(episodes) < num_episodes:
             loop_start = time.monotonic() if control_limiter is None else control_limiter.wait()
 

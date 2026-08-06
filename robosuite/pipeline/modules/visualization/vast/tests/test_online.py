@@ -13,6 +13,7 @@ from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerRe
 from robosuite.pipeline.algorithms.vast.common import VASTConfig
 from robosuite.pipeline.algorithms.vast.data_util import (
     clone_with_absorbing_success_tail,
+    clone_with_vast_absorbing_tails,
 )
 from robosuite.pipeline.common.types import Transition
 from robosuite.pipeline.common.types import ReplayBufferConfig
@@ -126,6 +127,36 @@ def test_select_online_episode_filters_ineligible_cumulative_data(tmp_path: Path
     assert selected.source_paths == [str(first.resolve()), str(second.resolve())]
 
 
+def test_online_materialization_pads_non_success_final_policy_section(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "round0.pt"
+    torch.save(
+        _payload(_episode(0, [False, False, False], terminal_reason="max_steps")),
+        path,
+    )
+
+    selected = select_online_episode([path], seed=0, action_horizon=2)
+    sections = materialize_policy_sections(
+        selected,
+        action_horizon=2,
+        reward_success=0.0,
+        reward_fail=-1.0,
+    )
+
+    assert selected.terminal_reason == "max_steps"
+    assert len(sections) == 1
+    assert len(sections[0]) == 5
+    assert sum(
+        bool((transition.info or {}).get("synthetic_vast_failure_tail", False))
+        for transition in sections[0]
+    ) == 2
+    assert all(
+        (transition.info or {}).get("policy_section_end_reason") == "max_steps"
+        for transition in sections[0]
+    )
+
+
 def test_online_assembly_preserves_global_gaps_and_section_local_stride() -> None:
     episode = _episode(
         0,
@@ -154,12 +185,16 @@ def test_online_assembly_preserves_global_gaps_and_section_local_stride() -> Non
         for section in sections
     ]
     assert source_frames == [
-        [0, 1, 2],
+        [0, 1, 2, 2, 2],
         [5, 6, 7, 7],
     ]
-    assert not any(
-        bool((item.info or {}).get("synthetic_vast_success_tail", False))
+    assert sum(
+        bool((item.info or {}).get("synthetic_vast_failure_tail", False))
         for item in sections[0]
+    ) == 2
+    assert not any(
+        bool((item.info or {}).get("synthetic_vast_failure_tail", False))
+        for item in sections[1]
     )
     assert bool(
         (sections[1][-1].info or {}).get("synthetic_vast_success_tail", False)
@@ -168,7 +203,7 @@ def test_online_assembly_preserves_global_gaps_and_section_local_stride() -> Non
     assembly = assemble_online_metrics(
         selected,
         sections,
-        [_result_rows(2), _result_rows(3)],
+        [_result_rows(4), _result_rows(3)],
         advantage_estimator="td1",
         threshold=0.5,
     )
@@ -176,17 +211,19 @@ def test_online_assembly_preserves_global_gaps_and_section_local_stride() -> Non
     assert isinstance(assembly, OnlineMetricAssembly)
     assert len(assembly.rows) == 8
     assert [int(row["step"]) for row in assembly.rows] == list(range(8))
-    assert assembly.computed_windows == 5
+    assert assembly.computed_windows == 6
     assert [index for index, value in enumerate(assembly.annotation_mask) if value] == [
         0,
         1,
+        2,
         5,
         6,
         7,
     ]
-    for index in (2, 3, 4):
+    for index in (3, 4):
         assert np.isnan(assembly.rows[index]["advantage_policy"])
         assert np.isnan(assembly.per_step_disc.failure_score[index])
+    assert assembly.rows[2]["section_step"] == 2.0
     assert assembly.rows[5]["section_step"] == 0.0
     assert assembly.rows[7]["section_step"] == 2.0
     assert assembly.rows[5]["future_frame_index"] == 7.0
@@ -200,7 +237,7 @@ def test_online_assembly_preserves_global_gaps_and_section_local_stride() -> Non
         for row in nonoverlap
         if float(row["valid_window"]) > 0.5
     ]
-    assert kept == [0, 5, 7]
+    assert kept == [0, 2, 5, 7]
     assert len(nonoverlap) == len(assembly.rows)
 
 
@@ -292,9 +329,12 @@ def test_discriminator_annotation_mask_blanks_human_outputs(
     not torch.cuda.is_available(),
     reason="Online advantage parity requires CUDA and never falls back to CPU.",
 )
-@pytest.mark.parametrize("success_terminal", [False, True])
+@pytest.mark.parametrize(
+    "boundary",
+    ["truncation", "success", "intervention_failure", "env_done_failure"],
+)
 def test_policy_boundary_metrics_match_training_td1_and_gae(
-    success_terminal: bool,
+    boundary: str,
 ) -> None:
     device = "cuda"
     horizon = 2
@@ -361,6 +401,10 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
         def g_value(current_state, future_state, k):
             return torch.zeros_like(current_state[..., :1])
 
+    end_reason = {
+        "intervention_failure": "ended_human_intervention",
+        "env_done_failure": "env_done",
+    }.get(boundary, boundary)
     transitions: list[Transition] = []
     for step in range(5):
         obs = {
@@ -375,22 +419,29 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
             Transition(
                 obs=obs,
                 action=np.asarray([0.25], dtype=np.float32),
-                reward=0.0 if success_terminal and step == 4 else -1.0,
+                reward=0.0 if boundary == "success" and step == 4 else -1.0,
                 next_obs=next_obs,
                 done=step == 4,
                 info={
                     "episode_index": 0,
                     "episode_step": step,
-                    "success": bool(success_terminal and step == 4),
+                    "success": bool(boundary == "success" and step == 4),
+                    "policy_section_end_reason": end_reason,
                 },
             )
         )
-    if success_terminal:
+    if boundary == "success":
         transitions, synthetic_count, _ = clone_with_absorbing_success_tail(
             transitions,
             horizon,
         )
         assert synthetic_count == horizon - 1
+    elif boundary in {"intervention_failure", "env_done_failure"}:
+        transitions, _, _, synthetic_count, padded_count = (
+            clone_with_vast_absorbing_tails(transitions, horizon)
+        )
+        assert synthetic_count == horizon
+        assert padded_count == 1
     encoder = FakeEncoder()
     discriminator = FakeDiscriminator()
     learner = FakeLearner()
@@ -456,7 +507,7 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
         assert row["g_mc_error"] == pytest.approx(
             -row["total_reward_horizon"]
         )
-    if success_terminal:
+    if boundary == "success":
         assert rows[-1]["done_chunk"] == 1.0
         assert rows[-1]["bootstrap_v"] == 0.0
         assert rows[-1]["has_valid_next"] == 0.0
@@ -464,3 +515,9 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
         assert rows[-1]["done_chunk"] == 0.0
         assert rows[-1]["bootstrap_v"] != 0.0
         assert rows[-1]["has_valid_next"] == 1.0
+    if boundary in {"intervention_failure", "env_done_failure"}:
+        assert rows[-1]["env_reward_horizon"] == pytest.approx(-1.9)
+        assert rows[-1]["disc_reward_horizon"] == pytest.approx(
+            rows[-1]["disc_intrinsic_step0"] * (1.0 + cfg.discount)
+        )
+        assert rows[-2]["disc_reward_horizon"] < -1.8

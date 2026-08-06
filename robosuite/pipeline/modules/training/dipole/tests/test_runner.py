@@ -214,7 +214,13 @@ def test_vast_policy_success_tail_anchors_every_chunk_phase(length: int) -> None
     )
 
 
-def test_vast_policy_truncation_does_not_add_absorbing_tail() -> None:
+@pytest.mark.parametrize(
+    "end_reason",
+    ["manual_reset", "env_done", "max_steps", "worker_exception"],
+)
+def test_vast_policy_non_success_ending_adds_absorbing_tail(
+    end_reason: str,
+) -> None:
     horizon = 4
     policy = [
         Transition(
@@ -229,7 +235,12 @@ def test_vast_policy_truncation_does_not_add_absorbing_tail() -> None:
                 "agentview": np.full((4, 4, 3), step + 1, dtype=np.uint8),
             },
             done=step == 5,
-            info={"episode_index": 0, "episode_step": step, "success": False},
+            info={
+                "episode_index": 0,
+                "episode_step": step,
+                "success": False,
+                "policy_section_end_reason": end_reason,
+            },
         )
         for step in range(6)
     ]
@@ -243,14 +254,106 @@ def test_vast_policy_truncation_does_not_add_absorbing_tail() -> None:
         capacity=32,
     )
 
-    assert len(buffer) == len(policy)
+    assert len(buffer) == len(policy) + horizon
     assert stats["synthetic_success_tail_transitions"] == 0
-    assert buffer._get_valid_start_indices_locked() == [0, 1, 2]  # noqa: SLF001
+    assert stats["synthetic_failure_tail_transitions"] == horizon
+    assert stats["padded_failure_sections"] == 1
+    assert stats["padded_failure_sections_by_reason"] == {end_reason: 1}
+    assert stats["synthetic_failure_disc_reward_transitions"] == horizon
+    assert buffer._get_valid_start_indices_locked() == list(range(7))  # noqa: SLF001
     replay = VASTReplayBuffer(
         base_buffer=buffer,
         cfg=VASTConfig(action_horizon=horizon, vast_max_k=1, disc_reward_coef=0.0),
     )
-    assert replay._raw_chunk_done_locked(2) is False  # noqa: SLF001
+    assert all(
+        replay._raw_chunk_done_locked(start) is False  # noqa: SLF001
+        for start in buffer._get_valid_start_indices_locked()  # noqa: SLF001
+    )
+
+
+def test_vast_intervention_failure_adds_continuing_absorbing_boundary() -> None:
+    horizon = 4
+    length = 6
+    policy = [
+        Transition(
+            obs={
+                "state": np.asarray([step], dtype=np.float32),
+                "agentview": np.full((4, 4, 3), step, dtype=np.uint8),
+            },
+            action=np.asarray([step], dtype=np.float32),
+            reward=-1.0,
+            next_obs={
+                "state": np.asarray([step + 1], dtype=np.float32),
+                "agentview": np.full((4, 4, 3), step + 1, dtype=np.uint8),
+            },
+            done=step == length - 1,
+            info={
+                "episode_index": 0,
+                "episode_step": step,
+                "success": False,
+                "policy_section_end_reason": "ended_human_intervention",
+                "nnpu_disc_intrinsic": -0.25,
+                "nnpu_failure_score": 0.5,
+                "nnpu_threshold": 0.0,
+            },
+        )
+        for step in range(length)
+    ]
+    source_final_info = dict(policy[-1].info or {})
+
+    buffer, stats = build_vast_finetune_buffer(
+        policy,
+        camera_names=["agentview"],
+        image_size=4,
+        action_horizon=horizon,
+        warmup_transitions_path=None,
+        reward_failure=-1.0,
+        capacity=32,
+    )
+
+    assert len(policy) == length
+    assert policy[-1].done is True
+    assert policy[-1].info == source_final_info
+    assert len(buffer) == length + horizon
+    assert stats["synthetic_failure_tail_transitions"] == horizon
+    assert stats["padded_failure_sections"] == 1
+    assert stats["failure_absorbing_boundary_windows"] == 1
+    assert stats["synthetic_failure_disc_reward_transitions"] == horizon
+    assert stats["padded_failure_sections_by_reason"] == {
+        "ended_human_intervention": 1
+    }
+    valid_starts = buffer._get_valid_start_indices_locked()  # noqa: SLF001
+    assert valid_starts == list(range(length + 1))
+    assert [index for index, item in enumerate(buffer._storage) if item.done] == [  # noqa: SLF001
+        length + horizon - 1
+    ]
+
+    synthetic = buffer._storage[length:]  # noqa: SLF001
+    assert len(synthetic) == horizon
+    assert all(item.reward == -1.0 for item in synthetic)
+    assert all((item.info or {})["success"] is False for item in synthetic)
+    assert all((item.info or {})["absorbing_failure"] is True for item in synthetic)
+    assert all(
+        (item.info or {})["synthetic_vast_failure_tail"] is True
+        for item in synthetic
+    )
+    assert all(
+        "nnpu_disc_intrinsic" not in (item.info or {})
+        and "nnpu_failure_score" not in (item.info or {})
+        and "nnpu_threshold" not in (item.info or {})
+        for item in synthetic
+    )
+    assert all(np.asarray(item.obs["state"]).item() == length for item in synthetic)
+    assert all(np.asarray(item.next_obs["state"]).item() == length for item in synthetic)
+
+    replay = VASTReplayBuffer(
+        base_buffer=buffer,
+        cfg=VASTConfig(action_horizon=horizon, vast_max_k=1, disc_reward_coef=0.0),
+    )
+    assert all(
+        replay._raw_chunk_done_locked(start) is False  # noqa: SLF001
+        for start in valid_starts
+    )
 
 
 def test_phase_a_without_relabel_rejects_reward_mismatch() -> None:

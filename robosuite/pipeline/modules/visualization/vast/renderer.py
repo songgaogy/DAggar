@@ -812,8 +812,8 @@ def compute_metrics(
         success = success_cpu[offset : offset + len(batch_starts)]
         post_success = post_success_cpu[offset : offset + len(batch_starts)]
         # Bootstrap terminal mask, mirroring VAST training
-        # (replay._build_step_batch). Benchmark truncations keep their bootstrap;
-        # policy sections use their materialized done boundary.
+        # (replay._build_step_batch). Structural section boundaries keep their
+        # bootstrap; only source success flags stop it.
         dones = dones_cpu[offset : offset + len(batch_starts)]
         batch, _, views, channels, height, width = batch_images_np.shape
         images = _image_tensor(batch_images_np.reshape(batch * horizon, views, channels, height, width))

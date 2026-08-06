@@ -245,37 +245,50 @@ class VASTLearner:
     def _update_vast(self, step_batch: VASTStepBatch) -> dict[str, float]:
         """Joint VAST G + expectile-V update on one macro-horizon batch.
 
-        G is trained only by Monte-Carlo endpoint and compositional consistency
-        losses. The V target is detached, so V gradients never update G. As in
-        the reference ``vast.py``, ``mc_mask`` zeros both G objectives for
-        k < 2 while both sides of the composition equation remain differentiable.
+        G is trained by Monte-Carlo endpoint and compositional consistency
+        losses. Every k >= 1 path has a direct MC target; composition is defined
+        only for k >= 2. The V target is detached, so V gradients never update G.
         """
         self._require_vast_batch(step_batch)
 
         k = step_batch.k.reshape(-1, 1)
         j = step_batch.j.reshape(-1, 1)
-        mask = step_batch.mc_mask.reshape(-1, 1).to(step_batch.v_state_feature.dtype)
+        mc_mask = step_batch.mc_mask.reshape(-1, 1).to(
+            step_batch.v_state_feature.dtype
+        )
+        comp_mask = (k >= 2).to(step_batch.v_state_feature.dtype)
         returns = step_batch.k_step_returns.reshape(-1, 1)
 
-        # G-composiiton loss
+        # G-composition loss. Evaluate j and k-j only for legal k >= 2 rows so
+        # a k=1 sample never constructs the undefined G(..., 0) term.
         g_tk = self.g_value(step_batch.v_state_feature, step_batch.future_v_state_feature, k)
-        g_tj = self.g_value(step_batch.v_state_feature, step_batch.intermediate_v_state_feature, j)
-        g_jk = self.g_value(
-            step_batch.intermediate_v_state_feature,
-            step_batch.future_v_state_feature,
-            k - j,
-        )
-        j_discount = torch.pow(
-            torch.full_like(g_tk, float(self.cfg.discount)),
-            j.to(g_tk.dtype) * int(self.cfg.action_horizon),
-        )
-        composition_rhs = g_tj + j_discount * g_jk
-        comp_sq = (g_tk - composition_rhs).square()
-        g_comp_loss = (comp_sq * mask).mean()
+        comp_rows = comp_mask.reshape(-1).to(torch.bool)
+        if bool(comp_rows.any().item()):
+            g_tj = self.g_value(
+                step_batch.v_state_feature[comp_rows],
+                step_batch.intermediate_v_state_feature[comp_rows],
+                j[comp_rows],
+            )
+            g_jk = self.g_value(
+                step_batch.intermediate_v_state_feature[comp_rows],
+                step_batch.future_v_state_feature[comp_rows],
+                k[comp_rows] - j[comp_rows],
+            )
+            j_discount = torch.pow(
+                torch.full_like(g_tj, float(self.cfg.discount)),
+                j[comp_rows].to(g_tj.dtype) * int(self.cfg.action_horizon),
+            )
+            composition_rhs = g_tj + j_discount * g_jk
+            comp_error = g_tk[comp_rows] - composition_rhs
+            # Preserve the established batch-diluted composition scale.
+            g_comp_loss = comp_error.square().sum() / g_tk.numel()
+        else:
+            comp_error = g_tk.new_zeros((0, 1))
+            g_comp_loss = g_tk.sum() * 0.0
 
         # G-MC loss
         mc_sq = (g_tk - returns).square()
-        g_mc_loss = (mc_sq * mask).mean()
+        g_mc_loss = (mc_sq * mc_mask).mean()
 
         g_loss = g_mc_loss + float(self.cfg.vast_comp_coef) * g_comp_loss
 
@@ -284,7 +297,7 @@ class VASTLearner:
         stitched_target = self._vast_stitched_target(step_batch)
 
         self.g_optim.zero_grad(set_to_none=True)
-        if bool(mask.bool().any().item()):
+        if bool(mc_mask.bool().any().item()) or bool(comp_mask.bool().any().item()):
             g_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.g.parameters(), float(self.cfg.grad_clip_norm))
             self.g_optim.step()
@@ -328,9 +341,10 @@ class VASTLearner:
             stitched_advantage = stitched_target_mean - v_mean
             v_loss_values = torch.stack(v_head_losses)
             v_loss = v_loss_values.mean()
-            active = mask.sum().clamp_min(1.0)
-            mc_abs = ((g_tk.detach() - returns).abs() * mask).sum() / active
-            comp_abs = ((g_tk.detach() - composition_rhs.detach()).abs() * mask).sum() / active
+            mc_active = mc_mask.sum().clamp_min(1.0)
+            comp_active = comp_mask.sum().clamp_min(1.0)
+            mc_abs = ((g_tk.detach() - returns).abs() * mc_mask).sum() / mc_active
+            comp_abs = comp_error.detach().abs().sum() / comp_active
 
         return {
             "g_loss": float(g_loss.detach().item()),
@@ -349,7 +363,8 @@ class VASTLearner:
             "stitched_advantage_mean": float(stitched_advantage.mean().item()),
             "td_error_abs_mean": float(stitched_advantage.abs().mean().item()),
             "k_mean": float(k.float().mean().item()),
-            "mc_mask_mean": float(mask.mean().item()),
+            "mc_mask_mean": float(mc_mask.mean().item()),
+            "comp_mask_mean": float(comp_mask.mean().item()),
         }
 
     # ------------------------------------------------------------------ #

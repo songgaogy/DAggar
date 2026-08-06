@@ -173,6 +173,8 @@ def test_macro_sampling_is_seeded_and_never_crosses_episode_or_terminal() -> Non
     torch.testing.assert_close(batch_a.j, batch_b.j)
     assert batch_a.k is not None and batch_a.j is not None
     assert torch.all(batch_a.k >= 1)
+    assert batch_a.mc_mask is not None
+    torch.testing.assert_close(batch_a.mc_mask, torch.ones_like(batch_a.k))
     assert torch.all(batch_a.k <= torch.tensor([[3], [3], [2], [2]], device=DEVICE))
     active = batch_a.k >= 2
     assert torch.all(batch_a.j[active] >= 1)
@@ -257,6 +259,8 @@ def test_vectorized_cache_sampler_is_exactly_legacy_equivalent() -> None:
         )
         torch.testing.assert_close(actual.k_step_returns, expected["returns"], rtol=0, atol=0)
         torch.testing.assert_close(actual.future_dones, expected["future_dones"], rtol=0, atol=0)
+        assert actual.mc_mask is not None
+        torch.testing.assert_close(actual.mc_mask, torch.ones_like(actual.k), rtol=0, atol=0)
         assert actual.metadata["sampled_k"] == expected["ks"]
         assert actual.metadata["sampled_j"] == expected["js"]
     assert cache._vast_rng.bit_generator.state == reference_rng.bit_generator.state

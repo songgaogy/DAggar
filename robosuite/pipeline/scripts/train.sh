@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260802_175238"
+RUN_ROOT="outputs/dipole/PickPlaceCereal/w0_explore_20260804_233553"
 STAGE="all"   # "all" or "disc" -> "vast" -> "policy"
-ROUND_INDEX="000"   # if "", then continue; else, retrain
+ROUND_INDEX=""   # if "", then continue; else, copy and retrain
 cd "${ROOT_DIR}"
 
 export CUDA_VISIBLE_DEVICES=1

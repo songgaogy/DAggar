@@ -36,6 +36,7 @@ storage:
   resolved_config_filename: "config_resolved.yaml"
 
 collection:
+  omega: 0.0
   num_episodes: 20
   episode_max_steps: 500
   deterministic: false

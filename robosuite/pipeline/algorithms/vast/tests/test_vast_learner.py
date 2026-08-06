@@ -174,12 +174,38 @@ def test_vast_update_step_runs_and_moves_v() -> None:
         "td_error_abs_mean",
         "v_std_mean",
     }.issubset(metrics)
+    assert metrics["g_mc_loss"] > 0.0
+    assert metrics["g_comp_loss"] > 0.0
+    assert metrics["mc_mask_mean"] == pytest.approx(1.0)
+    assert metrics["comp_mask_mean"] == pytest.approx(1.0)
 
     moved_v = any(
         not torch.equal(before, after)
         for before, after in zip(snapshot_v, vast.v.parameters())
     )
     assert moved_v, "v parameters did not move after update"
+
+
+def test_k1_updates_g_from_mc_without_composition() -> None:
+    cfg = _make_cfg(action_horizon=2, v_ensemble_size=1)
+    vast = _make_learner(cfg)
+    batch = _make_step_batch(B=8, D_state=12, D_chunk=16, D_a=4, H=2)
+    batch.k = torch.ones(8, 1, device=DEVICE)
+    batch.j = torch.ones(8, 1, device=DEVICE)
+    batch.k_step_returns = torch.full((8, 1), -3.0, device=DEVICE)
+    batch.mc_mask = torch.ones(8, 1, device=DEVICE)
+    snapshot_g = [parameter.detach().clone() for parameter in vast.g.parameters()]
+
+    metrics = vast.update(batch)
+
+    assert metrics["g_mc_loss"] > 0.0
+    assert metrics["g_comp_loss"] == pytest.approx(0.0)
+    assert metrics["mc_mask_mean"] == pytest.approx(1.0)
+    assert metrics["comp_mask_mean"] == pytest.approx(0.0)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(snapshot_g, vast.g.parameters())
+    )
 
 
 def test_compute_td_advantage_matches_formula() -> None:
