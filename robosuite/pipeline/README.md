@@ -13,9 +13,9 @@ CUDA for every tensor computation.
   and an optional reusable Q/V warmup cache.
 - Every executed transition enters the online replay buffer. Human intervention
   replaces the policy action and is also copied to the demonstration buffer.
-- Training runs synchronously for `trainer.updates_per_episode=100` updates
-  after each interactive episode. There is no alternative algorithm or
-  asynchronous learner mode.
+- Training runs synchronously for `trainer.updates_per_train=2000` updates
+  after every `trainer.episodes_per_train=10` interactive episodes. There is no
+  alternative algorithm or asynchronous learner mode.
 - Metrics are written to TensorBoard, JSONL, and the console log. WandB is not
   used.
 

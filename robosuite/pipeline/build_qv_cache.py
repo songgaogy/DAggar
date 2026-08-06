@@ -100,6 +100,11 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             "success_rollout": int(cfg.data.success_num_trajectories),
             "fail_rollout": int(cfg.data.fail_num_trajectories),
         },
+        split_directories={
+            "expert": to_absolute_path(str(cfg.data.expert_dir)),
+            "success_rollout": to_absolute_path(str(cfg.data.success_dir)),
+            "fail_rollout": to_absolute_path(str(cfg.data.fail_dir)),
+        },
         cache_dir=(
             Path(to_absolute_path(str(cfg.logging.output_root)))
             / str(cfg.task.name)

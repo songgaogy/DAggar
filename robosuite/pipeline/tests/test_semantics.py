@@ -1,10 +1,16 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 from robosuite.pipeline.src.data import Transition, TransitionChunkWriter
 from robosuite.pipeline.src.awr import AWRTrainer, TrainerConfig
 from robosuite.pipeline.src.environment import sparse_success_reward
+from robosuite.pipeline.train import (
+    _checkpoint_due,
+    _format_episode_summary,
+    _save_checkpoint,
+)
 
 
 class _SuccessEnv:
@@ -51,7 +57,7 @@ def test_policy_transition_is_not_persisted_as_demo(tmp_path: Path) -> None:
 class _ReadyAgent:
     def __init__(self) -> None:
         self.trainer_config = TrainerConfig(
-            updates_per_episode=100,
+            updates_per_train=100,
             inference_sync_interval=50,
         )
         self.updates = 0
@@ -80,3 +86,110 @@ def test_episode_boundary_runs_exactly_one_hundred_updates() -> None:
     assert trainer.total_value_updates == 100
     assert trainer.total_inference_syncs == 2
     assert agent.syncs == 2
+
+
+def test_episode_progress_preserves_update_and_episode_counts() -> None:
+    agent = _ReadyAgent()
+    trainer = AWRTrainer(agent)
+    trainer.total_env_steps = 1
+
+    metrics = trainer.train_episode(updates=3, show_progress=True)
+
+    assert len(metrics) == 3
+    assert trainer.total_episodes == 1
+    assert trainer.total_actor_updates == 3
+    assert agent.updates == 3
+
+
+def test_episode_summary_contains_runtime_and_intervention_details() -> None:
+    summary = _format_episode_summary(
+        4,
+        "environment",
+        {
+            "success": 1.0,
+            "return": 0.0,
+            "length": 25.0,
+            "env_fps": 19.5,
+            "intervention_steps": 5.0,
+            "intervention_rate": 0.2,
+            "learner_updates": 100.0,
+            "learner_seconds": 3.0,
+            "reset_seconds": 0.4,
+            "checkpoint_seconds": 0.0,
+            "pause_seconds": 0.0,
+            "boundary_seconds": 3.4,
+        },
+    )
+
+    for field in (
+        "index=4",
+        "reason=environment",
+        "success=1",
+        "return=0.00",
+        "length=25",
+        "fps=19.5",
+        "intervention_steps=5",
+        "intervention_rate=0.200",
+        "updates=100",
+        "learner_sec=3.00",
+        "reset_sec=0.40",
+        "checkpoint_sec=0.00",
+        "pause_sec=0.00",
+        "boundary_sec=3.40",
+    ):
+        assert field in summary
+
+
+def test_checkpoint_due_uses_completed_episode_count() -> None:
+    assert not _checkpoint_due(19, 20)
+    assert _checkpoint_due(20, 20)
+    assert not _checkpoint_due(21, 20)
+    assert _checkpoint_due(40, 20)
+
+
+class _CheckpointAgent:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def save_checkpoint(self, path, *, include_buffers, trainer_state) -> None:
+        self.calls.append((path, include_buffers, trainer_state))
+
+
+class _CheckpointTrainer:
+    total_env_steps = 1234
+    total_episodes = 20
+
+    def state_dict(self):
+        return {
+            "total_env_steps": self.total_env_steps,
+            "total_episodes": self.total_episodes,
+        }
+
+
+def test_checkpoint_filename_and_resume_state_use_episode_count(tmp_path: Path) -> None:
+    agent = _CheckpointAgent()
+    trainer = _CheckpointTrainer()
+    cfg = SimpleNamespace(
+        checkpoint=SimpleNamespace(directory="checkpoints"),
+    )
+
+    saved = _save_checkpoint(
+        agent,
+        trainer,
+        tmp_path,
+        cfg,
+        episode_index=20,
+        success_count=7,
+    )
+
+    assert saved.name == "episode_00000020.pt"
+    assert [call[0].name for call in agent.calls] == [
+        "episode_00000020.pt",
+        "latest.pt",
+    ]
+    assert [call[1] for call in agent.calls] == [False, True]
+    trainer_state = agent.calls[0][2]
+    assert trainer_state["total_env_steps"] == 1234
+    assert trainer_state["total_episodes"] == 20
+    assert trainer_state["episode_index"] == 20
+    assert trainer_state["success_count"] == 7

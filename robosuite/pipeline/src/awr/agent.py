@@ -150,12 +150,30 @@ class AWRAgent:
                 ),
             ),
         )
-        batch_size = int(cfg_get(trainer, "batch_size", 64))
+        value_batch_size = int(
+            cfg_get(
+                trainer,
+                "value_batch_size",
+                cfg_get(trainer, "batch_size", 256),
+            )
+        )
+        actor_batch_size = int(
+            cfg_get(
+                trainer,
+                "actor_batch_size",
+                cfg_get(trainer, "batch_size", 128),
+            )
+        )
+        buffer_batch_size = max(value_batch_size, actor_batch_size)
         trainer_config = TrainerConfig(
-            batch_size=batch_size,
+            value_batch_size=value_batch_size,
+            actor_batch_size=actor_batch_size,
             warmup_steps=int(cfg_get(trainer, "warmup_steps", 0)),
-            updates_per_episode=int(
-                cfg_get(trainer, "updates_per_episode", 100)
+            episodes_per_train=int(
+                cfg_get(trainer, "episodes_per_train", 10)
+            ),
+            updates_per_train=int(
+                cfg_get(trainer, "updates_per_train", 2000)
             ),
             inference_sync_interval=int(
                 cfg_get(trainer, "inference_sync_interval", 50)
@@ -179,11 +197,11 @@ class AWRAgent:
             camera_names=camera_names,
             online_buffer_config=ReplayBufferConfig(
                 capacity=int(cfg_get(online, "capacity", 200_000)),
-                batch_size=batch_size,
+                batch_size=buffer_batch_size,
             ),
             demo_buffer_config=ReplayBufferConfig(
                 capacity=int(cfg_get(demo, "capacity", 200_000)),
-                batch_size=batch_size,
+                batch_size=buffer_batch_size,
             ),
             trainer_config=trainer_config,
         )
@@ -289,7 +307,7 @@ class AWRAgent:
     def sample_mixed_actor_batch(
         self, batch_size: int | None = None
     ) -> AWRActorBatch:
-        size = int(batch_size or self.trainer_config.batch_size)
+        size = int(batch_size or self.trainer_config.actor_batch_size)
         if size < 2:
             raise ValueError("Mixed AWR batches require batch_size >= 2.")
         demo_size = size // 2
@@ -303,7 +321,7 @@ class AWRAgent:
     def sample_mixed_step_batch(
         self, batch_size: int | None = None
     ) -> AWRStepBatch:
-        size = int(batch_size or self.trainer_config.batch_size)
+        size = int(batch_size or self.trainer_config.value_batch_size)
         if size < 2:
             raise ValueError("Mixed AWR batches require batch_size >= 2.")
         demo_size = size // 2
@@ -331,7 +349,7 @@ class AWRAgent:
     def update_value_only(
         self, batch_size: int | None = None
     ) -> dict[str, float]:
-        size = int(batch_size or self.trainer_config.batch_size)
+        size = int(batch_size or self.trainer_config.value_batch_size)
         return self.core.update_value(
             self._step_batch(
                 self.online_buffer, "online", size, augment=False
@@ -339,9 +357,11 @@ class AWRAgent:
         )
 
     def update(self, batch_size: int | None = None) -> dict[str, float]:
+        value_size = int(batch_size or self.trainer_config.value_batch_size)
+        actor_size = int(batch_size or self.trainer_config.actor_batch_size)
         return self.core.update(
-            self.sample_mixed_step_batch(batch_size),
-            self.sample_mixed_actor_batch(batch_size),
+            self.sample_mixed_step_batch(value_size),
+            self.sample_mixed_actor_batch(actor_size),
         )
 
     def build_checkpoint_payload(

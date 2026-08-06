@@ -20,13 +20,22 @@ def test_pick_place_cereal_config_resolves() -> None:
     assert resolved["env"]["horizon"] == 500
     assert resolved["awr"]["discount"] == 0.97
     assert resolved["awr"]["task_name"] == "PickPlaceCereal"
-    assert resolved["data"]["expert_dir"] == "./data/PickPlaceCereal/expert"
+    assert (
+        resolved["data"]["expert_dir"]
+        == "./data/PickPlaceCereal/pretrain_data-20260615_174814"
+    )
     assert resolved["data"]["success_dir"] == "./data/PickPlaceCereal/success_rollout"
     assert resolved["data"]["fail_dir"] == "./data/PickPlaceCereal/fail_rollout"
-    assert resolved["trainer"]["updates_per_episode"] == 100
+    assert resolved["trainer"]["episodes_per_train"] == 10
+    assert resolved["trainer"]["updates_per_train"] == 2000
+    assert "updates_per_episode" not in resolved["trainer"]
     assert resolved["runtime"]["learner_device"] == "cuda:0"
     assert resolved["runtime"]["inference_device"] == "cuda:1"
     assert resolved["logging"]["output_root"] == "./outputs/baseline/awr"
+    assert resolved["checkpoint"]["interval_episodes"] == 20
+    assert "interval_env_steps" not in resolved["checkpoint"]
+    assert resolved["runtime"]["visualize_gripper_markers"] is True
+    assert resolved["runtime"]["episode_pause_sec"] == 0.0
 
 
 def test_config_exposes_only_awr_training_semantics() -> None:

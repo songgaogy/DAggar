@@ -88,8 +88,8 @@ def _compute_metrics(agent: AWRAgent, transitions: list, max_steps: int | None) 
     metrics: list[dict] = []
     discount = float(agent.awr_config.discount)
     powers = np.power(discount, np.arange(horizon, dtype=np.float32))
-    for offset in range(0, len(valid_starts), int(agent.trainer_config.batch_size)):
-        starts = valid_starts[offset : offset + int(agent.trainer_config.batch_size)]
+    for offset in range(0, len(valid_starts), int(agent.trainer_config.value_batch_size)):
+        starts = valid_starts[offset : offset + int(agent.trainer_config.value_batch_size)]
         sequences = [transitions[start : start + horizon] for start in starts]
         observations = [sequence[0].obs for sequence in sequences]
         next_observations = [sequence[-1].next_obs for sequence in sequences]
@@ -268,6 +268,13 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
         to_absolute_path(str(cfg.data.demo_root)),
         str(cfg.data.task_name),
         "success_rollout",
+        directory=to_absolute_path(
+            str(
+                cfg.visualization.success_rollout_dir
+                if cfg.visualization.success_rollout_dir is not None
+                else cfg.data.success_dir
+            )
+        ),
     )
     if not demo_paths:
         raise FileNotFoundError("No successful rollout was found for Q/V visualization.")

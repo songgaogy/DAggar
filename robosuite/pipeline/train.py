@@ -73,16 +73,16 @@ def _save_checkpoint(
     success_count: int,
 ) -> Path:
     checkpoint_dir = run_dir / str(cfg.checkpoint.directory)
-    step = int(trainer.total_env_steps)
+    completed_episodes = int(episode_index)
     trainer_state = {
         **trainer.state_dict(),
         "episode_index": int(episode_index),
         "success_count": int(success_count),
     }
-    step_path = checkpoint_dir / f"step_{step:08d}.pt"
+    episode_path = checkpoint_dir / f"episode_{completed_episodes:08d}.pt"
     latest_path = checkpoint_dir / "latest.pt"
     agent.save_checkpoint(
-        step_path,
+        episode_path,
         include_buffers=False,
         trainer_state=trainer_state,
     )
@@ -91,7 +91,31 @@ def _save_checkpoint(
         include_buffers=True,
         trainer_state=trainer_state,
     )
-    return step_path
+    return episode_path
+
+
+def _checkpoint_due(total_episodes: int, interval_episodes: int) -> bool:
+    return total_episodes > 0 and total_episodes % interval_episodes == 0
+
+
+def _format_episode_summary(
+    episode_index: int,
+    reason: str,
+    metrics: dict[str, float],
+) -> str:
+    return (
+        f"[episode] index={episode_index} reason={reason} "
+        f"success={int(metrics['success'])} return={metrics['return']:.2f} "
+        f"length={int(metrics['length'])} fps={metrics['env_fps']:.1f} "
+        f"intervention_steps={int(metrics['intervention_steps'])} "
+        f"intervention_rate={metrics['intervention_rate']:.3f} "
+        f"updates={int(metrics['learner_updates'])} "
+        f"learner_sec={metrics['learner_seconds']:.2f} "
+        f"reset_sec={metrics['reset_seconds']:.2f} "
+        f"checkpoint_sec={metrics['checkpoint_seconds']:.2f} "
+        f"pause_sec={metrics['pause_seconds']:.2f} "
+        f"boundary_sec={metrics['boundary_seconds']:.2f}"
+    )
 
 
 class _RateLimiter:
@@ -224,6 +248,11 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             "success_rollout": int(cfg.data.success_num_trajectories),
             "fail_rollout": int(cfg.data.fail_num_trajectories),
         },
+        split_directories={
+            "expert": to_absolute_path(str(cfg.data.expert_dir)),
+            "success_rollout": to_absolute_path(str(cfg.data.success_dir)),
+            "fail_rollout": to_absolute_path(str(cfg.data.fail_dir)),
+        },
         cache_dir=(
             Path(to_absolute_path(str(cfg.logging.output_root)))
             / str(cfg.task.name)
@@ -329,23 +358,108 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
     episode_return = 0.0
     episode_length = 0
     episode_interventions = 0
+    episodes_per_train = int(cfg.trainer.episodes_per_train)
+    if episodes_per_train <= 0:
+        raise ValueError("trainer.episodes_per_train must be positive.")
+    episodes_since_train = int(episode_index) % episodes_per_train
     last_runtime_log = time.monotonic()
     last_runtime_step = int(trainer.total_env_steps)
+    episode_started_at = time.perf_counter()
 
-    def finish_episode(*, success: bool, reason: str) -> None:
-        metrics_list = trainer.train_episode(
-            updates=int(cfg.trainer.updates_per_episode)
+    def finish_episode(
+        *,
+        success: bool,
+        reason: str,
+        pause_after: bool,
+    ) -> None:
+        nonlocal obs
+        nonlocal episode_index
+        nonlocal episode_return
+        nonlocal episode_length
+        nonlocal episode_interventions
+        nonlocal episode_started_at
+        nonlocal episodes_since_train
+
+        collection_seconds = max(
+            time.perf_counter() - episode_started_at,
+            1e-6,
         )
-        for metrics in metrics_list:
-            update = int(metrics["learner/actor_updates"])
-            if update % int(cfg.logging.log_interval_updates) == 0:
-                tensorboard.log(metrics, step=update, prefix="train")
-                events.log({"event": "train", "step": update, **metrics})
+        boundary_started_at = time.perf_counter()
+        episodes_since_train += 1
+        metrics_list: list[dict[str, float]] = []
+        learner_seconds = 0.0
+        if episodes_since_train >= episodes_per_train:
+            learner_started_at = time.perf_counter()
+            metrics_list = trainer.train_episode(
+                updates=int(cfg.trainer.updates_per_train),
+                episodes=episodes_since_train,
+                show_progress=True,
+            )
+            learner_seconds = time.perf_counter() - learner_started_at
+            episodes_since_train = 0
+            for metrics in metrics_list:
+                update = int(metrics["learner/actor_updates"])
+                if update % int(cfg.logging.log_interval_updates) == 0:
+                    tensorboard.log(metrics, step=update, prefix="train")
+                    events.log({"event": "train", "step": update, **metrics})
+
+        checkpoint_seconds = 0.0
+        completed_episodes = episode_index + 1
+        if _checkpoint_due(
+            completed_episodes,
+            int(cfg.checkpoint.interval_episodes),
+        ):
+            checkpoint_started_at = time.perf_counter()
+            saved = _save_checkpoint(
+                agent,
+                trainer,
+                run_dir,
+                cfg,
+                episode_index=completed_episodes,
+                success_count=success_count,
+            )
+            tensorboard.log(
+                {"saved": 1.0},
+                step=completed_episodes,
+                prefix="checkpoint",
+            )
+            checkpoint_seconds = time.perf_counter() - checkpoint_started_at
+            print(f"[checkpoint] {saved}")
+
+        pause_seconds = 0.0
+        if pause_after and float(cfg.runtime.episode_pause_sec) > 0:
+            pause_started_at = time.perf_counter()
+            time.sleep(float(cfg.runtime.episode_pause_sec))
+            pause_seconds = time.perf_counter() - pause_started_at
+
+        reset_started_at = time.perf_counter()
+        obs, _ = reset_policy_observation(
+            env,
+            preserve_mjviewer=True,
+            extractor=extractor,
+            camera_names=camera_names,
+            camera_aliases=camera_aliases,
+            image_height=int(cfg.env.img_height),
+            image_width=int(cfg.env.img_width),
+        )
+        reset_seconds = time.perf_counter() - reset_started_at
+        agent.reset_policy_state()
+        intervention.start_episode()
+        boundary_seconds = time.perf_counter() - boundary_started_at
         episode_metrics = {
             "return": float(episode_return),
             "length": float(episode_length),
             "success": float(success),
+            "env_fps": float(episode_length) / collection_seconds,
             "intervention_steps": float(episode_interventions),
+            "intervention_rate": float(episode_interventions)
+            / max(1, episode_length),
+            "learner_updates": float(len(metrics_list)),
+            "learner_seconds": learner_seconds,
+            "reset_seconds": reset_seconds,
+            "checkpoint_seconds": checkpoint_seconds,
+            "pause_seconds": pause_seconds,
+            "boundary_seconds": boundary_seconds,
             "online_size": float(len(agent.online_buffer)),
             "demo_size": float(len(agent.demo_buffer)),
         }
@@ -358,11 +472,13 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 **episode_metrics,
             }
         )
-        print(
-            f"[episode] index={episode_index} reason={reason} "
-            f"success={int(success)} length={episode_length} "
-            f"updates={len(metrics_list)}"
-        )
+        print(_format_episode_summary(episode_index, reason, episode_metrics))
+
+        episode_index += 1
+        episode_return = 0.0
+        episode_length = 0
+        episode_interventions = 0
+        episode_started_at = time.perf_counter()
 
     while trainer.total_env_steps < int(cfg.runtime.max_env_steps):
         limiter.wait()
@@ -373,22 +489,24 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 break
             completed_episode = episode_length > 0
             if completed_episode:
-                finish_episode(success=False, reason="device_reset")
-            obs, _ = reset_policy_observation(
-                env,
-                preserve_mjviewer=True,
-                extractor=extractor,
-                camera_names=camera_names,
-                camera_aliases=camera_aliases,
-                image_height=int(cfg.env.img_height),
-                image_width=int(cfg.env.img_width),
-            )
-            agent.reset_policy_state()
-            intervention.start_episode()
-            episode_index += int(completed_episode)
-            episode_return = 0.0
-            episode_length = 0
-            episode_interventions = 0
+                finish_episode(
+                    success=False,
+                    reason="device_reset",
+                    pause_after=False,
+                )
+            else:
+                obs, _ = reset_policy_observation(
+                    env,
+                    preserve_mjviewer=True,
+                    extractor=extractor,
+                    camera_names=camera_names,
+                    camera_aliases=camera_aliases,
+                    image_height=int(cfg.env.img_height),
+                    image_width=int(cfg.env.img_width),
+                )
+                agent.reset_policy_state()
+                intervention.start_episode()
+                episode_started_at = time.perf_counter()
             continue
         if active and override is not None:
             action = np.asarray(override, dtype=np.float32)
@@ -448,27 +566,19 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
         episode_length += 1
         episode_interventions += int(active)
         success_count += int(success)
-        render_mjviewer(env)
+        render_mjviewer(
+            env,
+            visualize_gripper_markers=bool(
+                cfg.runtime.visualize_gripper_markers
+            ),
+        )
 
         if done:
-            finish_episode(success=success, reason="environment")
-            if float(cfg.runtime.episode_pause_sec) > 0:
-                time.sleep(float(cfg.runtime.episode_pause_sec))
-            obs, _ = reset_policy_observation(
-                env,
-                preserve_mjviewer=True,
-                extractor=extractor,
-                camera_names=camera_names,
-                camera_aliases=camera_aliases,
-                image_height=int(cfg.env.img_height),
-                image_width=int(cfg.env.img_width),
+            finish_episode(
+                success=success,
+                reason="environment",
+                pause_after=True,
             )
-            agent.reset_policy_state()
-            intervention.start_episode()
-            episode_index += 1
-            episode_return = 0.0
-            episode_length = 0
-            episode_interventions = 0
         else:
             obs = next_obs
 
@@ -492,25 +602,6 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             events.log({"event": "runtime", **runtime_metrics})
             last_runtime_log = now
             last_runtime_step = current_env_step
-
-        if (
-            trainer.total_env_steps > 0
-            and trainer.total_env_steps % int(cfg.checkpoint.interval_env_steps) == 0
-        ):
-            saved = _save_checkpoint(
-                agent,
-                trainer,
-                run_dir,
-                cfg,
-                episode_index=episode_index,
-                success_count=success_count,
-            )
-            tensorboard.log(
-                {"saved": 1.0},
-                step=int(trainer.total_env_steps),
-                prefix="checkpoint",
-            )
-            print(f"[checkpoint] {saved}")
 
     writer.flush()
     final = _save_checkpoint(

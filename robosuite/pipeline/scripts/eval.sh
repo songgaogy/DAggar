@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-/home/dodo/Documents/DAggar/robosuite}"
 PYTHON="${PYTHON:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 TASK="${TASK:-PickPlaceCereal}"
-CHECKPOINT="${CHECKPOINT:-}"
+CHECKPOINT="outputs/baseline/awr/PickPlaceCereal/awr_2026-08-06_22-49-05/checkpoints/episode_00000060.pt"
 
 if [[ -z "${CHECKPOINT}" ]]; then
   echo "[ERROR] Set CHECKPOINT to an AWR checkpoint or run directory." >&2

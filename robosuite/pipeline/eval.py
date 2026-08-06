@@ -11,7 +11,6 @@ from typing import Any
 import hydra
 import imageio.v2 as imageio
 import numpy as np
-from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from robosuite.pipeline.bootstrap import build_agent_config
@@ -50,6 +49,16 @@ def _write_video(path: Path, frames: list[np.ndarray], fps: int) -> None:
     ) as writer:
         for frame in frames:
             writer.append_data(frame)
+
+
+def _run_directory_for_checkpoint(
+    checkpoint: Path, *, checkpoint_dirname: str
+) -> Path:
+    if checkpoint.is_dir():
+        return checkpoint
+    if checkpoint.parent.name == checkpoint_dirname:
+        return checkpoint.parent.parent
+    return checkpoint.parent
 
 
 def _run(cfg: DictConfig, resources: ExitStack) -> None:
@@ -112,10 +121,14 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
     agent.load_checkpoint(checkpoint, load_buffers=False)
     agent.reset_policy_state()
 
+    run_dir = _run_directory_for_checkpoint(
+        checkpoint,
+        checkpoint_dirname=str(cfg.checkpoint.directory),
+    )
     output_dir = (
-        Path(to_absolute_path(str(cfg.logging.output_root)))
-        / str(cfg.task.name)
-        / f"eval_{checkpoint.stem}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        run_dir
+        / "eval"
+        / f"{checkpoint.stem}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     )
     output_dir.mkdir(parents=True, exist_ok=False)
     OmegaConf.save(cfg, output_dir / str(cfg.logging.resolved_config_filename))

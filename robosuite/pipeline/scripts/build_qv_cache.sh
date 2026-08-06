@@ -8,7 +8,6 @@ TASK="${TASK:-PickPlaceCereal}"
 cd "${ROOT_DIR}"
 export HYDRA_FULL_ERROR=1
 export PYTHONFAULTHANDLER=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 "${PYTHON}" -m robosuite.pipeline.build_qv_cache "task=${TASK}" "$@"

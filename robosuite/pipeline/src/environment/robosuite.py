@@ -116,10 +116,20 @@ def reset_robosuite_env(env, *, preserve_mjviewer: bool) -> tuple[dict[str, Any]
         env.hard_reset = original_hard_reset
 
 
-def render_mjviewer(env) -> None:
+def render_mjviewer(env, *, visualize_gripper_markers: bool = False) -> None:
     if str(getattr(env, "renderer", "")).lower() != "mjviewer":
         raise ValueError("Interactive training requires renderer='mjviewer'.")
     if env.viewer is None:
         env.initialize_renderer()
         env.viewer_get_obs = hasattr(env.viewer, "_get_observations")
-    env.viewer.update()
+    if not visualize_gripper_markers:
+        env.viewer.update()
+        return
+
+    hidden_visuals = {name: False for name in env._visualizations}
+    viewer_visuals = {name: name == "grippers" for name in env._visualizations}
+    try:
+        env.visualize(vis_settings=viewer_visuals)
+        env.viewer.update()
+    finally:
+        env.visualize(vis_settings=hidden_visuals)

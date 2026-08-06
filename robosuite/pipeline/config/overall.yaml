@@ -120,9 +120,11 @@ buffers:
   demo_capacity: 500000
 
 trainer:
-  batch_size: 64
-  value_warmup_steps: 20000
-  updates_per_episode: 100
+  value_batch_size: 256
+  actor_batch_size: 128
+  value_warmup_steps: 15000
+  episodes_per_train: 10
+  updates_per_train: 500
   inference_sync_interval: 50
 
 grasp_penalty:
@@ -143,10 +145,10 @@ intervention:
 data:
   demo_root: "./data"
   task_name: ${task.demo_task}
-  expert_dir: "${data.demo_root}/${data.task_name}/expert"
+  expert_dir: "${data.demo_root}/${data.task_name}/pretrain_data-20260615_174814"
   success_dir: "${data.demo_root}/${data.task_name}/success_rollout"
   fail_dir: "${data.demo_root}/${data.task_name}/fail_rollout"
-  expert_num_trajectories: 20
+  expert_num_trajectories: 100    # all trajectories in the pretrain data
   success_num_trajectories: 20
   fail_num_trajectories: 20
 
@@ -160,17 +162,17 @@ runtime:
   control_fps: ${env.control_freq}
   spacemouse_fps: ${runtime.control_fps}
   policy_fps: ${runtime.control_fps}
-  episode_pause_sec: 1.0
+  episode_pause_sec: 0.0
 
 checkpoint:
   resume: false
   path: null
   load_buffers: true
-  init_path: "./checkpoints/multitask_6/policy/flow-20/flow_multi_ep0100_20260320_114720.pt"
+  init_path: "./checkpoints/multitask_6/flow_multi_ep0100.pt"
   use_init_camera_names: true
   use_init_model: true
   directory: "checkpoints"
-  interval_env_steps: 1000
+  interval_episodes: 20
   buffer_directory: "buffer_chunks"
   buffer_interval_env_steps: 200
 
@@ -191,7 +193,7 @@ logging:
   metadata_filename: "run_metadata.json"
   metrics_filename: "metrics.jsonl"
   console_filename: "console.log"
-  log_interval_updates: 10
+  log_interval_updates: 500
   runtime_log_interval_seconds: 1.0
 
 tensorboard:
@@ -202,7 +204,7 @@ tensorboard:
 evaluation:
   checkpoint: null
   seed: 42
-  num_episodes: 20
+  num_episodes: 50
   deterministic: true
   max_episode_steps: ${task.horizon}
   viewer_enabled: false

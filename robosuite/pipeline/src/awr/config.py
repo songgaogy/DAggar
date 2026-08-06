@@ -69,9 +69,11 @@ class AWRConfig:
 
 @dataclass
 class TrainerConfig:
-    batch_size: int = 64
+    value_batch_size: int = 256
+    actor_batch_size: int = 128
     warmup_steps: int = 0
-    updates_per_episode: int = 100
+    episodes_per_train: int = 10
+    updates_per_train: int = 2000
     inference_sync_interval: int = 50
     value_warmup_steps: int = 20_000
 

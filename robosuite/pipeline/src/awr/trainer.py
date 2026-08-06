@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from tqdm.auto import trange
+
 from robosuite.pipeline.src.data.transitions import Transition
 
 from .agent import AWRAgent
@@ -153,18 +155,29 @@ class AWRTrainer:
         *,
         updates: int | None = None,
         batch_size: int | None = None,
+        show_progress: bool = False,
+        episodes: int = 1,
     ) -> list[dict[str, float]]:
-        """Run the fixed synchronous update block after one completed episode."""
-        self.total_episodes += 1
+        """Run the fixed synchronous update block after collected episodes."""
+        self.total_episodes += int(episodes)
         if self.total_env_steps < self.config.warmup_steps:
             return []
         if not self.agent.ready_for_update():
             return []
         results = []
         requested = (
-            self.config.updates_per_episode if updates is None else int(updates)
+            self.config.updates_per_train if updates is None else int(updates)
         )
-        for _ in range(max(0, requested)):
+        update_range = range(max(0, requested))
+        if show_progress:
+            update_range = trange(
+                max(0, requested),
+                desc=f"Episode {self.total_episodes} learner",
+                unit="update",
+                leave=False,
+                dynamic_ncols=True,
+            )
+        for _ in update_range:
             metrics = self.agent.update(batch_size)
             self.total_value_updates += 1
             self.total_actor_updates += 1

@@ -60,16 +60,24 @@ def build_agent_config(
         "awr": awr,
         "online_buffer": {
             "capacity": int(cfg.buffers.online_capacity),
-            "batch_size": int(cfg.trainer.batch_size),
+            "batch_size": max(
+                int(cfg.trainer.value_batch_size),
+                int(cfg.trainer.actor_batch_size),
+            ),
         },
         "demo_buffer": {
             "capacity": int(cfg.buffers.demo_capacity),
-            "batch_size": int(cfg.trainer.batch_size),
+            "batch_size": max(
+                int(cfg.trainer.value_batch_size),
+                int(cfg.trainer.actor_batch_size),
+            ),
         },
         "trainer": {
-            "batch_size": int(cfg.trainer.batch_size),
+            "value_batch_size": int(cfg.trainer.value_batch_size),
+            "actor_batch_size": int(cfg.trainer.actor_batch_size),
             "warmup_steps": 0,
-            "updates_per_episode": int(cfg.trainer.updates_per_episode),
+            "episodes_per_train": int(cfg.trainer.episodes_per_train),
+            "updates_per_train": int(cfg.trainer.updates_per_train),
             "inference_sync_interval": int(cfg.trainer.inference_sync_interval),
             "value_warmup_steps": int(cfg.trainer.value_warmup_steps),
         },

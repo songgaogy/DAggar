@@ -30,15 +30,20 @@ def resolve_demo_paths(
     data_root: str | Path,
     task_name: str,
     split: str,
+    *,
+    directory: str | Path | None = None,
 ) -> list[Path]:
     if split not in DEMO_SPLITS:
         raise ValueError(f"Unsupported AWR demo split '{split}'. Expected one of {DEMO_SPLITS}.")
-    directory = Path(data_root).expanduser().resolve() / str(task_name) / split
-    if not directory.exists():
+    if directory is None:
+        root = Path(data_root).expanduser().resolve() / str(task_name) / split
+    else:
+        root = Path(directory).expanduser().resolve()
+    if not root.exists():
         return []
     return [
         path
-        for path in sorted(directory.iterdir())
+        for path in sorted(root.iterdir())
         if path.is_file() and path.suffix.lower() in {".hdf5", ".h5", ".pt"}
     ]
 
@@ -55,14 +60,21 @@ def load_demos(
     control_freq: int = 20,
     horizon: int = 500,
     trajectory_limits: Mapping[str, int | None] | None = None,
+    split_directories: Mapping[str, str | Path] | None = None,
     cache_dir: str | Path | None = None,
     mirror_cache_dir: str | Path | None = None,
     seed: int = 0,
 ) -> dict[str, list[Transition]]:
     limits = dict(trajectory_limits or {})
+    directories = dict(split_directories or {})
     return {
         split: _load_split(
-            paths=resolve_demo_paths(data_root, task_name, split),
+            paths=resolve_demo_paths(
+                data_root,
+                task_name,
+                split,
+                directory=directories.get(split),
+            ),
             split=split,
             camera_names=camera_names,
             camera_aliases=camera_aliases,
