@@ -60,20 +60,26 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             camera_names,
             has_renderer=interactive,
             has_offscreen_renderer=False,
-            renderer="mjviewer" if interactive else str(cfg.env.renderer),
+            renderer=str(cfg.env.renderer),
         )
     )
     resources.callback(env.close)
-    render_env = build_robosuite_env(
-        build_runtime_cfg(
-            cfg,
-            camera_names,
-            has_renderer=False,
-            has_offscreen_renderer=True,
+    if interactive:
+        render_env = env
+        if str(cfg.env.renderer).lower() == "mujoco":
+            env.viewer.width = int(cfg.env.viewer_width)
+            env.viewer.height = int(cfg.env.viewer_height)
+    else:
+        render_env = build_robosuite_env(
+            build_runtime_cfg(
+                cfg,
+                camera_names,
+                has_renderer=False,
+                has_offscreen_renderer=True,
+            )
         )
-    )
-    resources.callback(render_env.close)
-    render_env.reset()
+        resources.callback(render_env.close)
+        render_env.reset()
     adapter = RobosuiteObservationAdapter(
         env,
         render_env=render_env,
@@ -106,6 +112,8 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 deterministic=bool(cfg.evaluation.deterministic),
             )
             raw_next_obs, _, terminated, truncated, info = unpack_robosuite_step(env.step(action))
+            if interactive:
+                env.render()
             reward, success = sparse_success_reward(env, info if isinstance(info, dict) else None)
             episode_return += reward
             observation = adapter.transform(raw_next_obs)

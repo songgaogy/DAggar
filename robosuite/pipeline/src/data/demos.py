@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import pickle
 import random
@@ -58,23 +59,46 @@ def load_demo_paths(
     selected_demo_callback: Callable[[Path, list[str]], None] | None = None,
 ) -> list[Transition]:
     transitions: list[Transition] = []
-    remaining_trajectories = None if max_num_trajectories is None else int(max_num_trajectories)
-    sample_rng = random.Random(random_seed) if random_seed is not None else random.Random()
-    if remaining_trajectories is not None and remaining_trajectories <= 0:
-        return transitions
+    paths = [Path(raw_path) for raw_path in demo_paths]
+    selected_by_path: dict[Path, list[str]] | None = None
+    if max_num_trajectories is not None:
+        requested_trajectories = int(max_num_trajectories)
+        if requested_trajectories < 1:
+            raise ValueError(
+                f"max_num_trajectories must be at least 1, got {requested_trajectories}."
+            )
+        unsupported_paths = [
+            path for path in paths if path.suffix.lower() not in {".hdf5", ".h5"}
+        ]
+        if unsupported_paths:
+            raise ValueError(
+                "Trajectory-limited demo loading only supports HDF5 expert files. "
+                f"Remove max_num_trajectories or convert {unsupported_paths[0]} to HDF5 input."
+            )
+        demo_catalog = [
+            (path, demo_name)
+            for path in paths
+            for demo_name in list_hdf5_demo_names(path)
+        ]
+        if requested_trajectories > len(demo_catalog):
+            raise ValueError(
+                "Requested more expert trajectories than are available: "
+                f"requested {requested_trajectories}, available {len(demo_catalog)}."
+            )
+        if random_sample:
+            selected_catalog = random.Random(random_seed).sample(
+                demo_catalog,
+                requested_trajectories,
+            )
+        else:
+            selected_catalog = demo_catalog[:requested_trajectories]
+        selected_by_path = {path: [] for path in paths}
+        for path, demo_name in selected_catalog:
+            selected_by_path[path].append(demo_name)
 
-    for raw_path in demo_paths:
-        if remaining_trajectories is not None and remaining_trajectories <= 0:
-            break
-
-        path = Path(raw_path)
+    for path in paths:
         suffix = path.suffix.lower()
         if suffix == ".pt":
-            if remaining_trajectories is not None:
-                raise ValueError(
-                    "Trajectory-limited demo loading only supports HDF5 expert files. "
-                    f"Remove max_num_trajectories or convert {path} to HDF5 input."
-                )
             transitions.extend(load_transition_shard(path))
             continue
 
@@ -83,12 +107,11 @@ def load_demo_paths(
         if hdf5_loader is None:
             raise ValueError("An hdf5_loader must be provided to read HDF5 demos.")
 
-        selected_demo_names = list_hdf5_demo_names(path)
-        if remaining_trajectories is not None:
-            if random_sample and remaining_trajectories < len(selected_demo_names):
-                selected_demo_names = sample_rng.sample(selected_demo_names, remaining_trajectories)
-            else:
-                selected_demo_names = selected_demo_names[:remaining_trajectories]
+        selected_demo_names = (
+            list_hdf5_demo_names(path)
+            if selected_by_path is None
+            else selected_by_path[path]
+        )
         if not selected_demo_names:
             continue
         if selected_demo_callback is not None:
@@ -98,9 +121,7 @@ def load_demo_paths(
             path,
             cache_dir=cache_dir,
             cache_key=cache_key,
-            selected_demo_count=(
-                len(selected_demo_names) if remaining_trajectories is not None else None
-            ),
+            selected_demo_names=(selected_demo_names if selected_by_path is not None else None),
         )
         if cache_path is not None and _cache_is_current(cache_path, path):
             try:
@@ -121,8 +142,6 @@ def load_demo_paths(
             else:
                 _mirror_cache_file(cache_path, mirror_cache_dir)
                 transitions.extend(cached_transitions)
-                if remaining_trajectories is not None:
-                    remaining_trajectories -= len(selected_demo_names)
                 continue
 
         converted = hdf5_loader(path, demo_names=selected_demo_names)
@@ -130,8 +149,6 @@ def load_demo_paths(
         if cache_path is not None:
             save_transition_shard(cache_path, converted)
             _mirror_cache_file(cache_path, mirror_cache_dir)
-        if remaining_trajectories is not None:
-            remaining_trajectories -= len(selected_demo_names)
 
     return transitions
 
@@ -287,7 +304,7 @@ def _resolve_cache_path(
     *,
     cache_dir: str | Path | None,
     cache_key: str | None,
-    selected_demo_count: int | None,
+    selected_demo_names: Sequence[str] | None,
 ) -> Path | None:
     if cache_dir is None:
         return None
@@ -296,8 +313,17 @@ def _resolve_cache_path(
     cache_stem = source_path.stem
     if cache_key:
         cache_stem = f"{cache_stem}_{cache_key}"
-    if selected_demo_count is not None:
-        cache_stem = f"{cache_stem}_first_{selected_demo_count:05d}"
+    if selected_demo_names is not None:
+        selection_payload = json.dumps(
+            {
+                "source": str(source_path.resolve()),
+                "demo_names": sorted(selected_demo_names),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        selection_digest = hashlib.sha256(selection_payload).hexdigest()[:16]
+        cache_stem = f"{cache_stem}_selected_{selection_digest}"
     return cache_root / f"{cache_stem}.pt"
 
 

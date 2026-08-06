@@ -249,11 +249,13 @@ class MultiModalObservationEncoder(nn.Module):
                 for key in self.image_keys:
                     self.image_encoders[key] = self._build_image_encoder(key)
 
-        self.state_projector = nn.Sequential(
-            nn.LazyLinear(int(config.proprio_feature_dim)),
-            nn.LayerNorm(int(config.proprio_feature_dim)),
-            nn.Tanh(),
-        )
+        self.state_projector = None
+        if self.proprio_keys:
+            self.state_projector = nn.Sequential(
+                nn.LazyLinear(int(config.proprio_feature_dim)),
+                nn.LayerNorm(int(config.proprio_feature_dim)),
+                nn.Tanh(),
+            )
 
         image_output_dim = 0
         if self.image_keys:
@@ -317,6 +319,8 @@ class MultiModalObservationEncoder(nn.Module):
                 value = value.unsqueeze(0)
             proprio_features.append(value.flatten(start_dim=1))
         if proprio_features:
+            if self.state_projector is None:
+                raise RuntimeError("Proprioception features require a configured state projector.")
             proprio = self.state_projector(torch.cat(proprio_features, dim=-1))
             features.append(proprio.detach() if stop_gradient else proprio)
 

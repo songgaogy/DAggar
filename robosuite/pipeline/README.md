@@ -9,6 +9,7 @@ This package contains the single supported online learning method: HIL-SERL. It 
 - learner batches contain 50% online and 50% demonstration/intervention data;
 - one learner step performs `cta_ratio - 1` critic-only updates followed by one critic, grasp critic, actor, and temperature update;
 - the actor uses continuous SAC for `action[:-1]` and a three-way grasp critic for the final gripper action;
+- policy observations contain only the configured RGB camera images and exclude simulator object state and proprioception;
 - robosuite `is_success` supplies the binary `0/1` reward;
 - time-limit truncation preserves value bootstrapping;
 - a background learner trains continuously after replay warmup and publishes an inference snapshot every 50 learner steps.
@@ -24,6 +25,10 @@ Expert demonstrations are loaded from:
 ```text
 data/PickPlaceCereal/expert
 ```
+
+The baseline samples 20 trajectories without replacement from the complete expert dataset using the fixed data-selection
+seed `42`. The selected source file and demonstration IDs are stored in `demo_selection.json` for every run. Training
+seeds do not change this fixed demonstration subset.
 
 Outputs are written below:
 

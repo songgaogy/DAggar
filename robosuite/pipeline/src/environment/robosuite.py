@@ -29,7 +29,8 @@ class RobosuiteRuntimeConfig:
     has_offscreen_renderer: bool = True
     ignore_done: bool = False
     use_camera_obs: bool = False
-    proprio_keys: Sequence[str] = ()
+    use_object_obs: bool = True
+    proprio_keys: Optional[Sequence[str]] = None
     horizon: Optional[int] = None
 
 
@@ -60,6 +61,7 @@ def build_robosuite_env(runtime_cfg: RobosuiteRuntimeConfig):
         "has_offscreen_renderer": bool(runtime_cfg.has_offscreen_renderer),
         "ignore_done": bool(runtime_cfg.ignore_done),
         "use_camera_obs": bool(runtime_cfg.use_camera_obs),
+        "use_object_obs": bool(runtime_cfg.use_object_obs),
         "reward_shaping": bool(runtime_cfg.reward_shaping),
         "control_freq": int(runtime_cfg.control_freq),
     }
@@ -90,6 +92,7 @@ def build_runtime_config_from_env_info(
     renderer: str,
     reward_shaping: bool,
     control_freq: int,
+    use_object_obs: bool = False,
 ) -> RobosuiteRuntimeConfig:
     return RobosuiteRuntimeConfig(
         env_name=str(env_info["env_name"]),
@@ -108,6 +111,7 @@ def build_runtime_config_from_env_info(
         has_offscreen_renderer=bool(len(camera_names) > 0),
         ignore_done=False,
         use_camera_obs=False,
+        use_object_obs=bool(use_object_obs),
         proprio_keys=tuple(proprio_keys),
     )
 
@@ -121,7 +125,7 @@ class RobosuiteObservationAdapter:
         camera_names: Sequence[str],
         img_height: int,
         img_width: int,
-        proprio_keys: Sequence[str] = (),
+        proprio_keys: Optional[Sequence[str]] = None,
         image_obs_fps: float | None = None,
     ) -> None:
         self.env = env
@@ -129,7 +133,7 @@ class RobosuiteObservationAdapter:
         self.camera_names = [str(name) for name in camera_names]
         self.img_height = int(img_height)
         self.img_width = int(img_width)
-        self.proprio_keys = [str(key) for key in proprio_keys]
+        self.proprio_keys = None if proprio_keys is None else [str(key) for key in proprio_keys]
         self.image_obs_fps = None if image_obs_fps is None else float(image_obs_fps)
         self.image_obs_period = None
         if self.image_obs_fps is not None and self.image_obs_fps > 0.0:
@@ -158,12 +162,17 @@ class RobosuiteObservationAdapter:
         if images is None:
             images = self.render_images(force_render=force_render, now=now)
         policy_obs = {key: np.asarray(image, dtype=np.uint8) for key, image in images.items()}
-        policy_obs["state"] = self.flatten_proprio(raw_obs)
+        if self.proprio_keys is None or self.proprio_keys:
+            policy_obs["state"] = self.flatten_proprio(raw_obs)
         return policy_obs
 
     def flatten_proprio(self, raw_obs: dict[str, Any]) -> np.ndarray:
         values = []
-        keys = self.proprio_keys or [key for key in raw_obs if _is_numeric_observation(raw_obs[key])]
+        keys = (
+            self.proprio_keys
+            if self.proprio_keys is not None
+            else [key for key in raw_obs if _is_numeric_observation(raw_obs[key])]
+        )
         for key in keys:
             if key not in raw_obs:
                 continue
@@ -232,14 +241,16 @@ def estimate_gripper_openness(env) -> float | None:
             if joint_qpos.shape[0] != joint_ranges.shape[0]:
                 continue
 
-            span = joint_ranges[:, 1] - joint_ranges[:, 0]
+            # Panda finger joints move symmetrically away from zero as the gripper opens.
+            magnitude_ranges = np.sort(np.abs(joint_ranges), axis=1)
+            span = magnitude_ranges[:, 1] - magnitude_ranges[:, 0]
             valid = span > 1e-6
             if not np.any(valid):
                 continue
 
             normalized = np.zeros_like(joint_qpos, dtype=np.float32)
             normalized[valid] = np.clip(
-                (joint_qpos[valid] - joint_ranges[valid, 0]) / span[valid],
+                (np.abs(joint_qpos[valid]) - magnitude_ranges[valid, 0]) / span[valid],
                 0.0,
                 1.0,
             )

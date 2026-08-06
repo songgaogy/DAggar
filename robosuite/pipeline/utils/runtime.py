@@ -57,6 +57,7 @@ def build_runtime_cfg(
         has_offscreen_renderer=bool(has_offscreen_renderer),
         ignore_done=False,
         use_camera_obs=False,
+        use_object_obs=bool(cfg.env.use_object_obs),
         proprio_keys=tuple(cfg.env.proprio_keys or []),
         horizon=int(cfg.env.horizon) if cfg.env.horizon is not None else None,
     )

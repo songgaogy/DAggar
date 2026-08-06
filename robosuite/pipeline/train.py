@@ -67,7 +67,7 @@ def _algorithm_config(cfg: DictConfig) -> dict[str, Any]:
 
 def _run_directory(cfg: DictConfig) -> tuple[str, Path]:
     root = Path(to_absolute_path(str(cfg.logging.output_root))) / str(cfg.task.name)
-    run_name = f"{cfg.logging.run_name or 'hil_serl'}_{now_readable()}"
+    run_name = f"{cfg.logging.run_name or cfg.task.name}_{now_readable()}"
     run_dir = root / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_name, run_dir
@@ -83,9 +83,10 @@ def _checkpoint_reference(cfg: DictConfig) -> Path | None:
         return path
     if not bool(cfg.checkpoint.resume):
         return None
-    task_root = Path(to_absolute_path(str(cfg.logging.output_root))) / str(cfg.task.name)
+    root = Path(to_absolute_path(str(cfg.logging.output_root))) / str(cfg.task.name)
+    prefix = str(cfg.logging.run_name or cfg.task.name)
     candidates = sorted(
-        task_root.glob(f"*/{cfg.checkpoint.directory}/latest.pt"),
+        root.glob(f"{prefix}_*/{cfg.checkpoint.directory}/latest.pt"),
         key=lambda path: path.stat().st_mtime,
     )
     return candidates[-1] if candidates else None
@@ -95,6 +96,10 @@ def _write_metadata(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
+
+
+def _episode_checkpoint_due(episode_index: int, interval: int) -> bool:
+    return interval > 0 and episode_index > 0 and episode_index % interval == 0
 
 
 def _drain_learner_metrics(
@@ -142,7 +147,7 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
         camera_names,
         has_renderer=interactive,
         has_offscreen_renderer=False,
-        renderer="mjviewer" if interactive else str(cfg.env.renderer),
+        renderer=str(cfg.env.renderer),
     )
     env = maybe_wrap_visualization(
         build_robosuite_env(runtime_cfg),
@@ -150,19 +155,25 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
         label="training env",
     )
     resources.callback(env.close)
-    render_cfg = build_runtime_cfg(
-        cfg,
-        camera_names,
-        has_renderer=False,
-        has_offscreen_renderer=True,
-    )
-    render_env = maybe_wrap_visualization(
-        build_robosuite_env(render_cfg),
-        enabled=bool(cfg.runtime.visualize_gripper_markers),
-        label="observation render env",
-    )
-    resources.callback(render_env.close)
-    render_env.reset()
+    if interactive:
+        render_env = env
+        if str(runtime_cfg.renderer).lower() == "mujoco":
+            env.viewer.width = int(cfg.env.viewer_width)
+            env.viewer.height = int(cfg.env.viewer_height)
+    else:
+        render_cfg = build_runtime_cfg(
+            cfg,
+            camera_names,
+            has_renderer=False,
+            has_offscreen_renderer=True,
+        )
+        render_env = maybe_wrap_visualization(
+            build_robosuite_env(render_cfg),
+            enabled=bool(cfg.runtime.visualize_gripper_markers),
+            label="observation render env",
+        )
+        resources.callback(render_env.close)
+        render_env.reset()
     adapter = RobosuiteObservationAdapter(
         env,
         render_env=render_env,
@@ -199,9 +210,22 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
     )
     if not demo_paths:
         raise FileNotFoundError(f"No expert demonstrations found under {cfg.data.demo_path}.")
+    selected_demo_manifest: list[dict[str, str]] = []
+    demo_root = Path(to_absolute_path(str(cfg.data.demo_root))).resolve()
+
+    def record_selected_demos(path: Path, demo_names: list[str]) -> None:
+        source_path = path.resolve()
+        try:
+            source = str(source_path.relative_to(demo_root))
+        except ValueError:
+            source = str(source_path)
+        selected_demo_manifest.extend(
+            {"source": source, "demo_name": str(demo_name)} for demo_name in demo_names
+        )
+
     demo_transitions = load_demo_paths(
         demo_paths,
-        cache_dir=Path(to_absolute_path(str(cfg.logging.output_root))) / str(cfg.task.name) / "_demo_cache",
+        cache_dir=Path(to_absolute_path(str(cfg.logging.output_root))) / "_demo_cache",
         mirror_cache_dir=run_dir / "demo_cache",
         hdf5_loader=lambda path, demo_names=None: load_hdf5_demos_into_transitions(
             path,
@@ -218,13 +242,39 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             demo_names=demo_names,
         ),
         max_num_trajectories=cfg.data.num_trajectories,
+        random_sample=bool(cfg.data.random_sample),
+        random_seed=None if cfg.data.random_seed is None else int(cfg.data.random_seed),
+        selected_demo_callback=record_selected_demos,
         cache_key=(
-            f"{cfg.task.name}_{cfg.env.img_height}_{'_'.join(camera_names)}_reward01"
+            f"{cfg.task.name}_{cfg.env.img_height}x{cfg.env.img_width}_{'_'.join(camera_names)}"
+            f"_proprio-{'-'.join(cfg.env.proprio_keys) if cfg.env.proprio_keys else 'none'}"
+            "_reward01_gripper-openness-abs-range-v1"
             f"_gp{cfg.algorithm.grasp_penalty.penalty}"
             f"_gc{cfg.algorithm.grasp_penalty.command_threshold}"
             f"_go{cfg.algorithm.grasp_penalty.open_threshold}"
             f"_gx{cfg.algorithm.grasp_penalty.closed_threshold}"
         ),
+    )
+    selected_demo_manifest.sort(key=lambda item: (item["source"], item["demo_name"]))
+    if (
+        cfg.data.num_trajectories is not None
+        and len(selected_demo_manifest) != int(cfg.data.num_trajectories)
+    ):
+        raise RuntimeError(
+            "Demo selection manifest does not match the requested trajectory count: "
+            f"requested {cfg.data.num_trajectories}, selected {len(selected_demo_manifest)}."
+        )
+    _write_metadata(
+        run_dir / str(cfg.data.selection_manifest_filename),
+        {
+            "num_requested": (
+                None if cfg.data.num_trajectories is None else int(cfg.data.num_trajectories)
+            ),
+            "random_sample": bool(cfg.data.random_sample),
+            "random_seed": None if cfg.data.random_seed is None else int(cfg.data.random_seed),
+            "num_selected": len(selected_demo_manifest),
+            "trajectories": selected_demo_manifest,
+        },
     )
     if not demo_transitions:
         raise RuntimeError("Expert demonstration conversion produced no transitions.")
@@ -251,7 +301,6 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
     intervention_gate = IntervalGate(float(cfg.runtime.spacemouse_fps))
     fps = EMAFpsTracker()
     last_runtime_log = time.monotonic()
-    last_checkpoint_update = trainer.total_updates
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
     cached_override_action: np.ndarray | None = None
     cached_is_intervention = False
@@ -294,6 +343,11 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
         if resume_learner and not trainer.learner_finished:
             trainer.start_async_worker()
 
+    def save_episode_checkpoint_if_due() -> None:
+        checkpoint_interval = int(cfg.checkpoint.interval_online_episodes)
+        if _episode_checkpoint_due(episode_index, checkpoint_interval):
+            save_checkpoint(f"episode_{episode_index:08d}", resume_learner=True)
+
     try:
         while trainer.total_env_steps < int(cfg.runtime.max_env_steps):
             trainer.raise_if_failed()
@@ -321,12 +375,19 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                     total_intervention_segments += 1
                 stage_seconds["intervention"] += time.perf_counter() - stage_started
             if reset_requested:
+                print(
+                    f"[episode] index={episode_index} reason=manual_reset "
+                    f"return={episode_return:.2f} length={episode_length} "
+                    f"intervention_rate={episode_intervention_steps / max(1, episode_length):.3f} "
+                    f"updates={trainer.total_updates}"
+                )
                 obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=interactive)
                 episode_return = 0.0
                 episode_length = 0
                 episode_intervention_steps = 0
                 episode_intervention_segments = 0
                 episode_index += 1
+                save_episode_checkpoint_if_due()
                 policy_gate.force_ready()
                 intervention_gate.force_ready()
                 intervention.start_episode()
@@ -345,6 +406,8 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
             )
             stage_started = time.perf_counter()
             step_output = env.step(action)
+            if interactive:
+                env.render()
             stage_seconds["environment"] += time.perf_counter() - stage_started
             raw_next_obs, _, terminated, truncated, info = unpack_robosuite_step(step_output)
             info = dict(info) if isinstance(info, dict) else {"raw_info": info}
@@ -401,8 +464,16 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 }
                 tensorboard.log(episode_metrics, step=episode_index, prefix="episode")
                 events.log({"event": "episode_end", "episode": episode_index, **episode_metrics})
+                reason = "success" if is_success else ("terminated" if terminated else "truncated")
+                print(
+                    f"[episode] index={episode_index} reason={reason} "
+                    f"return={episode_return:.2f} length={episode_length} "
+                    f"intervention_rate={episode_metrics['intervention_step_ratio']:.3f} "
+                    f"updates={trainer.total_updates}"
+                )
                 obs, _ = reset_observation_adapter(adapter, preserve_mjviewer=interactive)
                 episode_index += 1
+                save_episode_checkpoint_if_due()
                 episode_return = 0.0
                 episode_length = 0
                 episode_intervention_steps = 0
@@ -419,11 +490,6 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 obs = next_obs
 
             progress = trainer.progress_snapshot()
-            checkpoint_interval = int(cfg.checkpoint.interval_learner_steps)
-            if checkpoint_interval > 0 and progress["total_updates"] - last_checkpoint_update >= checkpoint_interval:
-                last_checkpoint_update = progress["total_updates"]
-                save_checkpoint(f"learner_{last_checkpoint_update:08d}", resume_learner=True)
-
             elapsed = time.monotonic() - last_runtime_log
             if elapsed >= float(cfg.logging.runtime_log_interval_seconds):
                 learner_updates = progress["total_updates"] - last_runtime_update
@@ -440,6 +506,15 @@ def _run(cfg: DictConfig, resources: ExitStack) -> None:
                 }
                 tensorboard.log(runtime_metrics, step=trainer.total_env_steps, prefix="runtime")
                 events.log({"event": "runtime", **runtime_metrics})
+                print(
+                    f"[status] episode={episode_index} env_steps={progress['env_steps']} "
+                    f"updates={progress['total_updates']} "
+                    f"env_fps={runtime_metrics['env_fps']:.1f} "
+                    f"updates_per_second={runtime_metrics['learner_updates_per_second']:.1f} "
+                    f"intervention_rate={runtime_metrics['intervention_step_ratio']:.3f} "
+                    f"online_buffer={runtime_metrics['online_buffer_size']} "
+                    f"demo_buffer={runtime_metrics['demo_buffer_size']}"
+                )
                 last_runtime_update = progress["total_updates"]
                 stage_seconds = {name: 0.0 for name in stage_seconds}
                 last_runtime_log = time.monotonic()
