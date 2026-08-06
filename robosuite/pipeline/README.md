@@ -169,7 +169,7 @@ python -m robosuite.pipeline.train_flow_dagger \
 3. Roll out policy in robosuite; human can intervene via SpaceMouse
 4. Store transitions; intervention segments go to the demo buffer
 5. Async/sync gradient updates on mixed batches from both buffers
-6. Save checkpoints, demo buffer chunks, and WandB logs
+6. Save checkpoints every configured number of completed online episodes, plus demo buffer chunks and WandB logs
 
 Key runtime flags:
 
@@ -179,22 +179,38 @@ Key runtime flags:
 | `runtime.async_updates` | Run learner in background thread |
 | `runtime.online_updates_enabled` | Enable/disable online gradient updates |
 | `runtime.save_demo_buffer` | Persist intervention demo chunks to disk |
+| `runtime.viewer_async` | Refresh the decoupled viewer asynchronously; the training shell defaults to synchronous refresh |
 | `algorithm.trainer.max_pending_updates` | Cap async learner lag (default: 8) |
+| `logging.checkpoint_episode_interval` | Save a checkpoint every N completed online episodes (default: 20) |
 | `discriminator.enabled` | Run the PU-BCE fail/safe indicator thread + HUD |
 | `discriminator.inference.intervene_env` | Pause the env on sustained `fail` and wait for the human |
 
 Outputs are written to `logging.output_root/<run_name>/` with:
 
-- `checkpoints/` — model checkpoints (`step_*_updates_*_ep_*.pt`)
+- `checkpoints/` — periodic model checkpoints (`ep_*.pt`) and `latest.pt`
 - `buffers/demo_chunks/` — saved intervention transitions
 - `console.log`, `metrics_runtime.jsonl` — runtime logs
 - `resolved_config.yaml`, `run_info.json` — reproducibility metadata
+
+`scripts/train_flow_dagger.sh` defaults to synchronous viewer refresh to keep each displayed frame aligned
+with the latest completed environment step. Set `VIEWER_ASYNC=true` to restore the asynchronous preview.
+Runtime logs include `viewer_fps` and `policy_inference_ms_mean/max/count` to distinguish viewer slowdown
+from the synchronous action-chunk inference latency.
 
 #### Failure-discriminator indicator
 
 The PU-BCE discriminator (see [Failure Discriminator](#failure-discriminator-flow_daggerdiscriminatorpy))
 is composed into the run via Hydra `defaults` as `cfg.discriminator`. It is **on by default**
 (`discriminator.enabled=true`) and acts purely as an intervention indicator.
+
+The `scripts/train_flow_dagger.sh` entrypoint overrides this to disabled by default. Set
+`DISCRIMINATOR_ENABLED=true` to enable it, and use `CHECKPOINT_EPISODE_INTERVAL` to override
+the default 20-episode checkpoint interval:
+
+```bash
+DISCRIMINATOR_ENABLED=true CHECKPOINT_EPISODE_INTERVAL=10 \
+  bash robosuite/pipeline/scripts/train_flow_dagger.sh
+```
 
 ```bash
 # Indicator only — HUD shows fail/safe, never pauses (no effect on learning):

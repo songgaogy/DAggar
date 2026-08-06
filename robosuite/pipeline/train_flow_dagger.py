@@ -42,7 +42,6 @@ from robosuite.pipeline.utils import (
     build_flow_runtime_cfg,
     build_live_policy_observation,
     checkpoint_path,
-    checkpoint_step_path,
     convert_env_camera_observation,
     extract_flow_state,
     format_base_policy_trajectory_tag,
@@ -276,6 +275,7 @@ def main(cfg: DictConfig) -> None:
     async_updates = bool(getattr(cfg.runtime, "async_updates", False))
     eval_episode_max_steps = int(getattr(cfg.runtime, "eval_episode_max_steps", 300))
     viewer_runtime: RobosuiteViewerRuntime | None = None
+    viewer_async = bool(getattr(cfg.runtime, "viewer_async", False))
     if decoupled_viewer_enabled:
         viewer_requested_backend = str(getattr(cfg.runtime, "viewer_backend", "auto"))
         if viewer_requested_backend.lower() == "auto" and main_renderer == "mjviewer":
@@ -305,7 +305,7 @@ def main(cfg: DictConfig) -> None:
         viewer_runtime = RobosuiteViewerRuntime(
             viewer_env,
             render_fps=render_fps,
-            async_mode=bool(getattr(cfg.runtime, "viewer_async", False)),
+            async_mode=viewer_async,
             preview_camera=resolve_render_camera(cfg, render_camera_names),
             backend=viewer_backend,
         )
@@ -335,7 +335,8 @@ def main(cfg: DictConfig) -> None:
     if decoupled_viewer_enabled:
         print(
             "[INFO] Training viewer is decoupled from rollout. "
-            f"Window refresh runs at {render_fps:.2f}Hz while policy observations still come from the rollout env."
+            f"Window refresh runs at {render_fps:.2f}Hz in "
+            f"{'async' if viewer_async else 'sync'} mode while policy observations still come from the rollout env."
         )
     if frozen_eval_mode:
         print(
@@ -527,6 +528,11 @@ def main(cfg: DictConfig) -> None:
     overall_fps_tracker = EMAFpsTracker()
     last_fps_log_time = time.monotonic()
     training_started_monotonic = last_fps_log_time
+    if viewer_runtime is not None:
+        viewer_runtime.consume_render_count()
+    policy_inference_elapsed_sec = 0.0
+    policy_inference_max_sec = 0.0
+    policy_inference_count = 0
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
     latest_policy_action = cached_policy_action
     cached_override_action: np.ndarray | None = None
@@ -589,15 +595,28 @@ def main(cfg: DictConfig) -> None:
 
     def maybe_report_runtime(step: int) -> None:
         nonlocal last_fps_log_time
+        nonlocal policy_inference_elapsed_sec, policy_inference_max_sec, policy_inference_count
         now = time.monotonic()
         elapsed = now - last_fps_log_time
         if elapsed < fps_log_interval:
             return
         learner_progress = trainer.progress_snapshot()
         overall_fps = overall_fps_tracker.snapshot(elapsed)
+        viewer_frame_count = viewer_runtime.consume_render_count() if viewer_runtime is not None else 0
+        viewer_fps = float(viewer_frame_count) / max(float(elapsed), 1e-6)
+        policy_inference_ms_mean = (
+            1000.0 * policy_inference_elapsed_sec / float(policy_inference_count)
+            if policy_inference_count > 0
+            else 0.0
+        )
+        policy_inference_ms_max = 1000.0 * policy_inference_max_sec
         pending_updates = trainer.pending_async_updates() if async_updates else 0
         runtime_payload = {
             "overall_fps": overall_fps,
+            "viewer_fps": viewer_fps,
+            "policy_inference_ms_mean": policy_inference_ms_mean,
+            "policy_inference_ms_max": policy_inference_ms_max,
+            "policy_inference_count": float(policy_inference_count),
             "learner_actor_updates": float(learner_progress["actor_updates"]),
             "learner_updates_until_publish": float(learner_progress["updates_until_publish"]),
             "learner_publish_count": float(learner_progress["publish_count"]),
@@ -611,6 +630,11 @@ def main(cfg: DictConfig) -> None:
                 "step": int(step),
                 "episode_index": int(episode_index),
                 "overall_fps": float(overall_fps),
+                "viewer_fps": float(viewer_fps),
+                "viewer_frame_count": int(viewer_frame_count),
+                "policy_inference_ms_mean": float(policy_inference_ms_mean),
+                "policy_inference_ms_max": float(policy_inference_ms_max),
+                "policy_inference_count": int(policy_inference_count),
                 "pending_updates": int(pending_updates),
                 "learner_total_updates": int(learner_progress["total_updates"]),
                 "learner_actor_updates": int(learner_progress["actor_updates"]),
@@ -638,23 +662,25 @@ def main(cfg: DictConfig) -> None:
                 step=step,
                 episode_index=episode_index,
                 overall_fps=overall_fps,
+                viewer_fps=viewer_fps,
+                policy_inference_ms_mean=policy_inference_ms_mean,
+                policy_inference_ms_max=policy_inference_ms_max,
+                policy_inference_count=policy_inference_count,
                 learner_progress=learner_progress,
                 pending_updates=pending_updates,
             )
         )
         last_fps_log_time = now
+        policy_inference_elapsed_sec = 0.0
+        policy_inference_max_sec = 0.0
+        policy_inference_count = 0
 
-    def request_checkpoint_save(step: int, tag: str | None = None) -> None:
-        step_checkpoint = (
-            checkpoint_path(checkpoint_dir, tag)
-            if tag is not None
-            else checkpoint_step_path(
-                checkpoint_dir,
-                step=step,
-                learner_updates=trainer.total_updates,
-                episode_index=episode_index,
-            )
-        )
+    checkpoint_episode_interval = int(cfg.logging.checkpoint_episode_interval)
+    if checkpoint_episode_interval <= 0:
+        raise ValueError("logging.checkpoint_episode_interval must be positive.")
+
+    def request_checkpoint_save(step: int) -> None:
+        episode_checkpoint = checkpoint_path(checkpoint_dir, f"ep_{int(episode_index):05d}")
         checkpoint_extra = {
             "global_step": int(step),
             "episode_index": int(episode_index),
@@ -662,10 +688,10 @@ def main(cfg: DictConfig) -> None:
             "trainer_state": trainer.state_dict(),
         }
         checkpoint_writer.request_save(
-            paths=[step_checkpoint, checkpoint_path(checkpoint_dir, "latest")],
+            paths=[episode_checkpoint, checkpoint_path(checkpoint_dir, "latest")],
             include_buffers=False,
             extra=checkpoint_extra,
-            metadata={"step": int(step)},
+            metadata={"step": int(step), "episode_index": int(episode_index)},
         )
         pending_updates = trainer.pending_async_updates() if async_updates else 0
         runtime_logger.log(
@@ -675,11 +701,18 @@ def main(cfg: DictConfig) -> None:
                 "episode_index": int(episode_index),
                 "pending_updates": int(pending_updates),
                 "learner_total_updates": int(trainer.total_updates),
-                "checkpoint_name": step_checkpoint.name,
+                "checkpoint_name": episode_checkpoint.name,
                 **event_time_fields(),
             }
         )
-        print(f"[ckpt] step={step} pending={pending_updates} queued={step_checkpoint.name}")
+        print(
+            f"[ckpt] ep={episode_index} step={step} pending={pending_updates} "
+            f"queued={episode_checkpoint.name}"
+        )
+
+    def maybe_request_episode_checkpoint(step: int) -> None:
+        if episode_index > 0 and episode_index % checkpoint_episode_interval == 0:
+            request_checkpoint_save(step)
 
     cached_policy_images: dict[str, np.ndarray] | None = None
 
@@ -1024,7 +1057,13 @@ def main(cfg: DictConfig) -> None:
                     new_policy_chunk_inferred = agent.needs_action_chunk()
                     if on_demand_image_obs and new_policy_chunk_inferred:
                         obs = make_live_obs(include_images=True, refresh_images=True)
+                    inference_started = time.monotonic() if new_policy_chunk_inferred else None
                     policy_action = agent.select_action(obs, deterministic=bool(cfg.runtime.eval_deterministic))
+                    if inference_started is not None:
+                        inference_elapsed = time.monotonic() - inference_started
+                        policy_inference_elapsed_sec += inference_elapsed
+                        policy_inference_max_sec = max(policy_inference_max_sec, inference_elapsed)
+                        policy_inference_count += 1
                     if on_demand_image_obs:
                         obs = make_live_obs(include_images=False)
                     latest_policy_action = policy_action
@@ -1123,6 +1162,7 @@ def main(cfg: DictConfig) -> None:
                 episode_length = 0
                 episode_step_index = 0
                 episode_index += 1
+                maybe_request_episode_checkpoint(step)
                 episode_transition_count = 0
                 episode_intervention_transitions = 0
                 policy_gate.force_ready()
@@ -1312,6 +1352,7 @@ def main(cfg: DictConfig) -> None:
                 episode_length = 0
                 episode_step_index = 0
                 episode_index += 1
+                maybe_request_episode_checkpoint(step)
                 episode_transition_count = 0
                 episode_intervention_transitions = 0
                 cached_override_action = None
@@ -1325,8 +1366,6 @@ def main(cfg: DictConfig) -> None:
             else:
                 obs = next_obs
 
-            if step > 0 and step % int(cfg.logging.checkpoint_interval) == 0:
-                request_checkpoint_save(step)
             maybe_report_runtime(step)
             refresh_discriminator_hud()
     except KeyboardInterrupt:

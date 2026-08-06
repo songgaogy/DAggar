@@ -4,15 +4,16 @@ set -euo pipefail
 ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 
 # ----------------------------------------------------------------------
-ENVIRONMENT="NutAssemblySquare"
-NUM_TRAJECTORIES=30   # pretraining data
+ENVIRONMENT="PickPlaceCereal"
+NUM_TRAJECTORIES=10   # pretraining data
 UPDATE_PER_STEP=1     # 1 env step -> x policy updates
-SAVE_FREQ="${SAVE_FREQ:-5000}"        # save checkpoint every x env steps
+CHECKPOINT_EPISODE_INTERVAL=20
 DEMO_SPLIT="pretrain_data-20260615_174814"
 SEED_VALUE=42
-RUN_NAME_SUFFIX="_${NUM_TRAJECTORIES}pretrain_seed${SEED_VALUE}"
+RUN_NAME_SUFFIX="_seed${SEED_VALUE}"
 
 INIT_CHECKPOINT="/home/dodo/Documents/DAggar/robosuite/checkpoints/multitask_6/flow_multi_ep0100.pt"
+DISCRIMINATOR_ENABLED="false"
 DISCRIMINATOR_CHECKPOINT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_203140_NutAssemblySquare/checkpoints/pu_bce_head.pth"
 LEARNER_DEVICE="cuda:1"
 INFERENCE_DEVICE="cuda:0"
@@ -31,7 +32,6 @@ PRETRAIN_STEPS="${PRETRAIN_STEPS:-0}"
 # Async learner backpressure: cap queued updates so the learner cannot fall far behind the
 # rollout (avoids stale-progress backlog + end-of-run flush burst). 0 = unbounded (legacy).
 MAX_PENDING_UPDATES="${MAX_PENDING_UPDATES:-8}"
-N_ODE_STEPS=10
 FPS_LOG_INTERVAL="${FPS_LOG_INTERVAL:-3.0}"
 UNTHROTTLED="${UNTHROTTLED:-false}"
 
@@ -40,12 +40,11 @@ INTERVENTION_ENABLED="${INTERVENTION_ENABLED:-true}"
 ASYNC_UPDATES="${ASYNC_UPDATES:-true}"
 VISUALIZE_GRIPPER_MARKERS="${VISUALIZE_GRIPPER_MARKERS:-true}"
 LOGGING_USE_WANDB="${LOGGING_USE_WANDB:-false}"
-VIEWER_ASYNC="${VIEWER_ASYNC:-true}"
+VIEWER_ASYNC="${VIEWER_ASYNC:-false}"
 VIEWER_BACKEND="${VIEWER_BACKEND:-mjviewer}"
 RENDER_FPS="${RENDER_FPS:-20}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 BUFFER_SAVE_INTERVAL="${BUFFER_SAVE_INTERVAL:-5000}"
-CHECKPOINT_INTERVAL="${SAVE_FREQ}"
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 PUBLISH_INTERVAL="${PUBLISH_INTERVAL:-300}"
 EPISODE_PAUSE_SEC="${EPISODE_PAUSE_SEC:-0}"
@@ -94,7 +93,6 @@ python -m robosuite.pipeline.train_flow_dagger \
   algorithm.flow.inference_device="${INFERENCE_DEVICE}" \
   algorithm.flow.action_horizon="${ACTION_HORIZON}" \
   algorithm.flow.execute_horizon="${EXECUTE_HORIZON}" \
-  algorithm.flow.n_ode_steps="${N_ODE_STEPS}" \
   algorithm.trainer.batch_size="${TRAIN_BATCH_SIZE}" \
   algorithm.trainer.update_per_step="${UPDATE_PER_STEP}" \
   algorithm.trainer.steps_per_update="${PUBLISH_INTERVAL}" \
@@ -103,7 +101,8 @@ python -m robosuite.pipeline.train_flow_dagger \
   logging.use_wandb="${LOGGING_USE_WANDB}" \
   logging.run_name_suffix="${RUN_NAME_SUFFIX}" \
   logging.log_interval="${LOG_INTERVAL}" \
-  logging.checkpoint_interval="${CHECKPOINT_INTERVAL}" \
+  logging.checkpoint_episode_interval="${CHECKPOINT_EPISODE_INTERVAL}" \
+  discriminator.enabled="${DISCRIMINATOR_ENABLED}" \
   discriminator.task_name="${DISCRIMINATOR_TASK_NAME}" \
   discriminator.checkpoint="${DISCRIMINATOR_CHECKPOINT}" \
   "${EXTRA_ARGS[@]}"

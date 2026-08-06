@@ -176,7 +176,7 @@ runtime:
   episode_pause_sec: 1.0
 
 logging:
-  output_root: "./outputs/flow-DAgger_deterministic_pu-disc"
+  output_root: "./outputs/baseline/dagger"
   run_name: null
   run_name_suffix: null
   project: "Flow-DAgger_AIR"
@@ -184,7 +184,7 @@ logging:
   use_wandb: true
   wandb_mode: "offline"
   log_interval: 10
-  checkpoint_interval: 1000
+  checkpoint_episode_interval: 20
 
 hydra:
   run:

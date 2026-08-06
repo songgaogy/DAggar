@@ -201,13 +201,6 @@ def checkpoint_path(checkpoint_dir: Path, tag: str) -> Path:
     return checkpoint_dir / "checkpoints" / f"{tag}.pt"
 
 
-def checkpoint_step_path(checkpoint_dir: Path, *, step: int, learner_updates: int, episode_index: int) -> Path:
-    return checkpoint_path(
-        checkpoint_dir,
-        f"step_{int(step):08d}_updates_{int(learner_updates):08d}_ep_{int(episode_index):05d}",
-    )
-
-
 class FixedRateLimiter:
     def __init__(self, fps: float) -> None:
         if fps <= 0.0:

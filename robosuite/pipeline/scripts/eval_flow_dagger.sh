@@ -5,8 +5,8 @@ ROOT_DIR="${ROOT_DIR:-$HOME/Documents/DAggar/robosuite}"
 export CUDA_VISIBLE_DEVICES=1
 
 # -------------------------------------------------------------------------------------------------
-ENV_NAME="NutAssemblySquare"
-CHECKPOINT="outputs/flow-DAgger_deterministic_pu-disc/flow_dagger_NutAssemblySquare_2026-06-22_02-08-20_30pretrain_seed42/checkpoints/step_00015000_updates_00012292_ep_00055.pt"
+ENV_NAME="PickPlaceCereal"
+CHECKPOINT="outputs/baseline/dagger/PickPlaceCereal_2026-08-06_15-12-16_seed42/checkpoints/ep_00020.pt"
 EPISODES=50
 EVAL_EPISODE_MAX_STEPS=500
 VIDEO_OUTPUT="true"

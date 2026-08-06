@@ -95,7 +95,7 @@ def resolve_run_directory(cfg: DictConfig) -> tuple[str, Path]:
         run_name = str(explicit_run_name)
         return run_name, make_flow_run_directory(output_root, run_name)
 
-    run_name = f"flow_dagger_{cfg.env.environment}_{now_readable()}"
+    run_name = f"{cfg.env.environment}_{now_readable()}"
     run_name_suffix = getattr(cfg.logging, "run_name_suffix", None)
     if run_name_suffix is not None and str(run_name_suffix).strip():
         run_name = f"{run_name}_{str(run_name_suffix).strip().lstrip('_')}"
@@ -178,11 +178,17 @@ def format_runtime_line(
     step: int,
     episode_index: int,
     overall_fps: float,
+    viewer_fps: float,
+    policy_inference_ms_mean: float,
+    policy_inference_ms_max: float,
+    policy_inference_count: int,
     learner_progress: dict[str, int],
     pending_updates: int,
 ) -> str:
     return (
-        f"[runtime] step={step} ep={episode_index} fps={overall_fps:5.1f} "
+        f"[runtime] step={step} ep={episode_index} fps={overall_fps:5.1f} viewer={viewer_fps:5.1f} "
+        f"infer_ms(mean/max/n)={policy_inference_ms_mean:.1f}/{policy_inference_ms_max:.1f}/"
+        f"{policy_inference_count} "
         f"flow_updates={learner_progress['actor_updates']} "
         f"next_publish_in={learner_progress['updates_until_publish']} pending={pending_updates}"
     )
