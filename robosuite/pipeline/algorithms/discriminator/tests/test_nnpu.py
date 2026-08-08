@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -160,3 +164,155 @@ def test_runtime_chunk_cadence_and_pause_rearm() -> None:
     runtime.resume()
     assert not runtime.pause_requested()
     assert runtime.status().armed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_shared_encoder_batches_candidates_after_one_observation_encode() -> None:
+    device = torch.device("cuda:0")
+
+    class InnerEncoder:
+        def __init__(self) -> None:
+            self.observation_calls = 0
+
+        def _encode_observation_batch(self, images, proprio):
+            self.observation_calls += 1
+            return {
+                "visual": torch.ones((1, 2), device=device),
+                "proprio": proprio,
+            }
+
+        def _encode_chunk_from_encoding(self, observation, actions):
+            assert observation["visual"].shape[0] == actions.shape[0]
+            return torch.cat([observation["visual"], actions[:, 0, :2]], dim=-1)
+
+    encoder = object.__new__(SharedDynamicsEncoder)
+    encoder.device = device
+    encoder.chunk_feature_dim = 4
+    encoder.inner_encoder = InnerEncoder()
+    encoder._prepare_images = lambda images: {"camera": images[:, 0]}
+
+    features = encoder.encode_action_candidates(
+        image_obs_raw=torch.zeros((1, 1, 3, 4, 4), device=device),
+        proprio_raw=torch.zeros((1, 2), device=device),
+        action_candidates=torch.arange(
+            12, device=device, dtype=torch.float32
+        ).reshape(3, 2, 2),
+    )
+
+    assert encoder.inner_encoder.observation_calls == 1
+    assert features.shape == (3, 4)
+    torch.testing.assert_close(
+        features[:, 2:],
+        torch.tensor(
+            [[0, 1], [4, 5], [8, 9]], device=device, dtype=torch.float32
+        ),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_runtime_serializes_hud_and_candidate_inference() -> None:
+    device = torch.device("cuda:0")
+
+    class InferenceTracker:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def enter(self) -> None:
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.05)
+            with self.lock:
+                self.active -= 1
+
+    tracker = InferenceTracker()
+
+    class Encoder:
+        view_names = ["camera"]
+        device = torch.device("cuda:0")
+
+        def bind_policy_cameras(self, names):
+            pass
+
+        def encode_chunk(self, **kwargs):
+            tracker.enter()
+            return torch.zeros((1, 4), device=device)
+
+        def encode_action_candidates(self, *, action_candidates, **kwargs):
+            tracker.enter()
+            return torch.zeros((action_candidates.shape[0], 4), device=device)
+
+    class Discriminator:
+        threshold = 0.5
+
+        def score(self, *, chunk_feature):
+            score = torch.zeros(chunk_feature.shape[0], device=device)
+            return SimpleNamespace(decision=score.bool(), logit=score)
+
+        def failure_score(self, *, chunk_feature):
+            return torch.arange(chunk_feature.shape[0], device=device, dtype=torch.float32)
+
+    runtime = NNPUDiscriminatorRuntime(
+        NNPURuntimeConfig(), Encoder(), Discriminator(), policy_camera_names=["camera"]
+    )
+    images = {"camera": torch.zeros((4, 4, 3), dtype=torch.uint8).numpy()}
+    snapshot = {
+        "images": images,
+        "proprio": torch.zeros(2).numpy(),
+        "actions": torch.zeros((2, 2)).numpy(),
+    }
+    hud_thread = threading.Thread(target=runtime._score_snapshot, args=(snapshot,))
+    hud_thread.start()
+    scores = runtime.score_action_candidates(
+        images_per_view=images,
+        proprio=torch.zeros(2).numpy(),
+        action_candidates=torch.zeros((3, 2, 2), device=device),
+    )
+    hud_thread.join()
+
+    assert tracker.max_active == 1
+    assert scores.device.type == "cuda"
+    torch.testing.assert_close(scores, torch.arange(3, device=device, dtype=torch.float32))
+
+
+def test_runtime_discards_snapshot_scored_across_episode_reset() -> None:
+    class Encoder:
+        view_names = ["camera"]
+
+        def bind_policy_cameras(self, names):
+            pass
+
+    class Discriminator:
+        threshold = 0.5
+
+    runtime = NNPUDiscriminatorRuntime(
+        NNPURuntimeConfig(intervene_env=True, consecutive_fail_frames=1),
+        Encoder(),
+        Discriminator(),
+        policy_camera_names=["camera"],
+    )
+    scoring_started = threading.Event()
+    release_score = threading.Event()
+
+    def delayed_score(snapshot):
+        scoring_started.set()
+        assert release_score.wait(timeout=2.0)
+        return 1, 1.0
+
+    runtime._score_snapshot = delayed_score
+    runtime.start()
+    runtime.publish(
+        images_per_view={"camera": np.zeros((4, 4, 3), dtype=np.uint8)},
+        proprio=np.zeros(2, dtype=np.float32),
+        executed_action=np.zeros(2, dtype=np.float32),
+    )
+    assert scoring_started.wait(timeout=2.0)
+    runtime.on_episode_reset()
+    release_score.set()
+    time.sleep(0.1)
+    runtime.stop()
+
+    assert runtime.status().pred == -1
+    assert not runtime.pause_requested()

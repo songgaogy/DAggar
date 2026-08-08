@@ -102,7 +102,7 @@ policy:
   flow:
     action_horizon: 8
     execute_horizon: 8
-    ode_steps: 10
+    ode_steps: 8
     image_size: ${environment.image_height}
     learning_rate: 1.0e-4
     weight_decay: 1.0e-6

@@ -189,14 +189,26 @@ def test_refresh_run_config_uses_latest_settings_and_manifest_inputs(
     )
 
 
-def test_collection_omega_defaults_to_zero_and_reaches_stage_config() -> None:
+def test_collection_guidance_omegas_reach_stage_config() -> None:
     cfg = runner.load_default_config(task="PickPlaceCereal")
-    assert float(cfg.collection.omega) == 0.0
+    assert list(cfg.collection.guidance_omegas) == [0.0, 0.1, 0.2, 0.5]
 
-    cfg.collection.omega = 0.75
+    cfg.collection.guidance_omegas = [0.75, 1.25]
     stage_cfg = runner.collection_stage_config(cfg, round_index=0)
 
     assert float(stage_cfg.algorithm.dipole.guidance_omega) == 0.75
+    assert list(stage_cfg.offline_collect.guidance_omegas) == [0.75, 1.25]
+
+
+@pytest.mark.parametrize("guidance_omegas", [[], [0.0, float("inf")], [float("nan")]])
+def test_collection_guidance_omegas_must_be_non_empty_and_finite(
+    guidance_omegas,
+) -> None:
+    cfg = runner.load_default_config(task="PickPlaceCereal")
+    cfg.collection.guidance_omegas = guidance_omegas
+
+    with pytest.raises(ValueError, match="collection.guidance_omegas"):
+        runner.collection_stage_config(cfg, round_index=0)
 
 
 def test_all_training_stages_refresh_latest_config(tmp_path, monkeypatch) -> None:

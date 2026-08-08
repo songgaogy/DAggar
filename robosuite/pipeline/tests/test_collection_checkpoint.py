@@ -9,11 +9,15 @@ import torch
 
 from robosuite.pipeline.collection import (
     _EPISODE_SHARD_FORMAT,
+    _EpisodeBuilder,
+    _checkpoint_has_negative_policy,
     _EpisodeStats,
     _finalize_collection_checkpoint,
     _load_collection_checkpoint,
     _metadata_from_stats,
     _save_episode_shard,
+    _select_action_candidate,
+    _validate_resume_guidance,
     _write_collection_manifest,
 )
 from robosuite.pipeline.common.episodes import validate_offline_payload
@@ -76,6 +80,122 @@ def _runtime_payload(metadata: dict, *, final: bool = False) -> dict:
         "deterministic": False,
         "final": final,
     }
+
+
+def test_episode_builder_records_candidate_selection_per_step() -> None:
+    builder = _EpisodeBuilder(
+        episode_index=0, episode_seed=42, camera_names=["agentview"]
+    )
+    obs = {
+        "state": np.zeros(3, dtype=np.float32),
+        "agentview": np.zeros((4, 4, 3), dtype=np.uint8),
+    }
+    common = {
+        "obs": obs,
+        "next_obs": obs,
+        "executed_action": np.zeros(2, dtype=np.float32),
+        "policy_action": np.zeros(2, dtype=np.float32),
+        "human_action": np.zeros(2, dtype=np.float32),
+        "is_intervention": False,
+        "reward": 0.0,
+        "done": False,
+        "success": False,
+        "nnpu_pred": 0,
+        "nnpu_score": 0.1,
+        "nnpu_threshold": 0.0,
+        "grasp_penalty": None,
+        "policy_candidate_omegas": np.asarray([0.0, 0.1], dtype=np.float32),
+        "policy_candidate_nnpu_scores": np.asarray([0.5, -0.2], dtype=np.float32),
+        "policy_selected_candidate_index": 1,
+        "policy_selected_guidance_omega": 0.1,
+        "policy_latency": {
+            "context_ms": 1.0,
+            "ode_ms": 2.0,
+            "d2h_ms": 3.0,
+            "policy_total_ms": 6.0,
+            "discriminator_ms": 4.0,
+            "selector_total_ms": 10.0,
+        },
+    }
+    builder.append(**common, policy_chunk_start=True)
+    builder.append(**common, policy_chunk_start=False)
+
+    episode = builder.to_payload("max_steps")
+
+    assert episode["policy_chunk_start"].tolist() == [True, False]
+    assert episode["policy_candidate_omegas"].shape == (2, 2)
+    assert episode["policy_candidate_nnpu_scores"].shape == (2, 2)
+    assert episode["policy_selected_candidate_index"].tolist() == [1, 1]
+    np.testing.assert_allclose(
+        episode["policy_selected_guidance_omega"], [0.1, 0.1]
+    )
+    np.testing.assert_allclose(episode["policy_context_latency_ms"], [1.0, 1.0])
+    np.testing.assert_allclose(episode["policy_ode_latency_ms"], [2.0, 2.0])
+    np.testing.assert_allclose(episode["policy_d2h_latency_ms"], [3.0, 3.0])
+    np.testing.assert_allclose(episode["policy_total_latency_ms"], [6.0, 6.0])
+    np.testing.assert_allclose(episode["discriminator_latency_ms"], [4.0, 4.0])
+    np.testing.assert_allclose(episode["selector_total_latency_ms"], [10.0, 10.0])
+
+
+def test_candidate_selection_uses_lowest_score_and_first_tie() -> None:
+    candidates = np.arange(24, dtype=np.float32).reshape(3, 4, 2)
+    omegas = np.asarray([0.0, 0.1, 0.2], dtype=np.float32)
+
+    selected, chunk, omega = _select_action_candidate(
+        candidates, omegas, np.asarray([0.5, -0.2, -0.2], dtype=np.float32)
+    )
+
+    assert selected == 1
+    np.testing.assert_array_equal(chunk, candidates[1])
+    assert omega == pytest.approx(0.1)
+
+
+def test_candidate_selection_supports_positive_only_and_rejects_nonfinite() -> None:
+    candidates = np.zeros((1, 4, 2), dtype=np.float32)
+    selected, chunk, omega = _select_action_candidate(
+        candidates,
+        np.asarray([0.0], dtype=np.float32),
+        np.asarray([0.25], dtype=np.float32),
+    )
+
+    assert selected == 0
+    np.testing.assert_array_equal(chunk, candidates[0])
+    assert omega == 0.0
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _select_action_candidate(candidates, np.asarray([0.0]), np.asarray([np.nan]))
+
+
+def test_negative_policy_requires_dual_core_checkpoint() -> None:
+    assert not _checkpoint_has_negative_policy({"model": {}})
+    assert not _checkpoint_has_negative_policy({"core": {"core_pos": {}}})
+    assert _checkpoint_has_negative_policy(
+        {"core": {"core_pos": {}, "core_neg": {}}}
+    )
+
+
+def test_resume_guidance_requires_matching_protocol() -> None:
+    checkpoint = {
+        "configured_guidance_omegas": [0.0, 0.1],
+        "effective_guidance_omegas": [0.0, 0.1],
+    }
+    _validate_resume_guidance(
+        checkpoint,
+        has_episodes=True,
+        configured=[0.0, 0.1],
+        effective=[0.0, 0.1],
+    )
+
+    with pytest.raises(ValueError, match="configured guidance"):
+        _validate_resume_guidance(
+            checkpoint,
+            has_episodes=True,
+            configured=[0.0, 0.2],
+            effective=[0.0, 0.1],
+        )
+    with pytest.raises(ValueError, match="legacy partial"):
+        _validate_resume_guidance(
+            {}, has_episodes=True, configured=[0.0], effective=[0.0]
+        )
 
 
 def test_episode_checkpoints_serialize_only_the_new_episode(tmp_path, monkeypatch) -> None:

@@ -99,7 +99,9 @@ class NNPUDiscriminatorRuntime:
         self._latest: dict[str, Any] | None = None
         self._sequence = 0
         self._consumed_sequence = -1
+        self._episode_generation = 0
         self._state_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
         self._status = NNPUStatus(threshold=float(discriminator.threshold))
         self._consecutive_failures = 0
         self._armed = True
@@ -145,12 +147,14 @@ class NNPUDiscriminatorRuntime:
             ).copy(),
         }
         with self._condition:
+            snapshot["episode_generation"] = self._episode_generation
             self._latest = snapshot
             self._sequence += 1
             self._condition.notify_all()
 
     def on_episode_reset(self) -> None:
         with self._condition:
+            self._episode_generation += 1
             self._latest = None
         with self._state_lock:
             self._consecutive_failures = 0
@@ -211,14 +215,40 @@ class NNPUDiscriminatorRuntime:
                     self._status.error = f"{type(exc).__name__}: {exc}"
                 print(f"[nnPU HUD] scoring error: {type(exc).__name__}: {exc}", flush=True)
                 continue
-            last_score_time = time.monotonic()
-            self._update_debounce(pred, score)
+            with self._condition:
+                if snapshot.get("episode_generation") != self._episode_generation:
+                    continue
+                last_score_time = time.monotonic()
+                self._update_debounce(pred, score)
 
     @torch.no_grad()
     def _score_snapshot(self, snapshot: dict[str, Any]) -> tuple[int, float]:
+        image_tensor, proprio_tensor = self._observation_tensors(
+            snapshot["images"], snapshot["proprio"]
+        )
+        action_tensor = torch.from_numpy(snapshot["actions"]).to(
+            self.encoder.device, dtype=torch.float32, non_blocking=True
+        )
+        if action_tensor.ndim == 1:
+            action_tensor = action_tensor.unsqueeze(0)
+        action_tensor = action_tensor.unsqueeze(0)
+        with self._inference_lock:
+            feature = self.encoder.encode_chunk(
+                image_obs_raw=image_tensor,
+                proprio_raw=proprio_tensor,
+                action_chunk=action_tensor,
+            )
+            output = self.discriminator.score(chunk_feature=feature)
+        return int(output.decision.reshape(-1)[0]), float(output.logit.reshape(-1)[0])
+
+    def _observation_tensors(
+        self,
+        images_per_view: Mapping[str, np.ndarray],
+        proprio: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         views = []
         for name in self.policy_camera_names:
-            image = np.asarray(snapshot["images"][name])
+            image = np.asarray(images_per_view[name])
             if image.dtype == np.uint8:
                 image = image.astype(np.float32) / 255.0
             else:
@@ -226,19 +256,37 @@ class NNPUDiscriminatorRuntime:
                 if image.size and image.max() > 1.5:
                     image = image / 255.0
             views.append(np.transpose(image, (2, 0, 1)))
-        image_tensor = torch.from_numpy(np.stack(views, axis=0)).unsqueeze(0)
-        proprio_tensor = torch.from_numpy(snapshot["proprio"]).reshape(1, -1)
-        action_tensor = torch.from_numpy(snapshot["actions"])
-        if action_tensor.ndim == 1:
-            action_tensor = action_tensor.unsqueeze(0)
-        action_tensor = action_tensor.unsqueeze(0)
-        feature = self.encoder.encode_chunk(
-            image_obs_raw=image_tensor,
-            proprio_raw=proprio_tensor,
-            action_chunk=action_tensor,
+        image_tensor = torch.from_numpy(np.stack(views, axis=0)).unsqueeze(0).to(
+            self.encoder.device, non_blocking=True
         )
-        output = self.discriminator.score(chunk_feature=feature)
-        return int(output.decision.reshape(-1)[0]), float(output.logit.reshape(-1)[0])
+        proprio_tensor = torch.from_numpy(
+            np.asarray(proprio, dtype=np.float32)
+        ).reshape(1, -1).to(self.encoder.device, non_blocking=True)
+        return image_tensor, proprio_tensor
+
+    @torch.no_grad()
+    def score_action_candidates(
+        self,
+        *,
+        images_per_view: Mapping[str, np.ndarray],
+        proprio: np.ndarray,
+        action_candidates: np.ndarray | torch.Tensor,
+    ) -> torch.Tensor:
+        """Synchronously return nnPU failure scores for candidate action chunks."""
+        image_tensor, proprio_tensor = self._observation_tensors(images_per_view, proprio)
+        candidates = (
+            action_candidates
+            if isinstance(action_candidates, torch.Tensor)
+            else torch.from_numpy(np.asarray(action_candidates, dtype=np.float32))
+        ).to(self.encoder.device, dtype=torch.float32, non_blocking=True)
+        with self._inference_lock:
+            features = self.encoder.encode_action_candidates(
+                image_obs_raw=image_tensor,
+                proprio_raw=proprio_tensor,
+                action_candidates=candidates,
+            )
+            scores = self.discriminator.failure_score(chunk_feature=features)
+        return scores.reshape(-1)
 
     def _update_debounce(self, pred: int, score: float) -> None:
         trigger = False

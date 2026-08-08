@@ -80,6 +80,29 @@ class MultiModalFlowPolicy(nn.Module):
         proprio: torch.Tensor,
         language: list[str] | tuple[str, ...] | str,
     ) -> dict[str, torch.Tensor]:
+        language_tokens, language_global, language_mask = self.encode_language(language)
+        return self.encode_multimodal_context_from_language(
+            images=images,
+            proprio=proprio,
+            language_tokens=language_tokens,
+            language_global=language_global,
+            language_mask=language_mask,
+        )
+
+    def encode_language(
+        self,
+        text: list[str] | tuple[str, ...] | str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.language_encoder(text)
+
+    def encode_multimodal_context_from_language(
+        self,
+        images: torch.Tensor,
+        proprio: torch.Tensor,
+        language_tokens: torch.Tensor,
+        language_global: torch.Tensor,
+        language_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         batch_size, num_cameras, channels, height, width = images.shape
         if num_cameras != len(self.camera_names):
             raise ValueError(f"Expected {len(self.camera_names)} cameras, got {num_cameras}")
@@ -92,7 +115,6 @@ class MultiModalFlowPolicy(nn.Module):
         image_tokens = self.image_encoder(flat_images)
         image_tokens = image_tokens.reshape(batch_size, num_cameras * image_tokens.shape[1], image_tokens.shape[2])
         proprio_tokens = self.proprio_tokenizer(proprio)
-        language_tokens, language_global, language_mask = self.language_encoder(language)
 
         # language guided pre-processing
         image_tokens, proprio_tokens = self.language_guided_modulation(

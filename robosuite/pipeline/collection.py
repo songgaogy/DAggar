@@ -44,6 +44,7 @@ from robosuite.pipeline.common.flow import (
     serialize_seed,
 )
 from robosuite.pipeline.utils import (
+    EMAFpsTracker,
     EnvRandomReducer,
     FixedRateLimiter,
     IntervalGate,
@@ -136,6 +137,17 @@ class _EpisodeBuilder:
         self.nnpu_score: list[float] = []
         self.nnpu_threshold: list[float] = []
         self.grasp_penalty: list[float] = []
+        self.policy_chunk_start: list[bool] = []
+        self.policy_candidate_omegas: list[np.ndarray] = []
+        self.policy_candidate_nnpu_scores: list[np.ndarray] = []
+        self.policy_selected_candidate_index: list[int] = []
+        self.policy_selected_guidance_omega: list[float] = []
+        self.policy_context_latency_ms: list[float] = []
+        self.policy_ode_latency_ms: list[float] = []
+        self.policy_d2h_latency_ms: list[float] = []
+        self.policy_total_latency_ms: list[float] = []
+        self.discriminator_latency_ms: list[float] = []
+        self.selector_total_latency_ms: list[float] = []
 
     def __len__(self) -> int:
         return len(self.executed_action)
@@ -156,6 +168,12 @@ class _EpisodeBuilder:
         nnpu_score: float,
         nnpu_threshold: float,
         grasp_penalty: float | None,
+        policy_chunk_start: bool,
+        policy_candidate_omegas: np.ndarray,
+        policy_candidate_nnpu_scores: np.ndarray,
+        policy_selected_candidate_index: int,
+        policy_selected_guidance_omega: float,
+        policy_latency: dict[str, float] | None = None,
     ) -> None:
         self.obs.append(_copy_obs(obs, self.camera_names))
         self.next_obs.append(_copy_obs(next_obs, self.camera_names))
@@ -170,6 +188,22 @@ class _EpisodeBuilder:
         self.nnpu_score.append(float(nnpu_score))
         self.nnpu_threshold.append(float(nnpu_threshold))
         self.grasp_penalty.append(float("nan") if grasp_penalty is None else float(grasp_penalty))
+        self.policy_chunk_start.append(bool(policy_chunk_start))
+        self.policy_candidate_omegas.append(
+            np.asarray(policy_candidate_omegas, dtype=np.float32).copy()
+        )
+        self.policy_candidate_nnpu_scores.append(
+            np.asarray(policy_candidate_nnpu_scores, dtype=np.float32).copy()
+        )
+        self.policy_selected_candidate_index.append(int(policy_selected_candidate_index))
+        self.policy_selected_guidance_omega.append(float(policy_selected_guidance_omega))
+        timing = policy_latency or {}
+        self.policy_context_latency_ms.append(float(timing.get("context_ms", np.nan)))
+        self.policy_ode_latency_ms.append(float(timing.get("ode_ms", np.nan)))
+        self.policy_d2h_latency_ms.append(float(timing.get("d2h_ms", np.nan)))
+        self.policy_total_latency_ms.append(float(timing.get("policy_total_ms", np.nan)))
+        self.discriminator_latency_ms.append(float(timing.get("discriminator_ms", np.nan)))
+        self.selector_total_latency_ms.append(float(timing.get("selector_total_ms", np.nan)))
 
     def mark_terminal(self) -> None:
         if self.done:
@@ -196,6 +230,25 @@ class _EpisodeBuilder:
             "nnpu_score": np.asarray(self.nnpu_score, dtype=np.float32),
             "nnpu_threshold": np.asarray(self.nnpu_threshold, dtype=np.float32),
             "grasp_penalty": np.asarray(self.grasp_penalty, dtype=np.float32),
+            "policy_chunk_start": np.asarray(self.policy_chunk_start, dtype=np.bool_),
+            "policy_candidate_omegas": np.stack(
+                self.policy_candidate_omegas, axis=0
+            ).astype(np.float32),
+            "policy_candidate_nnpu_scores": np.stack(
+                self.policy_candidate_nnpu_scores, axis=0
+            ).astype(np.float32),
+            "policy_selected_candidate_index": np.asarray(
+                self.policy_selected_candidate_index, dtype=np.int16
+            ),
+            "policy_selected_guidance_omega": np.asarray(
+                self.policy_selected_guidance_omega, dtype=np.float32
+            ),
+            "policy_context_latency_ms": np.asarray(self.policy_context_latency_ms, dtype=np.float32),
+            "policy_ode_latency_ms": np.asarray(self.policy_ode_latency_ms, dtype=np.float32),
+            "policy_d2h_latency_ms": np.asarray(self.policy_d2h_latency_ms, dtype=np.float32),
+            "policy_total_latency_ms": np.asarray(self.policy_total_latency_ms, dtype=np.float32),
+            "discriminator_latency_ms": np.asarray(self.discriminator_latency_ms, dtype=np.float32),
+            "selector_total_latency_ms": np.asarray(self.selector_total_latency_ms, dtype=np.float32),
         }
 
 
@@ -207,6 +260,54 @@ def _terminal_reason(*, success: bool, env_done: bool, max_steps: bool) -> str |
     if max_steps:
         return "max_steps"
     return None
+
+
+def _select_action_candidate(
+    candidates: np.ndarray,
+    omegas: np.ndarray,
+    failure_scores: np.ndarray,
+) -> tuple[int, np.ndarray, float]:
+    candidate_array = np.asarray(candidates, dtype=np.float32)
+    omega_array = np.asarray(omegas, dtype=np.float32).reshape(-1)
+    score_array = np.asarray(failure_scores, dtype=np.float32).reshape(-1)
+    if candidate_array.ndim != 3:
+        raise ValueError(
+            f"candidates must be (K, H, A), got {candidate_array.shape}."
+        )
+    if candidate_array.shape[0] != len(omega_array) or len(omega_array) != len(score_array):
+        raise ValueError("Candidate, omega, and failure-score counts must match.")
+    if not np.isfinite(score_array).all():
+        raise RuntimeError("Discriminator returned non-finite candidate scores.")
+    selected = int(np.argmin(score_array))
+    return selected, candidate_array[selected].copy(), float(omega_array[selected])
+
+
+def _checkpoint_has_negative_policy(payload: dict[str, Any]) -> bool:
+    core = payload.get("core")
+    return isinstance(core, dict) and "core_neg" in core
+
+
+def _validate_resume_guidance(
+    checkpoint: dict[str, Any],
+    *,
+    has_episodes: bool,
+    configured: list[float],
+    effective: list[float],
+) -> None:
+    saved_configured = checkpoint.get("configured_guidance_omegas")
+    saved_effective = checkpoint.get("effective_guidance_omegas")
+    if has_episodes and (saved_configured is None or saved_effective is None):
+        raise ValueError(
+            "Cannot resume a legacy partial collection without guidance metadata."
+        )
+    if saved_configured is not None and list(saved_configured) != configured:
+        raise ValueError(
+            "Cannot resume collection with different configured guidance omegas."
+        )
+    if saved_effective is not None and list(saved_effective) != effective:
+        raise ValueError(
+            "Cannot resume collection with different effective guidance omegas."
+        )
 
 
 @dataclass
@@ -247,6 +348,9 @@ def _metadata_from_stats(
     started_at: str,
     finished_at: str,
     seed: int | None,
+    configured_guidance_omegas: list[float] | None = None,
+    effective_guidance_omegas: list[float] | None = None,
+    policy_inference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -270,6 +374,9 @@ def _metadata_from_stats(
         "started_at": str(started_at),
         "finished_at": str(finished_at),
         "seed": seed,
+        "configured_guidance_omegas": list(configured_guidance_omegas or []),
+        "effective_guidance_omegas": list(effective_guidance_omegas or []),
+        "policy_inference": dict(policy_inference or {}),
     }
 
 
@@ -524,7 +631,8 @@ def run_collection(cfg: DictConfig) -> None:
         action_low=action_low,
         action_high=action_high,
     )
-    agent.load_policy_checkpoint(policy_checkpoint, task_name=task_name)
+    policy_payload = agent.load_policy_checkpoint(policy_checkpoint, task_name=task_name)
+    has_negative_policy = _checkpoint_has_negative_policy(policy_payload)
     agent.core.model_pos.eval()
     agent.core.model_neg.eval()
     agent.core.inference_model_pos.eval()
@@ -559,13 +667,6 @@ def run_collection(cfg: DictConfig) -> None:
         discriminator=nnpu_discriminator,
     )
     enter_listener = EnterKeyListener()
-    if nnpu_runtime is not None:
-        nnpu_runtime.start()
-        enter_listener.start()
-        print(
-            f"[collect] nnPU scorer started device={nnpu_runtime.cfg.device} "
-            f"fps={nnpu_runtime.cfg.fps:g} threshold={nnpu_runtime.discriminator.threshold:+.3f}"
-        )
 
     intervention_runtime = None
     if bool(cfg.intervention.enabled):
@@ -592,6 +693,21 @@ def run_collection(cfg: DictConfig) -> None:
         )
     )
     deterministic = bool(OmegaConf.select(cfg, "offline_collect.deterministic", default=False))
+    configured_guidance_omegas = [
+        float(value)
+        for value in OmegaConf.select(
+            cfg, "offline_collect.guidance_omegas", default=[0.0]
+        )
+    ]
+    if not configured_guidance_omegas:
+        raise ValueError("offline_collect.guidance_omegas must be non-empty.")
+    effective_guidance_omegas = (
+        configured_guidance_omegas if has_negative_policy else [0.0]
+    )
+    print(
+        f"[collect][policy][candidates] guidance_omegas={effective_guidance_omegas} "
+        f"negative_policy={'enabled' if has_negative_policy else 'unavailable'}"
+    )
     save_every_episode = bool(OmegaConf.select(cfg, "offline_collect.save_every_episode", default=False))
     save_interval_episodes = max(
         0,
@@ -666,6 +782,12 @@ def run_collection(cfg: DictConfig) -> None:
             raise ValueError("Cannot resume collection with a different policy checkpoint.")
         if Path(str(existing.get("nnpu_checkpoint"))).resolve() != nnpu_checkpoint:
             raise ValueError("Cannot resume collection with a different discriminator checkpoint.")
+        _validate_resume_guidance(
+            existing,
+            has_episodes=bool(episodes),
+            configured=configured_guidance_omegas,
+            effective=effective_guidance_omegas,
+        )
         started_at = str(existing.get("started_at", started_at))
         if len(episodes) > num_episodes:
             raise ValueError(
@@ -678,11 +800,56 @@ def run_collection(cfg: DictConfig) -> None:
         print(f"[collect] resuming with {len(episodes)}/{num_episodes} completed episodes")
     elif resume_collection and _episode_shard_dir(output_path).is_dir():
         _load_collection_checkpoint(output_path)
+    print("[collect] preparing online policy inference (compile + warmup)...")
+    policy_inference_info = agent.prepare_online_inference(
+        obs=obs,
+        omegas=effective_guidance_omegas,
+        use_negative=has_negative_policy,
+    )
+    print(
+        "[collect] online policy ready "
+        f"precision={policy_inference_info['policy_precision']} "
+        f"strategy={policy_inference_info['compile_strategy']} "
+        f"compile_warmup_seconds={policy_inference_info['compile_warmup_seconds']:.3f}"
+    )
+    if nnpu_runtime is not None:
+        nnpu_runtime.start()
+        enter_listener.start()
+        print(
+            f"[collect] nnPU scorer started device={nnpu_runtime.cfg.device} "
+            f"fps={nnpu_runtime.cfg.fps:g} threshold={nnpu_runtime.discriminator.threshold:+.3f}"
+        )
     episode_stats = _EpisodeStats.from_episodes(episodes)
     persisted_episode_count = len(episodes)
     cached_policy_action = np.zeros_like(action_low, dtype=np.float32)
     cached_override_action: np.ndarray | None = None
     cached_is_intervention = False
+    cached_candidate_omegas = np.asarray(effective_guidance_omegas, dtype=np.float32)
+    cached_candidate_scores = np.full(
+        (len(effective_guidance_omegas),), np.nan, dtype=np.float32
+    )
+    cached_selected_candidate_index = 0
+    cached_selected_guidance_omega = float(effective_guidance_omegas[0])
+    cached_policy_latency = {
+        "context_ms": float("nan"),
+        "ode_ms": float("nan"),
+        "d2h_ms": float("nan"),
+        "policy_total_ms": float("nan"),
+        "discriminator_ms": float("nan"),
+        "selector_total_ms": float("nan"),
+    }
+    latency_history: dict[str, list[float]] = {
+        key: [] for key in cached_policy_latency
+    }
+    fps_log_interval = max(
+        float(getattr(cfg.runtime, "fps_log_interval", 1.0)),
+        1e-6,
+    )
+    control_fps_tracker = EMAFpsTracker()
+    policy_fps_tracker = EMAFpsTracker()
+    fps_window_started = time.monotonic()
+    measured_control_fps: float | None = None
+    measured_policy_fps: float | None = None
     global_step = 0
     episode_index = (
         max(int(episode.get("episode_index", -1)) for episode in episodes) + 1
@@ -783,6 +950,9 @@ def run_collection(cfg: DictConfig) -> None:
             started_at=started_at,
             finished_at=finished_at,
             seed=serialize_seed(getattr(cfg, "seed", None)),
+            configured_guidance_omegas=configured_guidance_omegas,
+            effective_guidance_omegas=effective_guidance_omegas,
+            policy_inference=policy_inference_info,
         )
         payload = {
             **metadata,
@@ -838,6 +1008,108 @@ def run_collection(cfg: DictConfig) -> None:
             new_policy_chunk = False
             if unthrottled_runtime or policy_gate.ready(loop_start):
                 new_policy_chunk = agent.needs_action_chunk()
+                if new_policy_chunk:
+                    if nnpu_runtime is None:
+                        raise RuntimeError(
+                            "Online candidate selection requires the nnPU runtime."
+                        )
+                    selector_started = time.perf_counter()
+                    candidates = agent.plan_action_candidates(
+                        obs,
+                        omegas=configured_guidance_omegas,
+                        deterministic=deterministic,
+                        use_negative=has_negative_policy,
+                    )
+                    cached_candidate_omegas = np.asarray(
+                        effective_guidance_omegas, dtype=np.float32
+                    )
+                    discriminator_started = time.perf_counter()
+                    score_tensor = nnpu_runtime.score_action_candidates(
+                        images_per_view={name: obs[name] for name in agent.camera_names},
+                        proprio=obs["state"],
+                        action_candidates=candidates,
+                    )
+                    cached_candidate_scores = (
+                        score_tensor.detach().cpu().numpy().astype(np.float32)
+                    )
+                    discriminator_ms = (
+                        time.perf_counter() - discriminator_started
+                    ) * 1000.0
+                    (
+                        cached_selected_candidate_index,
+                        selected_action_chunk,
+                        cached_selected_guidance_omega,
+                    ) = _select_action_candidate(
+                        candidates,
+                        cached_candidate_omegas,
+                        cached_candidate_scores,
+                    )
+                    agent.install_action_chunk(selected_action_chunk)
+                    policy_stats = agent.last_online_inference_stats()
+                    cached_policy_latency = {
+                        "context_ms": float(policy_stats["context_ms"]),
+                        "ode_ms": float(policy_stats["ode_ms"]),
+                        "d2h_ms": float(policy_stats["d2h_ms"]),
+                        "policy_total_ms": float(policy_stats["total_ms"]),
+                        "discriminator_ms": float(discriminator_ms),
+                        "selector_total_ms": float(
+                            (time.perf_counter() - selector_started) * 1000.0
+                        ),
+                    }
+                    for latency_name, latency_value in cached_policy_latency.items():
+                        history = latency_history[latency_name]
+                        history.append(latency_value)
+                        if len(history) > 100:
+                            del history[:-100]
+                    policy_fps_tracker.mark()
+                    fps_now = time.monotonic()
+                    fps_elapsed = fps_now - fps_window_started
+                    if fps_elapsed >= fps_log_interval:
+                        measured_control_fps = control_fps_tracker.snapshot(fps_elapsed)
+                        measured_policy_fps = policy_fps_tracker.snapshot(fps_elapsed)
+                        fps_window_started = fps_now
+                    score_text = ", ".join(
+                        f"w={omega:g}:{score:+.3f}"
+                        for omega, score in zip(
+                            cached_candidate_omegas, cached_candidate_scores
+                        )
+                    )
+                    print(
+                        f"[collect][policy][candidates] candidates=[{score_text}] "
+                        f"selected_w={cached_selected_guidance_omega:g} "
+                        + " ".join(
+                            f"{name}=p50:{np.percentile(values, 50):.1f}/p95:"
+                            f"{np.percentile(values, 95):.1f}ms"
+                            for name, values in latency_history.items()
+                        )
+                    )
+                    selected_score = float(
+                        cached_candidate_scores[cached_selected_candidate_index]
+                    )
+                    discriminator_threshold = float(
+                        nnpu_runtime.discriminator.threshold
+                    )
+                    discriminator_failed = selected_score >= discriminator_threshold
+                    discriminator_label = "FAIL" if discriminator_failed else "SAFE"
+                    discriminator_color = (
+                        "\033[1;31m" if discriminator_failed else "\033[1;32m"
+                    )
+                    fps_text = (
+                        "control=warming policy=warming"
+                        if measured_control_fps is None or measured_policy_fps is None
+                        else (
+                            f"control={measured_control_fps:.1f} "
+                            f"policy={measured_policy_fps:.1f}"
+                        )
+                    )
+                    print(
+                        f"[collect][policy] selected_w={cached_selected_guidance_omega:g} "
+                        f"disc={discriminator_color}{discriminator_label}\033[0m "
+                        f"disc_score={selected_score:+.3f} "
+                        f"disc_threshold={discriminator_threshold:+.3f} "
+                        f"selector_ms={cached_policy_latency['selector_total_ms']:.1f} "
+                        f"fps({fps_text})"
+                    )
                 cached_policy_action = agent.select_action(obs, deterministic=deterministic)
 
             env_action = np.asarray(cached_policy_action, dtype=np.float32)
@@ -944,8 +1216,15 @@ def run_collection(cfg: DictConfig) -> None:
                 nnpu_score=float("nan") if nnpu_status is None else float(nnpu_status.score),
                 nnpu_threshold=float("nan") if nnpu_status is None else float(nnpu_status.threshold),
                 grasp_penalty=grasp_penalty,
+                policy_chunk_start=new_policy_chunk,
+                policy_candidate_omegas=cached_candidate_omegas,
+                policy_candidate_nnpu_scores=cached_candidate_scores,
+                policy_selected_candidate_index=cached_selected_candidate_index,
+                policy_selected_guidance_omega=cached_selected_guidance_omega,
+                policy_latency=cached_policy_latency,
             )
             total_intervention_transitions += int(is_intervention)
+            control_fps_tracker.mark()
             global_step += 1
             episode_step += 1
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import threading
+import time
 from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from robosuite.pipeline.algorithms.flow_dagger.models.flow import _center_crop_resize
 from robosuite.pipeline.common.utils import clone_array_tree
@@ -15,10 +17,16 @@ from ..common import DipoleBatch, DipoleConfig, select_dipole_batch
 
 
 def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    # NOTE: this trick is tested to be useful, compared to the following naive version
     weights = weights.reshape(-1)
     values = values.reshape(-1)
     weight_sum = torch.sum(weights).clamp_min(1e-6)
     return torch.sum(values * weights) / weight_sum
+
+# def _weighted_mean(values, weights):
+#     weights = weights.reshape(-1)
+#     values = values.reshape(-1)
+#     return torch.mean(values * weights)
 
 
 @torch.inference_mode()
@@ -83,6 +91,170 @@ def _sample_guided_action_sequence(
             v = v_pos
         x = x + dt * v
     return x.transpose(1, 2)
+
+
+def _expand_context_batch(
+    context: dict[str, torch.Tensor], batch_size: int
+) -> dict[str, torch.Tensor]:
+    return {
+        key: context[key].expand(batch_size, *context[key].shape[1:])
+        for key in ("task_scene_cond", "context_tokens", "context_padding_mask")
+    }
+
+
+class _FixedLoopCandidateSampler(nn.Module):
+    """Tensor-only fixed-step sampler used by the compiled single-stream backend."""
+
+    def __init__(
+        self,
+        flow_head_pos: nn.Module,
+        flow_head_neg: nn.Module | None,
+        *,
+        n_steps: int,
+    ) -> None:
+        super().__init__()
+        self.flow_head_pos = flow_head_pos
+        self.flow_head_neg = flow_head_neg
+        self.n_steps = int(n_steps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        omega: torch.Tensor,
+        pos_task_scene_cond: torch.Tensor,
+        pos_context_tokens: torch.Tensor,
+        pos_context_padding_mask: torch.Tensor,
+        neg_task_scene_cond: torch.Tensor,
+        neg_context_tokens: torch.Tensor,
+        neg_context_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = x.shape[0]
+        for step in range(self.n_steps):
+            t = torch.full(
+                (batch_size,),
+                float(step) / float(self.n_steps),
+                device=x.device,
+                dtype=torch.float32,
+            )
+            v_pos = self.flow_head_pos(
+                x_t=x,
+                timesteps=t,
+                task_scene_cond=pos_task_scene_cond,
+                context_tokens=pos_context_tokens,
+                context_padding_mask=pos_context_padding_mask,
+            ).float()
+            if self.flow_head_neg is None:
+                v = v_pos
+            else:
+                v_neg = self.flow_head_neg(
+                    x_t=x,
+                    timesteps=t,
+                    task_scene_cond=neg_task_scene_cond,
+                    context_tokens=neg_context_tokens,
+                    context_padding_mask=neg_context_padding_mask,
+                ).float()
+                v = (1.0 + omega) * v_pos - omega * v_neg
+            x = x + v / float(self.n_steps)
+        return x
+
+
+@torch.inference_mode()
+def _sample_guided_action_candidates(
+    model_pos: MultiModalFlowPolicy,
+    model_neg: MultiModalFlowPolicy | None,
+    *,
+    images: torch.Tensor,
+    proprio: torch.Tensor,
+    action_horizon: int,
+    omegas: list[float],
+    deterministic: bool,
+    pos_stream: torch.cuda.Stream,
+    neg_stream: torch.cuda.Stream,
+    cached_language_pos: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    cached_language_neg: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    fixed_loop: Any,
+) -> tuple[torch.Tensor, dict[str, torch.cuda.Event]]:
+    """Sample FP32 candidates with cached contexts and a fixed-loop callable."""
+    if proprio.shape[0] != 1 or images.shape[0] != 1:
+        raise ValueError("Online candidate sampling requires exactly one observation.")
+    if len(omegas) == 0:
+        raise ValueError("omegas must contain at least one value.")
+
+    candidate_count = len(omegas)
+    omega = torch.as_tensor(
+        omegas, device=proprio.device, dtype=torch.float32
+    ).view(candidate_count, 1, 1)
+    if deterministic:
+        initial = torch.zeros(
+            1,
+            model_pos.action_dim,
+            action_horizon,
+            device=proprio.device,
+            dtype=torch.float32,
+        )
+    else:
+        initial = torch.randn(
+            1,
+            model_pos.action_dim,
+            action_horizon,
+            device=proprio.device,
+            dtype=torch.float32,
+        )
+    x = initial.expand(candidate_count, -1, -1).clone()
+
+    current_stream = torch.cuda.current_stream(device=proprio.device)
+    timing = {
+        "start": torch.cuda.Event(enable_timing=True),
+        "context_end": torch.cuda.Event(enable_timing=True),
+        "ode_end": torch.cuda.Event(enable_timing=True),
+    }
+    timing["start"].record(current_stream)
+    pos_stream.wait_stream(current_stream)
+    if model_neg is not None:
+        neg_stream.wait_stream(current_stream)
+    with torch.cuda.stream(pos_stream):
+        context_pos_single = model_pos.encode_multimodal_context_from_language(
+            images=images,
+            proprio=proprio,
+            language_tokens=cached_language_pos[0],
+            language_global=cached_language_pos[1],
+            language_mask=cached_language_pos[2],
+        )
+    if model_neg is not None:
+        if cached_language_neg is None:
+            raise RuntimeError("Negative language features were not prepared.")
+        with torch.cuda.stream(neg_stream):
+            context_neg_single = model_neg.encode_multimodal_context_from_language(
+                images=images,
+                proprio=proprio,
+                language_tokens=cached_language_neg[0],
+                language_global=cached_language_neg[1],
+                language_mask=cached_language_neg[2],
+            )
+    current_stream.wait_stream(pos_stream)
+    if model_neg is not None:
+        current_stream.wait_stream(neg_stream)
+    timing["context_end"].record(current_stream)
+
+    context_pos = _expand_context_batch(context_pos_single, candidate_count)
+    context_neg = (
+        _expand_context_batch(context_neg_single, candidate_count)
+        if model_neg is not None
+        else None
+    )
+    empty = torch.empty(0, device=x.device, dtype=x.dtype)
+    x = fixed_loop(
+        x,
+        omega,
+        context_pos["task_scene_cond"],
+        context_pos["context_tokens"],
+        context_pos["context_padding_mask"],
+        context_neg["task_scene_cond"] if context_neg is not None else empty,
+        context_neg["context_tokens"] if context_neg is not None else empty,
+        context_neg["context_padding_mask"] if context_neg is not None else empty.bool(),
+    )
+    timing["ode_end"].record(current_stream)
+    return x.transpose(1, 2), timing
 
 
 class DipoleFlowPolicy:
@@ -159,6 +331,12 @@ class DipoleFlowPolicy:
         self._inference_shadow_model_neg.eval()
         self._state_lock = threading.RLock()
         self._inference_lock = threading.Lock()
+        self._inference_pos_stream = torch.cuda.Stream(device=self.inference_device)
+        self._inference_neg_stream = torch.cuda.Stream(device=self.inference_device)
+        self._cached_language_pos: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._cached_language_neg: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._online_fixed_loop: Any | None = None
+        self._last_online_inference_stats: dict[str, float] = {}
 
         self.act_mean: np.ndarray | None = None
         self.act_std: np.ndarray | None = None
@@ -202,7 +380,90 @@ class DipoleFlowPolicy:
         self.branch_weight_policy = policy
 
     def set_language_instruction(self, language_instruction: str) -> None:
-        self.language_instruction = str(language_instruction)
+        value = str(language_instruction)
+        if value != self.language_instruction:
+            self.language_instruction = value
+            self._cached_language_pos = None
+            self._cached_language_neg = None
+
+    def _invalidate_online_model_runtime(self) -> None:
+        self._cached_language_pos = None
+        self._cached_language_neg = None
+        self._online_fixed_loop = None
+
+    @torch.inference_mode()
+    def _cache_online_language(self, *, use_negative: bool) -> None:
+        language = [self.language_instruction]
+        self._cached_language_pos = tuple(
+            value.detach()
+            for value in self.inference_model_pos.encode_language(language)
+        )
+        self._cached_language_neg = (
+            tuple(
+                value.detach()
+                for value in self.inference_model_neg.encode_language(language)
+            )
+            if use_negative
+            else None
+        )
+
+    @torch.inference_mode()
+    def prepare_online_inference(
+        self,
+        *,
+        obs: Any,
+        omegas: list[float],
+        use_negative: bool,
+    ) -> dict[str, Any]:
+        """Compile and warm up the fixed-loop FP32 online candidate sampler."""
+        with self._inference_lock:
+            self._invalidate_online_model_runtime()
+            self._cache_online_language(use_negative=use_negative)
+            started = time.perf_counter()
+            sampler = _FixedLoopCandidateSampler(
+                self.inference_model_pos.flow_head,
+                self.inference_model_neg.flow_head if use_negative else None,
+                n_steps=int(self.config.n_ode_steps),
+            ).to(self.inference_device)
+            sampler.eval()
+            self._online_fixed_loop = torch.compile(
+                sampler,
+                fullgraph=True,
+                dynamic=False,
+                mode="default",
+            )
+            self._warmup_online_sampler(
+                obs=obs,
+                omegas=omegas,
+                use_negative=use_negative,
+            )
+            torch.cuda.synchronize(self.inference_device)
+            compile_seconds = time.perf_counter() - started
+        return {
+            "policy_precision": "fp32",
+            "cache_language": True,
+            "compile_strategy": "fixed_loop",
+            "compile_mode": "default",
+            "compile_warmup_seconds": float(compile_seconds),
+        }
+
+    def _warmup_online_sampler(
+        self, *, obs: Any, omegas: list[float], use_negative: bool
+    ) -> None:
+        images, proprio = self._prepare_inference_inputs(obs)
+        candidates, events = self._sample_online_candidates_tensor(
+            images=images,
+            proprio=proprio,
+            omegas=omegas if use_negative else [0.0],
+            deterministic=True,
+            use_negative=use_negative,
+        )
+        events["ode_end"].synchronize()
+        if candidates.dtype != torch.float32 or not torch.isfinite(candidates).all():
+            raise RuntimeError("Online policy warmup produced invalid FP32 candidates.")
+
+    def last_online_inference_stats(self) -> dict[str, float]:
+        return dict(self._last_online_inference_stats)
 
     def set_normalizers(
         self,
@@ -247,6 +508,18 @@ class DipoleFlowPolicy:
         if self.current_chunk is None:
             return None
         return np.asarray(self.current_chunk, dtype=np.float32).copy()
+
+    def install_action_chunk(self, action_chunk: np.ndarray) -> None:
+        chunk = np.asarray(action_chunk, dtype=np.float32)
+        expected = (int(self.config.action_horizon), int(self.config.action_dim))
+        if chunk.shape != expected:
+            raise ValueError(
+                f"action_chunk must have shape {expected}, got {chunk.shape}."
+            )
+        if not np.isfinite(chunk).all():
+            raise ValueError("action_chunk contains non-finite values.")
+        self.current_chunk = chunk.copy()
+        self.step_in_chunk = 0
 
     def _prepare_inference_inputs(self, obs) -> tuple[torch.Tensor, torch.Tensor]:
         images = []
@@ -318,6 +591,76 @@ class DipoleFlowPolicy:
         if self.act_mean is not None and self.act_std is not None:
             action_seq = action_seq * self.act_std + self.act_mean
         return action_seq
+
+    @torch.inference_mode()
+    def plan_action_candidates(
+        self,
+        obs,
+        *,
+        omegas: list[float],
+        deterministic: bool = False,
+        use_negative: bool = True,
+    ) -> np.ndarray:
+        """Plan fresh online action chunks without changing the active chunk."""
+        started = time.perf_counter()
+        effective_omegas = [float(value) for value in omegas] if use_negative else [0.0]
+        image_tensor, proprio_tensor = self._prepare_inference_inputs(obs)
+        with self._inference_lock:
+            if self._cached_language_pos is None:
+                self._cache_online_language(use_negative=use_negative)
+            if self._online_fixed_loop is None:
+                raise RuntimeError(
+                    "Online inference is not prepared; call prepare_online_inference() "
+                    "after loading the policy checkpoint."
+                )
+            candidates, timing = self._sample_online_candidates_tensor(
+                images=image_tensor,
+                proprio=proprio_tensor,
+                omegas=effective_omegas,
+                deterministic=bool(deterministic),
+                use_negative=use_negative,
+            )
+            timing["ode_end"].synchronize()
+            context_ms = timing["start"].elapsed_time(timing["context_end"])
+            ode_ms = timing["context_end"].elapsed_time(timing["ode_end"])
+            d2h_started = time.perf_counter()
+            candidate_array = candidates.detach().cpu().numpy().astype(np.float32)
+            d2h_ms = (time.perf_counter() - d2h_started) * 1000.0
+        if self.act_mean is not None and self.act_std is not None:
+            candidate_array = candidate_array * self.act_std[None] + self.act_mean[None]
+        self._last_online_inference_stats = {
+            "context_ms": float(context_ms),
+            "ode_ms": float(ode_ms),
+            "d2h_ms": float(d2h_ms),
+            "total_ms": float((time.perf_counter() - started) * 1000.0),
+        }
+        return candidate_array
+
+    def _sample_online_candidates_tensor(
+        self,
+        *,
+        images: torch.Tensor,
+        proprio: torch.Tensor,
+        omegas: list[float],
+        deterministic: bool,
+        use_negative: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.cuda.Event]]:
+        if self._cached_language_pos is None or self._online_fixed_loop is None:
+            raise RuntimeError("Online FP32 fixed-loop inference is not prepared.")
+        return _sample_guided_action_candidates(
+            self.inference_model_pos,
+            self.inference_model_neg if use_negative else None,
+            images=images,
+            proprio=proprio,
+            action_horizon=int(self.config.action_horizon),
+            omegas=omegas,
+            deterministic=deterministic,
+            pos_stream=self._inference_pos_stream,
+            neg_stream=self._inference_neg_stream,
+            cached_language_pos=self._cached_language_pos,
+            cached_language_neg=self._cached_language_neg if use_negative else None,
+            fixed_loop=self._online_fixed_loop,
+        )
 
     def _g_weights_from_raw(
         self, raw: torch.Tensor, *, want_metrics: bool = True
@@ -567,6 +910,7 @@ class DipoleFlowPolicy:
                 self._inference_shadow_model_neg,
                 self.inference_model_neg,
             )
+            self._invalidate_online_model_runtime()
 
     def state_dict(self) -> dict[str, Any]:
         with self._state_lock:

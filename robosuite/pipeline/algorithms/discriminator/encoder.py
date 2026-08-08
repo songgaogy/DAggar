@@ -193,6 +193,45 @@ class SharedDynamicsEncoder:
         return features
 
     @torch.no_grad()
+    def encode_action_candidates(
+        self,
+        *,
+        image_obs_raw: torch.Tensor,
+        proprio_raw: torch.Tensor,
+        action_candidates: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse one observation with ``K`` action candidates in one batch."""
+        if image_obs_raw.shape[0] != 1 or proprio_raw.shape[0] != 1:
+            raise ValueError("encode_action_candidates requires exactly one observation")
+        if action_candidates.ndim not in (2, 3):
+            raise ValueError(
+                "action_candidates must be (K, H, D_a) or (K, action_input_dim); "
+                f"got {tuple(action_candidates.shape)}"
+            )
+        num_candidates = int(action_candidates.shape[0])
+        if num_candidates == 0:
+            raise ValueError("action_candidates cannot be empty")
+
+        observation = self.inner_encoder._encode_observation_batch(  # noqa: SLF001
+            self._prepare_images(image_obs_raw),
+            proprio_raw.to(self.device, dtype=torch.float32, non_blocking=True),
+        )
+        candidate_observations = {
+            name: value.expand(num_candidates, *value.shape[1:])
+            for name, value in observation.items()
+        }
+        features = self.inner_encoder._encode_chunk_from_encoding(  # noqa: SLF001
+            candidate_observations,
+            action_candidates.to(self.device, dtype=torch.float32, non_blocking=True),
+        )
+        if features.shape != (num_candidates, self.chunk_feature_dim):
+            raise RuntimeError(
+                "Candidate feature shape changed: expected "
+                f"{(num_candidates, self.chunk_feature_dim)}, got {tuple(features.shape)}"
+            )
+        return features
+
+    @torch.no_grad()
     def encode_state_and_chunk(
         self,
         *,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Sequence
@@ -14,6 +15,15 @@ def _plain(node: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError("Batch-online configuration must resolve to a mapping.")
     return value
+
+
+def _guidance_omegas(cfg: DictConfig) -> list[float]:
+    values = [float(value) for value in cfg.collection.guidance_omegas]
+    if not values:
+        raise ValueError("collection.guidance_omegas must be non-empty.")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("collection.guidance_omegas must contain only finite values.")
+    return values
 
 
 def _flow_config(cfg: DictConfig) -> dict[str, Any]:
@@ -222,7 +232,8 @@ def collection_stage_config(
         discriminator_checkpoint=discriminator_checkpoint,
         encoder_checkpoint=encoder_checkpoint,
     )
-    algorithm["dipole"]["guidance_omega"] = float(cfg.collection.omega)
+    guidance_omegas = _guidance_omegas(cfg)
+    algorithm["dipole"]["guidance_omega"] = guidance_omegas[0]
     collection = cfg.collection
     collection_seed = int(cfg.seed) + int(round_index) * int(collection.num_episodes)
     output = output_path or "offline_episodes.pt"
@@ -265,6 +276,7 @@ def collection_stage_config(
             },
             "data": {"demo_root": "data", "num_trajectories": None},
             "offline_collect": {
+                "guidance_omegas": guidance_omegas,
                 "num_episodes": int(collection.num_episodes),
                 "episode_max_steps": int(collection.episode_max_steps),
                 "deterministic": bool(collection.deterministic),

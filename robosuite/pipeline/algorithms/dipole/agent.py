@@ -187,6 +187,40 @@ class DipoleAgent:
     def plan_action_chunk(self, obs, deterministic: bool = False) -> np.ndarray:
         return self.core.plan_action_chunk(obs=obs, deterministic=deterministic, guided=True)
 
+    def plan_action_candidates(
+        self,
+        obs,
+        *,
+        omegas: list[float],
+        deterministic: bool = False,
+        use_negative: bool = True,
+    ) -> np.ndarray:
+        return self.core.plan_action_candidates(
+            obs,
+            omegas=omegas,
+            deterministic=deterministic,
+            use_negative=use_negative,
+        )
+
+    def prepare_online_inference(
+        self,
+        *,
+        obs: Any,
+        omegas: list[float],
+        use_negative: bool,
+    ) -> dict[str, Any]:
+        return self.core.prepare_online_inference(
+            obs=obs,
+            omegas=omegas,
+            use_negative=use_negative,
+        )
+
+    def last_online_inference_stats(self) -> dict[str, float]:
+        return self.core.last_online_inference_stats()
+
+    def install_action_chunk(self, action_chunk: np.ndarray) -> None:
+        self.core.install_action_chunk(action_chunk)
+
     def needs_action_chunk(self) -> bool:
         return self.core.needs_action_chunk()
 
