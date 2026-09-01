@@ -177,7 +177,6 @@ policy:
     g_mode: "advantage"
   advantage_g:
     alpha: 1.0
-    discriminator_beta: 0.0
   advantage:
     estimator: "td1"
     gae_lambda: 0.6

@@ -82,15 +82,11 @@ def test_static_cache_batch_supports_offline_g_provider_lookup() -> None:
         valid_starts = list(buffer._get_valid_start_indices_locked())  # noqa: SLF001
     start_to_row = {int(start): row for row, start in enumerate(valid_starts)}
     advantage_raw = torch.arange(len(valid_starts), dtype=torch.float32, device="cuda")
-    failure_raw = torch.zeros(len(valid_starts), dtype=torch.float32, device="cuda")
     provider = OfflineAdvantageGProvider(
         vast_learner=None,
-        discriminator=None,
         encoder=None,
         alpha=2.0,
-        beta=0.0,
         advantage_raw=advantage_raw,
-        failure_raw=failure_raw,
         start_to_row=start_to_row,
     )
 

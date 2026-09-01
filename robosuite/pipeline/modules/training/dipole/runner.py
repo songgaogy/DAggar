@@ -288,7 +288,7 @@ def _precompute_phase_b_advantage(
     encode_batch_size: int,
     estimator: str,
     gae_lambda: float,
-) -> tuple[torch.Tensor, torch.Tensor, dict[int, int]]:
+) -> tuple[torch.Tensor, dict[int, int]]:
     """Dispatch Phase B to VAST-value TD1/GAE, never stitched advantage."""
     return precompute_offline_advantage(
         base_buffer=base_buffer,
@@ -667,7 +667,7 @@ def run_offline_training(cfg: DictConfig) -> None:
         norm_desc="policy sections + online-success + pretrain positive demos",
     )
 
-    advantage_raw, failure_raw, start_to_row = _precompute_phase_b_advantage(
+    advantage_raw, start_to_row = _precompute_phase_b_advantage(
         base_buffer=agent.replay_buffer,
         vast_learner=vast_learner,
         encoder=shared_encoder,
@@ -683,7 +683,6 @@ def run_offline_training(cfg: DictConfig) -> None:
     advantage_std = (
         float(advantage_raw.std().item()) if advantage_raw.numel() > 1 else 0.0
     )
-    failure_mean = float(failure_raw.mean().item())
     print(
         f"[offline] advantage estimator={adv_estimator} gamma^H={gamma_h:.6f}"
         + (f" lambda={adv_gae_lambda}" if adv_estimator == "gae" else "")
@@ -695,7 +694,6 @@ def run_offline_training(cfg: DictConfig) -> None:
             "offline_advantage/is_gae": float(adv_estimator == "gae"),
             "offline_advantage/mean": advantage_mean,
             "offline_advantage/std": advantage_std,
-            "offline_advantage/failure_mean": failure_mean,
             "offline_advantage/gamma_h": gamma_h,
             "offline_advantage/gae_lambda": (
                 adv_gae_lambda if adv_estimator == "gae" else 0.0
@@ -705,12 +703,9 @@ def run_offline_training(cfg: DictConfig) -> None:
     )
     provider = OfflineAdvantageGProvider(
         vast_learner=vast_learner,
-        discriminator=discriminator,
         encoder=shared_encoder,
         alpha=float(cfg.algorithm.advantage_g_provider.alpha),
-        beta=float(cfg.algorithm.advantage_g_provider.beta),
         advantage_raw=advantage_raw,
-        failure_raw=failure_raw,
         start_to_row=start_to_row,
     )
     provider.bind_policy_cameras(camera_names)
@@ -727,8 +722,7 @@ def run_offline_training(cfg: DictConfig) -> None:
     agent.core.set_branch_weight_policy(branch_policy)
     print(
         f"[offline] branch_weight={type(branch_policy).__name__} beta={agent.core.config.beta} "
-        f"k={agent.core.config.k}; provider alpha={cfg.algorithm.advantage_g_provider.alpha} "
-        f"beta={cfg.algorithm.advantage_g_provider.beta}"
+        f"k={agent.core.config.k}; provider alpha={cfg.algorithm.advantage_g_provider.alpha}"
     )
 
     static_cache = agent.replay_buffer.build_static_cache(pin_memory=True)
@@ -776,7 +770,6 @@ def run_offline_training(cfg: DictConfig) -> None:
             "advantage_gamma_h": gamma_h,
             "advantage_mean": advantage_mean,
             "advantage_std": advantage_std,
-            "failure_mean": failure_mean,
             "vast_v_mode": str(vast_cfg.vast_v_mode),
             "vast_max_k": int(vast_cfg.vast_max_k),
             "vast_macro_horizon": int(H),

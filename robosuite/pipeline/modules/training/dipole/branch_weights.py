@@ -22,9 +22,9 @@ The default :class:`RoutedSigmoidBranchWeightPolicy` reads the per-frame
   computed by reusing the policy's own ``sigmoid_fn`` on the attached G provider's
   advantage — identical math to the online coupled path.
 
-:class:`DiscriminatorScaledBranchWeightPolicy` is a worked example of the "add a
-discriminator output scale" extension: it multiplies the advantage-row positive
-weight by a bounded factor derived from the provider's failure score.
+:class:`DiscriminatorScaledBranchWeightPolicy` is a worked example of a
+non-default branch-weight extension: it sharpens advantage-row ``w_pos`` with a
+tunable exponent. Kept as a template, not a tuned default.
 """
 
 from __future__ import annotations
@@ -134,13 +134,9 @@ class RoutedSigmoidBranchWeightPolicy:
 
 
 class DiscriminatorScaledBranchWeightPolicy(RoutedSigmoidBranchWeightPolicy):
-    """Example extension: scale advantage-row ``w_pos`` by a disc-derived factor.
+    """Example extension: sharpen advantage-row ``w_pos`` with a power scale.
 
-    Demonstrates the "add discriminator output scale" idea from PROMPT.md point 4.
-    ``discriminator.failure_score`` is not available per-row without re-encoding, so
-    this example instead rescales using the provider's own failure term already
-    baked into G; concretely it sharpens ``w_pos`` toward the advantage sign with a
-    tunable ``scale``. Kept minimal on purpose — a template, not a tuned default.
+    Kept minimal on purpose — a template, not a tuned default.
     """
 
     def __init__(self, *, scale: float = 1.0) -> None:

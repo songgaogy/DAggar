@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from robosuite.pipeline.algorithms.flow_dagger.common import ReplayBufferConfig
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
@@ -46,6 +47,8 @@ def test_offline_config_uses_confirmed_td1_baseline() -> None:
     assert estimator == "td1"
     assert gae_lambda == pytest.approx(0.6)
     assert cfg.offline.vast_finetune.relabel_disc_reward is True
+    assert float(cfg.algorithm.advantage_g_provider.alpha) == pytest.approx(1.0)
+    assert OmegaConf.select(cfg, "algorithm.advantage_g_provider.beta") is None
 
 
 def test_phase_a_explicitly_relabels_discriminator_reward_after_strict_load() -> None:
@@ -386,9 +389,9 @@ def test_phase_b_dispatches_only_vast_value_advantage(
     estimator: str,
 ) -> None:
     captured: dict[str, object] = {}
-    expected = (object(), object(), {7: 0})
+    expected = (object(), {7: 0})
 
-    def _fake_precompute(**kwargs: object) -> tuple[object, object, dict[int, int]]:
+    def _fake_precompute(**kwargs: object) -> tuple[object, dict[int, int]]:
         captured.update(kwargs)
         return expected
 

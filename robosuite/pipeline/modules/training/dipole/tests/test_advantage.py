@@ -167,12 +167,9 @@ def test_gae_lambda_zero_recovers_one_step_delta():
 def test_offline_advantage_provider_cuda_cache_lookup_stays_on_cuda():
     provider = OfflineAdvantageGProvider(
         vast_learner=None,
-        discriminator=None,
         encoder=None,
         alpha=2.0,
-        beta=0.25,
         advantage_raw=torch.tensor([1.0, -2.0, 3.0], device=DEVICE),
-        failure_raw=torch.tensor([0.5, 4.0, 1.0], device=DEVICE),
         start_to_row={10: 0, 20: 1, 30: 2},
     )
     batch = SimpleNamespace(
@@ -183,8 +180,7 @@ def test_offline_advantage_provider_cuda_cache_lookup_stays_on_cuda():
     g = provider.compute_g_for_batch(batch)
 
     assert provider._advantage_raw.device.type == "cuda"
-    assert provider._failure_raw.device.type == "cuda"
     assert g.device.type == "cuda"
-    expected = torch.tensor([5.75, 1.875], device=DEVICE)
+    expected = torch.tensor([6.0, 2.0], device=DEVICE)
     assert torch.allclose(g, expected, atol=1e-7), g
 

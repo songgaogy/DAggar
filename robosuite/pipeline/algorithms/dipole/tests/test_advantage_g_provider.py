@@ -36,10 +36,6 @@ class _FakeVAST:
     """Placeholder VAST learner (the stub provider never calls into it)."""
 
 
-class _FakeDisc:
-    """Placeholder discriminator (the stub provider never calls into it)."""
-
-
 def _make_batch(B: int = 4, H: int = 3, D_a: int = 2, D_s: int = 5):
     return SimpleNamespace(
         image_obs_raw=torch.zeros(B, 1, 3, 4, 4),
@@ -51,10 +47,8 @@ def _make_batch(B: int = 4, H: int = 3, D_a: int = 2, D_s: int = 5):
 def _make_provider() -> AdvantageGProvider:
     return AdvantageGProvider(
         vast_learner=_FakeVAST(),
-        discriminator=_FakeDisc(),
         encoder=_FakeEncoder(context_dim=4),
         alpha=1.0,
-        beta=0.0,
     )
 
 
@@ -74,10 +68,8 @@ def test_bind_policy_cameras_proxies_to_encoder() -> None:
     encoder = _FakeEncoder(context_dim=4)
     provider = AdvantageGProvider(
         vast_learner=_FakeVAST(),
-        discriminator=_FakeDisc(),
         encoder=encoder,
         alpha=1.0,
-        beta=0.0,
     )
     cams = ["frontview_image", "wristview_image"]
     provider.bind_policy_cameras(cams)

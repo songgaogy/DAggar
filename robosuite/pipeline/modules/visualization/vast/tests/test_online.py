@@ -467,7 +467,7 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
     )
     buffer.extend(transitions)
 
-    td1, _, _ = precompute_offline_advantage(
+    td1, _ = precompute_offline_advantage(
         base_buffer=buffer,
         vast_learner=learner,
         encoder=encoder,
@@ -478,7 +478,7 @@ def test_policy_boundary_metrics_match_training_td1_and_gae(
         estimator="td1",
         gae_lambda=0.6,
     )
-    gae, _, _ = precompute_offline_advantage(
+    gae, _ = precompute_offline_advantage(
         base_buffer=buffer,
         vast_learner=learner,
         encoder=encoder,

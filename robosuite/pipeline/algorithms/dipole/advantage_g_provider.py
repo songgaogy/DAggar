@@ -1,11 +1,10 @@
-"""G provider that mixes the VAST TD1 fallback with frozen nnPU failure scores.
+"""G provider that serves the VAST TD1/GAE advantage as DIPOLE's G.
 
-Provides frozen VAST/discriminator advantages for batch policy training.
+Provides frozen VAST advantages for batch policy training.
 
 Online fallback math (no Q head):
     A(s, a)        = r + gamma^H * target_V(s') - V(s)      # TD residual
-    failure        = FrozenNNPUDiscriminator.failure_score(z(s, a))
-    G              = alpha * A - beta * failure
+    G              = alpha * A
 
 The flow policy then maps G -> w_pos = sigmoid(beta_policy * (G + k)), so a
 larger advantage raises the positive-branch weight.
@@ -18,8 +17,8 @@ offline path precomputes the residual by start index instead — see
 Wiring next-state/reward through the online
 sampler is deferred; until then this provider raises ``NotImplementedError``.
 
-This object owns nothing it doesn't construct: the VAST learner, the
-discriminator, and the encoder are all injected.
+This object owns nothing it doesn't construct: the VAST learner and the encoder
+are injected.
 """
 
 from __future__ import annotations
@@ -30,35 +29,28 @@ import torch
 
 if TYPE_CHECKING:
     from robosuite.pipeline.algorithms.discriminator.encoder import SharedDynamicsEncoder
-    from robosuite.pipeline.algorithms.discriminator.nnpu import FrozenNNPUDiscriminator
     from robosuite.pipeline.algorithms.vast.vast import VASTLearner
 
 
 class AdvantageGProvider:
-    """Mix advantage and discriminator logit into a single G tensor.
+    """Scale the VAST advantage into a single G tensor.
 
     Args:
         vast_learner:           the VAST learner; provides advantage.
-        discriminator:         frozen nnPU head; provides failure score.
-        encoder:               shared frozen encoder; used to build features
-                               from `DipoleBatch.image_obs_raw` + `proprio_raw`.
-        alpha, beta:           linear mixing coefficients.
+        encoder:               shared frozen encoder; used to bind policy cameras.
+        alpha:                 linear scale on the advantage term.
     """
 
     def __init__(
         self,
         *,
         vast_learner: "VASTLearner",
-        discriminator: "FrozenNNPUDiscriminator",
         encoder: "SharedDynamicsEncoder",
         alpha: float,
-        beta: float,
     ) -> None:
         self.vast_learner = vast_learner
-        self.discriminator = discriminator
         self.encoder = encoder
         self.alpha = float(alpha)
-        self.beta = float(beta)
 
     # ------------------------------------------------------------------ #
     # G provider contract                                                  #

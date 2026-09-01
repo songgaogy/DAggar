@@ -127,7 +127,6 @@ def _algorithm_config(
         ),
         "advantage_g_provider": {
             "alpha": float(cfg.task.policy.advantage_g.alpha),
-            "beta": float(cfg.task.policy.advantage_g.discriminator_beta),
         },
     }
 
