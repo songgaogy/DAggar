@@ -185,7 +185,7 @@ policy:
     type: "routed_sigmoid"
     beta: 2.0
     k: 0.0
-  use_online_success: false
+    eta: 0.0
   include_policy_action_negative: true
   reward_success: 0.0
   reward_failure: -1.0

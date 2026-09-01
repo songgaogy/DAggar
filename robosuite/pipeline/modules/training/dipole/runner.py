@@ -31,7 +31,6 @@ from robosuite.pipeline.modules.training.dipole import (
     build_branch_weight_policy,
     build_vast_finetune_buffer,
     build_offline_transitions,
-    build_online_success_transitions,
     finalize_normalizers,
     finetune_vast,
     load_pretrain_transitions,
@@ -41,7 +40,6 @@ from robosuite.pipeline.modules.training.dipole import (
     save_finetuned_vast,
     validate_vast_checkpoint_payload,
 )
-from robosuite.pipeline.modules.training.dipole.episode_dataset import ROUTE_POS_ONLY
 from robosuite.pipeline.utils import (
     checkpoint_path,
     maybe_build_metric_logger,
@@ -470,37 +468,7 @@ def run_offline_training(cfg: DictConfig) -> None:
     print(f"[offline] episodes={episodes_paths}")
     print(f"[offline] streams: {streams.stats}")
 
-    use_online_success = bool(OmegaConf.select(cfg, "offline.use_online_success", default=False))
     next_ep_base = _next_episode_index(streams.policy_bc, streams.human_pos, streams.neg)
-    online_success_pos: list[Any] = []
-    online_success_stats: dict[str, Any] = {}
-    online_success_replaced_policy_bc = 0
-    policy_bc_for_policy = list(streams.policy_bc)
-    if use_online_success:
-        online_success_pos, next_ep_base, online_success_stats = build_online_success_transitions(
-            payload,
-            action_horizon=H,
-            episode_index_base=next_ep_base,
-            route=ROUTE_POS_ONLY,
-        )
-        source_episode_indices = {
-            int(idx)
-            for idx in online_success_stats.get("pure_success_source_episode_indices", [])
-        }
-        if source_episode_indices:
-            policy_bc_for_policy = [
-                transition
-                for transition in streams.policy_bc
-                if int((transition.info or {}).get("source_episode_index", -1))
-                not in source_episode_indices
-            ]
-            online_success_replaced_policy_bc = len(streams.policy_bc) - len(policy_bc_for_policy)
-        print(
-            f"[offline] online_success: {online_success_stats}; "
-            f"replaced_policy_bc={online_success_replaced_policy_bc}"
-        )
-    else:
-        print("[offline] online_success: disabled (offline.use_online_success=false)")
 
     pretrain_pos = []
     pretrain_data_path = None
@@ -646,25 +614,24 @@ def run_offline_training(cfg: DictConfig) -> None:
     # Phase B: weighted-BC policy update (frozen finetuned VAST).         #
     # ------------------------------------------------------------------ #
     all_transitions = (
-        list(policy_bc_for_policy)
+        list(streams.policy_bc)
         + list(streams.human_pos)
         + list(streams.neg)
-        + list(online_success_pos)
         + list(pretrain_pos)
     )
     n_valid = populate_replay_buffer(agent.replay_buffer, all_transitions)
     print(
         f"[offline] policy-BC buffer: {len(agent.replay_buffer)} transitions, {n_valid} valid windows "
-        f"(policy_bc={len(policy_bc_for_policy)}, human_pos={len(streams.human_pos)}, "
-        f"neg={len(streams.neg)}, online_success_pos={len(online_success_pos)}, "
+        f"(policy_bc={len(streams.policy_bc)}, human_pos={len(streams.human_pos)}, "
+        f"neg={len(streams.neg)}, "
         f"pretrain_pos={len(pretrain_pos)})"
     )
     batch_size = finalize_normalizers(
         agent,
         cfg,
-        list(policy_bc_for_policy) + list(online_success_pos) + list(pretrain_pos),
+        list(streams.policy_bc) + list(pretrain_pos),
         log_tag="offline",
-        norm_desc="policy sections + online-success + pretrain positive demos",
+        norm_desc="policy sections + pretrain positive demos",
     )
 
     advantage_raw, failure_raw, start_to_row = _precompute_phase_b_advantage(
@@ -718,7 +685,7 @@ def run_offline_training(cfg: DictConfig) -> None:
     agent.attach_discriminator(discriminator)
     agent.attach_g_provider(provider)
 
-    # Pluggable branch-weight policy: w_pos = sigmoid(beta * (G + k)).
+    # Pluggable branch-weight policy: w_pos = sigmoid(beta * (G + k) + eta * Y).
     agent.core.config.beta = float(OmegaConf.select(cfg, "offline.branch_weight.beta", default=agent.core.config.beta))
     agent.core.config.k = float(OmegaConf.select(cfg, "offline.branch_weight.k", default=agent.core.config.k))
     branch_policy = build_branch_weight_policy(
@@ -727,7 +694,9 @@ def run_offline_training(cfg: DictConfig) -> None:
     agent.core.set_branch_weight_policy(branch_policy)
     print(
         f"[offline] branch_weight={type(branch_policy).__name__} beta={agent.core.config.beta} "
-        f"k={agent.core.config.k}; provider alpha={cfg.algorithm.advantage_g_provider.alpha} "
+        f"k={agent.core.config.k} "
+        f"eta={float(OmegaConf.select(cfg, 'offline.branch_weight.eta', default=0.0))}; "
+        f"provider alpha={cfg.algorithm.advantage_g_provider.alpha} "
         f"beta={cfg.algorithm.advantage_g_provider.beta}"
     )
 
@@ -761,10 +730,6 @@ def run_offline_training(cfg: DictConfig) -> None:
             "episodes_paths": episodes_paths,
             "pretrain_data_path": pretrain_data_path,
             "pretrain_transitions": len(pretrain_pos),
-            "online_success_enabled": use_online_success,
-            "online_success_transitions": len(online_success_pos),
-            "online_success_replaced_policy_bc_transitions": online_success_replaced_policy_bc,
-            "online_success_stats": online_success_stats,
             "skip_rl": bool(skip_rl),
             "warmup_transitions_path": warmup_transitions_path,
             "algorithm": "vast_value_stitching_adaptation",

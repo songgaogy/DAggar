@@ -18,9 +18,9 @@ The default :class:`RoutedSigmoidBranchWeightPolicy` reads the per-frame
 - ``pos_only`` (human intervention → positive branch): ``w_pos=1, w_neg=0``.
 - ``neg_only`` (policy action during intervention → negative branch): ``w_pos=0,
   w_neg=1``.
-- ``advantage`` (policy rollout sections): ``w_pos=σ(β·(G+k))``, ``w_neg=1-w_pos``,
-  computed by reusing the policy's own ``sigmoid_fn`` on the attached G provider's
-  advantage — identical math to the online coupled path.
+- ``advantage`` (policy rollout sections): ``w_pos=σ(β·(G+k)+ηY)``,
+  ``w_neg=1-w_pos``, where ``Y=1`` for pure on-policy success trajectories.
+  The policy reuses its own ``sigmoid_fn`` on the attached G provider's advantage.
 
 :class:`DiscriminatorScaledBranchWeightPolicy` is a worked example of the "add a
 discriminator output scale" extension: it multiplies the advantage-row positive
@@ -81,7 +81,10 @@ def _route_masks(
 
 
 class RoutedSigmoidBranchWeightPolicy:
-    """Default routed weighting: pos_only→(1,0), neg_only→(0,1), advantage→σ(G)."""
+    """Routed weighting with an eta logit bonus for pure success trajectories."""
+
+    def __init__(self, *, eta: float = 0.0) -> None:
+        self.eta = float(eta)
 
     def __call__(
         self,
@@ -94,6 +97,7 @@ class RoutedSigmoidBranchWeightPolicy:
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         B = batch.batch_size
         masks = _route_masks(batch, device)
+        success_mask = self._success_trajectory_mask(batch, device)
         w_pos = torch.zeros(B, dtype=torch.float32, device=device)
         w_neg = torch.zeros(B, dtype=torch.float32, device=device)
 
@@ -105,7 +109,13 @@ class RoutedSigmoidBranchWeightPolicy:
         if bool(adv_mask.any().item()):
             adv_idx = torch.nonzero(adv_mask, as_tuple=False).squeeze(1)
             raw = self._advantage_raw_g(batch, adv_idx, g_provider, device)
-            w_adv_pos, w_adv_neg, g_metrics = sigmoid_fn(raw, want_metrics=want_metrics)
+            success = success_mask.index_select(0, adv_idx)
+            logit_bias = self.eta * success.to(dtype=torch.float32)
+            w_adv_pos, w_adv_neg, g_metrics = sigmoid_fn(
+                raw,
+                logit_bias=logit_bias,
+                want_metrics=want_metrics,
+            )
             w_pos[adv_mask] = w_adv_pos.to(device=device, dtype=torch.float32)
             w_neg[adv_mask] = w_adv_neg.to(device=device, dtype=torch.float32)
 
@@ -115,9 +125,24 @@ class RoutedSigmoidBranchWeightPolicy:
             metrics["frac_pos_only"] = float(masks[ROUTE_POS_ONLY].float().mean().item())
             metrics["frac_neg_only"] = float(masks[ROUTE_NEG_ONLY].float().mean().item())
             metrics["frac_advantage"] = float(adv_mask.float().mean().item())
+            metrics["frac_success_trajectory"] = float(
+                success_mask.float().mean().item()
+            )
+            metrics["success_logit_bonus_mean"] = float(
+                (self.eta * (success_mask & adv_mask).float()).mean().item()
+            )
             metrics["w_pos_mean"] = float(w_pos.mean().item())
             metrics["w_neg_mean"] = float(w_neg.mean().item())
         return w_pos, w_neg, metrics
+
+    @staticmethod
+    def _success_trajectory_mask(
+        batch: DipoleBatch, device: torch.device | str
+    ) -> torch.Tensor:
+        values = batch.metadata.get("is_success_trajectory")
+        if values is None or len(values) != batch.batch_size:
+            values = [False] * batch.batch_size
+        return torch.tensor(values, device=device, dtype=torch.bool)
 
     @staticmethod
     def _advantage_raw_g(
@@ -143,7 +168,8 @@ class DiscriminatorScaledBranchWeightPolicy(RoutedSigmoidBranchWeightPolicy):
     tunable ``scale``. Kept minimal on purpose — a template, not a tuned default.
     """
 
-    def __init__(self, *, scale: float = 1.0) -> None:
+    def __init__(self, *, scale: float = 1.0, eta: float = 0.0) -> None:
+        super().__init__(eta=eta)
         self.scale = float(scale)
 
     def __call__(
@@ -178,10 +204,13 @@ def build_branch_weight_policy(cfg: Any) -> BranchWeightPolicy:
     """Factory keyed on ``offline.branch_weight.type`` (default routed_sigmoid)."""
     weight_type = str(getattr(cfg, "type", "routed_sigmoid")).strip().lower()
     if weight_type in ("routed_sigmoid", "", "default"):
-        return RoutedSigmoidBranchWeightPolicy()
+        return RoutedSigmoidBranchWeightPolicy(
+            eta=float(getattr(cfg, "eta", 0.0))
+        )
     if weight_type in ("disc_scaled", "discriminator_scaled"):
         return DiscriminatorScaledBranchWeightPolicy(
-            scale=float(getattr(cfg, "scale", 1.0))
+            scale=float(getattr(cfg, "scale", 1.0)),
+            eta=float(getattr(cfg, "eta", 0.0)),
         )
     raise ValueError(f"Unknown offline.branch_weight.type={weight_type!r}")
 

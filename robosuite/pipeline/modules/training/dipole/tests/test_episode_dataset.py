@@ -60,6 +60,10 @@ def test_pure_success_policy_uses_per_frame_sparse_reward() -> None:
     ] == [False, False, False, True]
     assert streams.stats["policy_success_reward_frames"] == 1
     assert streams.stats["policy_failure_reward_frames"] == 3
+    assert all(
+        bool((transition.info or {})["is_success_trajectory"])
+        for transition in streams.policy_bc
+    )
 
 
 def test_intervention_boundary_keeps_success_metadata_for_truncation() -> None:
@@ -73,6 +77,10 @@ def test_intervention_boundary_keeps_success_metadata_for_truncation() -> None:
         )
 
     before, after = [sections[index] for index in sorted(sections)]
+    assert all(
+        not bool((transition.info or {})["is_success_trajectory"])
+        for transition in streams.policy_bc + streams.human_pos
+    )
     assert [int((transition.info or {})["source_frame_index"]) for transition in before] == [
         0,
         1,
@@ -119,6 +127,10 @@ def test_non_success_final_policy_section_is_kept_as_failure(
     assert [transition.reward for transition in streams.policy_bc] == [-1.0] * 3
     assert all(
         (transition.info or {})["success"] is False
+        for transition in streams.policy_bc
+    )
+    assert all(
+        not bool((transition.info or {})["is_success_trajectory"])
         for transition in streams.policy_bc
     )
     assert all(

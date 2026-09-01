@@ -122,6 +122,34 @@ def _build_eval_output_dir(
     return output_dir
 
 
+def _apply_resolved_model_paths(
+    checkpoint_payload: dict[str, Any],
+    resolved_cfg: Any,
+) -> None:
+    """Prefer run-local frozen model assets over stale checkpoint path metadata."""
+
+    if resolved_cfg is None:
+        return
+    model_cfg = checkpoint_payload.get("model_cfg")
+    if not isinstance(model_cfg, dict):
+        return
+
+    path_overrides = {
+        "algorithm.flow.model.image_encoder.pretrained_path": ("image_encoder", "pretrained_path"),
+        "algorithm.flow.model.language_encoder.pretrained_name": ("language_encoder", "pretrained_name"),
+    }
+    for config_path, (component_name, field_name) in path_overrides.items():
+        value = OmegaConf.select(resolved_cfg, config_path, default=None)
+        if value in (None, ""):
+            continue
+        resolved_path = Path(to_absolute_path(str(value))).resolve()
+        if not resolved_path.exists():
+            continue
+        component_cfg = model_cfg.get(component_name)
+        if isinstance(component_cfg, dict):
+            component_cfg[field_name] = str(resolved_path)
+
+
 def main() -> None:
     args = _parse_args()
     checkpoint_path = Path(to_absolute_path(args.checkpoint)).resolve()
@@ -168,6 +196,7 @@ def main() -> None:
             }
         )
     resolved_cfg.env.environment = str(args.env_name)
+    _apply_resolved_model_paths(checkpoint_payload, resolved_cfg)
 
     policy_camera_names = [str(name) for name in checkpoint_payload["camera_names"]]
     runtime_cfg = build_flow_runtime_cfg(

@@ -663,14 +663,18 @@ class DipoleFlowPolicy:
         )
 
     def _g_weights_from_raw(
-        self, raw: torch.Tensor, *, want_metrics: bool = True
+        self,
+        raw: torch.Tensor,
+        *,
+        logit_bias: torch.Tensor | None = None,
+        want_metrics: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
         """Map provider preference ``G`` to coupled branch weights.
 
         ``G`` is already the preference signal (larger -> more positive branch).
         Weights use an offset-then-scale logit::
 
-            w_pos = sigmoid(beta * (G + k))
+            w_pos = sigmoid(beta * (G + k) + logit_bias)
             w_neg = 1 - w_pos
 
         ``k`` shifts the decision threshold in G-space (``w_pos=0.5`` at ``G=-k``);
@@ -678,6 +682,8 @@ class DipoleFlowPolicy:
         """
         g = raw
         logit = float(self.config.beta) * (g + float(self.config.k))
+        if logit_bias is not None:
+            logit = logit + logit_bias.to(device=logit.device, dtype=logit.dtype)
         w_pos = torch.sigmoid(logit)
         w_neg = 1.0 - w_pos
         if not want_metrics:

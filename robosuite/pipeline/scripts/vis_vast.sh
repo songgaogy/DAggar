@@ -2,8 +2,8 @@
 # Visualize one round's published VAST and discriminator checkpoints.
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=1
-RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260804_200046"
+export CUDA_VISIBLE_DEVICES=0
+RUN_ROOT="outputs/dipole/PickPlaceCereal/multi-explore_20260804_233553"
 ROUND_INDEX="001"
 SEEDS=(1 2 3 4 5 6)
 SPLIT="online"  # success_rollout, fail_rollout, or online

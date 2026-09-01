@@ -406,7 +406,6 @@ def offline_stage_config(
         "vast_warmup_transitions_path": str(
             vast_warmup_transitions or inputs.vast_warmup_transitions
         ),
-        "use_online_success": bool(cfg.task.policy.use_online_success),
         "reward_success": float(cfg.task.policy.reward_success),
         "reward_fail": float(cfg.task.policy.reward_failure),
         "include_policy_action_neg": bool(cfg.task.policy.include_policy_action_negative),

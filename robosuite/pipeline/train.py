@@ -21,6 +21,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("run_root")
     parser.add_argument("stage", nargs="?", default="all", choices=("all", "disc", "vast", "policy"))
     parser.add_argument("--round-index", type=_non_negative_int, default=None)
+    parser.add_argument("--branch-beta", type=float, default=None)
+    parser.add_argument("--branch-k", type=float, default=None)
+    parser.add_argument("--branch-eta", type=float, default=None)
     return parser.parse_args()
 
 
@@ -41,7 +44,19 @@ def main() -> None:
             f"[batch-online] retrain start: round={args.round_index:03d} "
             f"stage={retrain_stage}"
         )
-    train(layout, requested_stage=args.stage)
+    branch_weight_overrides = {
+        key: value
+        for key, value in {
+            "beta": args.branch_beta,
+            "k": args.branch_k,
+            "eta": args.branch_eta,
+        }.items()
+        if value is not None
+    }
+    train_kwargs = {"requested_stage": args.stage}
+    if branch_weight_overrides:
+        train_kwargs["branch_weight_overrides"] = branch_weight_overrides
+    train(layout, **train_kwargs)
     print(f"[batch-online] training stage(s) complete: {layout.root}")
 
 

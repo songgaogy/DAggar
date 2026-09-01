@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from robosuite.pipeline.algorithms.flow_dagger.common import ReplayBufferConfig
 from robosuite.pipeline.algorithms.flow_dagger.replay_buffer import FlowDaggerReplayBuffer
@@ -46,6 +47,9 @@ def test_offline_config_uses_confirmed_td1_baseline() -> None:
     assert estimator == "td1"
     assert gae_lambda == pytest.approx(0.6)
     assert cfg.offline.vast_finetune.relabel_disc_reward is True
+    assert cfg.offline.branch_weight.eta == pytest.approx(0.5)
+    assert train_offline.build_branch_weight_policy(cfg.offline.branch_weight).eta == pytest.approx(0.5)
+    assert OmegaConf.select(cfg, "offline.use_online_success") is None
 
 
 def test_phase_a_explicitly_relabels_discriminator_reward_after_strict_load() -> None:

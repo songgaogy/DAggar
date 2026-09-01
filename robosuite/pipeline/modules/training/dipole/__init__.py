@@ -21,7 +21,6 @@ from .buffer import (
 from .episode_dataset import (
     OfflineStreams,
     build_offline_transitions,
-    build_online_success_transitions,
 )
 from .hard_label_providers import (
     NaiveNegativeGProvider,
@@ -56,7 +55,6 @@ __all__ = [
     "build_branch_weight_policy",
     "build_vast_finetune_buffer",
     "build_offline_transitions",
-    "build_online_success_transitions",
     "finalize_normalizers",
     "finetune_vast",
     "load_offline_data_transitions",

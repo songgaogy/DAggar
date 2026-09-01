@@ -19,7 +19,8 @@ from robosuite.pipeline.common.types import (
 @dataclass
 class DipoleConfig(FlowDaggerConfig):
     # CFG-style guidance + sigmoid weighting params.
-    # Coupled soft weights: w_pos = sigmoid(beta * (G + k)), w_neg = 1 - w_pos.
+    # Base coupled weights: w_pos = sigmoid(beta * (G + k)), w_neg = 1 - w_pos.
+    # Offline routed training may add eta * Y directly to the sigmoid logit.
     # k offsets G before scaling (w_pos=0.5 at G=-k); beta is the post-offset slope.
     beta: float = 2.0
     k: float = 0.0
@@ -81,7 +82,13 @@ def select_dipole_batch(batch: DipoleBatch, indices: torch.Tensor) -> DipoleBatc
     idx = indices.to(device=batch.image_obs.device, dtype=torch.long).reshape(-1)
     index_list = idx.detach().cpu().tolist()
     metadata: dict[str, Any] = {}
-    for key in ("start_indices", "episode_ids", "episode_steps", "route"):
+    for key in (
+        "start_indices",
+        "episode_ids",
+        "episode_steps",
+        "route",
+        "is_success_trajectory",
+    ):
         values = batch.metadata.get(key)
         if values is None:
             continue

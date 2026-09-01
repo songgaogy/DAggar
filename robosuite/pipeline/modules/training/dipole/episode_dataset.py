@@ -17,7 +17,8 @@ frame tagged with ``info["route"] in {"advantage", "pos_only", "neg_only"}``:
 
 - **policy_bc** (kept policy sections): ``action = executed_action``, per-frame
   sparse success reward, ``route="advantage"``. Fed to BOTH the VAST buffer and
-  the policy-BC buffer.
+  the policy-BC buffer. Frames from a pure on-policy success episode carry
+  ``info["is_success_trajectory"]=True``.
 - **human_pos** (every human section): ``action = executed_action`` (== human),
   ``route="pos_only"`` (forces ``w_pos=1, w_neg=0``). Policy-BC only.
 - **neg** (same human frames, opt-in default on): ``action = policy_action``,
@@ -144,6 +145,7 @@ def _materialize_section(
     reward_success: float | None = None,
     reward_fail: float | None = None,
     source_episode_index: int | None = None,
+    is_success_trajectory: bool = False,
 ) -> tuple[list[Transition], bool]:
     """Turn one section into a standalone-episode list of transitions.
 
@@ -181,6 +183,7 @@ def _materialize_section(
             "buffer_role": "offline",
             "episode_namespace": f"offline_{route}",
             "source_frame_index": int(src_i),
+            "is_success_trajectory": bool(is_success_trajectory),
         }
         if source_episode_index is not None:
             info["source_episode_index"] = int(source_episode_index)
@@ -259,6 +262,9 @@ def build_offline_transitions(
     for source_episode_index, episode in enumerate(episodes):
         is_intervention = np.asarray(episode["is_intervention"], dtype=np.bool_)
         terminal_reason = str(episode.get("terminal_reason", ""))
+        is_success_trajectory = (
+            terminal_reason == "success" and not bool(is_intervention.any())
+        )
         sections = _split_sections(is_intervention)
 
         for idx, section in enumerate(sections):
@@ -283,6 +289,7 @@ def build_offline_transitions(
                     reward_success=reward_success,
                     reward_fail=reward_fail,
                     source_episode_index=source_episode_index,
+                    is_success_trajectory=is_success_trajectory,
                 )
                 if not transitions:
                     # Kept by policy but too short for a single H window -> dropped.
@@ -318,6 +325,7 @@ def build_offline_transitions(
                     pad_to_h=True,
                     mark_success=False,
                     source_episode_index=source_episode_index,
+                    is_success_trajectory=False,
                 )
                 if pos_tr:
                     streams.human_pos.extend(pos_tr)
@@ -338,6 +346,7 @@ def build_offline_transitions(
                         pad_to_h=True,
                         mark_success=False,
                         source_episode_index=source_episode_index,
+                        is_success_trajectory=False,
                     )
                     if neg_tr:
                         streams.neg.extend(neg_tr)
@@ -361,91 +370,10 @@ def build_offline_transitions(
     return streams
 
 
-def build_online_success_transitions(
-    payload: dict[str, Any],
-    *,
-    action_horizon: int,
-    episode_index_base: int = 0,
-    route: str = ROUTE_ADVANTAGE,
-) -> tuple[list[Transition], int, dict[str, Any]]:
-    """Extract entire policy-success episodes that had **zero** human intervention.
-
-    Offline DAgger's ``USE_ONLINE_SUCCESS`` positive stream: an episode qualifies
-    only when ``terminal_reason == "success"`` **and** ``is_intervention`` is False
-    on every frame (a pure on-policy success rollout — no SpaceMouse corrections
-    anywhere). Each qualifying episode becomes one standalone-episode list of
-    positive BC transitions (``action = executed_action`` which, with no
-    intervention, equals ``policy_action``; ``route = advantage`` by default),
-    so its chunk windows never cross into other data. Callers can pass
-    ``route=pos_only`` when the same pure-success rollouts should force
-    ``w_pos=1, w_neg=0`` in routed DIPOLE policy training.
-
-    Episodes shorter than ``action_horizon`` are dropped (cannot form a window;
-    no padding — these are full rollouts, not stubs). Returns
-    ``(transitions, next_episode_index_base, stats)``.
-    """
-    episodes = list(payload.get("episodes", []))
-    camera_names = _camera_names_from_payload(payload, episodes)
-    H = int(action_horizon)
-
-    out: list[Transition] = []
-    next_index = int(episode_index_base)
-    stats: dict[str, Any] = {
-        "success_episodes_total": 0,
-        "pure_success_episodes_kept": 0,
-        "dropped_has_intervention": 0,
-        "dropped_short_lt_H": 0,
-        "online_success_transitions": 0,
-        "pure_success_source_episode_indices": [],
-    }
-    for source_episode_index, episode in enumerate(episodes):
-        if str(episode.get("terminal_reason", "")) != "success":
-            continue
-        stats["success_episodes_total"] += 1
-        is_intervention = np.asarray(episode["is_intervention"], dtype=np.bool_)
-        if bool(is_intervention.any()):
-            stats["dropped_has_intervention"] += 1
-            continue
-        section = Section("policy", 0, int(is_intervention.shape[0]))
-        transitions, _ = _materialize_section(
-            episode=episode,
-            section=section,
-            camera_names=camera_names,
-            action_key="executed_action",
-            route=route,
-            reward_value=0.0,
-            episode_index=next_index,
-            action_horizon=H,
-            pad_to_h=False,
-            mark_success=False,
-            source_episode_index=source_episode_index,
-        )
-        if not transitions:
-            stats["dropped_short_lt_H"] += 1
-            continue
-        out.extend(transitions)
-        stats["online_success_transitions"] += len(transitions)
-        stats["pure_success_episodes_kept"] += 1
-        stats["pure_success_source_episode_indices"].append(int(source_episode_index))
-        next_index += 1
-
-    logger.info(
-        "[offline] online-success: %d/%d success episodes are pure on-policy "
-        "(no intervention) -> %d transitions (dropped %d intervened, %d short)",
-        stats["pure_success_episodes_kept"],
-        stats["success_episodes_total"],
-        stats["online_success_transitions"],
-        stats["dropped_has_intervention"],
-        stats["dropped_short_lt_H"],
-    )
-    return out, next_index, stats
-
-
 __all__ = [
     "OfflineStreams",
     "Section",
     "build_offline_transitions",
-    "build_online_success_transitions",
     "ROUTE_ADVANTAGE",
     "ROUTE_POS_ONLY",
     "ROUTE_NEG_ONLY",

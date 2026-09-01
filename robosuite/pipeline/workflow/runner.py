@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -69,7 +70,11 @@ def load_run_config(layout: RunLayout) -> DictConfig:
     return OmegaConf.load(layout.config_path)
 
 
-def refresh_run_config(layout: RunLayout) -> DictConfig:
+def refresh_run_config(
+    layout: RunLayout,
+    *,
+    branch_weight_overrides: Mapping[str, float] | None = None,
+) -> DictConfig:
     """Refresh mutable settings while preserving run-bound input locations."""
 
     state = load_json(layout.state_path)
@@ -135,6 +140,19 @@ def refresh_run_config(layout: RunLayout) -> DictConfig:
         if not evaluation_path.is_absolute():
             evaluation_path = Path(__file__).resolve().parents[3] / evaluation_path
         cfg.task.evaluation.data_root = str(evaluation_path.resolve())
+
+    if branch_weight_overrides:
+        unknown = set(branch_weight_overrides) - {"beta", "k", "eta"}
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise ValueError(f"Unknown branch-weight override(s): {names}")
+        for name, value in branch_weight_overrides.items():
+            OmegaConf.update(
+                cfg,
+                f"task.policy.branch_weight.{name}",
+                float(value),
+                merge=False,
+            )
 
     resolved_yaml = OmegaConf.to_yaml(cfg, resolve=True)
     write_text_atomic(
@@ -348,7 +366,12 @@ def run_online(layout: RunLayout) -> Path:
         raise
 
 
-def train(layout: RunLayout, *, requested_stage: str = "all") -> None:
+def train(
+    layout: RunLayout,
+    *,
+    requested_stage: str = "all",
+    branch_weight_overrides: Mapping[str, float] | None = None,
+) -> None:
     if requested_stage not in {"all", "disc", "vast", "policy"}:
         raise ValueError("stage must be one of all, disc, vast, or policy.")
     recover_interrupted_stage(layout)
@@ -361,13 +384,25 @@ def train(layout: RunLayout, *, requested_stage: str = "all") -> None:
             raise RuntimeError(f"No requested training stage is ready; active_stage={active!r}.")
         if requested_stage != "all" and requested_stage != active:
             raise RuntimeError(f"Cannot run {requested_stage!r}; the next stage is {active!r}.")
-        _run_training_stage(layout, stage=str(active))
+        _run_training_stage(
+            layout,
+            stage=str(active),
+            branch_weight_overrides=branch_weight_overrides,
+        )
         if requested_stage != "all":
             return
 
 
-def _run_training_stage(layout: RunLayout, *, stage: str) -> None:
-    cfg = refresh_run_config(layout)
+def _run_training_stage(
+    layout: RunLayout,
+    *,
+    stage: str,
+    branch_weight_overrides: Mapping[str, float] | None = None,
+) -> None:
+    cfg = refresh_run_config(
+        layout,
+        branch_weight_overrides=branch_weight_overrides,
+    )
     state = load_json(layout.state_path)
     round_index = int(state["active_round"])
     episodes_paths = [
