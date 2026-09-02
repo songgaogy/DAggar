@@ -67,6 +67,7 @@ vast:
   num_steps: 15000
   batch_size: 512
   preencode_cache: true
+  preencode_batch_size: 64
   relabel_discriminator_reward: true
   value_mode: "indep_ensemble"
   value_ensemble_size: 5
@@ -184,7 +185,9 @@ policy:
     type: "routed_sigmoid"
     beta: 2.0
     k: 0.0
+  # If true, online success trajectories are used to train the DIPOLE positive branch
   use_online_success: false
-  include_policy_action_negative: true
+  # If true, human-intervention frames also train the DIPOLE negative branch on policy_action.
+  include_policy_action_negative: false
   reward_success: 0.0
   reward_failure: -1.0

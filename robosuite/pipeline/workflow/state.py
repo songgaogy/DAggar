@@ -19,7 +19,6 @@ from tqdm import tqdm
 
 ROUND_STAGES = ("collection", "disc", "vast", "policy")
 _STAGE_STATUSES = {"pending", "running", "completed", "failed"}
-_RUN_TIMESTAMP_RE = re.compile(r"^(?P<prefix>.+)_\d{8}_\d{6}$")
 
 
 def _utc_now() -> str:
@@ -246,53 +245,18 @@ def create_run(layout: RunLayout, *, task_name: str) -> dict[str, Any]:
     return state
 
 
-def clone_run_for_retrain(
-    source: RunLayout,
+def rollback_run_for_retrain(
+    layout: RunLayout,
     *,
     round_index: int,
     stage: str,
-) -> RunLayout:
-    """Clone a run and retain only the strict prefix before ``round_index/stage``."""
+) -> None:
+    """Roll a run back in place to the strict prefix before ``round_index/stage``."""
 
     _validate_round_index(round_index)
     _validate_training_stage(stage)
-    _validate_retrain_source(source, round_index=round_index, stage=stage)
-    destination = RunLayout(_retrain_destination(source.root))
-    if destination.root.exists():
-        raise FileExistsError(f"Retrain run already exists: {destination.root}")
-
-    temporary_parent = Path(
-        tempfile.mkdtemp(
-            prefix=f".{destination.root.name}.copy-",
-            dir=destination.root.parent,
-        )
-    )
-    temporary = RunLayout(temporary_parent / destination.root.name)
-    try:
-        subprocess.run(
-            [
-                "cp",
-                "--archive",
-                "--reflink=auto",
-                "--",
-                str(source.root),
-                str(temporary.root),
-            ],
-            check=True,
-        )
-        _prune_retrain_clone(
-            temporary,
-            source_root=source.root,
-            destination_root=destination.root,
-            round_index=round_index,
-            stage=stage,
-        )
-        os.replace(temporary.root, destination.root)
-        shutil.rmtree(temporary_parent, ignore_errors=True)
-    except BaseException:
-        shutil.rmtree(temporary_parent, ignore_errors=True)
-        raise
-    return destination
+    _validate_retrain_target(layout, round_index=round_index)
+    _rollback_retrain_run(layout, round_index=round_index, stage=stage)
 
 
 def start_stage(
@@ -696,33 +660,19 @@ def _tree_digest(files: list[dict[str, Any]]) -> str:
     return digest.hexdigest()
 
 
-def _validate_retrain_source(
+def _validate_retrain_target(
     layout: RunLayout,
     *,
     round_index: int,
-    stage: str,
 ) -> None:
     for path in (layout.config_path, layout.manifest_path, layout.state_path):
         if not path.is_file():
             raise FileNotFoundError(f"Run metadata does not exist: {path}")
     state = load_json(layout.state_path)
-    manifest = load_json(layout.manifest_path)
-    artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, list):
-        raise ValueError(f"Run manifest has malformed artifacts: {layout.manifest_path}")
-    artifact_records = {
-        str(record.get("path")): record
-        for record in artifacts
-        if isinstance(record, dict) and record.get("path")
-    }
-    if len(artifact_records) != len(artifacts):
-        raise ValueError("Run manifest contains malformed or duplicate artifacts")
+    load_json(layout.manifest_path)
     rounds = state.get("rounds")
     if not isinstance(rounds, dict) or f"{round_index:03d}" not in rounds:
         raise ValueError(f"Round {round_index:03d} does not exist in {layout.root}")
-    expected_keys = {f"{index:03d}" for index in range(round_index + 1)}
-    if not expected_keys.issubset(rounds):
-        raise ValueError("Run state has non-contiguous rounds before retrain target")
 
     for round_key, round_state in rounds.items():
         stages = round_state.get("stages") if isinstance(round_state, dict) else None
@@ -736,73 +686,30 @@ def _validate_retrain_source(
                 raise ValueError(f"Missing round {round_key} stage {stage_name}")
             if stage_state.get("status") == "running":
                 raise RuntimeError(
-                    f"Cannot clone a run with a running stage: round {round_key} "
+                    f"Cannot roll back a run with a running stage: round {round_key} "
                     f"stage {stage_name}"
                 )
 
-    target_stage_index = ROUND_STAGES.index(stage)
-    for retained_round in range(round_index + 1):
-        last_stage_index = (
-            len(ROUND_STAGES) if retained_round < round_index else target_stage_index
-        )
-        retained_stages = rounds[f"{retained_round:03d}"]["stages"]
-        for retained_stage in ROUND_STAGES[:last_stage_index]:
-            stage_state = retained_stages[retained_stage]
-            if stage_state.get("status") != "completed":
-                raise RuntimeError(
-                    f"Cannot retrain round {round_index:03d} stage {stage!r}: "
-                    f"retained round {retained_round:03d} stage {retained_stage!r} "
-                    "is not completed."
-                )
-            output_name = "episodes" if retained_stage == "collection" else "checkpoint"
-            output = stage_state.get("outputs", {}).get(output_name)
-            if not output:
-                raise ValueError(
-                    f"Retained round {retained_round:03d} stage {retained_stage!r} "
-                    f"has no {output_name} output."
-                )
-            output_path = Path(str(output))
-            resolved = output_path if output_path.is_absolute() else layout.root / output_path
-            if not resolved.is_file():
-                raise FileNotFoundError(
-                    f"Retained stage artifact does not exist: {resolved}"
-                )
-            try:
-                relative = resolved.resolve().relative_to(layout.root).as_posix()
-            except ValueError as exc:
-                raise ValueError(
-                    f"Retained stage artifact is outside the run: {resolved}"
-                ) from exc
-            record = artifact_records.get(relative)
-            if record is None:
-                raise ValueError(f"Retained artifact is missing from manifest: {relative}")
-            if (
-                int(record.get("round", -1)) != retained_round
-                or record.get("stage") != retained_stage
-            ):
-                raise ValueError(f"Retained artifact has incorrect ownership: {relative}")
 
-
-def _retrain_destination(source_root: Path) -> Path:
-    match = _RUN_TIMESTAMP_RE.fullmatch(source_root.name)
-    prefix = match.group("prefix") if match is not None else source_root.name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return source_root.parent / f"{prefix}_{timestamp}"
-
-
-def _prune_retrain_clone(
+def _rollback_retrain_run(
     layout: RunLayout,
     *,
-    source_root: Path,
-    destination_root: Path,
     round_index: int,
     stage: str,
 ) -> None:
     stage_index = ROUND_STAGES.index(stage)
-    old_root = str(source_root)
-    new_root = str(destination_root)
     state = load_json(layout.state_path)
+    manifest = load_json(layout.manifest_path)
     rounds = state["rounds"]
+    retained_artifacts = [
+        artifact
+        for artifact in manifest.get("artifacts", [])
+        if int(artifact.get("round", -1)) < round_index
+        or (
+            int(artifact.get("round", -1)) == round_index
+            and artifact.get("stage") in ROUND_STAGES[:stage_index]
+        )
+    ]
     for round_key in list(rounds):
         if int(round_key) > round_index:
             del rounds[round_key]
@@ -839,68 +746,18 @@ def _prune_retrain_clone(
             cache_path.unlink()
 
     now = _utc_now()
-    forked_from = {
-        "run_root": str(source_root),
-        "round_index": round_index,
-        "stage": stage,
-    }
-    state = _rebase_value(state, old_root=old_root, new_root=new_root)
     state.update(
         {
-            "created_at": now,
             "updated_at": now,
             "active_round": round_index,
             "active_stage": stage,
-            "forked_from": forked_from,
         }
     )
     write_json_atomic(layout.state_path, state)
 
-    manifest = load_json(layout.manifest_path)
-    manifest["artifacts"] = [
-        artifact
-        for artifact in manifest.get("artifacts", [])
-        if int(artifact.get("round", -1)) < round_index
-        or (
-            int(artifact.get("round", -1)) == round_index
-            and artifact.get("stage") in ROUND_STAGES[:stage_index]
-        )
-    ]
-    manifest.update(
-        {
-            "created_at": now,
-            "updated_at": now,
-            "forked_from": forked_from,
-        }
-    )
+    manifest["artifacts"] = retained_artifacts
+    manifest["updated_at"] = now
     write_json_atomic(layout.manifest_path, manifest)
-
-    for pattern in ("*.json", "*.yaml", "*.yml"):
-        for path in layout.root.rglob(pattern):
-            if path in {layout.state_path, layout.manifest_path}:
-                continue
-            if path.relative_to(layout.root).parts[0] == "inputs":
-                continue
-            text = path.read_text(encoding="utf-8")
-            updated = text.replace(old_root, new_root)
-            if updated != text:
-                write_text_atomic(path, updated)
-
-
-def _rebase_value(value: Any, *, old_root: str, new_root: str) -> Any:
-    if isinstance(value, str):
-        return value.replace(old_root, new_root)
-    if isinstance(value, list):
-        return [
-            _rebase_value(item, old_root=old_root, new_root=new_root)
-            for item in value
-        ]
-    if isinstance(value, dict):
-        return {
-            key: _rebase_value(item, old_root=old_root, new_root=new_root)
-            for key, item in value.items()
-        }
-    return value
 
 
 def _new_round_state(round_index: int) -> dict[str, Any]:

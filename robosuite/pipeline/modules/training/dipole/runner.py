@@ -460,7 +460,7 @@ def run_offline_training(cfg: DictConfig) -> None:
         reward_success=float(OmegaConf.select(cfg, "offline.reward_success", default=0.0)),
         reward_fail=float(OmegaConf.select(cfg, "offline.reward_fail", default=-1.0)),
         include_policy_action_neg=bool(
-            OmegaConf.select(cfg, "offline.include_policy_action_neg", default=True)
+            OmegaConf.select(cfg, "offline.include_policy_action_neg", default=False)
         ),
     )
     if not streams.policy_bc:

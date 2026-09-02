@@ -178,6 +178,11 @@ def vast_warmup_stage_config(cfg: DictConfig) -> DictConfig:
     )
     if not isinstance(warmup, dict):
         raise TypeError("warmup must resolve to a mapping.")
+    if warmup.get("preencode_batch_size") is None:
+        fallback = OmegaConf.select(cfg, "task.policy.preencode_batch_size", default=64)
+        warmup["preencode_batch_size"] = int(
+            OmegaConf.select(cfg, "task.vast.preencode_batch_size", default=fallback)
+        )
     algorithm["vast"] = {
         "enabled": True,
         "warmup_joint_steps": int(warmup.get("num_steps", cfg.task.vast.num_steps)),

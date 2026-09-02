@@ -189,14 +189,14 @@ def main() -> None:
         offline_paths = visualizer.visualize(
             sampled_offline_pools["offline"],
             out_dir=str(args.out_dir),
-            pdf_name="finetuned_scores_offline.pdf",
-            split="offline",
+            pdf_name="finetuned_scores_online.pdf",
+            split="online",
         )
         offline_success_paths = visualizer.visualize(
             sampled_offline_pools["offline-success"],
             out_dir=str(args.out_dir),
-            pdf_name="finetuned_scores_offline-success.pdf",
-            split="offline-success",
+            pdf_name="finetuned_scores_online-success.pdf",
+            split="online-success",
         )
         print(
             f"[pu_bce][viz] done. eval_videos={len(eval_paths['videos'])} "

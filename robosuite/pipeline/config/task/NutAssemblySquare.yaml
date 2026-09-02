@@ -1,0 +1,193 @@
+# PickPlaceCereal inputs and task-specific batch-online behavior.
+name: "NutAssemblySquare"
+history_mix_beta: 0.5
+
+evaluation:
+  data_root: "data"
+  fail_split: "fail_rollout-val-labeled"
+  success_split: "success_rollout-val"
+
+inputs:
+  base_policy_checkpoint: "checkpoints/multitask_6/flow_multi_ep0100.pt"
+  parent_discriminator_checkpoint: "checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260901_231331_NutAssemblySquare/checkpoints/pu_bce_head.pth"
+  dynamics_encoder_checkpoint: "checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
+  initial_vast_checkpoint: "outputs/dipole_rl-vast/tau0p7_en5_disc-reward0p1/NutAssemblySquare/vast_state.pt"
+  expert_data: "data/NutAssemblySquare/pretrain_data-20260615_174814"
+  discriminator_pretrain_data: "data/NutAssemblySquare/discriminator-pretrain-quadratic-c2-l1e2-v2"
+  vast_warmup_transitions: "data/NutAssemblySquare/offline_data-vast/vast_offline_transitions.pt"
+
+discriminator:
+  seed: 0
+  epochs: 10
+  scheduler_horizon_epochs: 10
+  steps_per_epoch: null
+  learning_rate: 1.0e-5
+  weight_decay: 1.0e-4
+  encode_batch_size: 32
+  log_interval: 100
+  camera_to_view: {}
+  pause:
+    consecutive_failure_frames: 2
+    require_safe_to_rearm: true
+  hud_enabled: true
+  logit_normalization:
+    enabled: true
+    method: "fixed_robust_iqr"
+  quadratic_logit_cap:
+    enabled: true
+    scope: "all_terms"
+    cap: 2.0
+    weight: 1.0e-2
+  losses:
+    nnpu_replay:
+      type: "nnpu"
+      enabled: true
+      weight: 0.1
+      batch_size: 256
+      positive_fraction: 0.5
+    gt_positive:
+      type: "positive_logistic"
+      enabled: true
+      weight: 0.2
+      batch_size: 128
+    gt_negative:
+      type: "negative_logistic"
+      enabled: true
+      weight: 0.01
+      batch_size: 128
+  gt_negative_window:
+    pre_intervention_chunks: 1
+    post_intervention_chunks: 0
+    pre_end_chunk: 1
+    action_source: "policy_action"
+    post_boundary: "intervention_block"
+    chunk_boundary: "continuous_window"
+
+vast:
+  num_steps: 15000
+  batch_size: 512
+  preencode_cache: true
+  preencode_batch_size: 128
+  relabel_discriminator_reward: true
+  value_mode: "indep_ensemble"
+  value_ensemble_size: 5
+  max_k: 10
+  composition_coefficient: 0.5
+  sampling_seed: ${seed}
+  reward_mode: "-1/0"
+  discount: 0.99
+  action_horizon: ${task.policy.flow.action_horizon}
+  expectile_tau: 0.7
+  n_step_aggregate: true
+  hidden_dims: [512, 512, 256]
+  state_projection_dim: 128
+  proprio_projection_dim: 32
+  projection_activation: "mish"
+  g_learning_rate: 1.0e-4
+  v_learning_rate: 1.0e-4
+  target_polyak: 0.005
+  grad_clip_norm: 2.0
+  weight_decay: 2.0e-6
+  output_reward_coefficient: 1.0
+  discriminator_reward_coefficient: 0.1
+  update_frequency: 1
+
+policy:
+  num_steps: 5000
+  batch_size: 256
+  replay_capacity: 5000000
+  log_interval: 500
+  plot_log_interval: null
+  checkpoint_interval: 5000
+  preencode_batch_size: 64
+  flow:
+    action_horizon: 8
+    execute_horizon: 8
+    ode_steps: 8
+    image_size: ${environment.image_height}
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-6
+    grad_clip_norm: 1.0
+    endpoint_loss_weight: 0.5
+    smoothness_loss_weight: 0.05
+    task_prompt_map: null
+    camera_aliases: {}
+    augmentation:
+      minimal_shift_pad: 2
+      eye_in_hand_crop_scale: 0.88
+    model:
+      image_encoder:
+        type: "shared_resnet18_spatial_softmax"
+        feature_dim: 256
+        pretrained_path: "robosuite/RL/models/resnet18-f37072fd.pth"
+        freeze_backbone: true
+        trainable_stages: ["layer3", "layer4"]
+        train_token_projections: true
+        include_spatial_softmax: true
+        layer3_pool_size: 2
+        layer4_pool_size: 2
+      proprio_encoder:
+        type: "mlp"
+        hidden_dim: 256
+        num_tokens: 2
+      language_encoder:
+        type: "clip_text"
+        pretrained_name: "data/pretrained/clip-vit-base-patch32"
+        max_length: 77
+        freeze_backbone: true
+        local_files_only: true
+      modulation:
+        type: "film"
+        hidden_dim: 512
+        modulate_visual: true
+        modulate_proprio: false
+      fusion:
+        type: "transformer"
+        feature_dim: 256
+        max_language_tokens: 77
+        num_heads: 8
+        depth: 3
+        dropout: 0.1
+        use_language_adaln: false
+      aggregator:
+        type: "attention_pool"
+        hidden_dim: 512
+        output_dim: 256
+      head:
+        type: "unet_1d"
+        hidden_dim: 128
+        time_dim: 128
+        condition_dim: 256
+        channel_multipliers: [1, 2, 2, 2]
+        dropout: 0.05
+        cross_attention:
+          enabled: true
+          attention_dim: 256
+          num_heads: 4
+          dropout: 0.05
+          middle: true
+          down_layers: []
+          up_layers: [0, 1]
+        action_step_embedding:
+          enabled: true
+          embedding_dim: 64
+  dipole:
+    condition_scale: 1.0
+    guidance_omega: 2.0
+    intervention_g: "+inf"
+    g_mode: "advantage"
+  advantage_g:
+    alpha: 1.0
+  advantage:
+    estimator: "td1"
+    gae_lambda: 0.6
+  branch_weight:
+    type: "routed_sigmoid"
+    beta: 2.0
+    k: 0.0
+  # If true, online success trajectories are used to train the DIPOLE positive branch
+  use_online_success: false
+  # If true, human-intervention frames also train the DIPOLE negative branch on policy_action.
+  include_policy_action_negative: false
+  reward_success: 0.0
+  reward_failure: -1.0

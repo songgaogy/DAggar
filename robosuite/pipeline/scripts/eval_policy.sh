@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT="outputs/dipole/PickPlaceCereal/w0_explore_20260804_233553"
+RUN_ROOT="outputs/dipole/PickPlaceCereal/currect_ref_20260901_212515"
 ROUND="000"
 CHECKPOINT="${RUN_ROOT}/rounds/${ROUND}/policy/checkpoints/latest.pt"
 INIT_CHECKPOINT="${RUN_ROOT}/inputs/checkpoints/base_policy.pt"

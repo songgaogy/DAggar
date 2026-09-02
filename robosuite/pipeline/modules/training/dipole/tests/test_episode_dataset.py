@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from robosuite.pipeline.modules.training.dipole.episode_dataset import (
+    ROUTE_NEG_ONLY,
+    ROUTE_POS_ONLY,
     build_offline_transitions,
 )
 
@@ -133,3 +135,39 @@ def test_short_non_success_policy_section_is_still_dropped() -> None:
 
     assert streams.policy_bc == []
     assert streams.stats["policy_sections_dropped_short"] == 1
+
+
+def test_policy_action_negative_branch_is_gated_by_flag() -> None:
+    episode = _episode([False, False, True, True, True])
+    executed = np.asarray(episode["executed_action"])
+    policy = executed + 1.0
+    episode["policy_action"] = policy
+
+    payload = {"camera_names": ["agentview"], "episodes": [episode]}
+    kwargs = dict(action_horizon=2, reward_success=0.0, reward_fail=-1.0)
+
+    disabled = build_offline_transitions(
+        payload, include_policy_action_neg=False, **kwargs
+    )
+    enabled = build_offline_transitions(
+        payload, include_policy_action_neg=True, **kwargs
+    )
+
+    assert disabled.neg == []
+    assert disabled.stats["neg_transitions"] == 0
+    assert [
+        (transition.info or {})["route"] for transition in disabled.human_pos
+    ] == [ROUTE_POS_ONLY] * len(disabled.human_pos)
+
+    assert len(enabled.neg) == len(enabled.human_pos) > 0
+    assert all(
+        (transition.info or {})["route"] == ROUTE_NEG_ONLY for transition in enabled.neg
+    )
+    np.testing.assert_allclose(
+        np.stack([transition.action for transition in enabled.neg[:3]], axis=0),
+        policy[2:5],
+    )
+    np.testing.assert_allclose(
+        np.stack([transition.action for transition in enabled.human_pos[:3]], axis=0),
+        executed[2:5],
+    )

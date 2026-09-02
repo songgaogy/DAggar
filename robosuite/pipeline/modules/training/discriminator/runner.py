@@ -812,21 +812,10 @@ def run_discriminator_finetune(cfg: DictConfig) -> None:
             },
             step=last_global_step,
         )
-        print(
-            f"[pu_bce][step] step={last_global_step} "
-            f"epoch={int(metrics['epoch']) + 1}/{epochs} "
-            f"epoch_step={int(metrics['epoch_step'])} "
-            f"loss={metrics['loss/total']:.5f} lr={metrics['lr']:.2e}",
-            flush=True,
-        )
 
     def log_epoch(metrics: dict[str, float]) -> None:
         nonlocal last_global_step
         last_global_step = int(metrics["global_step"])
-        positive_bce = metrics.get(
-            "gt/positive_bce",
-            metrics.get("gt/positive_logistic", float("nan")),
-        )
         maybe_log(
             metric_logger,
             {
@@ -839,23 +828,10 @@ def run_discriminator_finetune(cfg: DictConfig) -> None:
         print(
             f"[pu_bce][fit] epoch={int(metrics['epoch']) + 1}/{epochs} "
             f"loss={metrics['loss/total']:.5f} "
-            f"nnpu={metrics.get('loss/nnpu_replay/raw', float('nan')):.5f}/"
-            f"{metrics.get('loss/nnpu_replay/weighted', float('nan')):.5f} "
-            f"gt_p={metrics.get('loss/gt_positive/raw', float('nan')):.5f}/"
-            f"{metrics.get('loss/gt_positive/weighted', float('nan')):.5f} "
-            f"p_bce={positive_bce:.5f} "
-            f"p_safe={metrics.get('gt/positive_safety_margin', float('nan')):.5f} "
-            f"p_violate={metrics.get('safety/margin_violation_fraction', float('nan')):.3f} "
-            f"gt_n={metrics.get('loss/gt_negative/raw', float('nan')):.5f}/"
-            f"{metrics.get('loss/gt_negative/weighted', float('nan')):.5f} "
-            f"cap={metrics.get('regularization/quadratic_logit_cap', 0.0):.5f}/"
-            f"{metrics.get('regularization/quadratic_logit_cap_weighted', 0.0):.5f} "
-            f"cap_out={metrics.get('regularization/quadratic_logit_cap_fraction_outside', 0.0):.3f} "
-            f"batch={int(metrics.get('batch/pretrain_positive', 0.0))}/"
-            f"{int(metrics.get('batch/pretrain_unlabeled', 0.0))}/"
-            f"{int(metrics.get('batch/offline_positive', 0.0))}/"
-            f"{int(metrics.get('batch/offline_gt_negative', 0.0))} "
-            f"clamp_fraction={metrics.get('nnpu/clamp_fraction', 0.0):.3f} "
+            f"nnpu={metrics.get('loss/nnpu_replay/weighted', float('nan')):.5f} "
+            f"gt_p={metrics.get('loss/gt_positive/weighted', float('nan')):.5f} "
+            f"gt_n={metrics.get('loss/gt_negative/weighted', float('nan')):.5f} "
+            f"clamp={metrics.get('nnpu/clamp_fraction', 0.0):.3f} "
             f"delta_gt={metrics.get('scores/delta_gt', float('nan')):+.5f} "
             f"lr={metrics['lr']:.2e}",
             flush=True,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from robosuite.pipeline.workflow import RunLayout, clone_run_for_retrain
+from robosuite.pipeline.workflow import RunLayout, rollback_run_for_retrain
 from robosuite.pipeline.workflow.runner import train
 
 
@@ -24,22 +24,45 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _confirm_in_place_retrain(
+    layout: RunLayout,
+    *,
+    round_index: int,
+    stage: str,
+) -> bool:
+    print("[batch-online] WARNING: retrain will permanently roll back this run in place.")
+    print(f"[batch-online] run: {layout.root}")
+    print(f"[batch-online] rollback target: round={round_index:03d} stage={stage}")
+    try:
+        response = input("[batch-online] Press ENTER to continue; type anything to cancel: ")
+    except EOFError:
+        print("[batch-online] retrain cancelled: no interactive confirmation received.")
+        return False
+    if response:
+        print("[batch-online] retrain cancelled.")
+        return False
+    return True
+
+
 def main() -> None:
     args = _parse_args()
     layout = RunLayout(Path(args.run_root))
     if args.round_index is not None:
-        source = layout
         retrain_stage = "disc" if args.stage == "all" else args.stage
-        layout = clone_run_for_retrain(
-            source,
+        if not _confirm_in_place_retrain(
+            layout,
+            round_index=args.round_index,
+            stage=retrain_stage,
+        ):
+            return
+        rollback_run_for_retrain(
+            layout,
             round_index=args.round_index,
             stage=retrain_stage,
         )
-        print(f"[batch-online] retrain source: {source.root}")
-        print(f"[batch-online] retrain run: {layout.root}")
         print(
-            f"[batch-online] retrain start: round={args.round_index:03d} "
-            f"stage={retrain_stage}"
+            f"[batch-online] in-place retrain start: run={layout.root} "
+            f"round={args.round_index:03d} stage={retrain_stage}"
         )
     train(layout, requested_stage=args.stage)
     print(f"[batch-online] training stage(s) complete: {layout.root}")

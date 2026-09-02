@@ -385,20 +385,20 @@ def test_offline_success_visualization_uses_separate_directory(
     result = visualizer.visualize(
         [trajectory],
         out_dir=str(tmp_path),
-        pdf_name="finetuned_scores_offline-success.pdf",
-        split="offline-success",
+        pdf_name="finetuned_scores_online-success.pdf",
+        split="online-success",
     )
 
     expected = (
         tmp_path
         / "videos"
-        / "offline-success"
+        / "online-success"
         / "offline_episode_000000.mp4"
     )
     assert rendered == [str(expected)]
     assert result["videos"] == [str(expected)]
     assert result["pdf"] == str(
-        tmp_path / "finetuned_scores_offline-success.pdf"
+        tmp_path / "finetuned_scores_online-success.pdf"
     )
 
 

@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-TASK="PickPlaceCereal"
-RUN="outputs/dipole/PickPlaceCereal/base_20260804_232020"  # "new" or existing run root
-RUN_NAME=""  # only used when RUN is "new"; timestamp is appended automatically
+TASK="NutAssemblySquare"
+RUN="new"  # "new" or existing run root
+RUN_NAME="currect_ref"  # only used when RUN is "new"; timestamp is appended automatically
 cd "${ROOT_DIR}"
 
 export HYDRA_FULL_ERROR=1

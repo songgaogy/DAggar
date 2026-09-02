@@ -5,12 +5,10 @@ from pathlib import Path
 
 import pytest
 
-import robosuite.pipeline.workflow.state as workflow_state
 from robosuite.pipeline.workflow import (
     InputReference,
     InputSnapshot,
     RunLayout,
-    clone_run_for_retrain,
     complete_stage,
     create_run,
     fail_stage,
@@ -18,6 +16,7 @@ from robosuite.pipeline.workflow import (
     open_next_round,
     record_artifact,
     recover_interrupted_stage,
+    rollback_run_for_retrain,
     snapshot_inputs,
     start_stage,
     write_json_atomic,
@@ -109,7 +108,7 @@ def test_create_run_has_canonical_layout(tmp_path: Path) -> None:
         ("policy", ("collection", "disc", "vast"), True, True, True),
     ],
 )
-def test_clone_run_for_retrain_retains_strict_prefix(
+def test_rollback_run_for_retrain_retains_strict_prefix_in_place(
     tmp_path: Path,
     stage: str,
     retained_stages: tuple[str, ...],
@@ -117,27 +116,27 @@ def test_clone_run_for_retrain_retains_strict_prefix(
     keep_vast_eval: bool,
     keep_round_cache: bool,
 ) -> None:
-    source = _completed_two_round_run(tmp_path)
-    source_state = source.state_path.read_bytes()
-    source_manifest = source.manifest_path.read_bytes()
-    immutable_metadata = (source.inputs_dir / "metadata.json").read_bytes()
+    layout = _completed_two_round_run(tmp_path)
+    config_before = layout.config_path.read_bytes()
+    immutable_metadata = (layout.inputs_dir / "metadata.json").read_bytes()
+    state_before = load_json(layout.state_path)
+    manifest_before = load_json(layout.manifest_path)
+    state_before["forked_from"] = {"run_root": "/previous/run"}
+    manifest_before["forked_from"] = {"run_root": "/previous/run"}
+    write_json_atomic(layout.state_path, state_before)
+    write_json_atomic(layout.manifest_path, manifest_before)
 
-    cloned = clone_run_for_retrain(source, round_index=1, stage=stage)
+    rollback_run_for_retrain(layout, round_index=1, stage=stage)
 
-    assert cloned.root != source.root
-    assert cloned.root.name.startswith("trial_")
-    state = load_json(cloned.state_path)
+    state = load_json(layout.state_path)
     assert state["active_round"] == 1
     assert state["active_stage"] == stage
-    assert state["forked_from"] == {
-        "run_root": str(source.root),
-        "round_index": 1,
-        "stage": stage,
-    }
+    assert state["created_at"] == state_before["created_at"]
+    assert state["forked_from"] == {"run_root": "/previous/run"}
     assert set(state["rounds"]) == {"000", "001"}
     assert state["rounds"]["001"]["stages"]["collection"]["inputs"][
         "run_root"
-    ] == str(cloned.root)
+    ] == str(layout.root)
     for stage_name in retained_stages:
         assert state["rounds"]["001"]["stages"][stage_name]["status"] == "completed"
     for stage_name in ("disc", "vast", "policy"):
@@ -153,82 +152,70 @@ def test_clone_run_for_retrain_retains_strict_prefix(
                 "effective_losses": {},
                 "cache_keys": {},
             }
-            assert list(cloned.stage_dir(1, stage_name).iterdir()) == []
+            assert list(layout.stage_dir(1, stage_name).iterdir()) == []
 
-    assert cloned.disc_eval_vis_dir(1).exists() is keep_disc_eval
-    assert cloned.vast_eval_vis_dir(1).exists() is keep_vast_eval
+    assert not layout.round_dir(2).exists()
+    assert layout.disc_eval_vis_dir(1).exists() is keep_disc_eval
+    assert layout.vast_eval_vis_dir(1).exists() is keep_vast_eval
     assert (
-        cloned.cache_dir / "discriminator_features" / "round_001.pt"
+        layout.cache_dir / "discriminator_features" / "round_001.pt"
     ).exists() is keep_round_cache
-    assert not (cloned.cache_dir / "discriminator_features" / "round_002.pt").exists()
-    assert str(source.root) not in cloned.config_path.read_text(encoding="utf-8")
-    assert str(cloned.root) in cloned.config_path.read_text(encoding="utf-8")
-    episodes_meta = (cloned.round_data_dir(1) / "episodes.meta.json").read_text(
-        encoding="utf-8"
-    )
-    assert str(source.root) not in episodes_meta
-    assert str(cloned.root) in episodes_meta
-    assert (cloned.inputs_dir / "metadata.json").read_bytes() == immutable_metadata
-    assert str(source.root) in (cloned.inputs_dir / "metadata.json").read_text(
-        encoding="utf-8"
-    )
+    assert not (layout.cache_dir / "discriminator_features" / "round_002.pt").exists()
+    assert layout.config_path.read_bytes() == config_before
+    assert (layout.inputs_dir / "metadata.json").read_bytes() == immutable_metadata
 
-    manifest = load_json(cloned.manifest_path)
-    assert manifest["forked_from"]["run_root"] == str(source.root)
+    manifest = load_json(layout.manifest_path)
+    assert manifest["created_at"] == manifest_before["created_at"]
+    assert manifest["forked_from"] == {"run_root": "/previous/run"}
     assert all(
         int(record["round"]) < 1
         or record["stage"] in retained_stages
         for record in manifest["artifacts"]
     )
-    assert source.state_path.read_bytes() == source_state
-    assert source.manifest_path.read_bytes() == source_manifest
 
 
-def test_clone_run_for_retrain_rejects_running_source(tmp_path: Path) -> None:
+def test_rollback_run_for_retrain_removes_later_rounds(tmp_path: Path) -> None:
+    layout = _completed_two_round_run(tmp_path)
+
+    rollback_run_for_retrain(layout, round_index=0, stage="policy")
+
+    state = load_json(layout.state_path)
+    manifest = load_json(layout.manifest_path)
+    assert set(state["rounds"]) == {"000"}
+    assert not layout.round_dir(1).exists()
+    assert all(int(record["round"]) == 0 for record in manifest["artifacts"])
+    assert all(record["stage"] != "policy" for record in manifest["artifacts"])
+
+
+def test_rollback_run_for_retrain_rejects_running_run(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path / "trial_20260101_000000")
     create_run(layout, task_name="PickPlaceCereal")
     layout.config_path.write_text("task: PickPlaceCereal\n", encoding="utf-8")
     start_stage(layout, 0, "collection")
 
     with pytest.raises(RuntimeError, match="running stage"):
-        clone_run_for_retrain(layout, round_index=0, stage="disc")
+        rollback_run_for_retrain(layout, round_index=0, stage="disc")
 
 
-def test_clone_run_for_retrain_rejects_missing_round(tmp_path: Path) -> None:
+def test_rollback_run_for_retrain_rejects_missing_round(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path / "trial_20260101_000000")
     create_run(layout, task_name="PickPlaceCereal")
     layout.config_path.write_text("task: PickPlaceCereal\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="Round 001 does not exist"):
-        clone_run_for_retrain(layout, round_index=1, stage="disc")
+        rollback_run_for_retrain(layout, round_index=1, stage="disc")
 
 
-def test_clone_run_for_retrain_cleans_failed_temporary_copy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("missing_name", ["config_resolved.yaml", "manifest.json", "state.json"])
+def test_rollback_run_for_retrain_rejects_missing_metadata(
+    tmp_path: Path,
+    missing_name: str,
 ) -> None:
-    source = _completed_two_round_run(tmp_path)
-    destination = tmp_path / "trial_20260802_235959"
+    layout = _completed_two_round_run(tmp_path)
+    (layout.root / missing_name).unlink()
 
-    def fail_prune(*_args, **_kwargs) -> None:
-        raise RuntimeError("prune failed")
-
-    monkeypatch.setattr(
-        workflow_state,
-        "_retrain_destination",
-        lambda _source_root: destination,
-    )
-    monkeypatch.setattr(
-        workflow_state,
-        "_prune_retrain_clone",
-        fail_prune,
-    )
-
-    with pytest.raises(RuntimeError, match="prune failed"):
-        clone_run_for_retrain(source, round_index=1, stage="policy")
-
-    assert not destination.exists()
-    assert not list(tmp_path.glob(f".{destination.name}.copy-*"))
-    assert source.state_path.is_file()
+    with pytest.raises(FileNotFoundError, match="Run metadata does not exist"):
+        rollback_run_for_retrain(layout, round_index=1, stage="policy")
 
 
 def test_eval_vis_paths_are_read_only_and_round_scoped(tmp_path: Path) -> None:

@@ -20,8 +20,9 @@ frame tagged with ``info["route"] in {"advantage", "pos_only", "neg_only"}``:
   the policy-BC buffer.
 - **human_pos** (every human section): ``action = executed_action`` (== human),
   ``route="pos_only"`` (forces ``w_pos=1, w_neg=0``). Policy-BC only.
-- **neg** (same human frames, opt-in default on): ``action = policy_action``,
-  ``route="neg_only"`` (forces ``w_pos=0, w_neg=1``). Policy-BC only.
+- **neg** (same human frames, gated by ``include_policy_action_neg``):
+  ``action = policy_action``, ``route="neg_only"`` (forces ``w_pos=0, w_neg=1``).
+  Policy-BC only. Default off; enable via ``task.policy.include_policy_action_negative``.
 
 Chunk-boundary handling (confirmed with the user):
 - Each section becomes its own ``episode_index`` with contiguous ``episode_step``
@@ -227,7 +228,7 @@ def build_offline_transitions(
     action_horizon: int,
     reward_success: float = 0.0,
     reward_fail: float = -1.0,
-    include_policy_action_neg: bool = True,
+    include_policy_action_neg: bool = False,
 ) -> OfflineStreams:
     """Split collected episodes on ``is_intervention`` and route into 3 streams.
 

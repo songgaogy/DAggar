@@ -47,6 +47,7 @@ def test_offline_config_uses_confirmed_td1_baseline() -> None:
     assert estimator == "td1"
     assert gae_lambda == pytest.approx(0.6)
     assert cfg.offline.vast_finetune.relabel_disc_reward is True
+    assert cfg.offline.include_policy_action_neg is False
     assert float(cfg.algorithm.advantage_g_provider.alpha) == pytest.approx(1.0)
     assert OmegaConf.select(cfg, "algorithm.advantage_g_provider.beta") is None
 

@@ -4,15 +4,15 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES=1
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
-TASK="${TASK:-PickPlaceCereal}"
-NNPU_CKPT="${NNPU_CKPT:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2/run_20260717_121451_PickPlaceCereal/checkpoints/pu_bce_head.pth}"
+TASK="${TASK:-Stack}"
+NNPU_CKPT="${NNPU_CKPT:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite-chunk_v2-P98/run_20260901_232447_Stack/checkpoints/pu_bce_head.pth}"
 SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout}"
 FAILURE_SPLIT="${FAILURE_SPLIT:-fail_rollout}"
 SUCCESS_CAP="${SUCCESS_CAP:-50}"

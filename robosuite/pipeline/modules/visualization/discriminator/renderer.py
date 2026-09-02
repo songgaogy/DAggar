@@ -288,7 +288,7 @@ class FinetunedPUBCEVisualizer(PUBCEVisualizer):
             if split == "both":
                 kind = "fail_rollout" if bool(trajectory.is_failure) else "success_rollout"
                 target_dir = os.path.join(videos_dir, kind)
-            elif split in {"offline", "offline-success"}:
+            elif split in {"online", "online-success"}:
                 target_dir = os.path.join(videos_dir, split)
             else:
                 target_dir = videos_dir

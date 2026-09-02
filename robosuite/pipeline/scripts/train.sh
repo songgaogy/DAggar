@@ -3,12 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT="outputs/dipole/PickPlaceCereal/loss-change_20260804_233553"
-STAGE="all"   # "all" or "disc" -> "vast" -> "policy"
-ROUND_INDEX="000"   # if "", then continue; else, copy and retrain
+# Alternative source: outputs/dipole/PickPlaceCereal/currect_ref_20260901_212515
+RUN_ROOT="outputs/dipole/NutAssemblySquare/currect_ref_20260902_150659"
+STAGE="disc"   # "all" or "disc" -> "vast" -> "policy"
+ROUND_INDEX="000"   # if "", then continue; else, roll back in place and retrain
 cd "${ROOT_DIR}"
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export HYDRA_FULL_ERROR=1
 export MUJOCO_GL="egl"
 
