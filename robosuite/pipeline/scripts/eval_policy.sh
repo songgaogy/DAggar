@@ -5,11 +5,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
-RUN_ROOT="outputs/dipole/PickPlaceCereal/currect_ref_20260901_212515"
+RUN_ROOT="${RUN_ROOT:-outputs/dipole/NutAssemblySquare/currect_ref_20260902_162750}"
 ROUND="000"
 CHECKPOINT="${RUN_ROOT}/rounds/${ROUND}/policy/checkpoints/latest.pt"
 INIT_CHECKPOINT="${RUN_ROOT}/inputs/checkpoints/base_policy.pt"
-TASK="PickPlaceCereal"
+TASK="${TASK:-NutAssemblySquare}"
 OMEGA=(0 0.1 0.2 0.5 1.0 2.0)
 EPISODES=50
 MAX_STEPS=500
@@ -18,7 +18,7 @@ DEVICE="cuda:0"
 
 cd "$ROOT_DIR"
 export MUJOCO_GL="egl"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 for OMEGA in "${OMEGA[@]}"; do
     echo ">>> Evaluating policy with omega = $OMEGA"

@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
 # Alternative source: outputs/dipole/PickPlaceCereal/currect_ref_20260901_212515
-RUN_ROOT="outputs/dipole/NutAssemblySquare/currect_ref_20260902_150659"
-STAGE="disc"   # "all" or "disc" -> "vast" -> "policy"
+RUN_ROOT="${RUN_ROOT:-outputs/dipole/NutAssemblySquare/currect_ref_20260902_162750}"
+STAGE="all"   # "all" or "disc" -> "vast" -> "policy"
 ROUND_INDEX="000"   # if "", then continue; else, roll back in place and retrain
 cd "${ROOT_DIR}"
 

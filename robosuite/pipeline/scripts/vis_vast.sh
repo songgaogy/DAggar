@@ -3,8 +3,8 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=1
-RUN_ROOT="outputs/dipole/PickPlaceCereal/naive_trial_20260804_200046"
-ROUND_INDEX="001"
+RUN_ROOT="outputs/dipole/NutAssemblySquare/currect_ref_20260902_150659"
+ROUND_INDEX="000"
 SEEDS=(1 2 3 4 5 6)
 SPLIT="online"  # success_rollout, fail_rollout, or online
 
