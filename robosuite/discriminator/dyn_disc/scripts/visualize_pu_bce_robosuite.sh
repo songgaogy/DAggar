@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -19,19 +19,28 @@ DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 
-LOAD_CKPT="checkpoints/dyn_disc/pu_bce_eval_robosuite/run_20260619_203140_NutAssemblySquare/checkpoints/pu_bce_head.pth"
-MODEL_CKPT="checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
-TASK="NutAssemblySquare"
-NUM_TRAJS=5     # per split for each
-FAIL_SPLIT="fail_rollout-val-labeled"
-SUCCESS_SPLIT="success_rollout-val"
+LOAD_CKPT="${LOAD_CKPT:-}"
+MODEL_CKPT="${MODEL_CKPT:-}"
+TASK="${TASK:-NutAssemblySquare}"
+NUM_TRAJS="${NUM_TRAJS:-5}"     # per split for each
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"
 
 
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_viz_robosuite/${TASK}-${TIMESTAMP}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/ablations/TACO/visualizations/video/${TASK}-${TIMESTAMP}}"
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
+
+if [[ -z "${MODEL_CKPT}" || ! -f "${MODEL_CKPT}" ]]; then
+    echo "[pu_bce][viz] ERROR: set MODEL_CKPT to a TACO model checkpoint." >&2
+    exit 1
+fi
+if [[ -z "${LOAD_CKPT}" || ! -f "${LOAD_CKPT}" ]]; then
+    echo "[pu_bce][viz] ERROR: set LOAD_CKPT to the matching nnPU head checkpoint." >&2
+    exit 1
+fi
 
 EXTRA_ARGS=(--quiet-fit)
 if [[ -n "${MAX_FAIL_PER_TASK:-}" && "${MAX_FAIL_PER_TASK}" -gt 0 ]]; then
@@ -54,8 +63,6 @@ fi
     --device            "${DEVICE:-cuda}" \
     --encode-batch-size "${ENCODE_BATCH_SIZE:-32}" \
     --camera-name       "${CAMERA_NAME:-agentview}" \
-    --feature-source    "${FEATURE_SOURCE:-transformer}" \
-    --transformer-layer "${TRANSFORMER_LAYER:-1}" \
     --seed              "${SEED:-0}" \
     --fps               "${FPS:-20}" \
     --border-thickness  "${BORDER_THICKNESS:-10}" \

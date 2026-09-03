@@ -74,9 +74,6 @@ def _parse_args() -> argparse.Namespace:
                         help="False-alarm budget %% for success_percentile calib: "
                              "tau = percentile(success-calib failure scores, 100 - delta).")
     parser.add_argument("--knn-chunk-size", type=int, default=2048)
-    parser.add_argument("--knn-feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--knn-transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
@@ -317,8 +314,6 @@ def main() -> None:
         action_weight=float(args.action_weight),
         delta=float(args.delta),
         knn_chunk_size=int(args.knn_chunk_size),
-        feature_source=str(args.knn_feature_source),
-        transformer_layer=int(args.knn_transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),
@@ -370,8 +365,7 @@ def main() -> None:
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
-                "knn_feature_source": str(args.knn_feature_source),
-                "knn_transformer_layer": int(args.knn_transformer_layer),
+                "feature_source": "encoder",
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)

@@ -327,8 +327,7 @@ class PUBCEVisualizer:
                 f"model_ckpt: {summary.get('model_ckpt', 'n/a')}",
                 f"view_names: {summary.get('view_names', 'n/a')}",
                 f"camera_to_view: {summary.get('camera_to_view', 'n/a')}",
-                f"feature_source: {summary.get('feature_source', 'n/a')}  "
-                f"transformer_layer: {summary.get('transformer_layer', 'n/a')}",
+                f"feature_source: {summary.get('feature_source', 'n/a')}",
                 f"delta (FA budget %): {summary.get('delta', 'n/a')}  "
                 f"calib_fraction: {summary.get('calib_fraction', 'n/a')}",
                 f"calib_mode: {summary.get('calib_mode', 'success_percentile')}",
@@ -626,6 +625,8 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
 
 def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if payload.get("feature_source", "encoder") != "encoder":
+        raise ValueError("Only nnPU heads trained from TACO encoder features are supported.")
     state = payload["pu_bce_detector"]
     detector = PUBCEDiscriminator(
         in_dim=int(payload["in_dim"]),
@@ -647,7 +648,6 @@ def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> N
         "head_hidden": int(payload["hidden"]),
         "head_layers": int(payload["num_layers"]),
         "feature_source": str(payload.get("feature_source", disc.feature_source)),
-        "transformer_layer": int(payload.get("transformer_layer", disc.transformer_layer)),
         "pi_p": payload.get("pi_p"),
         "loss_surrogate": payload.get("loss_surrogate"),
         "nn_correction": payload.get("nn_correction"),
@@ -688,7 +688,7 @@ def _parse_args() -> argparse.Namespace:
         choices=["success_rollout", "fail_rollout", "both"],
         help="Eval pool to visualize: fail_rollout, success_rollout, or both.",
     )
-    parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
+    parser.add_argument("--model-ckpt", required=True, help="TACO representation checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -716,9 +716,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--proprio-weight", type=float, default=2.0)
     parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=10.0)
-    parser.add_argument("--feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--quiet-fit", action="store_true")
 
@@ -781,8 +778,6 @@ def main() -> None:
         proprio_weight=float(args.proprio_weight),
         action_weight=float(args.action_weight),
         delta=float(args.delta),
-        feature_source=str(args.feature_source),
-        transformer_layer=int(args.transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),

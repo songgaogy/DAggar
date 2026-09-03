@@ -37,10 +37,7 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    default_ckpt = os.environ.get(
-        "MODEL_CKPT",
-        "checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_50.pth",
-    )
+    default_ckpt = os.environ.get("MODEL_CKPT")
     p.add_argument("--model-ckpt", default=default_ckpt)
     p.add_argument("--data-root", default="data")
     p.add_argument("--task", default="PickPlaceCereal")
@@ -48,8 +45,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fail-train-split", default="fail_rollout")
     p.add_argument("--n-success", type=int, default=50)
     p.add_argument("--n-fail", type=int, default=50)
-    p.add_argument("--transformer-layer", type=int, default=1)
-    p.add_argument("--feature-source", default="transformer")
     p.add_argument("--device", default="cuda")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -67,6 +62,8 @@ def _split(n, rng, test_frac):
 
 def main() -> None:
     args = _parse_args()
+    if not args.model_ckpt:
+        raise ValueError("Set MODEL_CKPT or pass --model-ckpt with a TACO checkpoint.")
     rng = np.random.default_rng(args.seed)
 
     succ = discover_success_rollouts(
@@ -81,8 +78,7 @@ def main() -> None:
 
     disc = PUBCEBenchmarkDiscriminator(
         model_ckpt=args.model_ckpt, unlabeled_fail_trajectories=fail, pi_p=0.3,
-        device=args.device, feature_source=args.feature_source,
-        transformer_layer=args.transformer_layer, verbose_fit=False,
+        device=args.device, verbose_fit=False,
     )
 
     print("[grid] encoding P (pre-done) + U (whole) ...", flush=True)

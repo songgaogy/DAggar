@@ -1,4 +1,4 @@
-"""HDF5 dataset adapter for the cleaned LPB v2 dynamics-model training loop.
+"""HDF5 dataset adapter for TACO representation pretraining.
 
 API contract matches `dyn_model.datasets.robomimic_dset.RobomimicImageDynamicsModelDataset`
 so the original LPB train.py can swap zarr for HDF5 with a config-only change.
@@ -9,7 +9,9 @@ Expected HDF5 layout per file (matches robosuite/discriminator/lpb/dataset.py):
     demos/<demo_key>/observations/<view>/images   (T, H, W, 3)
 
 The dataset returns 3-tuples (obs, act, state) where:
-    obs['visual'][view] : (num_frames, 3, H, W) float in [0, 1]
+    obs['visual'][view] : (view_frames, 3, H, W) float in [0, 1], or uint8
+                          when ``return_uint8_images=True``. ``view_frames``
+                          defaults to ``num_frames`` and can be configured per view.
     obs['proprio']      : (num_frames, proprio_dim) float
     act                 : (num_frames * frameskip, action_dim) float
     state               : (num_frames, state_dim) float
@@ -92,6 +94,8 @@ class HDF5DynamicsModelDataset(Dataset):
         proprio_map: Optional[Mapping[str, Mapping[str, Sequence[int]]]] = None,
         max_trajectories: Optional[int] = None,
         causal_action_chunks: bool = False,
+        return_uint8_images: bool = False,
+        view_frame_counts: Optional[Mapping[str, int]] = None,
     ) -> None:
         super().__init__()
 
@@ -108,7 +112,27 @@ class HDF5DynamicsModelDataset(Dataset):
         self.train = bool(train)
         self.action_dim = self.original_action_dim * self.frameskip
         self.causal_action_chunks = bool(causal_action_chunks)
+        self.return_uint8_images = bool(return_uint8_images)
+        self.view_frame_counts = (
+            None
+            if view_frame_counts is None
+            else {str(view): int(count) for view, count in view_frame_counts.items()}
+        )
         self._proprio_map = dict(proprio_map) if proprio_map is not None else None
+
+        if self.view_frame_counts is not None:
+            unknown_views = set(self.view_frame_counts) - set(self.view_names)
+            if unknown_views:
+                raise ValueError(f"view_frame_counts contains unknown views: {sorted(unknown_views)}")
+            invalid_counts = {
+                view: count
+                for view, count in self.view_frame_counts.items()
+                if count < 1 or count > self.num_frames
+            }
+            if invalid_counts:
+                raise ValueError(
+                    f"view_frame_counts must be in [1, {self.num_frames}], got {invalid_counts}"
+                )
 
         if isinstance(zarr_path, (list, tuple)):
             files = _expand_hdf5_inputs(list(zarr_path))
@@ -136,6 +160,8 @@ class HDF5DynamicsModelDataset(Dataset):
                     str(int(num_pred)),
                     str(int(frameskip)),
                     ",".join(list(view_names)),
+                    str(int(self.return_uint8_images)),
+                    json.dumps(self.view_frame_counts, sort_keys=True),
                 ]
             )
             meta = {
@@ -160,6 +186,8 @@ class HDF5DynamicsModelDataset(Dataset):
                 "proprio_map": self._proprio_map,
                 "max_trajectories": None if max_trajectories is None else int(max_trajectories),
                 "causal_action_chunks": self.causal_action_chunks,
+                "return_uint8_images": self.return_uint8_images,
+                "view_frame_counts": self.view_frame_counts,
                 "train": bool(train),
             }
             key = "|".join(
@@ -202,6 +230,8 @@ class HDF5DynamicsModelDataset(Dataset):
                 self.use_crop = bool(payload["use_crop"])
                 self.train = bool(payload["train"])
                 self.causal_action_chunks = bool(payload.get("causal_action_chunks", False))
+                self.return_uint8_images = bool(payload.get("return_uint8_images", False))
+                self.view_frame_counts = payload.get("view_frame_counts", None)
                 self._proprio_map = payload.get("proprio_map", None)
 
                 if self.use_crop:
@@ -368,6 +398,8 @@ class HDF5DynamicsModelDataset(Dataset):
                 "proprio_indices": None if self._proprio_indices is None else self._proprio_indices.tolist(),
                 "proprio_map": self._proprio_map,
                 "causal_action_chunks": self.causal_action_chunks,
+                "return_uint8_images": self.return_uint8_images,
+                "view_frame_counts": self.view_frame_counts,
                 "files": [str(Path(fp).resolve()) for fp in files],
             }
             try:
@@ -391,8 +423,13 @@ class HDF5DynamicsModelDataset(Dataset):
 
         obs: Dict[str, Dict] = {"visual": {}}
         for v in self.view_names:
-            arr = self.imgs[v][obs_indices]                     # (F, H, W, 3) uint8
-            arr = np.moveaxis(arr, -1, 1).astype(np.float32) / 255.0
+            view_obs_indices = obs_indices
+            if self.view_frame_counts is not None:
+                view_obs_indices = obs_indices[: self.view_frame_counts.get(v, self.num_frames)]
+            arr = self.imgs[v][view_obs_indices]                # (F, H, W, 3) uint8
+            arr = np.moveaxis(arr, -1, 1)
+            if not self.return_uint8_images:
+                arr = arr.astype(np.float32) / 255.0
             obs["visual"][v] = torch.from_numpy(arr)
 
         prop = self.states[obs_indices].astype(np.float32, copy=False)

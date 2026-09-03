@@ -1,6 +1,6 @@
 """Benchmark adapter for the nnPU (PU-BCE) failure discriminator.
 
-Sits on top of :class:`DynBenchmarkDiscriminator` so all the DINOv3 dynamics
+Sits on top of :class:`DynBenchmarkDiscriminator` so all the DINOv3 TACO
 encoding + trajectory feature cache is reused unchanged. Replaces any per-task
 scorer with a single shared :class:`PUBCEDiscriminator` trained with the
 non-negative PU risk on (positives = pre-done success frames, unlabeled = WHOLE
@@ -92,8 +92,6 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         action_weight: float = 1.0,
         delta: float = 10.0,
         knn_chunk_size: int = 2048,
-        feature_source: str = "transformer",
-        transformer_layer: int = 1,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
@@ -109,8 +107,6 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             action_weight=action_weight,
             delta=delta,
             knn_chunk_size=knn_chunk_size,
-            feature_source=feature_source,
-            transformer_layer=transformer_layer,
             calib_fraction=calib_fraction,
             seed=seed,
             verbose_fit=verbose_fit,
@@ -230,7 +226,6 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "num_layers": int(self._shared_detector.num_layers),
             "pu_bce_detector": self._shared_detector.state_dict(),
             "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
             "model_ckpt": str(self.model_ckpt),
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
@@ -396,7 +391,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 f"Np(success train)={n_p} Nu(unlabeled fail whole)={n_u} N_calib={n_c} "
                 f"pi_p={self.pi_p} surrogate={self.loss_surrogate} "
                 f"nn_correction={self.nn_correction} "
-                f"feature_source={self.feature_source} layer={self.transformer_layer}",
+                f"feature_source={self.feature_source}",
                 flush=True,
             )
 
@@ -447,7 +442,6 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "beta": float(self.beta),
             "seed": int(self.seed),
             "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
             "num_unlabeled_fail_trajectories": int(len(self.unlabeled_fail_trajectories)),
             "train_history": list(self._shared_detector._train_history),
         }
@@ -529,7 +523,6 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "step_scores_raw": step_scores,
             "feature_len": int(feat.shape[0]),
             "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
             "view_names": list(self.encoder.view_names),
         }
         if not bool(trajectory.is_failure):
@@ -555,6 +548,5 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "loss_surrogate": str(self.loss_surrogate),
             "encode_batch_size": int(self.encode_batch_size),
             "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
             "save_ckpt_dir": self.save_ckpt_dir,
         }

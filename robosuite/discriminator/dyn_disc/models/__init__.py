@@ -1,12 +1,11 @@
-from .proprio import MLPEmbedding, ProprioceptiveEmbedding
+from .proprio import MLPEmbedding
 from .dinov3_encoder import DINOv3Encoder
-from .visual_dynamics import VisualDynamicsModel
-from .vit import ViTPredictor
+from .taco import RandomShiftsAug, TACOActionEncoder, TACORepresentationModel
 
 __all__ = [
-    "ProprioceptiveEmbedding",
     "MLPEmbedding",
     "DINOv3Encoder",
-    "VisualDynamicsModel",
-    "ViTPredictor",
+    "RandomShiftsAug",
+    "TACOActionEncoder",
+    "TACORepresentationModel",
 ]

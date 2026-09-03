@@ -1,4 +1,4 @@
-"""Non-negative PU (nnPU) failure discriminator on the frozen dynamics latent.
+"""Non-negative PU (nnPU) failure discriminator on frozen TACO latents.
 
 This is the **no-GT-failure-timing** sibling of the GT-split BCE head. Instead of
 slicing each failure trajectory at ``first_gt_failure_frame()`` into a clean

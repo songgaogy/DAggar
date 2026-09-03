@@ -1,8 +1,7 @@
 """Diagnostic: is P (pre-done success frames) separable from U (whole failure rollouts)?
 
-Uses the EXACT same frozen-encoder feature space the nnPU head trains on
-(``feature_source=transformer``, ``transformer_layer=1``) so the read-out is
-faithful to training. No nnPU is trained here -- instead we fit a fully
+Uses the exact same frozen TACO encoder feature space the nnPU head trains on,
+so the read-out is faithful to training. No nnPU is trained here -- instead we fit a fully
 *supervised* logistic-regression probe on P-vs-U (trajectory-disjoint train/test
 split). That supervised AUROC is the **separability upper bound**:
 
@@ -47,10 +46,7 @@ from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscr
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    default_ckpt = os.environ.get(
-        "MODEL_CKPT",
-        "checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_50.pth",
-    )
+    default_ckpt = os.environ.get("MODEL_CKPT")
     p.add_argument("--model-ckpt", default=default_ckpt)
     p.add_argument("--data-root", default="data")
     p.add_argument("--task", default="PickPlaceCereal")
@@ -58,8 +54,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fail-train-split", default="fail_rollout")
     p.add_argument("--n-success", type=int, default=50)
     p.add_argument("--n-fail", type=int, default=50)
-    p.add_argument("--transformer-layer", type=int, default=1)
-    p.add_argument("--feature-source", default="transformer")
     p.add_argument("--device", default="cuda")
     p.add_argument("--test-frac", type=float, default=0.4)
     p.add_argument("--seed", type=int, default=0)
@@ -85,6 +79,8 @@ def _probe_auroc(Xtr, ytr, Xte, yte, seed):
 
 def main() -> None:
     args = _parse_args()
+    if not args.model_ckpt:
+        raise ValueError("Set MODEL_CKPT or pass --model-ckpt with a TACO checkpoint.")
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     out_dir = Path(args.out_dir or f"checkpoints/pu_diag_{args.task}")
@@ -109,8 +105,6 @@ def main() -> None:
         unlabeled_fail_trajectories=fail,
         pi_p=0.3,
         device=args.device,
-        feature_source=args.feature_source,
-        transformer_layer=args.transformer_layer,
         verbose_fit=False,
     )
 
@@ -189,7 +183,7 @@ def main() -> None:
         ax.set_title(f"{name}\nAUROC={r['auroc']:.3f}")
         ax.set_xlabel("probe g(z) (>0 -> class1)")
         ax.legend()
-    fig.suptitle(f"PU separability probe — task={args.task}  layer={args.transformer_layer}")
+    fig.suptitle(f"PU separability probe — task={args.task}  TACO encoder")
     fig.tight_layout()
     png = out_dir / f"separability_{args.task}.png"
     fig.savefig(png, dpi=130)

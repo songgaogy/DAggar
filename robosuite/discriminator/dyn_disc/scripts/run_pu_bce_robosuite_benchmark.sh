@@ -21,35 +21,33 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 
-MODEL_CKPT="checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
-FEATURE_SOURCE="transformer"
-TRANSFORMER_LAYER=1
-FAIL_SPLIT="fail_rollout-val-labeled"       # benchmark eval failures
-SUCCESS_SPLIT="success_rollout-val"         # benchmark eval success
-SUCCESS_TRAIN_SPLIT="success_rollout"       # nnPU positives + calibration
-FAIL_TRAIN_SPLIT="fail_rollout"             # unlabeled failure pool
-TASKS="NutAssemblyRound"
-TRAIN_MAX_SUCCESS_PER_TASK=50                    # train: success_rollout (per task)
-TRAIN_MAX_FAIL_PER_TASK=50                       # train: fail_rollout (per task)
-MAX_FAIL_PER_TASK=50                             # eval: fail_rollout-val-labeled
-MAX_SUCCESS_PER_TASK=50                          # eval: success_rollout-val
+MODEL_CKPT="${MODEL_CKPT:-}"
+FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"       # benchmark eval failures
+SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"      # benchmark eval success
+SUCCESS_TRAIN_SPLIT="${SUCCESS_TRAIN_SPLIT:-success_rollout}" # nnPU positives + calibration
+FAIL_TRAIN_SPLIT="${FAIL_TRAIN_SPLIT:-fail_rollout}"       # unlabeled failure pool
+TASKS="${TASKS:-NutAssemblyRound}"
+TRAIN_MAX_SUCCESS_PER_TASK="${TRAIN_MAX_SUCCESS_PER_TASK:-50}" # train success, per task
+TRAIN_MAX_FAIL_PER_TASK="${TRAIN_MAX_FAIL_PER_TASK:-50}"       # train failure, per task
+MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-50}"                   # eval failure, per task
+MAX_SUCCESS_PER_TASK="${MAX_SUCCESS_PER_TASK:-50}"             # eval success, per task
 
 # nnPU + head knobs.
-PI_P=0.3                     # class prior; set from domain knowledge
+PI_P="${PI_P:-0.3}"         # class prior; set from domain knowledge
 # logistic (softplus) surrogate: robust to pi_p and never collapses to the
 # trivial risk==pi_p solution. The sigmoid surrogate saturates to zero gradient
 # and collapses under low pi_p + weak features (empirically verified).
-LOSS_SURROGATE="logistic"
-BETA=0.0
-HEAD_HIDDEN=512
-HEAD_LAYERS=3
+LOSS_SURROGATE="${LOSS_SURROGATE:-logistic}"
+BETA="${BETA:-0.0}"
+HEAD_HIDDEN="${HEAD_HIDDEN:-512}"
+HEAD_LAYERS="${HEAD_LAYERS:-3}"
 EPOCHS="${EPOCHS:-20}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -57,10 +55,15 @@ BATCH_SIZE="${BATCH_SIZE:-512}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/ablations/TACO/nnpu/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
+
+if [[ -z "${MODEL_CKPT}" || ! -f "${MODEL_CKPT}" ]]; then
+    echo "[robosuite][pu_bce] ERROR: set MODEL_CKPT to a TACO model checkpoint." >&2
+    exit 1
+fi
 
 DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
@@ -97,8 +100,6 @@ fi
     --device                "${DEVICE}" \
     --encode-batch-size     "${ENCODE_BATCH_SIZE}" \
     --delta                 "${DELTA}" \
-    --knn-feature-source    "${FEATURE_SOURCE}" \
-    --knn-transformer-layer "${TRANSFORMER_LAYER}" \
     --calib-fraction        "${CALIB_FRACTION}" \
     --seed                  "${SEED}" \
     --pi-p                  "${PI_P}" \

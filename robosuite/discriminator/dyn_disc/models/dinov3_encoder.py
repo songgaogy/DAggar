@@ -14,7 +14,7 @@ class DINOv3Encoder(nn.Module):
         self,
         model_path: str,
         view_names: Sequence[str],
-        emb_dim: int = 382,
+        emb_dim: int = 384,
         pooled_grid_size: int = 4,
         freeze_backbone: bool = True,
         train_projection: bool = True,

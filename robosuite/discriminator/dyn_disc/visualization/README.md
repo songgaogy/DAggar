@@ -10,6 +10,7 @@ caveats so future edits can stay coherent.
 | File | Purpose |
 | --- | --- |
 | `visualize_pu_bce.py` | nnPU (PU-BCE) discriminator visualization (`PUBCEVisualizer`). Robosuite only. Driven by `scripts/visualize_pu_bce_robosuite.sh`. |
+| `vis_taco_latent.py` | CUDA-only TACO encoder inference followed by PCA and t-SNE. Driven by `scripts/vis_taco_latent_robosuite.sh`. |
 
 It produces these artifacts per run:
 
@@ -19,6 +20,27 @@ It produces these artifacts per run:
   <pdf-name>.pdf               # 1 summary page + 1 page per sampled trajectory
   checkpoints/pu_bce_head.pth  # only on cold fit (absent under --load-ckpt)
 ```
+
+## TACO latent-space visualization
+
+The TACO latent visualizer uses `DynBenchmarkDiscriminator` only as the shared
+trajectory preprocessing and encoder-cache layer. It does not fit an nnPU head
+or run benchmark evaluation. Encoder inference is CUDA-only; PCA and t-SNE run
+through NumPy / scikit-learn after the latent tensors have been copied to CPU.
+Both latent and nnPU visualizations use the TACO `feature_source=encoder`
+representation; this branch has no transformer-predictor feature mode.
+
+```bash
+MODEL_CKPT=/abs/path/to/model_50.pth TASK=NutAssemblyRound \
+  bash robosuite/discriminator/dyn_disc/scripts/vis_taco_latent_robosuite.sh
+```
+
+The default output root is
+`checkpoints/dyn_disc/ablations/TACO/visualizations/latent/`. Artifacts are
+`taco_latent_pca.png`, `taco_latent_tsne.png`, `taco_latent_points.npz`, and
+`taco_latent_points_meta.json`. The NPZ includes the original frame-level
+encoder latent, both 2-D embeddings, sampled t-SNE indices, and phase labels:
+`success`, `failure_before_gt`, and `failure_after_gt`.
 
 ## PU-BCE visualization — design
 

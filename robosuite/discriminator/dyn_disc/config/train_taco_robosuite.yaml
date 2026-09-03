@@ -1,0 +1,78 @@
+# TACO representation pretraining on the unchanged robosuite success rollouts.
+defaults:
+  - train
+  - override /encoder: dinov3
+  - override /proprio_encoder: mlp
+  - _self_
+
+run_name: taco_robosuite
+task_idx: ${run_name}-${now:%Y%m%d_%H%M%S}
+
+hydra:
+  run:
+    dir: ./checkpoints/dyn_disc/ablations/TACO/${task_idx}
+  job:
+    chdir: true
+
+training:
+  seed: 0
+  epochs: 50
+  batch_size: 256
+  save_every_x_epoch: 10
+  checkpoint_subdir: checkpoint
+  checkpoint_epoch_offset: 1
+  encoder_lr: 1e-4
+  num_workers: 4
+  prefetch_factor: 4
+  log_every_steps: 50
+
+source_view_names: [agentview, robot0_eye_in_hand]
+target_view_names: [agentview]
+
+env:
+  use_cache: false
+  view_names: [agentview, robot0_eye_in_hand]
+  train_data_path:
+    - data/NutAssemblyRound/success_rollout
+    - data/NutAssemblySquare/success_rollout
+    - data/PickPlaceBread/success_rollout
+    - data/PickPlaceCan/success_rollout
+    - data/PickPlaceCereal/success_rollout
+    - data/PickPlaceMilk/success_rollout
+    - data/Stack/success_rollout
+  val_data_path: ${env.train_data_path}
+  action_dim: 7
+  proprio_dim: 14
+  original_img_size: 256
+  cropped_img_size: 224
+  action_emb_dim: 256
+  proprio_emb_dim: 128
+
+encoder:
+  model_path: data/pretrained/dinov3-vitb16-pretrain-lvd1689m_80M
+
+frameskip: 8
+causal_action_chunks: true
+max_trajectories: 100
+return_uint8_images: true
+view_frame_counts:
+  agentview: 2
+  robot0_eye_in_hand: 1
+model:
+  train_encoder: false
+
+proprio_map:
+  NutAssemblyRound:
+    indices: ${proprio.NutAssemblyRound.indices}
+  NutAssemblySquare:
+    indices: ${proprio.NutAssemblySquare.indices}
+  Stack:
+    indices: ${proprio.Stack.indices}
+  PickPlaceBread:
+    indices: ${proprio.PickPlaceBread.indices}
+  PickPlaceCan:
+    indices: ${proprio.PickPlaceCan.indices}
+  PickPlaceCereal:
+    indices: ${proprio.PickPlaceCereal.indices}
+  PickPlaceMilk:
+    indices: ${proprio.PickPlaceMilk.indices}

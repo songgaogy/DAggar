@@ -1,8 +1,8 @@
-# Latent Dynamics Features for Failure Discrimination
+# TACO Features for Failure Discrimination
 
-`robosuite.discriminator.dyn_disc` contains a compact dynamics-latent pipeline:
+`robosuite.discriminator.dyn_disc` contains a compact TACO representation pipeline:
 
-1. train a visual dynamics model (DINOv3 encoder) on demonstration trajectories;
+1. pretrain a TACO temporal action-driven contrastive model on demonstration trajectories;
 2. freeze the learned latent encoder;
 3. run a lightweight failure discriminator on top of the latent sequence.
 
@@ -12,7 +12,7 @@ This branch (`v0-pu-bce`) ships a single discriminator variant:
 | --- | --- | --- |
 | PU-BCE (nnPU) | `PUBCEBenchmarkDiscriminator` | Train one shared MLP head with the non-negative PU risk on (positives = success frames, unlabeled = whole failure rollouts), then calibrate per-task thresholds via success_percentile. **No GT failure timing.** |
 
-The head reuses the frozen DINOv3 dynamics encoder (`DynEncoder`) and the shared
+The head reuses the frozen TACO encoder (`DynEncoder`) and the shared
 benchmark adapter backbone (`DynBenchmarkDiscriminator`).
 
 ## PU-BCE method (nnPU) and how it differs from a GT-label BCE head
@@ -67,7 +67,7 @@ is available without failure labels.
 ```text
 dyn_disc/
   core/
-    model_loader.py                # Rebuild/load VisualDynamicsModel checkpoints
+    model_loader.py                # Rebuild/load TACO checkpoints
   detectors/
     single_bank_knn.py             # DynEncoder (shared frozen encoder) + helpers
     pu_bce.py                      # BCEHead + nnPU risk + PUBCEDiscriminator
@@ -76,12 +76,12 @@ dyn_disc/
     pu_bce.py                      # PUBCEBenchmarkDiscriminator
   robosuite_pu_bce.py              # Robosuite benchmark runner (entry)
   training/
-    train.py                       # Hydra entry for latent dynamics pretraining
+    train.py                       # Hydra entry for TACO InfoNCE pretraining
   visualization/
     visualize_pu_bce.py            # PU-BCE per-trajectory visualization (robosuite)
   config/                          # Hydra configs (DINOv3 only)
-  data/                            # HDF5 / preprocessed / Agilex datasets
-  models/                          # DINOv3 encoder, proprio MLP, ViT predictor, dynamics model
+  data/                            # HDF5 dataset and image transforms
+  models/                          # Frozen DINOv3 backbone and TACO representation model
   utils/                           # Normalization, tensor helpers, latent plotting
   scripts/                         # Bash entrances for train/eval/vis
   tests/
@@ -98,142 +98,55 @@ In this workspace the expected Python environment is:
 /home/dodo/miniconda3/envs/dagger/bin/python
 ```
 
-Bash scripts generally expose this as `PYTHON_BIN`. For runs that log through tensorboard, use:
+Bash scripts generally expose this as `PYTHON_BIN`. TACO writes TensorBoard
+events under `<run>/tensorboard/`.
 
 Core dependencies include PyTorch, Hydra/OmegaConf, torchvision, einops, numpy, scikit-learn, matplotlib, and the local `benchmark` package.
 
 ---
 
-## Training the LPB v2 dynamics model
+## TACO representation pretraining
 
 Entry point:
 
 ```bash
-python -m robosuite.discriminator.dyn_disc.training.train
+bash robosuite/discriminator/dyn_disc/scripts/train_taco_robosuite.sh
 ```
 
-The trainer is Hydra-configured through `config/train.yaml` and `config/env/*.yaml`.
+The launcher uses two GPUs by default and reads
+`config/train_taco_robosuite.yaml`. It keeps the seven success-rollout sources,
+`frameskip=8`, `num_hist=1`, `num_pred=1`, and `max_trajectories=100`.
+The source at time `t` contains both camera views and proprioception; the target
+at `t+8` contains `agentview` and proprioception. Actions are the eight-step
+window `a_t ... a_{t+7}`.
 
-Main data backends:
+The representation objective is TACO InfoNCE only:
 
-| Hydra env | Dataset |
-| --- | --- |
-| `env=hdf5` | `HDF5DynamicsModelDataset` for robosuite-style rollout HDF5 trees. |
-| `env=preprocessed` | `PreprocessedCacheDynamicsModelDataset` for `.npz` caches. |
-| `env=agilex` | `AgilexCacheDynamicsModelDataset` for real-world Agilex cache data. |
+```text
+g_i = G([z_t, action_latent])
+h_j = stop_gradient(z_{t+8})
+score(i, j) = g_i^T W h_j
+```
+
+The diagonal pair is positive, while gathered future state representations from
+the global DDP batch are negatives. Logits and cross entropy run in FP32. The
+DINOv3 backbone is frozen; its projection, the proprio/action encoders, and TACO
+heads are trainable. This branch does not support future-latent MSE, a dynamics
+predictor, or transformer-feature pretraining.
+
+Throughput settings include BF16 autocast, TF32, fused Adam, pinned/prefetched
+data loading, uint8 image transfer, frozen-DINO micro-batches, and global-key-only
+DDP communication. Formal runs are written under
+`checkpoints/dyn_disc/ablations/TACO/`.
 
 Checkpoint directory contents expected by downstream encoders:
 
 ```text
 hydra.yaml
 normalizer.pth
-checkpoints/model_<epoch>.pth
+tensorboard/
+checkpoint/model_<epoch>.pth
 ```
-
-Real-world Agilex training entrance:
-
-```bash
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
-```
-
-Useful overrides:
-
-```bash
-TASKS="candy_in_plate duck_in_bowl" \
-EPOCHS=50 \
-BATCH_SIZE=256 \
-FRAMESKIP=1 \
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_agilex_dynamics.sh
-```
-
-The script assumes a built Agilex cache. It points at `data/.agilex_train_cache` by default and writes under `checkpoints/dyn_disc/dynamics/<run-name>-<timestamp>/`.
-
-Simulator/preprocessed-cache training entrance:
-
-```bash
-TASK=PickPlaceCan \
-bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
-```
-
-This script uses `env=preprocessed`, defaults to caches under `data/.lpb_score_preprocessed_cache`, and accepts Hydra overrides through trailing CLI arguments.
-
-### Visual encoder choice
-
-For discriminator pretraining, prefer a strong frozen self-supervised visual encoder before tuning a supervised ResNet from scratch. A practical priority order is:
-
-1. **Frozen DINOv3 / DINO-style ViT** as the first baseline.
-2. **DINOv3 partial tuning** with LoRA, adapters, or the last 1-2 transformer blocks if the frozen baseline underfits.
-3. **ResNet50 finetune** as a speed / memory ablation, with strict validation monitoring.
-
-The reason is that failure detection is closer to OOD / dynamics-consistency scoring than closed-set image classification. With limited labeled failure data, a finetuned ResNet50 can overfit task, camera, background, or object shortcuts. A frozen DINO-style encoder usually gives more stable features and better transfer across tasks.
-
-If using DINOv3, do not only use the global `CLS` token unless this is an intentional lightweight baseline. Robot failures are often local: missed grasp, object slip, collision, or bad hand-object geometry. These signals can be diluted in one global image vector. Prefer one of:
-
-```text
-Lowest cost:
-  patch_tokens -> mean pool -> one visual token
-
-Recommended:
-  patch_tokens on a dense grid -> spatial pool to 4x4 or 2x2 -> P visual tokens
-
-Highest capacity:
-  full patch_tokens -> P visual tokens
-```
-
-The current `VisualDynamicsModel` already uses the shape:
-
-```text
-z: (B, T, P, D)
-```
-
-With the current ResNet encoder, `P=1` in practice. A DINOv3 encoder should expose `P>1` patch or pooled dense tokens, for example `P=16` from a 4x4 pooled token grid. Then the WAM loss predicts future local visual tokens instead of only a whole-image summary:
-
-```text
-image_t, proprio_t, action_t -> patch_tokens_{t+1}
-loss = MSE(pred_patch_tokens_{t+1}, target_patch_tokens_{t+1})
-```
-
-This preserves spatial evidence that is important for frame-level failure scores. If compute is limited, start with grid-pooled dense tokens rather than full patch tokens.
-
-### DINOv3 WAM dynamics v1
-
-The robosuite simulation DINOv3 dynamics config is:
-
-```bash
-bash robosuite/discriminator/dyn_disc/scripts/train_dinov3_robosuite_dynamics.sh
-```
-
-The current v1 setup is intentionally asymmetric:
-
-```text
-source:
-  agentview_t, robot0_eye_in_hand_t, proprio_t, action[t:t+7]
-
-target:
-  agentview_{t+8}, proprio_{t+8}
-```
-
-Main choices:
-
-- visual encoder: frozen DINOv3 ViT-B/16 from `data/pretrained/dinov3-vitb16-pretrain-lvd1689m_80M`;
-- visual tokens: DINO patch tokens spatially pooled to a 4x4 grid, so `P=16`;
-- visual projection: DINO hidden tokens are projected to `382` dimensions;
-- source views: `agentview` and `robot0_eye_in_hand`;
-- target view: `agentview` only;
-- proprio: Panda `qpos[7] + qvel[7]`, selected per robosuite task through `proprio_map`;
-- action chunk: causal horizon 8, flattened as `7 * 8 = 56`;
-- supervision: no action target loss (`action_loss_weight=0.0`); action is used only as a conditioning input.
-
-The v1 proprio/action encoders are MLPs rather than one-layer projections:
-
-```text
-proprio_encoder: 14 -> 64 -> 64
-action_encoder:  56 -> 128 -> 64
-```
-
-This avoids the old bottleneck where an 8-step action chunk was compressed from
-56 dimensions to 7 dimensions by a single linear layer. The dynamics predictor is
-kept near a 60M-parameter trainable budget by using a 9-layer ViT predictor.
 
 ---
 
@@ -241,20 +154,16 @@ kept near a 60M-parameter trainable budget by using a 9-layer ViT predictor.
 
 `DynEncoder` loads:
 
-- the dynamics checkpoint;
+- the TACO checkpoint;
 - sibling `hydra.yaml`;
 - sibling `normalizer.pth`.
 
 It applies the same image/state/action normalization and view mapping used in training, then emits frame-level features.
 
-Supported feature spaces:
-
-| `feature_source` | Feature |
-| --- | --- |
-| `encoder` | Concatenated `[visual_emb; proprio_emb; action_emb]`. Block weights apply to visual/proprio/action dimensions. |
-| `transformer` | Flattened ViT hidden state at `transformer_layer`. Distances use uniform L2 in benchmark adapters. |
-
-The PU-BCE head defaults to `feature_source=transformer` and `transformer_layer=1`.
+The only supported feature space is `feature_source=encoder`: concatenated
+`[dual-view DINO projected features; proprio latent; eight-step TACO action latent]`.
+Block weights apply to visual, proprio, and action dimensions. TACO has no
+transformer predictor feature path.
 
 ---
 
@@ -297,8 +206,6 @@ LR=3e-4
 WEIGHT_DECAY=1e-4
 BATCH_SIZE=512
 DELTA=10.0               # success_percentile false-alarm budget %
-KNN_FEATURE_SOURCE=transformer
-KNN_TRANSFORMER_LAYER=1
 CALIB_FRACTION=0.2
 ```
 

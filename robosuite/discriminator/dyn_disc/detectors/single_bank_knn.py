@@ -1,13 +1,9 @@
-"""Shared frozen-dynamics encoder (``DynEncoder``) + small helpers.
+"""Shared frozen-TACO encoder (``DynEncoder``) + small helpers.
 
-``DynEncoder`` loads the frozen DINOv3 dynamics model and exposes a
-``(visual + proprio + action)`` per-frame encoding in the configured feature
-space (encoder embeddings or a transformer-layer feature). It is the shared
+``DynEncoder`` loads the frozen DINOv3 TACO model and exposes a
+``(visual + proprio + action-sequence)`` per-frame encoding. It is the shared
 encoder backbone used by every benchmark adapter in this package
 (``DynBenchmarkDiscriminator`` and its subclasses).
-
-The dynamics model that produces the encoder + proprio_encoder is loaded from a
-checkpoint via ``robosuite.discriminator.dyn_disc.core.model_loader.load_model``.
 
 This module also defines:
   * :class:`DetectionResult` -- the shared per-frame score/threshold/pred struct.
@@ -84,12 +80,8 @@ def _resolve_dataset_class_path(path: str) -> str:
     mapping = {
         "robosuite.discriminator.lpb_original.datasets.HDF5DynamicsModelDataset":
             "robosuite.discriminator.dyn_disc.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
-        "robosuite.discriminator.lpb_original.datasets.PreprocessedCacheDynamicsModelDataset":
-            "robosuite.discriminator.dyn_disc.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
         "robosuite.discriminator.lpb_original.datasets.hdf5_dynamics_dataset.HDF5DynamicsModelDataset":
             "robosuite.discriminator.dyn_disc.data.hdf5_dynamics_dataset.HDF5DynamicsModelDataset",
-        "robosuite.discriminator.lpb_original.datasets.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset":
-            "robosuite.discriminator.dyn_disc.data.preprocessed_cache_dataset.PreprocessedCacheDynamicsModelDataset",
     }
     return mapping.get(str(path), str(path))
 
@@ -100,10 +92,10 @@ def _resolve_dataset_class_path(path: str) -> str:
 
 
 class DynEncoder:
-    """Loads the frozen dynamics model and exposes (visual+proprio+action) encoding.
+    """Loads a frozen TACO model and exposes visual+proprio+action encoding.
 
     Reads:
-      <ckpt_dir>/hydra.yaml       # full training config (used by dyn_model.plan.load_model)
+      <ckpt_dir>/hydra.yaml       # full TACO training config
       <ckpt_dir>/normalizer.pth   # saved LinearNormalizer state_dict (image + state stats)
 
     `model_ckpt` is the actual `.pth` produced by the training loop (e.g. checkpoints/model_50.pth).
@@ -113,19 +105,18 @@ class DynEncoder:
         self,
         model_ckpt: str,
         device: str = "cuda",
-        feature_source: str = "encoder",
-        transformer_layer: int = -1,
     ) -> None:
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
-        feature_source = str(feature_source)
-        if feature_source not in {"encoder", "transformer"}:
-            raise ValueError(f"feature_source must be 'encoder' or 'transformer', got {feature_source!r}")
-        self.feature_source = feature_source
-        self.transformer_layer = int(transformer_layer)
+        requested_device = torch.device(device)
+        if requested_device.type != "cuda":
+            raise ValueError("DynEncoder requires a CUDA device; CPU inference is disabled.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("DynEncoder requires CUDA, but CUDA is not available.")
+        self.device = requested_device
+        self.feature_source = "encoder"
 
         ckpt_path = Path(model_ckpt)
         if not ckpt_path.exists():
-            raise FileNotFoundError(f"LPB dynamics ckpt not found: {ckpt_path}")
+            raise FileNotFoundError(f"TACO checkpoint not found: {ckpt_path}")
 
         # ------------------------------------------------------------------ #
         # Locate saved Hydra config + normalizer across common layouts.
@@ -167,12 +158,14 @@ class DynEncoder:
         if cfg_path is None:
             tried = "\n  - " + "\n  - ".join(str(p) for p in cfg_candidates[:12])
             raise FileNotFoundError(
-                "Could not locate a Hydra config for the LPB dynamics checkpoint.\n"
+                "Could not locate a Hydra config for the TACO checkpoint.\n"
                 f"Checkpoint: {ckpt_path}\n"
                 f"Tried (first few):{tried}"
             )
 
         self.cfg = OmegaConf.load(cfg_path)
+        if str(OmegaConf.select(self.cfg, "pretraining_method", default="")) != "taco":
+            raise ValueError("DynEncoder only supports TACO training configs.")
 
         # Normalizer: prefer a saved `normalizer.pth` next to the run dir; if missing,
         # rebuild it from the dataset specified in the saved config.
@@ -230,28 +223,6 @@ class DynEncoder:
                     kwargs["cache_dir"] = to_absolute_path(str(getattr(env, "cache_dir")))
                 if hasattr(env, "shape_obs") and getattr(env, "shape_obs") is not None:
                     kwargs["shape_obs"] = OmegaConf.to_container(getattr(env, "shape_obs"), resolve=True)
-                if hasattr(env, "cache_root") and getattr(env, "cache_root") is not None:
-                    kwargs["cache_root"] = to_absolute_path(str(getattr(env, "cache_root")))
-                if hasattr(env, "tasks") and getattr(env, "tasks") is not None:
-                    kwargs["tasks"] = list(getattr(env, "tasks"))
-                if hasattr(env, "train_sources") and getattr(env, "train_sources") is not None:
-                    kwargs["train_sources"] = list(getattr(env, "train_sources"))
-                if hasattr(env, "camera_to_view") and getattr(env, "camera_to_view") is not None:
-                    kwargs["camera_to_view"] = OmegaConf.to_container(
-                        getattr(env, "camera_to_view"), resolve=True
-                    )
-                if hasattr(env, "max_cached_episodes") and getattr(env, "max_cached_episodes") is not None:
-                    kwargs["max_cached_episodes"] = int(getattr(env, "max_cached_episodes"))
-                if hasattr(env, "load_all_into_ram"):
-                    kwargs["load_all_into_ram"] = bool(getattr(env, "load_all_into_ram"))
-                if hasattr(env, "metadata_cache_root") and getattr(env, "metadata_cache_root") is not None:
-                    kwargs["metadata_cache_root"] = to_absolute_path(str(getattr(env, "metadata_cache_root")))
-                if hasattr(env, "num_expert"):
-                    kwargs["num_expert"] = int(getattr(env, "num_expert"))
-                if hasattr(env, "num_success"):
-                    kwargs["num_success"] = int(getattr(env, "num_success"))
-                if hasattr(env, "num_fail"):
-                    kwargs["num_fail"] = int(getattr(env, "num_fail"))
                 if getattr(self.cfg, "proprio_indices", None):
                     kwargs["proprio_indices"] = list(getattr(self.cfg, "proprio_indices"))
                 if getattr(self.cfg, "proprio_map", None):
@@ -348,10 +319,9 @@ class DynEncoder:
         Args:
             images_per_view[view]: (B, 3, H, W) float tensor in [0, 1]; H=W=original_img_size.
             proprio: (B, proprio_dim) float tensor (same layout as the train-time concat).
-            actions:
-              - feature_source="encoder": required flattened action windows shaped (B, action_dim_per_step * frameskip)
-                (typically produced by `prepare_actions`).
-              - feature_source="transformer": required per-step actions shaped (B, action_dim_per_step).
+            actions: flattened eight-step action windows shaped
+                (B, action_dim_per_step * frameskip), typically produced by
+                :meth:`prepare_actions`.
         """
         B = next(iter(images_per_view.values())).shape[0]
 
@@ -370,28 +340,8 @@ class DynEncoder:
 
         obs = {"visual": visual_in, "proprio": proprio_in}
         enc = self.model.encode_obs(obs)
-        if self.feature_source == "transformer":
-            if actions is None:
-                raise ValueError("actions are required when feature_source='transformer'")
-            action_in = self._normalize_flat_actions(actions, B)
-            act_emb = self.model.encode_act(action_in)
-            visual_emb = enc["visual"]
-            proprio_emb = enc["proprio"]
-            if visual_emb.dim() == 4:
-                num_patches = visual_emb.shape[2]
-                proprio_emb = proprio_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
-                act_emb = act_emb.unsqueeze(2).expand(-1, -1, num_patches, -1)
-            z = torch.cat([visual_emb, proprio_emb, act_emb], dim=-1)
-            if z.dim() == 4:
-                z = z.reshape(z.shape[0], z.shape[1] * z.shape[2], z.shape[3])
-            feat = self.model.predictor.extract_transformer_features(
-                z,
-                layer_index=self.transformer_layer,
-            )
-            return feat.reshape(feat.shape[0], -1)
-
         if actions is None:
-            raise ValueError("actions are required when feature_source='encoder'")
+            raise ValueError("actions are required for TACO encoder features")
 
         v = enc["visual"].squeeze(1) if enc["visual"].dim() == 3 else enc["visual"]
         p = enc["proprio"].squeeze(1) if enc["proprio"].dim() == 3 else enc["proprio"]
@@ -405,4 +355,3 @@ class DynEncoder:
         if a.dim() > 2:
             a = a.reshape(a.shape[0], -1)
         return torch.cat([v, p, a], dim=-1)
-

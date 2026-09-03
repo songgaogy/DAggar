@@ -1,23 +1,11 @@
-"""Single-GPU Hydra training entry for the dyn_disc dynamics model.
-
-This is a stripped-down rewrite of `dyn_model/train.py` that:
-  * reads HDF5 / preprocessed data via robosuite.discriminator.dyn_disc.data
-  * skips Accelerate (single GPU torch loop), keeping the dependency surface small
-  * keeps the dynamics model architecture (DINOv3 encoder + hydra-instantiated
-    proprio/action encoders + ViT predictor + VisualDynamicsModel), so checkpoints
-    are loadable by `robosuite.discriminator.dyn_disc.core.model_loader.load_model`.
-  * saves <run_dir>/{checkpoints/model_<epoch>.pth, hydra.yaml, normalizer.pth}
-    in the layout the discriminator expects.
-
-Run from repo root:
-    bash robosuite/discriminator/dyn_disc/scripts/train_dyn_disc_dynamics.sh
-"""
+"""CUDA training entry for TACO InfoNCE representation pretraining."""
 
 from __future__ import annotations
 
 import logging
 import os
 import random
+import time
 import warnings
 from pathlib import Path
 
@@ -28,6 +16,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from hydra.core.hydra_config import HydraConfig
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DistributedSampler
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
@@ -60,7 +49,7 @@ def _instantiate_dataset(cfg: DictConfig, train: bool):
     if isinstance(data_path, ListConfig):
         data_path = OmegaConf.to_container(data_path, resolve=True)
     data_path = _resolve_data_paths(data_path)
-    # Dataset contract (shared by HDF5 + preprocessed-cache backends):
+    # HDF5 dataset contract:
     #   __getitem__ -> (obs, act, state)
     #     obs["visual"][view]: (F, 3, H, W) float in [0, 1]
     #     obs["proprio"]:      (F, P) float
@@ -83,38 +72,21 @@ def _instantiate_dataset(cfg: DictConfig, train: bool):
         kwargs["use_cache"] = bool(cfg.env.use_cache)
     if "cache_dir" in cfg.env and cfg.env.cache_dir is not None:
         kwargs["cache_dir"] = hydra.utils.to_absolute_path(str(cfg.env.cache_dir))
-    if "shape_obs" in cfg.env and cfg.env.shape_obs is not None:
-        kwargs["shape_obs"] = OmegaConf.to_container(cfg.env.shape_obs, resolve=True)
-    # PreprocessedCacheDynamicsModelDataset-specific params
-    if "cache_root" in cfg.env and cfg.env.cache_root is not None:
-        kwargs["cache_root"] = hydra.utils.to_absolute_path(str(cfg.env.cache_root))
-    if "tasks" in cfg.env and cfg.env.tasks is not None:
-        kwargs["tasks"] = list(cfg.env.tasks)
-    if "train_sources" in cfg.env and cfg.env.train_sources is not None:
-        kwargs["train_sources"] = list(cfg.env.train_sources)
-    if "camera_to_view" in cfg.env and cfg.env.camera_to_view is not None:
-        kwargs["camera_to_view"] = OmegaConf.to_container(cfg.env.camera_to_view, resolve=True)
-    if "max_cached_episodes" in cfg.env and cfg.env.max_cached_episodes is not None:
-        kwargs["max_cached_episodes"] = int(cfg.env.max_cached_episodes)
-    if "load_all_into_ram" in cfg.env:
-        kwargs["load_all_into_ram"] = bool(cfg.env.load_all_into_ram)
-    if "metadata_cache_root" in cfg.env and cfg.env.metadata_cache_root is not None:
-        kwargs["metadata_cache_root"] = hydra.utils.to_absolute_path(str(cfg.env.metadata_cache_root))
-    if "num_expert" in cfg.env:
-        kwargs["num_expert"] = int(cfg.env.num_expert)
-    if "num_success" in cfg.env:
-        kwargs["num_success"] = int(cfg.env.num_success)
-    if "num_fail" in cfg.env:
-        kwargs["num_fail"] = int(cfg.env.num_fail)
     if cfg.get("proprio_indices", None):
         kwargs["proprio_indices"] = list(cfg.proprio_indices)
-    is_hdf5_backend = "HDF5DynamicsModelDataset" in str(cfg.env.dataset_class)
-    if is_hdf5_backend and cfg.get("proprio_map", None):
+    if cfg.get("proprio_map", None):
         kwargs["proprio_map"] = OmegaConf.to_container(cfg.proprio_map, resolve=True)
     if cfg.get("max_trajectories", None):
         kwargs["max_trajectories"] = int(cfg.max_trajectories)
-    if is_hdf5_backend and cfg.get("causal_action_chunks", None) is not None:
+    if cfg.get("causal_action_chunks", None) is not None:
         kwargs["causal_action_chunks"] = bool(cfg.causal_action_chunks)
+    if cfg.get("return_uint8_images", None) is not None:
+        kwargs["return_uint8_images"] = bool(cfg.return_uint8_images)
+    if cfg.get("view_frame_counts", None) is not None:
+        kwargs["view_frame_counts"] = OmegaConf.to_container(
+            cfg.view_frame_counts,
+            resolve=True,
+        )
     return DatasetCls(**kwargs)
 
 
@@ -129,19 +101,11 @@ def _instantiate_encoder(cfg: DictConfig):
 
 
 def _build_model(cfg: DictConfig, dataset, device: torch.device):
-    """Replicates the original LPB model construction with local v2 modules."""
-    if cfg.policy_ckpt_path not in (None, "", "null", "None"):
-        raise ValueError(
-            "dyn_disc does not support diffusion-policy policy_ckpt_path. "
-            "Set env.policy_ckpt_path=null or use lpb_original."
-        )
+    """Build the TACO representation model."""
     encoder = _instantiate_encoder(cfg)
-    if cfg.encoder_ckpt_path:
-        ckpt = torch.load(cfg.encoder_ckpt_path, map_location=device)
-        if "encoder" in ckpt:
-            encoder.load_state_dict(ckpt["encoder"])
-            log.info(f"Loaded encoder weights from {cfg.encoder_ckpt_path}")
     train_encoder_flag = bool(getattr(cfg.model, "train_encoder", False))
+    if train_encoder_flag:
+        raise ValueError("TACO pretraining requires a frozen DINOv3 backbone.")
     if hasattr(encoder, "set_trainable"):
         train_projection = bool(getattr(cfg.encoder, "train_projection", True))
         encoder.set_trainable(train_backbone=train_encoder_flag, train_projection=train_projection)
@@ -149,8 +113,8 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
         for p in encoder.parameters():
             p.requires_grad = train_encoder_flag
     log.info(
-        f"encoder: train={train_encoder_flag}, use_pretrained_encoder={bool(cfg.use_pretrained_encoder)}, "
-        f"encoder_ckpt_path={cfg.encoder_ckpt_path}"
+        "encoder: frozen DINOv3 backbone with trainable projection=%s",
+        bool(getattr(cfg.encoder, "train_projection", True)),
     )
 
     proprio_encoder = instantiate_local(
@@ -158,57 +122,39 @@ def _build_model(cfg: DictConfig, dataset, device: torch.device):
         in_chans=dataset.proprio_dim,
         emb_dim=cfg.env.proprio_emb_dim,
     )
-    # The training dataset returns per-step actions, but the LPB dynamics model consumes
-    # a flattened action sequence of length frameskip for each observed frame.
-    action_encoder = instantiate_local(
-        cfg.action_encoder,
-        in_chans=cfg.env.action_dim * cfg.frameskip,
-        emb_dim=cfg.env.action_emb_dim,
-    )
-
     source_view_names = list(getattr(cfg, "source_view_names", cfg.view_names))
     target_view_names = list(getattr(cfg, "target_view_names", cfg.view_names))
-    source_visual_dim = encoder.emb_dim * len(source_view_names)
-    target_visual_dim = encoder.emb_dim * len(target_view_names)
-    num_patches = int(getattr(encoder, "num_patches", 1))
-    predictor = instantiate_local(
-        cfg.predictor,
-        num_patches=num_patches,
-        num_frames=cfg.num_hist,
-        dim=source_visual_dim + (proprio_encoder.emb_dim + action_encoder.emb_dim),
-        visual_dim=target_visual_dim,
-        proprio_dim=cfg.env.proprio_emb_dim,
-        action_dim=cfg.env.action_emb_dim,
-    )
-
-    if cfg.predictor_ckpt_path:
-        ckpt = torch.load(cfg.predictor_ckpt_path, map_location=device)
-        parts = {
-            "predictor": predictor,
-            "proprio_encoder": proprio_encoder,
-            "action_encoder": action_encoder,
-        }
-        for k, mod in parts.items():
-            if k in ckpt:
-                mod.load_state_dict(ckpt[k])
-                log.info(f"Loaded {k} weights from {cfg.predictor_ckpt_path}")
 
     model = instantiate_local(
         cfg.model,
         encoder=encoder,
         proprio_encoder=proprio_encoder,
-        action_encoder=action_encoder,
-        predictor=predictor,
         proprio_dim=cfg.env.proprio_emb_dim,
-        action_dim=cfg.env.action_emb_dim,
+        action_dim_per_step=cfg.env.action_dim,
+        frameskip=cfg.frameskip,
         view_names=list(cfg.view_names),
         source_view_names=source_view_names,
         target_view_names=target_view_names,
-        use_layernorm=cfg.use_layernorm,
-        language_encoder=None,
-        action_loss_weight=OmegaConf.select(cfg, "action_loss_weight", default=0.0),
     )
-    return model.to(device), encoder, proprio_encoder, action_encoder, predictor
+    configured_action_emb = int(cfg.env.action_emb_dim)
+    actual_action_emb = int(model.action_encoder.emb_dim)
+    if configured_action_emb != actual_action_emb:
+        raise ValueError(
+            "env.action_emb_dim must equal action_step_emb_dim * frameskip; "
+            f"got env.action_emb_dim={configured_action_emb}, "
+            f"action encoder emb_dim={actual_action_emb}"
+        )
+    log.info(
+        "TACO capacity: encoder.emb_dim=%s state_dim=%s proprio_emb_dim=%s "
+        "action_emb_dim=%s transition_hidden=%s",
+        int(encoder.emb_dim),
+        int(model.state_dim),
+        int(cfg.env.proprio_emb_dim),
+        actual_action_emb,
+        int(model.transition_hidden),
+    )
+    model = model.to(device)
+    return model, encoder, proprio_encoder, model.action_encoder
 
 
 def _prepare_action_chunks(act: torch.Tensor, num_frames: int, frameskip: int) -> torch.Tensor:
@@ -226,11 +172,22 @@ def _prepare_action_chunks(act: torch.Tensor, num_frames: int, frameskip: int) -
     return act.reshape(b, int(num_frames), int(frameskip) * action_dim)
 
 
-def _normalize_batch(batch, normalizer, view_names, device, num_frames: int, frameskip: int, normalize_images: bool):
+def _normalize_batch(
+    batch,
+    normalizer,
+    view_names,
+    device,
+    num_frames: int,
+    frameskip: int,
+    normalize_images: bool,
+):
     obs, act, _state = batch
     visual = obs["visual"]
     for v in view_names:
-        x = visual[v].to(device)
+        x = visual[v]
+        x = x.to(device, non_blocking=True)
+        if x.dtype == torch.uint8:
+            x = x.to(dtype=torch.float32).div_(255.0)
         if normalize_images:
             # x: (B, num_frames, 3, H, W)
             B, F, C, H, W = x.shape
@@ -238,9 +195,9 @@ def _normalize_batch(batch, normalizer, view_names, device, num_frames: int, fra
             x_flat = normalizer[v].normalize(x_flat)
             x = x_flat.view(B, F, C, H, W)
         visual[v] = x
-    proprio = obs["proprio"].to(device)
+    proprio = obs["proprio"].to(device, non_blocking=True)
     proprio = normalizer["state"].normalize(proprio)
-    act = act.to(device)
+    act = act.to(device, non_blocking=True)
     act = normalizer["act"].normalize(act)
     act = _prepare_action_chunks(act, num_frames=num_frames, frameskip=frameskip)
     return {"visual": visual, "proprio": proprio}, act
@@ -258,26 +215,6 @@ def _save_ckpt(out_dir: Path, epoch: int, parts: dict, ckpt_subdir: str = "check
     fp = ckpt_dir / f"model_{epoch}.pth"
     torch.save(payload, fp)
     return fp
-
-
-def _accumulate_loss_components(sums: dict, components: dict) -> None:
-    for key, value in components.items():
-        if key == "loss":
-            continue
-        if torch.is_tensor(value):
-            sums[key] = sums.get(key, 0.0) + float(value.detach().item())
-        elif isinstance(value, (int, float)):
-            sums[key] = sums.get(key, 0.0) + float(value)
-
-
-def _format_loss_components(prefix: str, sums: dict, n_batches: int) -> str:
-    keys = ("z_loss", "z_visual_loss", "z_proprio_loss", "z_action_loss")
-    parts = []
-    denom = max(1, int(n_batches))
-    for key in keys:
-        if key in sums:
-            parts.append(f"{prefix}_{key}={sums[key] / denom:.5f}")
-    return " ".join(parts)
 
 
 def _count_trainable_params(module: nn.Module) -> int:
@@ -308,13 +245,17 @@ def _log_trainable_parameters(model: nn.Module, **named_modules: nn.Module) -> N
 
 
 def _distributed_context() -> tuple[bool, int, int, int]:
+    if not torch.cuda.is_available():
+        raise RuntimeError("dyn_disc representation pretraining requires CUDA; CPU fallback is disabled.")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
+        torch.cuda.set_device(0)
         return False, 0, 0, 1
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = int(os.environ.get("RANK", "0"))
+    torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+        dist.init_process_group(backend="nccl")
     return True, local_rank, rank, world_size
 
 
@@ -323,11 +264,27 @@ def _cleanup_distributed() -> None:
         dist.destroy_process_group()
 
 
+def _distributed_mean(value: torch.Tensor, world_size: int) -> torch.Tensor:
+    value = value.detach().float().clone()
+    if int(world_size) > 1:
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        value.div_(int(world_size))
+    return value
+
+
 @hydra.main(config_path="../config", config_name="train", version_base=None)
 def main(cfg: DictConfig) -> None:
-    _seed_all(int(cfg.training.seed))
+    if str(cfg.pretraining_method).lower() != "taco":
+        raise ValueError("This branch only supports pretraining_method=taco.")
     is_dist, local_rank, rank, world_size = _distributed_context()
     is_main = rank == 0
+    _seed_all(int(cfg.training.seed) + rank)
+
+    device = torch.device("cuda", local_rank if is_dist else 0)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
     out_dir = Path(HydraConfig.get().runtime.output_dir)
     if is_main:
@@ -343,33 +300,12 @@ def main(cfg: DictConfig) -> None:
         )
 
     with open_dict(cfg):
-        # Preserve legacy aliases used by older configs / downstream tooling.
-        # Some env configs (e.g. `env=preprocessed`) don't define HDF5 paths.
-        train_alias = OmegaConf.select(cfg, "env.train_data_path", default=None)
-        if train_alias is None:
-            train_alias = OmegaConf.select(cfg, "env.cache_root", default=None)
-        cfg.train_data_path = train_alias
-
-        val_alias = OmegaConf.select(cfg, "env.val_data_path", default=None)
-        if val_alias is None:
-            val_alias = train_alias
-        cfg.val_data_path = val_alias
-
-        # Save the actual proprio/action input dims so `dyn_disc.core.model_loader.load_model`
-        # can reconstruct the encoders deterministically.
+        cfg.train_data_path = cfg.env.train_data_path
+        cfg.val_data_path = cfg.env.val_data_path
         cfg.prior_in_chans = int(train_ds.proprio_dim)
         cfg.action_dim_per_step = int(cfg.env.action_dim)
     if is_main:
         OmegaConf.save(cfg, out_dir / "hydra.yaml", resolve=True)
-
-    if torch.cuda.is_available():
-        if is_dist:
-            torch.cuda.set_device(local_rank)
-            device = torch.device("cuda", local_rank)
-        else:
-            device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
 
     normalizer = train_ds.get_normalizer().to(device)
     # Persist normalizer alongside the checkpoint so benchmark/KNN encoding matches training.
@@ -387,32 +323,35 @@ def main(cfg: DictConfig) -> None:
         train_ds, batch_size=cfg.training.batch_size, shuffle=(sampler is None),
         num_workers=cfg.training.num_workers, drop_last=True,
         sampler=sampler,
+        pin_memory=True,
+        persistent_workers=int(cfg.training.num_workers) > 0,
+        prefetch_factor=(
+            int(OmegaConf.select(cfg, "training.prefetch_factor", default=4))
+            if int(cfg.training.num_workers) > 0 else None
+        ),
     )
 
-    model, encoder, proprio_encoder, action_encoder, predictor = _build_model(cfg, train_ds, device)
+    model, encoder, proprio_encoder, action_encoder = _build_model(cfg, train_ds, device)
     ddp_model = DistributedDataParallel(
         model,
-        device_ids=[local_rank] if torch.cuda.is_available() else None,
-        output_device=local_rank if torch.cuda.is_available() else None,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        gradient_as_bucket_view=True,
+        static_graph=True,
     ) if is_dist else model
 
-    optim_groups = []
-    encoder_params = [p for p in encoder.parameters() if p.requires_grad]
-    if encoder_params:
-        optim_groups.append({"params": encoder_params, "lr": cfg.training.encoder_lr})
-    if cfg.model.train_predictor:
-        optim_groups.append({"params": list(predictor.parameters()), "lr": cfg.training.predictor_lr})
-    optim_groups.append({
-        "params": list(proprio_encoder.parameters()) + list(action_encoder.parameters()),
-        "lr": cfg.training.action_encoder_lr,
-    })
-    optimizer = torch.optim.AdamW([g for g in optim_groups if len(g["params"]) > 0])
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(
+        trainable_params,
+        lr=float(cfg.training.encoder_lr),
+        weight_decay=0.0,
+        fused=True,
+    )
 
     if is_main:
         _log_trainable_parameters(
             model,
             encoder=encoder,
-            predictor=predictor,
             proprio_encoder=proprio_encoder,
             action_encoder=action_encoder,
         )
@@ -420,54 +359,98 @@ def main(cfg: DictConfig) -> None:
     save_every = max(1, int(cfg.training.save_every_x_epoch))
     ckpt_subdir = str(OmegaConf.select(cfg, "training.checkpoint_subdir", default="checkpoints"))
     ckpt_epoch_offset = int(OmegaConf.select(cfg, "training.checkpoint_epoch_offset", default=0))
+    log_every = max(1, int(OmegaConf.select(cfg, "training.log_every_steps", default=50)))
     view_names = list(cfg.view_names)
+    writer = SummaryWriter(str(out_dir / "tensorboard")) if is_main else None
+    global_step = 0
+    last_logged_step = 0
+    last_log_time = time.perf_counter()
+    interval_data_time = 0.0
+    last_step_end = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats(device)
 
-    for epoch in range(int(cfg.training.epochs)):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        ddp_model.train()
-        epoch_loss = 0.0
-        train_comp_sums = {}
-        n_batches = 0
-        for batch in train_loader:
-            obs, act = _normalize_batch(
-                batch,
-                normalizer,
-                view_names,
-                device,
-                num_frames=int(cfg.num_hist) + int(cfg.num_pred),
-                frameskip=int(cfg.frameskip),
-                normalize_images=not bool(getattr(model.encoder, "normalizes_images", False)),
-            )
-            optimizer.zero_grad(set_to_none=True)
-            loss, comp = ddp_model(obs, act)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.item())
-            _accumulate_loss_components(train_comp_sums, comp)
-            n_batches += 1
-        avg_train = epoch_loss / max(1, n_batches)
-        train_comp_msg = _format_loss_components("train", train_comp_sums, n_batches)
-        if is_main:
-            log.info(
-                f"epoch={epoch} train_loss={avg_train:.5f} {train_comp_msg}"
-            )
+    try:
+        for epoch in range(int(cfg.training.epochs)):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+            ddp_model.train()
+            epoch_loss = torch.zeros((), device=device, dtype=torch.float32)
+            n_batches = 0
+            for batch in train_loader:
+                interval_data_time += time.perf_counter() - last_step_end
+                obs, act = _normalize_batch(
+                    batch,
+                    normalizer,
+                    view_names,
+                    device,
+                    num_frames=int(cfg.num_hist) + int(cfg.num_pred),
+                    frameskip=int(cfg.frameskip),
+                    normalize_images=not bool(getattr(model.encoder, "normalizes_images", False)),
+                )
+                optimizer.zero_grad(set_to_none=True)
+                measure_step = (global_step + 1) % log_every == 0
+                if measure_step:
+                    forward_start = torch.cuda.Event(enable_timing=True)
+                    forward_end = torch.cuda.Event(enable_timing=True)
+                    backward_end = torch.cuda.Event(enable_timing=True)
+                    forward_start.record()
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.bfloat16,
+                ):
+                    loss, _components = ddp_model(obs, act)
+                if measure_step:
+                    forward_end.record()
+                loss.backward()
+                optimizer.step()
+                if measure_step:
+                    backward_end.record()
+                epoch_loss.add_(loss.detach().float())
+                n_batches += 1
+                global_step += 1
 
-        if is_main and ((epoch + 1) % save_every == 0 or epoch == int(cfg.training.epochs) - 1):
-            parts = {
-                "encoder": encoder,
-                "predictor": predictor,
-                "proprio_encoder": proprio_encoder,
-                "action_encoder": action_encoder,
-            }
-            if hasattr(model, "per_view_norm"):
-                parts["per_view_norm"] = model.per_view_norm
-            if hasattr(model, "fusion_norm"):
-                parts["fusion_norm"] = model.fusion_norm
-            fp = _save_ckpt(out_dir, epoch + ckpt_epoch_offset, parts, ckpt_subdir=ckpt_subdir)
-            log.info(f"saved checkpoint to {fp}")
+                if measure_step:
+                    torch.cuda.synchronize(device)
+                    now = time.perf_counter()
+                    elapsed = max(now - last_log_time, 1e-9)
+                    logged_steps = global_step - last_logged_step
+                    mean_loss = _distributed_mean(loss, world_size)
+                    if is_main and writer is not None:
+                        global_batch = int(cfg.training.batch_size) * int(world_size)
+                        writer.add_scalar("train/taco_loss", float(mean_loss.item()), global_step)
+                        writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+                        writer.add_scalar("performance/samples_per_second", global_batch * logged_steps / elapsed, global_step)
+                        writer.add_scalar("performance/steps_per_second", logged_steps / elapsed, global_step)
+                        writer.add_scalar("performance/data_time_seconds", interval_data_time / logged_steps, global_step)
+                        writer.add_scalar("performance/forward_time_ms", forward_start.elapsed_time(forward_end), global_step)
+                        writer.add_scalar("performance/backward_optimizer_time_ms", forward_end.elapsed_time(backward_end), global_step)
+                        writer.add_scalar("performance/step_time_ms", forward_start.elapsed_time(backward_end), global_step)
+                        writer.add_scalar("performance/global_batch_size", global_batch, global_step)
+                        writer.add_scalar("performance/negative_count", global_batch - 1, global_step)
+                        writer.add_scalar("memory/allocated_gib", torch.cuda.memory_allocated(device) / 2**30, global_step)
+                        writer.add_scalar("memory/reserved_gib", torch.cuda.memory_reserved(device) / 2**30, global_step)
+                        writer.add_scalar("memory/peak_allocated_gib", torch.cuda.max_memory_allocated(device) / 2**30, global_step)
+                    last_log_time = now
+                    last_logged_step = global_step
+                    interval_data_time = 0.0
+                last_step_end = time.perf_counter()
 
-    _cleanup_distributed()
+            avg_train_tensor = _distributed_mean(epoch_loss / max(1, n_batches), world_size)
+            avg_train = float(avg_train_tensor.item())
+            if is_main:
+                log.info(f"epoch={epoch} train_loss={avg_train:.5f}")
+                if writer is not None:
+                    writer.add_scalar("epoch/train_loss", avg_train, epoch + 1)
+
+            if is_main and ((epoch + 1) % save_every == 0 or epoch == int(cfg.training.epochs) - 1):
+                parts = {"pretraining_method": "taco", "model": model}
+                fp = _save_ckpt(out_dir, epoch + ckpt_epoch_offset, parts, ckpt_subdir=ckpt_subdir)
+                log.info(f"saved checkpoint to {fp}")
+    finally:
+        if writer is not None:
+            writer.flush()
+            writer.close()
+        _cleanup_distributed()
 
 
 if __name__ == "__main__":

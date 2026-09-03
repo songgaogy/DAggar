@@ -1,3 +1,3 @@
 _target_: robosuite.discriminator.dyn_disc.models.proprio.MLPEmbedding
-hidden_dim: 64
+hidden_dim: 128
 dropout: 0.0
