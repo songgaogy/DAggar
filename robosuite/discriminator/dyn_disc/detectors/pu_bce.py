@@ -1,4 +1,4 @@
-"""Non-negative PU (nnPU) failure discriminator on the frozen dynamics latent.
+"""Non-negative PU (nnPU) failure discriminator on frozen policy latents.
 
 This is the **no-GT-failure-timing** sibling of the GT-split BCE head. Instead of
 slicing each failure trajectory at ``first_gt_failure_frame()`` into a clean
@@ -52,7 +52,14 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from .single_bank_knn import DetectionResult
+
+@dataclass
+class DetectionResult:
+    """Per-frame failure score, threshold, and binary prediction arrays."""
+
+    step_scores: np.ndarray
+    thresholds: np.ndarray
+    preds: np.ndarray
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +221,11 @@ class PUBCEDiscriminator:
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError("PUBCEDiscriminator requires a CUDA device; CPU training is disabled.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("PUBCEDiscriminator requires CUDA, but CUDA is not available.")
 
         self.head: BCEHead = BCEHead(in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers).to(self.device)
         self.thresholds: Dict[str, float] = {}
@@ -262,6 +273,7 @@ class PUBCEDiscriminator:
         loss_surrogate: str = "sigmoid",
         nn_correction: bool = True,
         beta: float = 0.0,
+        pin_memory: bool = True,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """Train the shared head with the nnPU risk; calibrate per-task thresholds.
@@ -282,6 +294,7 @@ class PUBCEDiscriminator:
             loss_surrogate: 'sigmoid' (nnPU default) or 'logistic'.
             nn_correction: enable the non-negative correction (clamp neg-risk).
             beta: lower clamp for the negative-risk term (Kiryo default 0).
+            pin_memory: pin CPU latent batches before non-blocking CUDA transfer.
         Returns:
             Per-task threshold dict.
         """
@@ -356,7 +369,7 @@ class PUBCEDiscriminator:
             batch_size=int(batch_size),
             sampler=sampler,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=bool(pin_memory),
             drop_last=True,
         )
 

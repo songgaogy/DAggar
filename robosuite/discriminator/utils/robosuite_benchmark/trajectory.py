@@ -49,6 +49,32 @@ class RobosuiteBenchmarkTrajectory(BenchmarkTrajectory):
         with h5py.File(self.file_path, "r") as f:
             return self._demo_group(f)["actions"][:]
 
+    def load_model_inputs(
+        self,
+        cameras: Sequence[str],
+        frame_end: Optional[int] = None,
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """Load all model inputs while opening the trajectory file only once."""
+        req = tuple(cameras)
+        missing = [camera for camera in req if camera not in self.available_cameras]
+        if missing:
+            raise KeyError(
+                f"cameras {missing} not available for {self.video_id}; "
+                f"available: {self.available_cameras}"
+            )
+
+        with h5py.File(self.file_path, "r") as handle:
+            demo = self._demo_group(handle)
+            observations = demo["observations"]
+            selection = slice(None) if frame_end is None else slice(0, int(frame_end))
+            images = {
+                camera: observations[camera]["images"][selection]
+                for camera in req
+            }
+            states = demo["states"][selection]
+            actions = demo["actions"][selection]
+        return images, states, actions
+
     def load_failure_mask(self) -> Optional[np.ndarray]:
         if not self.is_failure:
             return None

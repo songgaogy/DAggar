@@ -1,7 +1,0 @@
-_target_: robosuite.discriminator.dyn_disc.models.dinov3_encoder.DINOv3Encoder
-model_path: data/pretrained/dinov3-vitb16-pretrain-lvd1689m_80M
-emb_dim: 382
-pooled_grid_size: 4
-freeze_backbone: true
-train_projection: true
-image_size: 224

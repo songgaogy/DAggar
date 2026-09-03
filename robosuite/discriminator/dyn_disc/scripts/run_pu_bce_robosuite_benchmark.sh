@@ -9,8 +9,8 @@
 # Hard constraint: training does NOT run benchmark evaluation. bench.evaluate
 # is called by the runner only after fit_on_benchmark returns.
 #
-# Required env:
-#   MODEL_CKPT=/path/to/checkpoints/model_<epoch>.pth \
+# Optional checkpoint override:
+#   POLICY_CKPT=/path/to/flow_multi_epXXXX.pt \
 #     bash robosuite/discriminator/dyn_disc/scripts/run_pu_bce_robosuite_benchmark.sh
 #
 # Layout assumptions (override via env vars):
@@ -21,21 +21,19 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 
-MODEL_CKPT="checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_10.pth"
-FEATURE_SOURCE="transformer"
-TRANSFORMER_LAYER=1
+POLICY_CKPT="${POLICY_CKPT:-checkpoints/multitask_6/flow_multi_ep0100.pt}"
 FAIL_SPLIT="fail_rollout-val-labeled"       # benchmark eval failures
 SUCCESS_SPLIT="success_rollout-val"         # benchmark eval success
 SUCCESS_TRAIN_SPLIT="success_rollout"       # nnPU positives + calibration
 FAIL_TRAIN_SPLIT="fail_rollout"             # unlabeled failure pool
-TASKS="NutAssemblyRound"
+TASKS="PickPlaceCereal"
 TRAIN_MAX_SUCCESS_PER_TASK=50                    # train: success_rollout (per task)
 TRAIN_MAX_FAIL_PER_TASK=50                       # train: fail_rollout (per task)
 MAX_FAIL_PER_TASK=50                             # eval: fail_rollout-val-labeled
@@ -57,18 +55,33 @@ BATCH_SIZE="${BATCH_SIZE:-512}"
 
 
 RUN_NAME="${RUN_NAME:-run_$(date +%Y%m%d_%H%M%S)_${TASKS}}"
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/pu_bce_eval_robosuite/${RUN_NAME}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/ablations/policy/runs/${RUN_NAME}}"
 SAVE_JSON="${SAVE_JSON:-${OUT_DIR}/benchmark.json}"
 SAVE_CKPT_DIR="${SAVE_CKPT_DIR:-${OUT_DIR}/checkpoints}"
 mkdir -p "${OUT_DIR}"
 
 DEVICE="${DEVICE:-cuda}"
-ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
+ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-128}"
+PRELOAD_WORKERS="${PRELOAD_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+PIN_MEMORY="${PIN_MEMORY:-1}"
+FEATURE_CACHE_DIR="${FEATURE_CACHE_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/ablations/policy/feature_cache}"
+REUSE_FEATURE_CACHE="${REUSE_FEATURE_CACHE:-1}"
 DELTA="${DELTA:-10.0}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
 
 EXTRA_ARGS=()
+if [[ "${PIN_MEMORY}" == "1" ]]; then
+    EXTRA_ARGS+=(--pin-memory)
+else
+    EXTRA_ARGS+=(--no-pin-memory)
+fi
+if [[ "${REUSE_FEATURE_CACHE}" == "1" ]]; then
+    EXTRA_ARGS+=(--reuse-feature-cache)
+else
+    EXTRA_ARGS+=(--no-reuse-feature-cache)
+fi
 if [[ -n "${TRAIN_MAX_SUCCESS_PER_TASK}" && "${TRAIN_MAX_SUCCESS_PER_TASK}" -gt 0 ]]; then
     EXTRA_ARGS+=(--train-max-success-per-task "${TRAIN_MAX_SUCCESS_PER_TASK}")
 fi
@@ -86,7 +99,7 @@ if [[ -n "${TASKS}" ]]; then
 fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.robosuite_pu_bce \
-    --model-ckpt            "${MODEL_CKPT}" \
+    --policy-ckpt           "${POLICY_CKPT}" \
     --data-root             "${DATA_ROOT}" \
     --fail-split            "${FAIL_SPLIT}" \
     --success-split         "${SUCCESS_SPLIT}" \
@@ -96,9 +109,10 @@ fi
     --save-ckpt-dir         "${SAVE_CKPT_DIR}" \
     --device                "${DEVICE}" \
     --encode-batch-size     "${ENCODE_BATCH_SIZE}" \
+    --preload-workers       "${PRELOAD_WORKERS}" \
+    --prefetch-factor       "${PREFETCH_FACTOR}" \
+    --feature-cache-dir     "${FEATURE_CACHE_DIR}" \
     --delta                 "${DELTA}" \
-    --knn-feature-source    "${FEATURE_SOURCE}" \
-    --knn-transformer-layer "${TRANSFORMER_LAYER}" \
     --calib-fraction        "${CALIB_FRACTION}" \
     --seed                  "${SEED}" \
     --pi-p                  "${PI_P}" \

@@ -15,7 +15,7 @@ Use ``--split`` to choose which eval trajectories are rendered:
   * ``both``            - sample from failure and success eval pools (default)
 
 Outputs:
-    <out_dir>/videos/<video_id>.mp4
+    <out_dir>/video/<video_id>.mp4
     <out_dir>/<pdf-name>.pdf
     <out_dir>/checkpoints/pu_bce_head.pth  (only when fitting; absent under --load-ckpt)
 """
@@ -100,16 +100,6 @@ def _load_font() -> ImageFont.ImageFont:
             except Exception:
                 continue
     return ImageFont.load_default()
-
-
-def _parse_camera_to_view(s: Optional[str]) -> Optional[Dict[str, str]]:
-    if not s:
-        return None
-    out: Dict[str, str] = {}
-    for chunk in s.split(","):
-        cam, view = chunk.split(":", 1)
-        out[cam.strip()] = view.strip()
-    return out
 
 
 def _safe_id(s: str) -> str:
@@ -320,15 +310,14 @@ class PUBCEVisualizer:
         with PdfPages(out_path) as pdf:
             fig, ax = plt.subplots(figsize=(8.5, 6.0))
             ax.axis("off")
-            ax.set_title(f"dyn_disc PU-BCE (nnPU) summary - task={task}", fontsize=14, loc="left")
+            ax.set_title(f"Policy-feature PU-BCE (nnPU) - task={task}", fontsize=14, loc="left")
 
             lines = [
                 f"discriminator: {self.discriminator.name}",
-                f"model_ckpt: {summary.get('model_ckpt', 'n/a')}",
-                f"view_names: {summary.get('view_names', 'n/a')}",
-                f"camera_to_view: {summary.get('camera_to_view', 'n/a')}",
-                f"feature_source: {summary.get('feature_source', 'n/a')}  "
-                f"transformer_layer: {summary.get('transformer_layer', 'n/a')}",
+                f"policy_ckpt: {summary.get('policy_ckpt', 'n/a')}",
+                f"policy_ckpt_hash: {summary.get('policy_ckpt_hash', 'n/a')}",
+                f"camera_names: {summary.get('camera_names', 'n/a')}",
+                f"feature_source: {summary.get('feature_source', 'n/a')}",
                 f"delta (FA budget %): {summary.get('delta', 'n/a')}  "
                 f"calib_fraction: {summary.get('calib_fraction', 'n/a')}",
                 f"calib_mode: {summary.get('calib_mode', 'success_percentile')}",
@@ -447,7 +436,7 @@ class PUBCEVisualizer:
     ) -> dict:
         if not trajectories:
             raise RuntimeError("No trajectories provided for visualization.")
-        videos_dir = os.path.join(out_dir, "videos")
+        videos_dir = os.path.join(out_dir, "video")
         os.makedirs(videos_dir, exist_ok=True)
         vizs: List[PerTrajectoryViz] = []
         video_paths: List[str] = []
@@ -625,7 +614,29 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
 
 
 def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    payload = torch.load(ckpt_path, map_location=disc.device, weights_only=False)
+    feature_metadata = disc.feature_metadata()
+    contract_keys = (
+        "policy_ckpt_hash",
+        "policy_weight_source",
+        "feature_source",
+        "latent",
+        "feature_dim",
+        "dtype",
+        "camera_names",
+        "task_prompts",
+        "preprocess_version",
+    )
+    mismatches = {
+        key: {"saved": payload.get(key), "current": feature_metadata.get(key)}
+        for key in contract_keys
+        if payload.get(key) != feature_metadata.get(key)
+    }
+    if mismatches:
+        raise RuntimeError(
+            "PU-BCE checkpoint feature contract does not match the loaded policy: "
+            f"{mismatches}"
+        )
     state = payload["pu_bce_detector"]
     detector = PUBCEDiscriminator(
         in_dim=int(payload["in_dim"]),
@@ -646,8 +657,9 @@ def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> N
         "epochs": int(payload.get("epoch", 0)),
         "head_hidden": int(payload["hidden"]),
         "head_layers": int(payload["num_layers"]),
-        "feature_source": str(payload.get("feature_source", disc.feature_source)),
-        "transformer_layer": int(payload.get("transformer_layer", disc.transformer_layer)),
+        "feature_source": str(payload["feature_source"]),
+        "policy_ckpt_hash": str(payload["policy_ckpt_hash"]),
+        "policy_weight_source": str(payload.get("policy_weight_source", "ema_model")),
         "pi_p": payload.get("pi_p"),
         "loss_surrogate": payload.get("loss_surrogate"),
         "nn_correction": payload.get("nn_correction"),
@@ -688,7 +700,11 @@ def _parse_args() -> argparse.Namespace:
         choices=["success_rollout", "fail_rollout", "both"],
         help="Eval pool to visualize: fail_rollout, success_rollout, or both.",
     )
-    parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
+    parser.add_argument(
+        "--policy-ckpt",
+        default="checkpoints/multitask_6/flow_multi_ep0100.pt",
+        help="Frozen flow_multi policy checkpoint.",
+    )
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -705,20 +721,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-success-per-task", type=int, default=None)
     parser.add_argument("--no-flip-vertical", action="store_true",
                         help="Disable the default top/bottom flip applied to rendered frames.")
-    parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
-
-    # shared encoder / scoring knobs
+    # Policy encoder / I/O knobs.
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encode-batch-size", type=int, default=32)
-    parser.add_argument("--camera-to-view", type=str, default=None)
+    parser.add_argument("--encode-batch-size", type=int, default=128)
+    parser.add_argument("--preload-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--pin-memory", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--feature-cache-dir",
+        default="checkpoints/dyn_disc/ablations/policy/feature_cache",
+    )
+    parser.add_argument(
+        "--reuse-feature-cache", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--camera-name", type=str, default="agentview")
-    parser.add_argument("--visual-weight", type=float, default=1.0)
-    parser.add_argument("--proprio-weight", type=float, default=2.0)
-    parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=10.0)
-    parser.add_argument("--feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--quiet-fit", action="store_true")
 
@@ -760,7 +779,7 @@ def main() -> None:
 
     save_ckpt_dir = args.save_ckpt_dir or os.path.join(str(args.out_dir), "checkpoints")
     discriminator = PUBCEBenchmarkDiscriminator(
-        model_ckpt=str(args.model_ckpt),
+        policy_ckpt=str(args.policy_ckpt),
         unlabeled_fail_trajectories=unlabeled_trajs if not args.load_ckpt else [],
         pi_p=float(args.pi_p),
         loss_surrogate=str(args.loss_surrogate),
@@ -775,14 +794,12 @@ def main() -> None:
         save_ckpt_dir=None if args.load_ckpt else save_ckpt_dir,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
-        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
-        camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        action_weight=float(args.action_weight),
+        preload_workers=int(args.preload_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        pin_memory=bool(args.pin_memory),
+        feature_cache_dir=str(args.feature_cache_dir),
+        reuse_feature_cache=bool(args.reuse_feature_cache),
         delta=float(args.delta),
-        feature_source=str(args.feature_source),
-        transformer_layer=int(args.transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),

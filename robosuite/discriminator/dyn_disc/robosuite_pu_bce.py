@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from benchmark.core import EvalConfig
@@ -31,9 +33,13 @@ from robosuite.discriminator.utils.robosuite_benchmark import (
 from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
 
 
+DEFAULT_POLICY_CKPT = "checkpoints/multitask_6/flow_multi_ep0100.pt"
+DEFAULT_OUTPUT_ROOT = Path("checkpoints/dyn_disc/ablations/policy")
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-ckpt", required=True)
+    parser.add_argument("--policy-ckpt", default=DEFAULT_POLICY_CKPT)
     parser.add_argument("--data-root", type=str, default="data",
                         help="Root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -63,20 +69,19 @@ def _parse_args() -> argparse.Namespace:
                              "--train-max-fail-per-task when those are omitted.")
 
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encode-batch-size", type=int, default=32)
-    parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
-    parser.add_argument("--camera-to-view", type=str, default=None)
-
-    parser.add_argument("--visual-weight", type=float, default=1.0)
-    parser.add_argument("--proprio-weight", type=float, default=2.0)
-    parser.add_argument("--action-weight", type=float, default=1.0)
+    parser.add_argument("--encode-batch-size", type=int, default=128)
+    parser.add_argument("--preload-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--pin-memory", action=argparse.BooleanOptionalAction, default=True,
+    )
+    parser.add_argument("--feature-cache-dir", type=str, default=None)
+    parser.add_argument(
+        "--reuse-feature-cache", action=argparse.BooleanOptionalAction, default=True,
+    )
     parser.add_argument("--delta", type=float, default=10.0,
                         help="False-alarm budget %% for success_percentile calib: "
                              "tau = percentile(success-calib failure scores, 100 - delta).")
-    parser.add_argument("--knn-chunk-size", type=int, default=2048)
-    parser.add_argument("--knn-feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--knn-transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
@@ -140,16 +145,6 @@ def _effective_train_caps(
     return train_success_cap, train_fail_cap, unlabeled_cap
 
 
-def _parse_camera_to_view(value: Optional[str]):
-    if not value:
-        return None
-    out = {}
-    for chunk in value.split(","):
-        cam, view = chunk.split(":", 1)
-        out[cam.strip()] = view.strip()
-    return out
-
-
 def _select_unlabeled(
     pool_by_task: Dict[str, List[RobosuiteBenchmarkTrajectory]],
     eval_tasks: Sequence[str],
@@ -192,8 +187,27 @@ def _select_unlabeled(
     return out
 
 
+def _configure_output_paths(args: argparse.Namespace) -> None:
+    """Resolve all generated artifacts under the policy ablation root by default."""
+    task_tag = "all" if not args.tasks else "-".join(sorted(args.tasks))
+    run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{task_tag}"
+    default_run_dir = DEFAULT_OUTPUT_ROOT / "runs" / run_name
+
+    if args.save_json is None and args.save_ckpt_dir is None:
+        args.save_json = str(default_run_dir / "benchmark.json")
+        args.save_ckpt_dir = str(default_run_dir / "checkpoints")
+    elif args.save_json is None:
+        args.save_json = str(Path(args.save_ckpt_dir).parent / "benchmark.json")
+    elif args.save_ckpt_dir is None:
+        args.save_ckpt_dir = str(Path(args.save_json).parent / "checkpoints")
+
+    if args.feature_cache_dir is None:
+        args.feature_cache_dir = str(DEFAULT_OUTPUT_ROOT / "feature_cache")
+
+
 def main() -> None:
     args = _parse_args()
+    _configure_output_paths(args)
     train_max_success_per_task, train_max_fail_per_task, unlabeled_per_task = (
         _effective_train_caps(args)
     )
@@ -295,7 +309,7 @@ def main() -> None:
     )
 
     discriminator = PUBCEBenchmarkDiscriminator(
-        model_ckpt=str(args.model_ckpt),
+        policy_ckpt=str(args.policy_ckpt),
         unlabeled_fail_trajectories=unlabeled_trajs,
         pi_p=float(args.pi_p),
         loss_surrogate=str(args.loss_surrogate),
@@ -310,15 +324,12 @@ def main() -> None:
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
-        proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
-        camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        action_weight=float(args.action_weight),
+        preload_workers=int(args.preload_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        pin_memory=bool(args.pin_memory),
+        feature_cache_dir=str(args.feature_cache_dir),
+        reuse_feature_cache=bool(args.reuse_feature_cache),
         delta=float(args.delta),
-        knn_chunk_size=int(args.knn_chunk_size),
-        feature_source=str(args.knn_feature_source),
-        transformer_layer=int(args.knn_transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),
@@ -332,7 +343,13 @@ def main() -> None:
             train_success_trajectories=train_success_trajs,
         )
 
-        print("[robosuite][pu_bce] training complete; running bench.evaluate(...)", flush=True)
+        print("[robosuite][pu_bce] training complete; pre-encoding eval set...", flush=True)
+        discriminator.preencode_trajectories(
+            trajs,
+            success_prefix=True,
+            desc="[pu_bce][encode] eval",
+        )
+        print("[robosuite][pu_bce] running bench.evaluate(...)", flush=True)
         result = bench.evaluate(
             discriminator,
             EvalConfig(step_binarize_strategy="provided"),
@@ -370,8 +387,9 @@ def main() -> None:
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
-                "knn_feature_source": str(args.knn_feature_source),
-                "knn_transformer_layer": int(args.knn_transformer_layer),
+                "feature": discriminator.feature_metadata(),
+                "feature_cache_dir": str(args.feature_cache_dir),
+                "reuse_feature_cache": bool(args.reuse_feature_cache),
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)

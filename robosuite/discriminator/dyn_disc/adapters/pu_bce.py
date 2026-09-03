@@ -1,7 +1,7 @@
 """Benchmark adapter for the nnPU (PU-BCE) failure discriminator.
 
-Sits on top of :class:`DynBenchmarkDiscriminator` so all the DINOv3 dynamics
-encoding + trajectory feature cache is reused unchanged. Replaces any per-task
+Sits on top of :class:`PolicyBenchmarkDiscriminator` so frozen policy encoding
+and the trajectory feature cache are reused unchanged. Replaces any per-task
 scorer with a single shared :class:`PUBCEDiscriminator` trained with the
 non-negative PU risk on (positives = pre-done success frames, unlabeled = WHOLE
 failure trajectories), plus per-task success_percentile thresholds.
@@ -36,7 +36,7 @@ import torch
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput
 
 from robosuite.discriminator.dyn_disc.adapters.single_bank import (
-    DynBenchmarkDiscriminator,
+    PolicyBenchmarkDiscriminator,
     _pad_to_length,
 )
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
@@ -61,15 +61,15 @@ def _pad_to_length_with_fill(
     return np.concatenate([arr, pad], axis=0)
 
 
-class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
+class PUBCEBenchmarkDiscriminator(PolicyBenchmarkDiscriminator):
     """nnPU failure detector (no GT timing, success_percentile calib) over the benchmark API."""
 
-    name = "dyn_disc_pu_bce"
+    name = "policy_disc_pu_bce"
 
     def __init__(
         self,
         *,
-        model_ckpt: str,
+        policy_ckpt: str,
         unlabeled_fail_trajectories: Sequence[BenchmarkTrajectory],
         pi_p: float = 0.5,
         head_hidden: int = 256,
@@ -84,33 +84,26 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         save_ckpt_dir: Optional[str] = None,
         # forwarded to the shared parent for encoding / cache parity
         device: str = "cuda",
-        encode_batch_size: int = 32,
-        proprio_indices: Optional[Sequence[int]] = None,
-        camera_to_view: Optional[Dict[str, str]] = None,
-        visual_weight: float = 1.0,
-        proprio_weight: float = 2.0,
-        action_weight: float = 1.0,
+        encode_batch_size: int = 128,
         delta: float = 10.0,
-        knn_chunk_size: int = 2048,
-        feature_source: str = "transformer",
-        transformer_layer: int = 1,
+        preload_workers: int = 4,
+        prefetch_factor: int = 2,
+        pin_memory: bool = True,
+        feature_cache_dir: Optional[str] = None,
+        reuse_feature_cache: bool = True,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
     ) -> None:
         super().__init__(
-            model_ckpt=model_ckpt,
+            policy_ckpt=policy_ckpt,
             device=device,
             encode_batch_size=encode_batch_size,
-            proprio_indices=proprio_indices,
-            camera_to_view=camera_to_view,
-            visual_weight=visual_weight,
-            proprio_weight=proprio_weight,
-            action_weight=action_weight,
-            delta=delta,
-            knn_chunk_size=knn_chunk_size,
-            feature_source=feature_source,
-            transformer_layer=transformer_layer,
+            preload_workers=preload_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=pin_memory,
+            feature_cache_dir=feature_cache_dir,
+            reuse_feature_cache=reuse_feature_cache,
             calib_fraction=calib_fraction,
             seed=seed,
             verbose_fit=verbose_fit,
@@ -129,6 +122,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         self.loss_surrogate = str(loss_surrogate)
         self.nn_correction = bool(nn_correction)
         self.beta = float(beta)
+        self.delta = float(delta)
         self.save_ckpt_dir = None if save_ckpt_dir is None else str(save_ckpt_dir)
 
         # Single shared detector across tasks (constructed in fit_on_benchmark
@@ -194,29 +188,17 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         if not trajectories:
             return []
 
-        iterable: Sequence[BenchmarkTrajectory] = trajectories
-        if self.verbose_fit:
-            try:
-                from tqdm import tqdm
-
-                iterable = tqdm(
-                    trajectories,
-                    desc=desc,
-                    unit="traj",
-                    dynamic_ncols=True,
-                )
-            except ImportError:
-                pass
-
-        out: List[torch.Tensor] = []
-        for traj in iterable:
+        frame_ends: List[int] = []
+        for traj in trajectories:
             t_end = self._success_prefix_frame_end(traj)
             if t_end <= 0:
                 raise ValueError(
                     f"Success trajectory has no pre-done frames: {traj.describe()}"
                 )
-            out.append(self._encode(traj, frame_end=t_end))
-        return out
+            frame_ends.append(t_end)
+        return self._encode_trajectories(
+            trajectories, desc=desc, frame_ends=frame_ends
+        )
 
     def _save_checkpoint(self) -> Optional[Path]:
         if self.save_ckpt_dir is None or self._shared_detector is None:
@@ -229,9 +211,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "hidden": int(self._shared_detector.hidden),
             "num_layers": int(self._shared_detector.num_layers),
             "pu_bce_detector": self._shared_detector.state_dict(),
-            "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
-            "model_ckpt": str(self.model_ckpt),
+            **self.feature_metadata(),
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
             "nn_correction": bool(self.nn_correction),
@@ -396,7 +376,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 f"Np(success train)={n_p} Nu(unlabeled fail whole)={n_u} N_calib={n_c} "
                 f"pi_p={self.pi_p} surrogate={self.loss_surrogate} "
                 f"nn_correction={self.nn_correction} "
-                f"feature_source={self.feature_source} layer={self.transformer_layer}",
+                f"latent={self.encoder.latent_name}",
                 flush=True,
             )
 
@@ -423,6 +403,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             loss_surrogate=self.loss_surrogate,
             nn_correction=self.nn_correction,
             beta=self.beta,
+            pin_memory=self.pin_memory,
             verbose=self.verbose_fit,
         )
 
@@ -446,8 +427,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
             "seed": int(self.seed),
-            "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
+            "latent": self.encoder.latent_name,
+            "policy_ckpt_hash": self.policy_ckpt_hash,
             "num_unlabeled_fail_trajectories": int(len(self.unlabeled_fail_trajectories)),
             "train_history": list(self._shared_detector._train_history),
         }
@@ -528,9 +509,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "thresholds": thresholds,
             "step_scores_raw": step_scores,
             "feature_len": int(feat.shape[0]),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
-            "view_names": list(self.encoder.view_names),
+            "latent": self.encoder.latent_name,
+            "camera_names": list(self.camera_names),
         }
         if not bool(trajectory.is_failure):
             aux["success_prefix_frames"] = int(feat.shape[0])
@@ -545,16 +525,12 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         return {
             "per_task": dict(self._calibration_stats),
             "global": dict(self._global_stats),
-            "model_ckpt": self.model_ckpt,
-            "view_names": list(self.encoder.view_names),
-            "camera_to_view": dict(self.camera_to_view),
+            **self.feature_metadata(),
             "delta": float(self.delta),
             "calib_fraction": float(self.calib_fraction),
             "calib_mode": "success_percentile",
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
             "encode_batch_size": int(self.encode_batch_size),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
             "save_ckpt_dir": self.save_ckpt_dir,
         }

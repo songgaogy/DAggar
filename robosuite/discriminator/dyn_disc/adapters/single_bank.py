@@ -1,376 +1,414 @@
-"""Shared benchmark-adapter base (``DynBenchmarkDiscriminator``).
-
-This is the encoder + trajectory-feature-cache backbone shared by every head in
-this package. It owns:
-
-  * a :class:`DynEncoder` (frozen DINOv3 dynamics model) built from ``model_ckpt``;
-  * camera->view resolution, proprio/action slicing, image preprocessing;
-  * a per-trajectory feature cache keyed by (file_path, demo/cache path,
-    feature_source, transformer_layer).
-
-It does **not** define a discriminator head of its own anymore. Concrete heads
-subclass it and implement ``fit_on_benchmark`` / ``score_trajectory`` /
-``calibration_summary`` (see ``adapters/pu_bce.py``).
-"""
+"""Policy-encoder backbone shared by benchmark discriminator heads."""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import tempfile
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import torch
-from omegaconf import OmegaConf
 
 from benchmark.core import BenchmarkTrajectory, DiscriminatorOutput  # noqa: F401
 
-from robosuite.discriminator.dyn_disc.detectors.single_bank_knn import DynEncoder
+from robosuite.discriminator.dyn_disc.detectors.policy_encoder import PolicyFeatureEncoder
 
 
 def _pad_to_length(values: np.ndarray, target_len: int, dtype=np.float32) -> np.ndarray:
     arr = np.asarray(values, dtype=dtype).reshape(-1)
     n = int(arr.shape[0])
-    T = int(target_len)
-    if n == T:
+    target_len = int(target_len)
+    if n == target_len:
         return arr
-    if n > T:
-        return arr[:T].copy()
+    if n > target_len:
+        return arr[:target_len].copy()
     if n == 0:
-        return np.zeros((T,), dtype=dtype)
-    pad = np.full((T - n,), arr[-1], dtype=dtype)
-    return np.concatenate([arr, pad], axis=0)
+        return np.zeros((target_len,), dtype=dtype)
+    return np.concatenate(
+        [arr, np.full((target_len - n,), arr[-1], dtype=dtype)], axis=0
+    )
 
 
-class DynBenchmarkDiscriminator:
-    """Encoder + feature-cache backbone exposed through the BenchmarkTrajectory API.
+class PolicyBenchmarkDiscriminator:
+    """Frozen policy encoder plus memory/disk trajectory feature caches."""
 
-    Concrete heads subclass this and override ``fit_on_benchmark`` /
-    ``score_trajectory`` / ``calibration_summary``.
-    """
-
-    name = "dyn_disc"
+    name = "policy_disc"
 
     def __init__(
         self,
         *,
-        model_ckpt: str,
+        policy_ckpt: str,
         device: str = "cuda",
-        encode_batch_size: int = 32,
-        proprio_indices: Optional[Sequence[int]] = None,
-        camera_to_view: Optional[Dict[str, str]] = None,
-        visual_weight: float = 1.0,
-        proprio_weight: float = 2.0,
-        action_weight: float = 1.0,
-        delta: float = 10.0,
-        knn_chunk_size: int = 2048,
-        feature_source: str = "encoder",
-        transformer_layer: int = -1,
+        encode_batch_size: int = 128,
+        preload_workers: int = 4,
+        prefetch_factor: int = 2,
+        pin_memory: bool = True,
+        feature_cache_dir: Optional[str] = None,
+        reuse_feature_cache: bool = True,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
     ) -> None:
         if not (0.0 < float(calib_fraction) < 1.0):
             raise ValueError(f"calib_fraction must be in (0, 1), got {calib_fraction}")
+        if int(encode_batch_size) <= 0:
+            raise ValueError("encode_batch_size must be positive")
+        if int(preload_workers) < 0 or int(prefetch_factor) <= 0:
+            raise ValueError("preload_workers must be >= 0 and prefetch_factor must be positive")
 
-        self.model_ckpt = str(model_ckpt)
+        self.policy_ckpt = str(Path(policy_ckpt).resolve())
         self.device = str(device)
         self.encode_batch_size = int(encode_batch_size)
-        self.proprio_indices = None if proprio_indices is None else np.asarray(proprio_indices, dtype=np.int64)
-        self.camera_to_view = dict(camera_to_view) if camera_to_view else None
-        self.visual_weight = float(visual_weight)
-        self.proprio_weight = float(proprio_weight)
-        self.action_weight = float(action_weight)
-        self.delta = float(delta)
-        self.knn_chunk_size = int(knn_chunk_size)
-        self.feature_source = str(feature_source)
-        self.transformer_layer = int(transformer_layer)
+        self.preload_workers = int(preload_workers)
+        self.prefetch_factor = int(prefetch_factor)
+        self.pin_memory = bool(pin_memory)
+        self.feature_cache_dir = (
+            None if feature_cache_dir is None else Path(feature_cache_dir).resolve()
+        )
+        self.reuse_feature_cache = bool(reuse_feature_cache)
         self.calib_fraction = float(calib_fraction)
         self.seed = int(seed)
         self.verbose_fit = bool(verbose_fit)
+        if self.feature_cache_dir is not None:
+            self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.encoder = DynEncoder(
-            model_ckpt=self.model_ckpt,
-            device=self.device,
-            feature_source=self.feature_source,
-            transformer_layer=self.transformer_layer,
-        )
-        cfg_map = getattr(self.encoder.cfg, "proprio_map", None)
-        self.proprio_map = (
-            OmegaConf.to_container(cfg_map, resolve=True) if cfg_map is not None else {}
-        ) or {}
-
-        # If user did not provide a camera->view map, default to a 1:1 identity
-        # over the encoder's view_names (assume cameras are named the same).
-        if self.camera_to_view is None:
-            self.camera_to_view = {v: v for v in self.encoder.view_names}
-
-        # Per-task state (populated by concrete subclasses).
+        self.encoder = PolicyFeatureEncoder(policy_ckpt=self.policy_ckpt, device=self.device)
+        self.camera_names = list(self.encoder.camera_names)
+        self.policy_ckpt_hash = self.encoder.checkpoint_sha256
+        self.feature_dim = self.encoder.feature_dim
+        self.feature_source = "policy_task_scene_cond"
+        self.policy_weight_source = "ema_model"
         self._detectors_per_task: Dict[str, Any] = {}
         self._calibration_stats: Dict[str, dict] = {}
-        # Cache encoded trajectories: key -> (T, D) tensor.
-        self._feature_cache: Dict[tuple, torch.Tensor] = {}
-        # Optional list populated with per-call encode_batch() latencies (seconds).
+        self._feature_cache: Dict[str, torch.Tensor] = {}
         self.batch_infer_times: Optional[List[float]] = None
 
-    # ------------------------------------------------------------------ #
-    # Encoding helpers                                                   #
-    # ------------------------------------------------------------------ #
+    def prompt_for_task(self, task_name: str) -> str:
+        return self.encoder.prompt_for_task(task_name)
 
-    def _trajectory_key(self, trajectory: BenchmarkTrajectory) -> tuple[str, str, str, str]:
+    def feature_metadata(self) -> dict[str, Any]:
+        return self.encoder.metadata()
+
+    def _trajectory_identity(
+        self,
+        trajectory: BenchmarkTrajectory,
+        frame_end: Optional[int],
+    ) -> dict[str, Any]:
+        file_path = Path(str(getattr(trajectory, "file_path", ""))).resolve()
+        file_stat = file_path.stat() if file_path.is_file() else None
         group_key = getattr(trajectory, "demo_path", None)
         if group_key is None:
             group_key = getattr(trajectory, "episode_path", "")
-        cache_key = getattr(trajectory, "cache_npz_path", "")
-        return (
-            str(getattr(trajectory, "file_path", "")),
-            str(cache_key or group_key),
-            self.feature_source,
-            str(self.transformer_layer),
-        )
+        cache_path = getattr(trajectory, "cache_npz_path", "")
+        task_name = str(trajectory.task_name)
+        return {
+            "policy_sha256": self.policy_ckpt_hash,
+            "state_dict": "ema_model",
+            "latent": self.encoder.latent_name,
+            "task": task_name,
+            "prompt": self.prompt_for_task(task_name),
+            "camera_names": self.camera_names,
+            "preprocess_version": self.encoder.preprocess_version,
+            "file_path": str(file_path),
+            "file_size": None if file_stat is None else int(file_stat.st_size),
+            "file_mtime_ns": None if file_stat is None else int(file_stat.st_mtime_ns),
+            "trajectory_path": str(cache_path or group_key),
+            "success_prefix_end": None if frame_end is None else int(frame_end),
+        }
 
-    def _resolve_camera(self, view: str) -> str:
-        # Reverse-lookup camera name from view_name (we stored cam->view map).
-        for cam, vname in self.camera_to_view.items():
-            if vname == view:
-                return cam
-        raise KeyError(
-            f"No camera mapped to view {view!r}. Camera->view map: {self.camera_to_view}"
-        )
-
-    def _slice_proprio(
+    def _trajectory_key(
         self,
-        states: np.ndarray,
-        target_dim: Optional[int],
-        task_name: Optional[str] = None,
-    ) -> np.ndarray:
-        if self.proprio_indices is not None:
-            states = states[:, self.proprio_indices]
-        elif task_name and self.proprio_map:
-            task_cfg = self.proprio_map.get(str(task_name), {})
-            indices = task_cfg.get("indices") if isinstance(task_cfg, dict) else None
-            if indices:
-                states = states[:, np.asarray(indices, dtype=np.int64)]
-        if target_dim is None:
-            return states.astype(np.float32, copy=False)
-        d = int(states.shape[1])
-        if d == target_dim:
-            return states.astype(np.float32, copy=False)
-        if d > target_dim:
-            return states[:, :target_dim].astype(np.float32, copy=False)
-        pad = np.zeros((states.shape[0], target_dim - d), dtype=np.float32)
-        return np.concatenate([states.astype(np.float32, copy=False), pad], axis=1)
+        trajectory: BenchmarkTrajectory,
+        frame_end: Optional[int] = None,
+    ) -> str:
+        payload = json.dumps(
+            self._trajectory_identity(trajectory, frame_end),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
-    def _slice_action(self, actions: np.ndarray, target_dim: Optional[int]) -> np.ndarray:
-        if target_dim is None:
-            return actions.astype(np.float32, copy=False)
-        d = int(actions.shape[1])
-        if d == target_dim:
-            return actions.astype(np.float32, copy=False)
-        if d > target_dim:
-            return actions[:, :target_dim].astype(np.float32, copy=False)
-        pad = np.zeros((actions.shape[0], target_dim - d), dtype=np.float32)
-        return np.concatenate([actions.astype(np.float32, copy=False), pad], axis=1)
+    def _disk_cache_path(self, key: str) -> Optional[Path]:
+        if self.feature_cache_dir is None:
+            return None
+        return self.feature_cache_dir / key[:2] / f"{key}.npy"
 
-    def _prepare_trajectory_tensors(self, trajectory: BenchmarkTrajectory) -> Dict[str, Any]:
-        view_names = self.encoder.view_names
-        cameras_needed = [self._resolve_camera(v) for v in view_names]
-        images_by_cam = trajectory.load_images(cameras=cameras_needed)
-        states = np.asarray(trajectory.load_states(), dtype=np.float32)
-        actions = np.asarray(trajectory.load_actions(), dtype=np.float32)
-
-        cam_lens = [int(images_by_cam[c].shape[0]) for c in cameras_needed]
-        t_len = int(min([states.shape[0], actions.shape[0]] + cam_lens))
-        if t_len <= 0:
-            raise ValueError(f"Empty trajectory: {trajectory.describe()}")
-
-        target_proprio_dim = None
+    def _load_cached(self, key: str) -> Optional[torch.Tensor]:
+        cached = self._feature_cache.get(key)
+        if cached is not None:
+            return cached
+        path = self._disk_cache_path(key)
+        if not self.reuse_feature_cache or path is None or not path.is_file():
+            return None
         try:
-            target_proprio_dim = int(self.encoder.model.proprio_encoder.in_chans)
-        except Exception:
-            target_proprio_dim = None
+            array = np.load(path, allow_pickle=False)
+        except (OSError, ValueError):
+            return None
+        if array.ndim != 2 or array.shape[1] != self.feature_dim:
+            return None
+        tensor = torch.from_numpy(np.asarray(array, dtype=np.float32))
+        self._feature_cache[key] = tensor
+        return tensor
 
-        prop = self._slice_proprio(
-            states[:t_len],
-            target_dim=target_proprio_dim,
-            task_name=str(trajectory.task_name),
-        )
-        if self.feature_source == "encoder":
-            act = self.encoder.prepare_actions(actions[:t_len], t_len=t_len)
+    def _store_cached(self, key: str, features: torch.Tensor) -> None:
+        features = features.detach().cpu().to(dtype=torch.float32).contiguous()
+        self._feature_cache[key] = features
+        path = self._disk_cache_path(key)
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, suffix=".npy", delete=False
+            ) as handle:
+                temp_path = Path(handle.name)
+                np.save(handle, features.numpy(), allow_pickle=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
+
+    def _prepare_trajectory_tensors(
+        self,
+        trajectory: BenchmarkTrajectory,
+        frame_end: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        load_all = getattr(trajectory, "load_model_inputs", None)
+        if load_all is not None:
+            images_by_camera, states, actions = load_all(
+                self.camera_names, frame_end=frame_end
+            )
         else:
-            target_action_dim = None
-            try:
-                target_action_dim = int(self.encoder.model.action_encoder.in_chans)
-            except Exception:
-                target_action_dim = None
-            act = self._slice_action(actions[:t_len], target_dim=target_action_dim)
-
-        h = self.encoder.original_img_size
-        per_view_chw: Dict[str, np.ndarray] = {}
-        for view in view_names:
-            cam = self._resolve_camera(view)
-            imgs = np.asarray(images_by_cam[cam][:t_len])
-            if imgs.shape[1] != h or imgs.shape[2] != h:
-                t_imgs = torch.from_numpy(imgs.astype(np.float32))
-                if t_imgs.max() > 1.5:
-                    t_imgs = t_imgs / 255.0
-                t_imgs = t_imgs.permute(0, 3, 1, 2)
-                t_imgs = torch.nn.functional.interpolate(
-                    t_imgs, size=(h, h), mode="bilinear", align_corners=False
-                )
-                per_view_chw[view] = t_imgs.numpy()
-            else:
-                arr = imgs.astype(np.float32)
-                if arr.max() > 1.5:
-                    arr = arr / 255.0
-                per_view_chw[view] = np.transpose(arr, (0, 3, 1, 2))
-
+            images_by_camera = trajectory.load_images(cameras=self.camera_names)
+            states = trajectory.load_states()
+            actions = trajectory.load_actions()
+        states = np.asarray(states)
+        actions = np.asarray(actions)
+        camera_lengths = [len(images_by_camera[name]) for name in self.camera_names]
+        length = min([len(states), len(actions), *camera_lengths])
+        if frame_end is not None:
+            length = min(length, int(frame_end))
+        if length <= 0:
+            raise ValueError(f"Empty trajectory: {trajectory.describe()}")
+        proprio = self.encoder.extract_proprio(
+            states[:length], task_name=str(trajectory.task_name)
+        )
+        images = {
+            name: np.asarray(images_by_camera[name][:length])
+            for name in self.camera_names
+        }
         return {
-            "view_names": view_names,
-            "per_view_chw": per_view_chw,
-            "prop": prop,
-            "act": act,
-            "t_len": t_len,
+            "images": images,
+            "proprio": proprio,
+            "task_name": str(trajectory.task_name),
+            "t_len": int(length),
         }
 
-    @staticmethod
-    def _truncate_prepared(prepared: Dict[str, Any], frame_end: int) -> Dict[str, Any]:
-        t_end = min(int(frame_end), int(prepared["t_len"]))
-        if t_end <= 0:
-            raise ValueError(f"frame_end must be positive, got {t_end}")
-        return {
-            "view_names": prepared["view_names"],
-            "per_view_chw": {k: v[:t_end] for k, v in prepared["per_view_chw"].items()},
-            "prop": prepared["prop"][:t_end],
-            "act": prepared["act"][:t_end],
-            "t_len": t_end,
-        }
+    def _to_host_tensor(self, array: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(np.ascontiguousarray(array))
+        if self.pin_memory:
+            tensor = tensor.pin_memory()
+        return tensor
 
-    def _encode_tensors(self, key: tuple, prepared: Dict[str, Any]) -> torch.Tensor:
-        view_names: List[str] = prepared["view_names"]
-        per_view_chw: Dict[str, np.ndarray] = prepared["per_view_chw"]
-        prop: np.ndarray = prepared["prop"]
-        act: np.ndarray = prepared["act"]
-        t_len: int = int(prepared["t_len"])
-
-        feats: List[torch.Tensor] = []
-        bs = self.encode_batch_size
-        for start in range(0, t_len, bs):
-            end = min(start + bs, t_len)
-            batch_imgs = {
-                v: torch.from_numpy(per_view_chw[v][start:end]) for v in view_names
-            }
-            batch_prop = torch.from_numpy(prop[start:end])
-            batch_act = torch.from_numpy(act[start:end])
+    def _encode_tensors(self, key: str, prepared: Dict[str, Any]) -> torch.Tensor:
+        images_by_camera: Dict[str, np.ndarray] = prepared["images"]
+        proprio: np.ndarray = prepared["proprio"]
+        task_name = str(prepared["task_name"])
+        length = int(prepared["t_len"])
+        features: List[torch.Tensor] = []
+        for start in range(0, length, self.encode_batch_size):
+            end = min(start + self.encode_batch_size, length)
+            images = np.stack(
+                [images_by_camera[name][start:end] for name in self.camera_names], axis=1
+            )
+            image_tensor = self._to_host_tensor(images)
+            proprio_tensor = self._to_host_tensor(proprio[start:end])
             if self.batch_infer_times is not None:
-                if self.device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t0 = time.perf_counter()
-            f = self.encoder.encode_batch(batch_imgs, batch_prop, actions=batch_act)
+                torch.cuda.synchronize(self.encoder.device)
+                started = time.perf_counter()
+            encoded = self.encoder.encode_batch(image_tensor, proprio_tensor, task_name)
             if self.batch_infer_times is not None:
-                if self.device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                self.batch_infer_times.append(float(time.perf_counter() - t0))
-            feats.append(f.detach().cpu())
+                torch.cuda.synchronize(self.encoder.device)
+                self.batch_infer_times.append(time.perf_counter() - started)
+            features.append(encoded.detach())
+        output = torch.cat(features, dim=0).cpu()
+        self._store_cached(key, output)
+        return output
 
-        out = torch.cat(feats, dim=0)
-        self._feature_cache[key] = out
-        return out
+    def preload_trajectory(
+        self,
+        trajectory: BenchmarkTrajectory,
+        *,
+        frame_end: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._prepare_trajectory_tensors(trajectory, frame_end=frame_end)
 
-    def preload_trajectory(self, trajectory: BenchmarkTrajectory) -> Dict[str, Any]:
-        return self._prepare_trajectory_tensors(trajectory)
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_preloaded(
         self,
         trajectory: BenchmarkTrajectory,
         prepared: Dict[str, Any],
+        *,
+        frame_end: Optional[int] = None,
     ) -> torch.Tensor:
-        key = self._trajectory_key(trajectory)
-        cached = self._feature_cache.get(key, None)
-        if cached is not None:
-            return cached
-        return self._encode_tensors(key, prepared)
+        key = self._trajectory_key(trajectory, frame_end=frame_end)
+        cached = self._load_cached(key)
+        return cached if cached is not None else self._encode_tensors(key, prepared)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _encode(
         self,
         trajectory: BenchmarkTrajectory,
         *,
         frame_end: Optional[int] = None,
     ) -> torch.Tensor:
-        key = self._trajectory_key(trajectory)
-        if frame_end is not None:
-            key = key + (f"end{int(frame_end)}",)
-        cached = self._feature_cache.get(key, None)
+        key = self._trajectory_key(trajectory, frame_end=frame_end)
+        cached = self._load_cached(key)
         if cached is not None:
             return cached
-
-        prepared = self._prepare_trajectory_tensors(trajectory)
-        if frame_end is not None:
-            prepared = self._truncate_prepared(prepared, frame_end)
+        prepared = self._prepare_trajectory_tensors(trajectory, frame_end=frame_end)
         return self._encode_tensors(key, prepared)
 
-    @torch.no_grad()
+    def _preload_job(
+        self,
+        trajectory: BenchmarkTrajectory,
+        frame_end: Optional[int],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        key = self._trajectory_key(trajectory, frame_end=frame_end)
+        if self._load_cached(key) is not None:
+            return key, None
+        return key, self._prepare_trajectory_tensors(trajectory, frame_end=frame_end)
+
+    @torch.inference_mode()
     def _encode_trajectories(
         self,
         trajectories: Sequence[BenchmarkTrajectory],
         *,
         desc: str = "encode",
+        frame_ends: Optional[Sequence[Optional[int]]] = None,
     ) -> List[torch.Tensor]:
-        """Encode trajectories sequentially; show a tqdm bar when verbose_fit."""
         if not trajectories:
             return []
+        if frame_ends is None:
+            frame_ends = [None] * len(trajectories)
+        if len(frame_ends) != len(trajectories):
+            raise ValueError("frame_ends must have one entry per trajectory")
 
-        iterable: Iterable[BenchmarkTrajectory] = trajectories
+        items: Iterable[tuple[BenchmarkTrajectory, Optional[int]]] = zip(
+            trajectories, frame_ends
+        )
+        progress = None
         if self.verbose_fit:
             try:
                 from tqdm import tqdm
 
-                iterable = tqdm(
-                    trajectories,
-                    desc=desc,
-                    unit="traj",
-                    dynamic_ncols=True,
-                )
+                progress = tqdm(total=len(trajectories), desc=desc, unit="traj", dynamic_ncols=True)
             except ImportError:
                 pass
 
-        out: List[torch.Tensor] = []
-        for traj in iterable:
-            out.append(self._encode(traj))
-        return out
+        output: List[torch.Tensor] = []
+        if self.preload_workers == 0:
+            for trajectory, frame_end in items:
+                output.append(self._encode(trajectory, frame_end=frame_end))
+                if progress is not None:
+                    progress.update(1)
+        else:
+            max_pending = max(1, self.preload_workers * self.prefetch_factor)
+            iterator = iter(items)
+            pending: deque[tuple[BenchmarkTrajectory, Optional[int], Future]] = deque()
+            with ThreadPoolExecutor(max_workers=self.preload_workers) as executor:
+                for _ in range(max_pending):
+                    try:
+                        trajectory, frame_end = next(iterator)
+                    except StopIteration:
+                        break
+                    pending.append(
+                        (
+                            trajectory,
+                            frame_end,
+                            executor.submit(self._preload_job, trajectory, frame_end),
+                        )
+                    )
+                while pending:
+                    trajectory, frame_end, future = pending.popleft()
+                    key, prepared = future.result()
+                    cached = self._load_cached(key)
+                    if cached is None:
+                        assert prepared is not None
+                        cached = self._encode_tensors(key, prepared)
+                    output.append(cached)
+                    if progress is not None:
+                        progress.update(1)
+                    try:
+                        next_trajectory, next_end = next(iterator)
+                    except StopIteration:
+                        continue
+                    pending.append(
+                        (
+                            next_trajectory,
+                            next_end,
+                            executor.submit(self._preload_job, next_trajectory, next_end),
+                        )
+                    )
+        if progress is not None:
+            progress.close()
+        return output
 
-    # ------------------------------------------------------------------ #
-    # Public API (overridden by concrete heads)                         #
-    # ------------------------------------------------------------------ #
+    def preencode_trajectories(
+        self,
+        trajectories: Sequence[BenchmarkTrajectory],
+        *,
+        desc: str = "encode",
+        success_prefix: bool = False,
+    ) -> List[torch.Tensor]:
+        frame_ends: Optional[List[Optional[int]]] = None
+        if success_prefix:
+            frame_ends = []
+            for trajectory in trajectories:
+                if bool(trajectory.is_failure):
+                    frame_ends.append(None)
+                    continue
+                prefix_fn = getattr(trajectory, "prefix_frames_before_done", None)
+                frame_end = (
+                    int(prefix_fn()) if prefix_fn is not None else int(trajectory.num_frames)
+                )
+                if frame_end <= 0:
+                    raise ValueError(
+                        f"Success trajectory has no pre-done frames: {trajectory.describe()}"
+                    )
+                frame_ends.append(frame_end)
+        return self._encode_trajectories(
+            trajectories, desc=desc, frame_ends=frame_ends
+        )
 
     def fit_on_benchmark(self, trajectories: List[BenchmarkTrajectory]) -> None:
-        raise NotImplementedError(
-            "DynBenchmarkDiscriminator is an encoder/cache backbone; subclass it "
-            "and implement fit_on_benchmark (see adapters/pu_bce.py)."
-        )
+        raise NotImplementedError
 
     def score_trajectory(self, trajectory: BenchmarkTrajectory) -> DiscriminatorOutput:
-        raise NotImplementedError(
-            "DynBenchmarkDiscriminator is an encoder/cache backbone; subclass it "
-            "and implement score_trajectory (see adapters/pu_bce.py)."
-        )
+        raise NotImplementedError
 
     def calibration_summary(self) -> dict:
         return {
             "per_task": dict(self._calibration_stats),
-            "model_ckpt": self.model_ckpt,
-            "view_names": list(self.encoder.view_names),
-            "camera_to_view": dict(self.camera_to_view),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
-            "delta": float(self.delta),
-            "calib_fraction": float(self.calib_fraction),
-            "encode_batch_size": int(self.encode_batch_size),
+            **self.feature_metadata(),
+            "calib_fraction": self.calib_fraction,
+            "encode_batch_size": self.encode_batch_size,
+            "preload_workers": self.preload_workers,
+            "prefetch_factor": self.prefetch_factor,
+            "pin_memory": self.pin_memory,
+            "feature_cache_dir": (
+                None if self.feature_cache_dir is None else str(self.feature_cache_dir)
+            ),
         }
 
     def close(self) -> None:
-        try:
-            self.encoder.model.to("cpu")
-        except Exception:
-            pass
+        self.encoder.close()

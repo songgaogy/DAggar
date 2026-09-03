@@ -12,7 +12,7 @@ reports, per config:
     failure score -g(z). 0.5 == collapsed/no signal; high == learned.
 
 Run (GPU):
-    MODEL_CKPT=.../model_50.pth \
+    POLICY_CKPT=checkpoints/multitask_6/flow_multi_ep0100.pt \
     /home/dodo/miniconda3/envs/dagger/bin/python \
         -m robosuite.discriminator.dyn_disc.diagnose_pu_fit_grid \
         --task PickPlaceCereal --n-success 50 --n-fail 50
@@ -35,22 +35,28 @@ from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscr
 from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
 
 
+DEFAULT_POLICY_CKPT = "checkpoints/multitask_6/flow_multi_ep0100.pt"
+DEFAULT_CACHE_DIR = "checkpoints/dyn_disc/ablations/policy/feature_cache"
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    default_ckpt = os.environ.get(
-        "MODEL_CKPT",
-        "checkpoints/dyn_disc/dynamics/dinov3_dyn_robosuite-20260619_024518/checkpoint/model_50.pth",
-    )
-    p.add_argument("--model-ckpt", default=default_ckpt)
+    p.add_argument("--policy-ckpt", default=os.environ.get("POLICY_CKPT", DEFAULT_POLICY_CKPT))
     p.add_argument("--data-root", default="data")
     p.add_argument("--task", default="PickPlaceCereal")
     p.add_argument("--success-train-split", default="success_rollout")
     p.add_argument("--fail-train-split", default="fail_rollout")
     p.add_argument("--n-success", type=int, default=50)
     p.add_argument("--n-fail", type=int, default=50)
-    p.add_argument("--transformer-layer", type=int, default=1)
-    p.add_argument("--feature-source", default="transformer")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--encode-batch-size", type=int, default=128)
+    p.add_argument("--preload-workers", type=int, default=4)
+    p.add_argument("--prefetch-factor", type=int, default=2)
+    p.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--feature-cache-dir", default=DEFAULT_CACHE_DIR)
+    p.add_argument(
+        "--reuse-feature-cache", action=argparse.BooleanOptionalAction, default=True,
+    )
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=512)
@@ -80,9 +86,11 @@ def main() -> None:
     print(f"[grid] success={len(succ)} fail={len(fail)}", flush=True)
 
     disc = PUBCEBenchmarkDiscriminator(
-        model_ckpt=args.model_ckpt, unlabeled_fail_trajectories=fail, pi_p=0.3,
-        device=args.device, feature_source=args.feature_source,
-        transformer_layer=args.transformer_layer, verbose_fit=False,
+        policy_ckpt=args.policy_ckpt, unlabeled_fail_trajectories=fail, pi_p=0.3,
+        device=args.device, encode_batch_size=args.encode_batch_size,
+        preload_workers=args.preload_workers, prefetch_factor=args.prefetch_factor,
+        pin_memory=args.pin_memory, feature_cache_dir=args.feature_cache_dir,
+        reuse_feature_cache=args.reuse_feature_cache, verbose_fit=False,
     )
 
     print("[grid] encoding P (pre-done) + U (whole) ...", flush=True)
