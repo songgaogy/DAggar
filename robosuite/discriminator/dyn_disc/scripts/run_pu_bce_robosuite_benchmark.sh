@@ -21,19 +21,19 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES=1
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 
 
-MODEL_CKPT="${MODEL_CKPT:-}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/ablations/TACO/taco_robosuite-20260903_172611/checkpoint/model_50.pth}"
 FAIL_SPLIT="${FAIL_SPLIT:-fail_rollout-val-labeled}"       # benchmark eval failures
 SUCCESS_SPLIT="${SUCCESS_SPLIT:-success_rollout-val}"      # benchmark eval success
 SUCCESS_TRAIN_SPLIT="${SUCCESS_TRAIN_SPLIT:-success_rollout}" # nnPU positives + calibration
 FAIL_TRAIN_SPLIT="${FAIL_TRAIN_SPLIT:-fail_rollout}"       # unlabeled failure pool
-TASKS="${TASKS:-NutAssemblyRound}"
+TASKS="${TASKS:-NutAssemblySquare}"
 TRAIN_MAX_SUCCESS_PER_TASK="${TRAIN_MAX_SUCCESS_PER_TASK:-50}" # train success, per task
 TRAIN_MAX_FAIL_PER_TASK="${TRAIN_MAX_FAIL_PER_TASK:-50}"       # train failure, per task
 MAX_FAIL_PER_TASK="${MAX_FAIL_PER_TASK:-50}"                   # eval failure, per task
@@ -67,6 +67,9 @@ fi
 
 DEVICE="${DEVICE:-cuda}"
 ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
+PRELOAD_WORKERS="${PRELOAD_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
+PIN_MEMORY="${PIN_MEMORY:-1}"
 DELTA="${DELTA:-10.0}"
 CALIB_FRACTION="${CALIB_FRACTION:-0.2}"
 SEED="${SEED:-0}"
@@ -87,6 +90,11 @@ fi
 if [[ -n "${TASKS}" ]]; then
     EXTRA_ARGS+=(--tasks ${TASKS})
 fi
+if [[ "${PIN_MEMORY}" == "1" ]]; then
+    EXTRA_ARGS+=(--pin-memory)
+else
+    EXTRA_ARGS+=(--no-pin-memory)
+fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.robosuite_pu_bce \
     --model-ckpt            "${MODEL_CKPT}" \
@@ -99,6 +107,8 @@ fi
     --save-ckpt-dir         "${SAVE_CKPT_DIR}" \
     --device                "${DEVICE}" \
     --encode-batch-size     "${ENCODE_BATCH_SIZE}" \
+    --preload-workers       "${PRELOAD_WORKERS}" \
+    --prefetch-factor       "${PREFETCH_FACTOR}" \
     --delta                 "${DELTA}" \
     --calib-fraction        "${CALIB_FRACTION}" \
     --seed                  "${SEED}" \

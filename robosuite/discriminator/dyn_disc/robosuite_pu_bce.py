@@ -64,6 +64,13 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encode-batch-size", type=int, default=32)
+    parser.add_argument("--preload-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
     parser.add_argument("--camera-to-view", type=str, default=None)
 
@@ -307,6 +314,9 @@ def main() -> None:
         save_ckpt_dir=str(args.save_ckpt_dir) if args.save_ckpt_dir else None,
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
+        preload_workers=int(args.preload_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        pin_memory=bool(args.pin_memory),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
         camera_to_view=_parse_camera_to_view(args.camera_to_view),
         visual_weight=float(args.visual_weight),
@@ -327,7 +337,13 @@ def main() -> None:
             train_success_trajectories=train_success_trajs,
         )
 
-        print("[robosuite][pu_bce] training complete; running bench.evaluate(...)", flush=True)
+        print("[robosuite][pu_bce] training complete; pre-encoding eval set...", flush=True)
+        discriminator.preencode_trajectories(
+            trajs,
+            success_prefix=True,
+            desc="[pu_bce][encode] eval",
+        )
+        print("[robosuite][pu_bce] running bench.evaluate(...)", flush=True)
         result = bench.evaluate(
             discriminator,
             EvalConfig(step_binarize_strategy="provided"),
@@ -363,6 +379,10 @@ def main() -> None:
                 "epochs": int(args.epochs),
                 "lr": float(args.lr),
                 "batch_size": int(args.batch_size),
+                "encode_batch_size": int(args.encode_batch_size),
+                "preload_workers": int(args.preload_workers),
+                "prefetch_factor": int(args.prefetch_factor),
+                "pin_memory": bool(args.pin_memory),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
                 "feature_source": "encoder",

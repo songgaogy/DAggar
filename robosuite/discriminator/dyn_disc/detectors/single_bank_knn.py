@@ -317,7 +317,8 @@ class DynEncoder:
         """Encode a batch of timesteps into the configured KNN feature space.
 
         Args:
-            images_per_view[view]: (B, 3, H, W) float tensor in [0, 1]; H=W=original_img_size.
+            images_per_view[view]: (B, H, W, 3) uint8 or (B, 3, H, W)
+                float tensor in [0, 1]. uint8 conversion runs on ``self.device``.
             proprio: (B, proprio_dim) float tensor (same layout as the train-time concat).
             actions: flattened eight-step action windows shaped
                 (B, action_dim_per_step * frameskip), typically produced by
@@ -328,6 +329,27 @@ class DynEncoder:
         visual_in: Dict[str, torch.Tensor] = {}
         for v in self.view_names:
             x = images_per_view[v].to(self.device, non_blocking=True)
+            if x.ndim != 4:
+                raise ValueError(f"Expected 4D images for view {v!r}, got {tuple(x.shape)}")
+            if x.shape[-1] == 3:
+                x = x.permute(0, 3, 1, 2)
+            if not x.is_floating_point():
+                x = x.to(dtype=torch.float32).div_(255.0)
+            else:
+                x = x.to(dtype=torch.float32)
+                scale = torch.where(
+                    x.amax() > 1.5,
+                    x.new_tensor(1.0 / 255.0),
+                    x.new_tensor(1.0),
+                )
+                x = x * scale
+            if x.shape[-2:] != (self.original_img_size, self.original_img_size):
+                x = torch.nn.functional.interpolate(
+                    x,
+                    size=(self.original_img_size, self.original_img_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
             if not bool(getattr(self.model.encoder, "normalizes_images", False)):
                 x = self.normalizer[v].normalize(x)  # per-view image normalize
                 x = self.img_transform(x.view(-1, 3, self.original_img_size, self.original_img_size))

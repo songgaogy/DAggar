@@ -262,6 +262,7 @@ class PUBCEDiscriminator:
         loss_surrogate: str = "sigmoid",
         nn_correction: bool = True,
         beta: float = 0.0,
+        pin_memory: bool = True,
         verbose: bool = True,
     ) -> Dict[str, float]:
         """Train the shared head with the nnPU risk; calibrate per-task thresholds.
@@ -282,6 +283,7 @@ class PUBCEDiscriminator:
             loss_surrogate: 'sigmoid' (nnPU default) or 'logistic'.
             nn_correction: enable the non-negative correction (clamp neg-risk).
             beta: lower clamp for the negative-risk term (Kiryo default 0).
+            pin_memory: pin latent batches before CUDA transfer.
         Returns:
             Per-task threshold dict.
         """
@@ -356,7 +358,7 @@ class PUBCEDiscriminator:
             batch_size=int(batch_size),
             sampler=sampler,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=bool(pin_memory) and self.device.type == "cuda",
             drop_last=True,
         )
 

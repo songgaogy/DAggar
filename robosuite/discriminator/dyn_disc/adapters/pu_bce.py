@@ -85,6 +85,9 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         # forwarded to the shared parent for encoding / cache parity
         device: str = "cuda",
         encode_batch_size: int = 32,
+        preload_workers: int = 0,
+        prefetch_factor: int = 1,
+        pin_memory: bool = True,
         proprio_indices: Optional[Sequence[int]] = None,
         camera_to_view: Optional[Dict[str, str]] = None,
         visual_weight: float = 1.0,
@@ -100,6 +103,9 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             model_ckpt=model_ckpt,
             device=device,
             encode_batch_size=encode_batch_size,
+            preload_workers=preload_workers,
+            prefetch_factor=prefetch_factor,
+            pin_memory=pin_memory,
             proprio_indices=proprio_indices,
             camera_to_view=camera_to_view,
             visual_weight=visual_weight,
@@ -190,29 +196,19 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         if not trajectories:
             return []
 
-        iterable: Sequence[BenchmarkTrajectory] = trajectories
-        if self.verbose_fit:
-            try:
-                from tqdm import tqdm
-
-                iterable = tqdm(
-                    trajectories,
-                    desc=desc,
-                    unit="traj",
-                    dynamic_ncols=True,
-                )
-            except ImportError:
-                pass
-
-        out: List[torch.Tensor] = []
-        for traj in iterable:
+        frame_ends: List[int] = []
+        for traj in trajectories:
             t_end = self._success_prefix_frame_end(traj)
             if t_end <= 0:
                 raise ValueError(
                     f"Success trajectory has no pre-done frames: {traj.describe()}"
                 )
-            out.append(self._encode(traj, frame_end=t_end))
-        return out
+            frame_ends.append(t_end)
+        return self._encode_trajectories(
+            trajectories,
+            desc=desc,
+            frame_ends=frame_ends,
+        )
 
     def _save_checkpoint(self) -> Optional[Path]:
         if self.save_ckpt_dir is None or self._shared_detector is None:
@@ -418,6 +414,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             loss_surrogate=self.loss_surrogate,
             nn_correction=self.nn_correction,
             beta=self.beta,
+            pin_memory=self.pin_memory,
             verbose=self.verbose_fit,
         )
 
@@ -547,6 +544,9 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
             "encode_batch_size": int(self.encode_batch_size),
+            "preload_workers": int(self.preload_workers),
+            "prefetch_factor": int(self.prefetch_factor),
+            "pin_memory": bool(self.pin_memory),
             "feature_source": self.feature_source,
             "save_ckpt_dir": self.save_ckpt_dir,
         }

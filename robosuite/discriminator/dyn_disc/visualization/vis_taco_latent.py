@@ -23,7 +23,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 from benchmark.core import BenchmarkTrajectory
 from robosuite.discriminator.dyn_disc.adapters.single_bank import DynBenchmarkDiscriminator
@@ -55,6 +54,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-to-view", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--encode-batch-size", type=int, default=32)
+    parser.add_argument("--preload-workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=1)
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--tsne-max-points", type=int, default=20000)
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
@@ -77,19 +83,24 @@ def _parse_camera_to_view(value: Optional[str]) -> Optional[dict[str, str]]:
 
 
 def _first_gt_failure_frame(traj: BenchmarkTrajectory) -> Optional[int]:
+    first = traj.first_gt_failure_frame()
+    if first is not None:
+        return int(first)
     mask = traj.load_failure_mask()
     if mask is not None:
         positive = np.flatnonzero(np.asarray(mask).reshape(-1) > 0)
         if positive.size:
             return int(positive[0])
-    first = traj.first_gt_failure_frame()
-    return None if first is None else int(first)
+    return None
 
 
-def _phase_labels(traj: BenchmarkTrajectory, n_frames: int) -> list[str]:
+def _phase_labels(
+    traj: BenchmarkTrajectory,
+    n_frames: int,
+    first_gt: Optional[int] = None,
+) -> list[str]:
     if not bool(traj.is_failure):
         return [PHASE_SUCCESS] * n_frames
-    first_gt = _first_gt_failure_frame(traj)
     if first_gt is None:
         first_gt = n_frames
     return [
@@ -102,55 +113,50 @@ def _collect_latents(
     discriminator: DynBenchmarkDiscriminator,
     trajectories: list[BenchmarkTrajectory],
 ) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict]]:
-    prepared = []
-    with tqdm(total=len(trajectories) * 2, desc="preload", unit="traj") as bar:
-        for traj in trajectories:
-            prepared.append(discriminator.preload_trajectory(traj))
-            bar.update()
+    encoded = discriminator.preencode_trajectories(
+        trajectories,
+        desc="load+encode",
+    )
+    features: list[np.ndarray] = []
+    tasks: list[str] = []
+    video_ids: list[str] = []
+    frame_indices: list[int] = []
+    is_failure: list[bool] = []
+    phases: list[str] = []
+    metadata: list[dict] = []
 
-        bar.set_description("encode")
-        features: list[np.ndarray] = []
-        tasks: list[str] = []
-        video_ids: list[str] = []
-        frame_indices: list[int] = []
-        is_failure: list[bool] = []
-        phases: list[str] = []
-        metadata: list[dict] = []
-
-        for traj_idx, (traj, tensors) in enumerate(zip(trajectories, prepared)):
-            feat = (
-                discriminator.encode_preloaded(traj, tensors)
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float32, copy=False)
-            )
-            n_frames = min(int(feat.shape[0]), int(traj.num_frames), int(tensors["t_len"]))
-            if n_frames <= 0:
-                bar.update()
-                continue
-            feat = feat[:n_frames]
-            phase = _phase_labels(traj, n_frames)
-            first_gt = _first_gt_failure_frame(traj) if bool(traj.is_failure) else None
-            features.append(feat)
-            tasks.extend([str(traj.task_name)] * n_frames)
-            video_ids.extend([str(traj.video_id)] * n_frames)
-            frame_indices.extend(range(n_frames))
-            is_failure.extend([bool(traj.is_failure)] * n_frames)
-            phases.extend(phase)
-            metadata.append(
-                {
-                    "trajectory_index": traj_idx,
-                    "task_name": str(traj.task_name),
-                    "video_id": str(traj.video_id),
-                    "is_failure": bool(traj.is_failure),
-                    "num_encoded_frames": n_frames,
-                    "num_frames": int(traj.num_frames),
-                    "first_gt_failure_frame": first_gt,
-                    "failure_segments": list(traj.failure_segments),
-                }
-            )
-            bar.update()
+    for traj_idx, (traj, feat_tensor) in enumerate(zip(trajectories, encoded)):
+        feat = (
+            feat_tensor
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        n_frames = min(int(feat.shape[0]), int(traj.num_frames))
+        if n_frames <= 0:
+            continue
+        feat = feat[:n_frames]
+        first_gt = _first_gt_failure_frame(traj) if bool(traj.is_failure) else None
+        phase = _phase_labels(traj, n_frames, first_gt=first_gt)
+        features.append(feat)
+        tasks.extend([str(traj.task_name)] * n_frames)
+        video_ids.extend([str(traj.video_id)] * n_frames)
+        frame_indices.extend(range(n_frames))
+        is_failure.extend([bool(traj.is_failure)] * n_frames)
+        phases.extend(phase)
+        metadata.append(
+            {
+                "trajectory_index": traj_idx,
+                "task_name": str(traj.task_name),
+                "video_id": str(traj.video_id),
+                "is_failure": bool(traj.is_failure),
+                "num_encoded_frames": n_frames,
+                "num_frames": int(traj.num_frames),
+                "first_gt_failure_frame": first_gt,
+                "failure_segments": list(traj.failure_segments),
+            }
+        )
 
     if not features:
         raise RuntimeError("No latent features were encoded.")
@@ -244,6 +250,9 @@ def main() -> None:
         model_ckpt=str(args.model_ckpt),
         device=str(args.device),
         encode_batch_size=int(args.encode_batch_size),
+        preload_workers=int(args.preload_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        pin_memory=bool(args.pin_memory),
         proprio_indices=list(args.proprio_indices) if args.proprio_indices else None,
         camera_to_view=_parse_camera_to_view(args.camera_to_view),
     )
@@ -300,6 +309,9 @@ def main() -> None:
         "model_ckpt": str(args.model_ckpt),
         "feature_source": "encoder",
         "encode_batch_size": int(args.encode_batch_size),
+        "preload_workers": int(args.preload_workers),
+        "prefetch_factor": int(args.prefetch_factor),
+        "pin_memory": bool(args.pin_memory),
         "single_infer_mean_s": float(np.mean(measured_times)) if measured_times else None,
         "num_batch_infers": len(infer_times),
         "outputs": {

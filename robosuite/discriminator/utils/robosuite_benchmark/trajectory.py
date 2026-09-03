@@ -22,6 +22,38 @@ class RobosuiteBenchmarkTrajectory(BenchmarkTrajectory):
     def _demo_group(self, handle: h5py.File):
         return handle[self.demo_path]
 
+    def load_model_inputs(
+        self,
+        cameras: Sequence[str],
+        *,
+        frame_end: Optional[int] = None,
+        action_frame_end: Optional[int] = None,
+    ) -> dict[str, object]:
+        """Load encoder inputs with one HDF5 open and optional prefix slicing."""
+        req = tuple(cameras)
+        missing = [c for c in req if c not in self.available_cameras]
+        if missing:
+            raise KeyError(
+                f"cameras {missing} not available for {self.video_id}; "
+                f"available: {self.available_cameras}"
+            )
+
+        frame_slice = slice(None, None if frame_end is None else int(frame_end))
+        action_slice = slice(
+            None,
+            None if action_frame_end is None else int(action_frame_end),
+        )
+        with h5py.File(self.file_path, "r") as f:
+            group = self._demo_group(f)
+            observations = group["observations"]
+            images = {
+                camera: observations[camera]["images"][frame_slice]
+                for camera in req
+            }
+            states = group["states"][frame_slice]
+            actions = group["actions"][action_slice]
+        return {"images": images, "states": states, "actions": actions}
+
     def load_images(
         self,
         cameras: Optional[Sequence[str]] = None,

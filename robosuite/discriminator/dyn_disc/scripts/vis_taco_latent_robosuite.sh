@@ -6,14 +6,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "${REPO_ROOT}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES=1
 
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
-MODEL_CKPT="${MODEL_CKPT:-}"
-TASK="${TASK:-NutAssemblyRound}"
+MODEL_CKPT="${MODEL_CKPT:-checkpoints/dyn_disc/ablations/TACO/taco_robosuite-20260903_172611/checkpoint/model_50.pth}"
+TASK="${TASK:-Stack}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/checkpoints/dyn_disc/ablations/TACO/visualizations/latent/${TASK}-${TIMESTAMP}}"
 PYTHON_BIN="${PYTHON_BIN:-/home/dodo/miniconda3/envs/dagger/bin/python}"
+PRELOAD_WORKERS="${PRELOAD_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
+PIN_MEMORY="${PIN_MEMORY:-1}"
 
 if [[ -z "${MODEL_CKPT}" || ! -f "${MODEL_CKPT}" ]]; then
     echo "[dyn_disc][latent][taco] ERROR: set MODEL_CKPT to a TACO model checkpoint." >&2
@@ -23,6 +26,16 @@ fi
 mkdir -p "${OUT_DIR}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${OUT_DIR}/.matplotlib}"
 mkdir -p "${MPLCONFIGDIR}"
+
+LOADER_ARGS=(
+    --preload-workers "${PRELOAD_WORKERS}"
+    --prefetch-factor "${PREFETCH_FACTOR}"
+)
+if [[ "${PIN_MEMORY}" == "1" ]]; then
+    LOADER_ARGS+=(--pin-memory)
+else
+    LOADER_ARGS+=(--no-pin-memory)
+fi
 
 "${PYTHON_BIN}" -m robosuite.discriminator.dyn_disc.visualization.vis_taco_latent \
     --model-ckpt "${MODEL_CKPT}" \
@@ -36,6 +49,7 @@ mkdir -p "${MPLCONFIGDIR}"
     --device cuda \
     --encode-batch-size "${ENCODE_BATCH_SIZE:-32}" \
     --seed "${SEED:-0}" \
+    "${LOADER_ARGS[@]}" \
     "$@"
 
 echo "[dyn_disc][latent][taco] wrote to ${OUT_DIR}"
