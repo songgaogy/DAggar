@@ -1,4 +1,4 @@
-"""Non-negative PU (nnPU) failure discriminator on the frozen dynamics latent.
+"""Non-negative PU (nnPU) failure discriminator on the frozen RPT latent.
 
 This is the **no-GT-failure-timing** sibling of the GT-split BCE head. Instead of
 slicing each failure trajectory at ``first_gt_failure_frame()`` into a clean
@@ -52,7 +52,15 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from .single_bank_knn import DetectionResult
+
+
+@dataclass
+class DetectionResult:
+    """Per-frame discriminator output."""
+
+    step_scores: np.ndarray
+    thresholds: np.ndarray
+    preds: np.ndarray
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +222,14 @@ class PUBCEDiscriminator:
         self.in_dim = int(in_dim)
         self.hidden = int(hidden)
         self.num_layers = int(num_layers)
-        self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+        requested_device = torch.device(device)
+        if requested_device.type != "cuda":
+            raise ValueError(
+                f"PUBCEDiscriminator is CUDA-only; got device={device!r}"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for nnPU training and scoring")
+        self.device = requested_device
 
         self.head: BCEHead = BCEHead(in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers).to(self.device)
         self.thresholds: Dict[str, float] = {}
@@ -356,14 +371,13 @@ class PUBCEDiscriminator:
             batch_size=int(batch_size),
             sampler=sampler,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=not Z.is_cuda,
             drop_last=True,
         )
 
         # ------- deterministic head init + optim & schedule ----------
         torch.manual_seed(int(seed))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(seed))
+        torch.cuda.manual_seed_all(int(seed))
         self.head = BCEHead(
             in_dim=self.in_dim, hidden=self.hidden, num_layers=self.num_layers,
         ).to(self.device)

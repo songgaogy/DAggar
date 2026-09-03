@@ -1,0 +1,35 @@
+# RPT masked sensorimotor pretraining on the unchanged robosuite success data.
+defaults:
+  - train
+  - _self_
+
+run_name: rpt_robosuite
+
+env:
+  train_data_path:
+    - data/NutAssemblyRound/success_rollout
+    - data/NutAssemblySquare/success_rollout
+    - data/PickPlaceBread/success_rollout
+    - data/PickPlaceCan/success_rollout
+    - data/PickPlaceCereal/success_rollout
+    - data/PickPlaceMilk/success_rollout
+    - data/Stack/success_rollout
+  val_data_path: ${env.train_data_path}
+
+max_trajectories: 100
+proprio_map:
+  NutAssemblyRound:
+    indices: ${proprio.NutAssemblyRound.indices}
+  NutAssemblySquare:
+    indices: ${proprio.NutAssemblySquare.indices}
+  Stack:
+    indices: ${proprio.Stack.indices}
+  PickPlaceBread:
+    indices: ${proprio.PickPlaceBread.indices}
+  PickPlaceCan:
+    indices: ${proprio.PickPlaceCan.indices}
+  PickPlaceCereal:
+    indices: ${proprio.PickPlaceCereal.indices}
+  PickPlaceMilk:
+    indices: ${proprio.PickPlaceMilk.indices}
+

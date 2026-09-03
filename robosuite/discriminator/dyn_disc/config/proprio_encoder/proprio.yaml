@@ -1,3 +1,0 @@
-_target_: robosuite.discriminator.dyn_disc.models.proprio.ProprioceptiveEmbedding
-num_frames: 1
-tubelet_size: 1

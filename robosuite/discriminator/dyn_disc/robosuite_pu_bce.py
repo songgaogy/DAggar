@@ -63,20 +63,13 @@ def _parse_args() -> argparse.Namespace:
                              "--train-max-fail-per-task when those are omitted.")
 
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--encode-batch-size", type=int, default=32)
+    parser.add_argument("--encode-batch-size", type=int, default=128)
     parser.add_argument("--proprio-indices", type=int, nargs="*", default=None)
     parser.add_argument("--camera-to-view", type=str, default=None)
 
-    parser.add_argument("--visual-weight", type=float, default=1.0)
-    parser.add_argument("--proprio-weight", type=float, default=2.0)
-    parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=10.0,
                         help="False-alarm budget %% for success_percentile calib: "
                              "tau = percentile(success-calib failure scores, 100 - delta).")
-    parser.add_argument("--knn-chunk-size", type=int, default=2048)
-    parser.add_argument("--knn-feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--knn-transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--quiet-fit", action="store_true")
@@ -312,13 +305,7 @@ def main() -> None:
         encode_batch_size=int(args.encode_batch_size),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
         camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        action_weight=float(args.action_weight),
         delta=float(args.delta),
-        knn_chunk_size=int(args.knn_chunk_size),
-        feature_source=str(args.knn_feature_source),
-        transformer_layer=int(args.knn_transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),
@@ -347,6 +334,9 @@ def main() -> None:
             result.save_json(args.save_json)
             manifest_path = os.path.join(out_dir, "unlabeled_pool_manifest.json")
             manifest = {
+                "pretraining_method": "rpt",
+                "feature_source": "rpt_action_token",
+                "representation_fingerprint": discriminator.representation_fingerprint,
                 "labeling": "pu_no_gt_timing",
                 "loss": "nnpu",
                 "loss_surrogate": str(args.loss_surrogate),
@@ -370,8 +360,6 @@ def main() -> None:
                 "batch_size": int(args.batch_size),
                 "head_hidden": int(args.head_hidden),
                 "head_layers": int(args.head_layers),
-                "knn_feature_source": str(args.knn_feature_source),
-                "knn_transformer_layer": int(args.knn_transformer_layer),
             }
             with open(manifest_path, "w") as fh:
                 json.dump(manifest, fh, indent=2, sort_keys=True)

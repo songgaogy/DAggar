@@ -1,7 +1,7 @@
-"""Benchmark adapter for the nnPU (PU-BCE) failure discriminator.
+"""Benchmark adapter for the nnPU (PU-BCE) failure discriminator over RPT.
 
-Sits on top of :class:`DynBenchmarkDiscriminator` so all the DINOv3 dynamics
-encoding + trajectory feature cache is reused unchanged. Replaces any per-task
+Sits on top of :class:`DynBenchmarkDiscriminator` so RPT action-token encoding
+and the trajectory feature cache are shared. Replaces any per-task
 scorer with a single shared :class:`PUBCEDiscriminator` trained with the
 non-negative PU risk on (positives = pre-done success frames, unlabeled = WHOLE
 failure trajectories), plus per-task success_percentile thresholds.
@@ -82,18 +82,12 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         nn_correction: bool = True,
         beta: float = 0.0,
         save_ckpt_dir: Optional[str] = None,
-        # forwarded to the shared parent for encoding / cache parity
+        # RPT encoding and cache settings.
         device: str = "cuda",
-        encode_batch_size: int = 32,
+        encode_batch_size: int = 128,
         proprio_indices: Optional[Sequence[int]] = None,
         camera_to_view: Optional[Dict[str, str]] = None,
-        visual_weight: float = 1.0,
-        proprio_weight: float = 2.0,
-        action_weight: float = 1.0,
         delta: float = 10.0,
-        knn_chunk_size: int = 2048,
-        feature_source: str = "transformer",
-        transformer_layer: int = 1,
         calib_fraction: float = 0.2,
         seed: int = 0,
         verbose_fit: bool = True,
@@ -104,13 +98,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             encode_batch_size=encode_batch_size,
             proprio_indices=proprio_indices,
             camera_to_view=camera_to_view,
-            visual_weight=visual_weight,
-            proprio_weight=proprio_weight,
-            action_weight=action_weight,
             delta=delta,
-            knn_chunk_size=knn_chunk_size,
-            feature_source=feature_source,
-            transformer_layer=transformer_layer,
             calib_fraction=calib_fraction,
             seed=seed,
             verbose_fit=verbose_fit,
@@ -224,13 +212,14 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         out_dir = Path(self.save_ckpt_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         payload = {
+            "pretraining_method": "rpt",
+            "representation_fingerprint": self.representation_fingerprint,
             "epoch": int(self.epochs),
             "in_dim": int(self._shared_detector.in_dim),
             "hidden": int(self._shared_detector.hidden),
             "num_layers": int(self._shared_detector.num_layers),
             "pu_bce_detector": self._shared_detector.state_dict(),
-            "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
+            "feature_source": "rpt_action_token",
             "model_ckpt": str(self.model_ckpt),
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
@@ -243,6 +232,46 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
         fp = out_dir / "pu_bce_head.pth"
         torch.save(payload, fp)
         return fp
+
+    def load_head_checkpoint(self, checkpoint_path: str | Path) -> None:
+        """Restore a fitted nnPU head after validating its RPT representation."""
+        payload = torch.load(
+            Path(checkpoint_path), map_location="cpu", weights_only=False
+        )
+        if payload.get("pretraining_method") != "rpt":
+            raise ValueError("nnPU checkpoint is not marked pretraining_method='rpt'")
+        stored_fingerprint = payload.get("representation_fingerprint")
+        if stored_fingerprint != self.representation_fingerprint:
+            raise ValueError(
+                "nnPU/RPT checkpoint mismatch: representation_fingerprint differs "
+                f"({stored_fingerprint!r} != {self.representation_fingerprint!r})"
+            )
+        detector = PUBCEDiscriminator(
+            in_dim=int(payload["in_dim"]),
+            hidden=int(payload["hidden"]),
+            num_layers=int(payload["num_layers"]),
+            device=self.device,
+        )
+        detector.load_state_dict(payload["pu_bce_detector"])
+        if not detector.thresholds:
+            raise ValueError("nnPU checkpoint has no calibrated task thresholds")
+        self._shared_detector = detector
+        self._detectors_per_task = {
+            task: detector for task in detector.thresholds
+        }
+        self._global_stats = {
+            "feat_dim": int(payload["in_dim"]),
+            "epochs": int(payload.get("epoch", 0)),
+            "head_hidden": int(payload["hidden"]),
+            "head_layers": int(payload["num_layers"]),
+            "feature_source": "rpt_action_token",
+            "pretraining_method": "rpt",
+            "representation_fingerprint": self.representation_fingerprint,
+            "pi_p": payload.get("pi_p"),
+            "loss_surrogate": payload.get("loss_surrogate"),
+            "nn_correction": payload.get("nn_correction"),
+            "loaded_from_ckpt": str(checkpoint_path),
+        }
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #
@@ -396,7 +425,7 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
                 f"Np(success train)={n_p} Nu(unlabeled fail whole)={n_u} N_calib={n_c} "
                 f"pi_p={self.pi_p} surrogate={self.loss_surrogate} "
                 f"nn_correction={self.nn_correction} "
-                f"feature_source={self.feature_source} layer={self.transformer_layer}",
+                "feature_source=rpt_action_token",
                 flush=True,
             )
 
@@ -446,8 +475,9 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "nn_correction": bool(self.nn_correction),
             "beta": float(self.beta),
             "seed": int(self.seed),
-            "feature_source": str(self.feature_source),
-            "transformer_layer": int(self.transformer_layer),
+            "feature_source": "rpt_action_token",
+            "pretraining_method": "rpt",
+            "representation_fingerprint": self.representation_fingerprint,
             "num_unlabeled_fail_trajectories": int(len(self.unlabeled_fail_trajectories)),
             "train_history": list(self._shared_detector._train_history),
         }
@@ -528,8 +558,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "thresholds": thresholds,
             "step_scores_raw": step_scores,
             "feature_len": int(feat.shape[0]),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
+            "feature_source": "rpt_action_token",
+            "representation_fingerprint": self.representation_fingerprint,
             "view_names": list(self.encoder.view_names),
         }
         if not bool(trajectory.is_failure):
@@ -554,7 +584,8 @@ class PUBCEBenchmarkDiscriminator(DynBenchmarkDiscriminator):
             "pi_p": float(self.pi_p),
             "loss_surrogate": str(self.loss_surrogate),
             "encode_batch_size": int(self.encode_batch_size),
-            "feature_source": self.feature_source,
-            "transformer_layer": int(self.transformer_layer),
+            "feature_source": "rpt_action_token",
+            "pretraining_method": "rpt",
+            "representation_fingerprint": self.representation_fingerprint,
             "save_ckpt_dir": self.save_ckpt_dir,
         }

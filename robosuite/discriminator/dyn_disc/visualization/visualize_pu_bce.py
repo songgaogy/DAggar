@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
-import torch
 
 if "MPLCONFIGDIR" not in os.environ:
     os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib-dyn-disc"
@@ -48,7 +47,6 @@ from PIL import Image, ImageDraw, ImageFont
 from benchmark.core import BenchmarkTrajectory
 
 from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
-from robosuite.discriminator.dyn_disc.detectors.pu_bce import PUBCEDiscriminator
 
 
 # ---------------------------------------------------------------------- #
@@ -327,8 +325,7 @@ class PUBCEVisualizer:
                 f"model_ckpt: {summary.get('model_ckpt', 'n/a')}",
                 f"view_names: {summary.get('view_names', 'n/a')}",
                 f"camera_to_view: {summary.get('camera_to_view', 'n/a')}",
-                f"feature_source: {summary.get('feature_source', 'n/a')}  "
-                f"transformer_layer: {summary.get('transformer_layer', 'n/a')}",
+                f"feature_source: {summary.get('feature_source', 'rpt_action_token')}",
                 f"delta (FA budget %): {summary.get('delta', 'n/a')}  "
                 f"calib_fraction: {summary.get('calib_fraction', 'n/a')}",
                 f"calib_mode: {summary.get('calib_mode', 'success_percentile')}",
@@ -625,35 +622,10 @@ def _build_benchmark_and_pool(args: argparse.Namespace):
 
 
 def _bootstrap_from_ckpt(disc: PUBCEBenchmarkDiscriminator, ckpt_path: str) -> None:
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state = payload["pu_bce_detector"]
-    detector = PUBCEDiscriminator(
-        in_dim=int(payload["in_dim"]),
-        hidden=int(payload["hidden"]),
-        num_layers=int(payload["num_layers"]),
-        device=str(disc.device),
-    )
-    detector.load_state_dict(state)
-    if not detector.thresholds:
-        raise RuntimeError(
-            f"PU-BCE checkpoint at {ckpt_path} has no per-task thresholds; cannot score."
-        )
-
-    disc._shared_detector = detector
-    disc._detectors_per_task = {task: detector for task in detector.thresholds}
-    disc._global_stats = {
-        "feat_dim": int(payload["in_dim"]),
-        "epochs": int(payload.get("epoch", 0)),
-        "head_hidden": int(payload["hidden"]),
-        "head_layers": int(payload["num_layers"]),
-        "feature_source": str(payload.get("feature_source", disc.feature_source)),
-        "transformer_layer": int(payload.get("transformer_layer", disc.transformer_layer)),
-        "pi_p": payload.get("pi_p"),
-        "loss_surrogate": payload.get("loss_surrogate"),
-        "nn_correction": payload.get("nn_correction"),
-        "num_unlabeled_fail_trajectories": len(payload.get("unlabeled_fail_video_ids", []) or []),
-        "loaded_from_ckpt": str(ckpt_path),
-    }
+    disc.load_head_checkpoint(ckpt_path)
+    detector = disc._shared_detector
+    if detector is None:
+        raise RuntimeError(f"Failed to restore nnPU head from {ckpt_path}.")
     disc._calibration_stats = {}
     for task, tau in detector.thresholds.items():
         cs = detector.calib_stats.get(task)
@@ -688,7 +660,7 @@ def _parse_args() -> argparse.Namespace:
         choices=["success_rollout", "fail_rollout", "both"],
         help="Eval pool to visualize: fail_rollout, success_rollout, or both.",
     )
-    parser.add_argument("--model-ckpt", required=True, help="dyn_disc dynamics checkpoint .pth")
+    parser.add_argument("--model-ckpt", required=True, help="RPT representation checkpoint .pth")
     parser.add_argument("--data-root", type=str, default="data",
                         help="Robosuite data root containing data/<task>/<split> directories.")
     parser.add_argument("--fail-split", type=str, default="fail_rollout-val-labeled")
@@ -712,13 +684,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--encode-batch-size", type=int, default=32)
     parser.add_argument("--camera-to-view", type=str, default=None)
     parser.add_argument("--camera-name", type=str, default="agentview")
-    parser.add_argument("--visual-weight", type=float, default=1.0)
-    parser.add_argument("--proprio-weight", type=float, default=2.0)
-    parser.add_argument("--action-weight", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=10.0)
-    parser.add_argument("--feature-source", type=str, default="transformer",
-                        choices=["encoder", "transformer"])
-    parser.add_argument("--transformer-layer", type=int, default=1)
     parser.add_argument("--calib-fraction", type=float, default=0.2)
     parser.add_argument("--quiet-fit", action="store_true")
 
@@ -749,7 +715,28 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    bench, trajs, unlabeled_trajs = _build_benchmark_and_pool(args)
+    if args.load_ckpt:
+        from robosuite.discriminator.utils.robosuite_benchmark import FailureBenchmark
+
+        bench = FailureBenchmark(
+            data_root=args.data_root,
+            tasks=[str(args.task)],
+            fail_split=args.fail_split,
+            success_split=args.success_split,
+            max_fail_per_task=args.max_fail_per_task,
+            max_success_per_task=args.max_success_per_task,
+        )
+        trajs = bench.trajectories()
+        if not trajs:
+            raise RuntimeError(f"No trajectories discovered for task {args.task!r}.")
+        unlabeled_trajs = []
+        print(
+            f"[pu_bce][viz] load-only mode: discovered {len(trajs)} eval trajectories; "
+            "skipping unlabeled-pool discovery.",
+            flush=True,
+        )
+    else:
+        bench, trajs, unlabeled_trajs = _build_benchmark_and_pool(args)
     sampled = _sample_trajectories_for_viz(
         trajs,
         task=str(args.task),
@@ -777,12 +764,7 @@ def main() -> None:
         encode_batch_size=int(args.encode_batch_size),
         proprio_indices=(list(args.proprio_indices) if args.proprio_indices else None),
         camera_to_view=_parse_camera_to_view(args.camera_to_view),
-        visual_weight=float(args.visual_weight),
-        proprio_weight=float(args.proprio_weight),
-        action_weight=float(args.action_weight),
         delta=float(args.delta),
-        feature_source=str(args.feature_source),
-        transformer_layer=int(args.transformer_layer),
         calib_fraction=float(args.calib_fraction),
         seed=int(args.seed),
         verbose_fit=not bool(args.quiet_fit),

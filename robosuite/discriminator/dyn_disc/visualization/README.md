@@ -1,82 +1,64 @@
-# dyn_disc Per-Trajectory Visualization
+# RPT and nnPU Visualizations
 
-Context and design notes for the discriminator visualization tool under
-`dyn_disc/visualization/`. The dyn_disc top-level `../README.md` documents
-user-facing invocation; this file captures the design rationale, interfaces, and
-caveats so future edits can stay coherent.
+This directory contains two robosuite-only visualization entry points.
 
-## What lives here
-
-| File | Purpose |
+| Module | Outputs |
 | --- | --- |
-| `visualize_pu_bce.py` | nnPU (PU-BCE) discriminator visualization (`PUBCEVisualizer`). Robosuite only. Driven by `scripts/visualize_pu_bce_robosuite.sh`. |
+| `visualize_pu_bce.py` | nnPU score MP4s plus a multi-page PDF |
+| `visualize_rpt_latents.py` | PCA/t-SNE PNGs, raw NPZ data, and metadata JSON |
 
-It produces these artifacts per run:
+## nnPU video visualization
 
-```text
-<out_dir>/
-  videos/<video_id>.mp4        # per-frame HUD + red border on predicted-failure frames
-  <pdf-name>.pdf               # 1 summary page + 1 page per sampled trajectory
-  checkpoints/pu_bce_head.pth  # only on cold fit (absent under --load-ckpt)
-```
+`PUBCEVisualizer` calls the benchmark adapter's public
+`score_trajectory()` interface. Each video contains the failure score
+`-g(z)`, the calibrated per-task threshold, and a red frame border when the
+detector fires. The PDF includes calibration metadata and one score curve per
+trajectory.
 
-## PU-BCE visualization — design
+`--load-ckpt` is the standard visualization path. It loads the saved nnPU head
+and thresholds, verifies `pretraining_method=rpt`, and checks that the head's
+`representation_fingerprint` equals the loaded RPT checkpoint fingerprint.
+This path only builds the evaluation benchmark and deliberately skips
+unlabeled-pool discovery. Cold fit remains available for debugging and uses the
+same whole-trajectory U semantics as nnPU training.
 
-### Discriminator construction is shared with the runner
+Frames are vertically flipped by default to retain the existing visualization
+convention. Use `--no-flip-vertical` or launcher environment variable
+`NO_FLIP_VERTICAL=1` to disable it.
 
-`PUBCEBenchmarkDiscriminator` inherits from `DynBenchmarkDiscriminator`, so its
-`score_trajectory()` returns a `DiscriminatorOutput(step_scores, predictions,
-aux)` identical in structure to any other head. Construction needs
-`unlabeled_fail_trajectories` (the WHOLE failure pool — **no GT timing**) plus
-the nnPU + head hyperparameters (`pi_p`, `loss_surrogate`, `nn_correction`,
-`head_hidden`, ...).
-
-Score semantics: `step_scores = -g(z)` (negative head logit, higher = more
-failure-like). HUD text is `failure_score=-g(z)=...`.
-
-The unlabeled-pool discovery / disjointness logic in
-`visualize_pu_bce.py::_build_benchmark_and_pool` mirrors the runner
-(`robosuite_pu_bce.py`): pull failure trajectories from `--fail-train-split`,
-filter eval `video_id`s out for defence-in-depth, and use each failure
-trajectory as a whole.
-
-### Cold fit vs. `--load-ckpt`
-
-Default behaviour calls `discriminator.fit_on_benchmark(eval_trajs)`, identical
-to the benchmark runner; the trained head is saved to
-`<out-dir>/checkpoints/pu_bce_head.pth`.
-
-`--load-ckpt /path/to/pu_bce_head.pth` restores via `_bootstrap_from_ckpt(...)`:
-unpacks `in_dim/hidden/num_layers`, head state dict, per-task thresholds,
-calibration stats, then aliases the loaded detector into `disc._shared_detector`
-and `disc._detectors_per_task[task]`. Skipping fit also skips pool discovery;
-the discriminator is constructed with `unlabeled_fail_trajectories=[]`. The
-disjointness invariant only runs inside `fit_on_benchmark`, so this is safe.
-
-### Threshold: success_percentile only
-
-The visualizer uses the detector's own per-task **success_percentile**
-threshold: `tau = percentile(success-calib failure scores, 100 - delta)`. There
-is no two-class Youden option in this branch — that rule needs failure labels,
-which the PU formulation deliberately does not consume. To move the operating
-point, change `--delta` and re-fit.
-
-### Video orientation
-
-Frames are flipped along the vertical axis by default (`canvas[:, ::-1, :, :]`)
-to match the in-training image convention. Set `NO_FLIP_VERTICAL=1` if a future
-dataset stores frames in the rendered orientation.
-
-## File map
+Output layout:
 
 ```text
-visualize_pu_bce.py
-├── argparse                     # encoder + nnPU knobs (robosuite-only)
-├── _build_benchmark_and_pool    # benchmark factory + disjoint unlabeled pool
-├── _bootstrap_from_ckpt         # restore fitted head without fit_on_benchmark
-├── PUBCEVisualizer
-│   ├── _score_trajectory        # uses PUBCEBenchmarkDiscriminator.score_trajectory()
-│   ├── render_video             # ffmpeg/libx264 writer + HUD + border
-│   └── render_pdf               # PdfPages: summary + per-trajectory panel
-└── main                         # cold-fit OR --load-ckpt → sample → render
+<out-dir>/
+  videos/[fail_rollout|success_rollout]/<video-id>.mp4
+  pu_bce_scores.pdf
 ```
+
+## RPT latent visualization
+
+`visualize_rpt_latents.py` uses
+`DynBenchmarkDiscriminator.preload_trajectory()` and
+`encode_preloaded()` so plots use exactly the same causal RPT action-token
+features as nnPU. It samples success and labeled failure evaluation
+trajectories, then labels frames as:
+
+- `success`
+- `failure-before-GT`
+- `failure-after-GT`
+
+The GT mask is used only for plot coloring. Encoding is CUDA-only; PCA and
+t-SNE run in scikit-learn after features have been copied to NumPy.
+
+Output layout:
+
+```text
+<out-dir>/
+  pca.png
+  tsne.png
+  rpt_latents.npz
+  metadata.json
+```
+
+The NPZ stores the 192-D features, integer labels and names, both embeddings,
+video IDs, and frame indices. `--max-points` deterministically subsamples before
+PCA/t-SNE to bound runtime and memory.

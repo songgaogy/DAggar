@@ -7,6 +7,7 @@ Run with:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List
 
 import numpy as np
@@ -20,14 +21,19 @@ from robosuite.discriminator.dyn_disc.detectors.pu_bce import (
 )
 
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="nnPU tensor tests require CUDA"
+)
+
+
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
 
 
 def _gaussian(n: int, dim: int, mean: float, std: float, seed: int) -> torch.Tensor:
-    g = torch.Generator(device="cpu").manual_seed(int(seed))
-    return torch.randn((n, dim), generator=g, dtype=torch.float32) * std + mean
+    g = torch.Generator(device="cuda").manual_seed(int(seed))
+    return torch.randn((n, dim), generator=g, dtype=torch.float32, device="cuda") * std + mean
 
 
 def _auroc(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -60,8 +66,8 @@ class _StubTraj:
 
 
 def test_head_shapes() -> None:
-    head = BCEHead(in_dim=32, hidden=16, num_layers=2)
-    z = torch.randn(8, 32)
+    head = BCEHead(in_dim=32, hidden=16, num_layers=2).cuda()
+    z = torch.randn(8, 32, device="cuda")
     g = head(z)
     assert g.shape == (8,)
 
@@ -80,11 +86,11 @@ def test_nnpu_correction_triggers_and_clamps() -> None:
     With nn_correction the reported `neg_risk_used` is clamped to >= -beta and
     differs from the raw `neg_risk`; uPU (no correction) leaves it negative.
     """
-    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
     # Positives extremely positive => ell(-1,g_p)=sigmoid(g_p) ~ 1 => big subtracted term.
-    g_p = torch.full((64,), 8.0)
+    g_p = torch.full((64,), 8.0, device="cuda")
     # Unlabeled extremely negative => ell(-1,g_u)=sigmoid(g_u) ~ 0.
-    g_u = torch.full((64,), -8.0)
+    g_u = torch.full((64,), -8.0, device="cuda")
     pi = 0.5
 
     parts_nn = pu_risk(g_p, g_u, pi_p=pi, surrogate="sigmoid", nn_correction=True, beta=0.0)
@@ -103,8 +109,8 @@ def test_nnpu_correction_triggers_and_clamps() -> None:
 
 def test_nnpu_correction_inactive_when_positive() -> None:
     """When neg_risk >= -beta the correction is a no-op (used == raw)."""
-    g_p = torch.full((32,), -2.0)  # ell(-1,g_p)=sigmoid(g_p) small => subtracted term small
-    g_u = torch.full((32,), 2.0)   # ell(-1,g_u)=sigmoid(g_u) large => neg_risk positive
+    g_p = torch.full((32,), -2.0, device="cuda")  # ell(-1,g_p)=sigmoid(g_p) small
+    g_u = torch.full((32,), 2.0, device="cuda")   # ell(-1,g_u)=sigmoid(g_u) large
     parts = pu_risk(g_p, g_u, pi_p=0.5, surrogate="sigmoid", nn_correction=True, beta=0.0)
     assert float(parts["neg_risk"]) > 0.0
     assert float(parts["neg_risk_used"]) == pytest.approx(float(parts["neg_risk"]), abs=1e-6)
@@ -136,7 +142,7 @@ def test_pu_synthetic_separability() -> None:
 
     Z_calib = _gaussian(200, in_dim, mean=+1.5, std=0.6, seed=4)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=32, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=32, num_layers=2, device="cuda")
     thresholds = det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -180,7 +186,7 @@ def test_pu_threshold_determinism() -> None:
     Z_calib = _gaussian(80, in_dim, mean=+1.0, std=0.5, seed=13)
 
     def _run() -> float:
-        det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+        det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
         thr = det.fit(
             positive_features=[Z_p],
             unlabeled_features=[Z_u],
@@ -214,7 +220,7 @@ def test_score_emits_detection_result() -> None:
     ], dim=0)
     Z_calib = _gaussian(40, in_dim, mean=+1.0, std=0.5, seed=23)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -245,7 +251,7 @@ def test_invalid_prior_raises() -> None:
     Z_p = _gaussian(40, in_dim, mean=+1.0, std=0.5, seed=70)
     Z_u = _gaussian(40, in_dim, mean=0.0, std=0.5, seed=71)
     Z_calib = _gaussian(20, in_dim, mean=+1.0, std=0.5, seed=72)
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=8, num_layers=1, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=8, num_layers=1, device="cuda")
     for bad in (0.0, 1.0, -0.1, 1.5):
         with pytest.raises(ValueError):
             det.fit(
@@ -267,18 +273,21 @@ def test_invalid_prior_raises() -> None:
 def test_assert_disjoint_raises_on_overlap() -> None:
     from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
 
-    eval_trajs = [_StubTraj(video_id="v1"), _StubTraj(video_id="v2")]
+    eval_trajs = [
+        _StubTraj(video_id="v1", is_failure=True),
+        _StubTraj(video_id="v2", is_failure=True),
+    ]
     unlabeled = [_StubTraj(video_id="v3", is_failure=True), _StubTraj(video_id="v1", is_failure=True)]
 
     with pytest.raises(RuntimeError) as excinfo:
-        PUBCEBenchmarkDiscriminator._assert_disjoint(
+        PUBCEBenchmarkDiscriminator._assert_disjoint_unlabeled_eval_fail(
             eval_trajs=eval_trajs,
             unlabeled_fail_trajs=unlabeled,
         )
     assert "v1" in str(excinfo.value)
 
     # No overlap -> should not raise.
-    PUBCEBenchmarkDiscriminator._assert_disjoint(
+    PUBCEBenchmarkDiscriminator._assert_disjoint_unlabeled_eval_fail(
         eval_trajs=eval_trajs,
         unlabeled_fail_trajs=[_StubTraj(video_id="v3", is_failure=True),
                               _StubTraj(video_id="v4", is_failure=True)],
@@ -299,7 +308,7 @@ def test_state_dict_roundtrip() -> None:
     ], dim=0)
     Z_calib = _gaussian(30, in_dim, mean=+1.0, std=0.5, seed=33)
 
-    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det.fit(
         positive_features=[Z_p],
         unlabeled_features=[Z_u],
@@ -312,7 +321,7 @@ def test_state_dict_roundtrip() -> None:
     sd = det.state_dict()
     assert sd["pi_p"] == pytest.approx(0.4, abs=1e-9)
 
-    det2 = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cpu")
+    det2 = PUBCEDiscriminator(in_dim=in_dim, hidden=16, num_layers=2, device="cuda")
     det2.load_state_dict(sd)
     assert det2.thresholds["t"] == pytest.approx(det.thresholds["t"], abs=1e-6)
     assert det2._pi_p == pytest.approx(0.4, abs=1e-9)
@@ -321,3 +330,20 @@ def test_state_dict_roundtrip() -> None:
     g_a = det._logits_np(z_probe)
     g_b = det2._logits_np(z_probe)
     np.testing.assert_allclose(g_a, g_b, atol=1e-6)
+
+
+def test_nnpu_checkpoint_rejects_mismatched_rpt_fingerprint(tmp_path) -> None:
+    from robosuite.discriminator.dyn_disc.adapters.pu_bce import PUBCEBenchmarkDiscriminator
+
+    disc = PUBCEBenchmarkDiscriminator.__new__(PUBCEBenchmarkDiscriminator)
+    disc.encoder = SimpleNamespace(checkpoint_fingerprint="expected")
+    checkpoint = tmp_path / "pu_bce_head.pth"
+    torch.save(
+        {
+            "pretraining_method": "rpt",
+            "representation_fingerprint": "different",
+        },
+        checkpoint,
+    )
+    with pytest.raises(ValueError, match="representation_fingerprint differs"):
+        disc.load_head_checkpoint(checkpoint)

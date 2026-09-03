@@ -1,129 +1,71 @@
-# Single-GPU HDF5-backed training entrypoint for the LPB v2 dynamics
-# model. Drop-in replacement for `conf/train.yaml` that uses HDF5 data.
+# RPT masked sensorimotor representation pretraining.
 defaults:
   - _self_
   - env: hdf5
-  - encoder: resnet
-  - action_encoder: proprio
-  - proprio_encoder: proprio
-  - predictor: vit
+  - encoder: dinov3
+
+pretraining_method: rpt
+run_name: rpt
 
 hydra:
   run:
-    dir: ./checkpoints/dyn_disc/dynamics/${run_name}-${now:%Y%m%d_%H%M%S}
+    dir: ./checkpoints/dyn_disc/ablations/RPT/pretrain/${run_name}-${now:%Y%m%d_%H%M%S}
   job:
     chdir: true
-
-run_name: train
 
 training:
   seed: 0
   epochs: 50
-  batch_size: 256
+  batch_size: 2048  # per rank; the two-GPU global batch is 4096
+  peak_lr: 4.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 8
   save_every_x_epoch: 10
-  checkpoint_subdir: checkpoints
-  checkpoint_epoch_offset: 0
-  # Finetune lr for the visual encoder when model.train_encoder=True.
-  # 1.5e-4 == 30% of predictor_lr (5e-4); ignored if encoder is frozen.
-  encoder_lr: 2e-5
-  predictor_lr: 1e-4
-  action_encoder_lr: 1e-4
+  checkpoint_subdir: checkpoint
   num_workers: 4
+  prefetch_factor: 4
+  log_every_steps: 20
 
-img_size: ${env.original_img_size}
-frameskip: 1               # robosuite HDF5 dumps store every action; default no skip
+cache:
+  root: checkpoints/dyn_disc/ablations/RPT/cache/dinov3_mean_v1
+  version: rpt_dinov3_mean_v1
+  build_batch_size: 800
 
-# Dataset references via env.
-train_data_path: ${env.train_data_path}
-val_data_path: ${env.val_data_path}
+context_length: 8
 view_names: ${env.view_names}
-source_view_names: ${view_names}
-target_view_names: ${view_names}
-original_img_size: ${env.original_img_size}
-cropped_img_size: ${env.cropped_img_size}
-action_emb_dim: ${env.action_emb_dim}
-proprio_emb_dim: ${env.proprio_emb_dim}
-policy_ckpt_path: null
-
-# Per-task proprio slice from HDF5 `states` (= sim.get_state().flatten()).
-# Flatten layout: [time, qpos[0:nq), qvel[0:nv), (actuator...)]
-# Panda proprio = robot0 joint qpos (7) + robot0 joint qvel (7) -> proprio_dim=14.
-# `indices` are positions in the flattened state vector (time occupies index 0).
-proprio:
-  Lift:
-    state_dim: 32
-    nq: 16
-    nv: 15
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 17, 18, 19, 20, 21, 22, 23]
-  Stack:
-    state_dim: 45
-    nq: 23
-    nv: 21
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
-  NutAssemblyRound:
-    state_dim: 45
-    nq: 23
-    nv: 21
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
-  NutAssemblySquare:
-    state_dim: 45
-    nq: 23
-    nv: 21
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
-  PickPlaceBread:
-    state_dim: 71
-    nq: 37
-    nv: 33
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
-  PickPlaceCan:
-    state_dim: 71
-    nq: 37
-    nv: 33
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
-  PickPlaceCereal:
-    state_dim: 71
-    nq: 37
-    nv: 33
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
-  PickPlaceMilk:
-    state_dim: 71
-    nq: 37
-    nv: 33
-    proprio_dim: 14
-    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
-
-# General settings.
-use_layernorm: True
-use_crop: True
-abs_action: False
-normalize_action: True
-num_hist: 1
-num_pred: 1
-action_loss_weight: 0.0
-has_predictor: True
-use_pretrained_encoder: True
-encoder_ckpt_path: null
-predictor_ckpt_path: null
-
-# Optional proprio slice into HDF5 states (passed to HDF5DynamicsModelDataset).
-proprio_indices: null
-proprio_map: null
 max_trajectories: null
-causal_action_chunks: false
 
 model:
-  _target_: robosuite.discriminator.dyn_disc.models.visual_dynamics.VisualDynamicsModel
-  image_size: ${img_size}
-  num_hist: ${num_hist}
-  num_pred: ${num_pred}
-  train_encoder: False
-  train_predictor: True
+  _target_: robosuite.discriminator.dyn_disc.models.rpt.RPTModel
+  view_names: ${view_names}
+  visual_dim: 768
+  proprio_dim: ${env.proprio_dim}
+  action_dim: ${env.action_dim}
+  context_length: ${context_length}
+  hidden_dim: 192
+  depth: 4
+  heads: 4
+  mlp_dim: 384
+  dropout: 0.0
+  slot_position_embedding: learned
+  mask_ratio_min: 0.7
+  mask_ratio_max: 0.9
 
-debug: False
+# Panda joint qpos[7] + qvel[7] in flattened robosuite simulator state.
+proprio:
+  Stack:
+    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
+  NutAssemblyRound:
+    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
+  NutAssemblySquare:
+    indices: [1, 2, 3, 4, 5, 6, 7, 24, 25, 26, 27, 28, 29, 30]
+  PickPlaceBread:
+    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
+  PickPlaceCan:
+    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
+  PickPlaceCereal:
+    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
+  PickPlaceMilk:
+    indices: [1, 2, 3, 4, 5, 6, 7, 38, 39, 40, 41, 42, 43, 44]
+
+proprio_map: null
