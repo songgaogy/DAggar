@@ -42,6 +42,7 @@ from robosuite.pipeline.modules.evaluation.policy_runtime import (
     DEFAULT_VIDEO_FPS,
     DEFAULT_VIDEO_SIZE,
     _assert_eval_seeds_disjoint,
+    _bind_run_local_model_assets,
     _build_dipole_policy,
     _capture_frame,
     _load_json,
@@ -182,6 +183,10 @@ def main() -> None:
     env = build_robosuite_env(runtime_cfg)
     proprio_extractor = bind_flow_proprio_extractor(env, env_metadata)
     eval_device = _resolve_eval_device(checkpoint_payload, args.device)
+    checkpoint_payload = _bind_run_local_model_assets(
+        checkpoint_payload,
+        init_checkpoint=init_checkpoint,
+    )
     policy = _build_dipole_policy(
         checkpoint_payload,
         task_name=args.task_name,

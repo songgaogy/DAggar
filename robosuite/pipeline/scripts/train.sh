@@ -6,7 +6,7 @@ PY="/home/dodo/miniconda3/envs/dagger/bin/python"
 # Alternative source: outputs/dipole/PickPlaceCereal/currect_ref_20260901_212515
 RUN_ROOT="${RUN_ROOT:-outputs/dipole/NutAssemblySquare/currect_ref_20260902_162750}"
 STAGE="all"   # "all" or "disc" -> "vast" -> "policy"
-ROUND_INDEX="000"   # if "", then continue; else, roll back in place and retrain
+ROUND_INDEX="001"   # if "", then continue; else, roll back in place and retrain
 cd "${ROOT_DIR}"
 
 export CUDA_VISIBLE_DEVICES=0

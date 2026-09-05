@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PY="/home/dodo/miniconda3/envs/dagger/bin/python"
 RUN_ROOT="${RUN_ROOT:-outputs/dipole/NutAssemblySquare/currect_ref_20260902_162750}"
-ROUND="000"
+ROUND="001"
 CHECKPOINT="${RUN_ROOT}/rounds/${ROUND}/policy/checkpoints/latest.pt"
 INIT_CHECKPOINT="${RUN_ROOT}/inputs/checkpoints/base_policy.pt"
 TASK="${TASK:-NutAssemblySquare}"

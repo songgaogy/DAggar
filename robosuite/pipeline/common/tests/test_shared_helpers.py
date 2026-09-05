@@ -1,5 +1,7 @@
 """Import smoke tests for helpers extracted from legacy entrypoints."""
 
+from pathlib import Path
+
 import pytest
 
 from robosuite.pipeline.common import flow
@@ -49,3 +51,25 @@ def test_device_resolution_has_no_cpu_fallback(monkeypatch) -> None:
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA is unavailable"):
         resolve_requested_device("cuda:0", fallback="cuda:0")
+
+
+def test_eval_rebinds_checkpoint_model_assets_to_run_snapshots() -> None:
+    payload = {
+        "model_cfg": {
+            "image_encoder": {"pretrained_path": "/stale/resnet.pth"},
+            "language_encoder": {"pretrained_name": "/stale/clip"},
+        }
+    }
+
+    rebound = policy_runtime._bind_run_local_model_assets(
+        payload,
+        init_checkpoint=Path("/run/inputs/checkpoints/base_policy.pt"),
+    )
+
+    assert payload["model_cfg"]["image_encoder"]["pretrained_path"] == "/stale/resnet.pth"
+    assert rebound["model_cfg"]["image_encoder"]["pretrained_path"] == (
+        "/run/inputs/checkpoints/flow_image_encoder.pth"
+    )
+    assert rebound["model_cfg"]["language_encoder"]["pretrained_name"] == (
+        "/run/inputs/data/language_encoder"
+    )

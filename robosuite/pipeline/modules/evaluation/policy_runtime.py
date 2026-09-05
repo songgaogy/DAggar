@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,25 @@ def _resolve_eval_device(payload: dict[str, Any], override: str | None) -> str:
     return resolve_requested_device(requested, fallback="cuda:0")
 
 
+def _bind_run_local_model_assets(
+    payload: dict[str, Any],
+    *,
+    init_checkpoint: Path,
+) -> dict[str, Any]:
+    """Replace checkpoint-machine asset paths with this run's snapshots."""
+    rebound = dict(payload)
+    rebound["model_cfg"] = copy.deepcopy(payload["model_cfg"])
+    inputs_dir = init_checkpoint.parent.parent
+    model_cfg = rebound["model_cfg"]
+    model_cfg["image_encoder"]["pretrained_path"] = str(
+        inputs_dir / "checkpoints" / "flow_image_encoder.pth"
+    )
+    model_cfg["language_encoder"]["pretrained_name"] = str(
+        inputs_dir / "data" / "language_encoder"
+    )
+    return rebound
+
+
 def _build_dipole_policy(
     payload: dict[str, Any],
     *,
@@ -209,6 +229,7 @@ __all__ = [
     "DEFAULT_VIDEO_FPS",
     "DEFAULT_VIDEO_SIZE",
     "_assert_eval_seeds_disjoint",
+    "_bind_run_local_model_assets",
     "_build_dipole_policy",
     "_capture_frame",
     "_load_json",
