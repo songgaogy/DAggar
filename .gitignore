@@ -142,5 +142,6 @@ wandb/
 logs/
 redundant/
 tmp/
+tmp/armada
 
 robosuite/scripts/RL

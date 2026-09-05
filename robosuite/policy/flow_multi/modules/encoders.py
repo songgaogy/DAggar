@@ -36,7 +36,7 @@ class SharedResNetSpatialSoftmaxEncoder(nn.Module):
     def __init__(
         self,
         feature_dim: int,
-        pretrained_path: str,
+        pretrained_path: str | None,
         freeze_backbone: bool = False,
         trainable_stages: list[str] | None = None,
         train_token_projections: bool = True,
@@ -46,8 +46,9 @@ class SharedResNetSpatialSoftmaxEncoder(nn.Module):
     ):
         super().__init__()
         backbone = resnet18(weights=None)
-        state_dict = torch.load(pretrained_path, map_location="cpu")
-        backbone.load_state_dict(state_dict, strict=True)
+        if pretrained_path is not None:
+            state_dict = torch.load(pretrained_path, map_location="cpu")
+            backbone.load_state_dict(state_dict, strict=True)
 
         self.include_spatial_softmax = bool(include_spatial_softmax)
         self.layer3_pool_size = int(layer3_pool_size)
@@ -214,9 +215,10 @@ def build_image_encoder(cfg: Any) -> nn.Module:
     encoder_type = _cfg_get(cfg, "type", "shared_resnet18_spatial_softmax")
     if encoder_type != "shared_resnet18_spatial_softmax":
         raise ValueError(f"Unsupported image encoder type: {encoder_type}")
+    pretrained_path = _cfg_get(cfg, "pretrained_path")
     return SharedResNetSpatialSoftmaxEncoder(
         feature_dim=int(_cfg_get(cfg, "feature_dim")),
-        pretrained_path=str(_cfg_get(cfg, "pretrained_path")),
+        pretrained_path=None if pretrained_path is None else str(pretrained_path),
         freeze_backbone=bool(_cfg_get(cfg, "freeze_backbone", False)),
         trainable_stages=_cfg_get(cfg, "trainable_stages", None),
         train_token_projections=bool(_cfg_get(cfg, "train_token_projections", True)),
