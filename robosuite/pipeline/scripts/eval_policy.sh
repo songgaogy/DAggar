@@ -6,10 +6,7 @@ PYTHON="${PYTHON:-/home/dodo/miniconda3/envs/dagger/bin/python}"
 NUM_EPISODES="${NUM_EPISODES:-50}"
 MAX_STEPS="${MAX_STEPS:-500}"
 
-if [[ -z "${CKPT:-}" ]]; then
-  echo "[ERROR] Set CKPT to a DSRL checkpoint file." >&2
-  exit 1
-fi
+CKPT="outputs/baseline/dsrl/PickPlaceCereal/PickPlaceCereal_2026-09-06_23-10-50/checkpoints/episode_00000200.pt"
 
 cd "${ROOT_DIR}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"

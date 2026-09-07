@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
@@ -12,9 +11,7 @@ from torch.nn import functional as F
 
 from .batch import DSRLBatch
 from .config import DSRLConfig
-from .networks import SharedBottleneck, TanhGaussianActor, TwinQ
-
-FlowDecoder = Callable[[Any, torch.Tensor], torch.Tensor]
+from .networks import TanhGaussianActor, TwinQ, flatten_state
 
 
 def require_cuda(device_name: str) -> torch.device:
@@ -47,15 +44,12 @@ def _polyak_update(source: nn.Module, target: nn.Module, tau: float) -> None:
 
 
 class DSRLAgent:
-    def __init__(self, config: DSRLConfig, flow_decoder: FlowDecoder) -> None:
+    def __init__(self, config: DSRLConfig) -> None:
         config.validate()
         self.config = config
         self.device = require_cuda(config.learner_device)
-        self.flow_decoder = flow_decoder
         network = config.network
 
-        self.bottleneck = SharedBottleneck(network.visual_dim, network.proprio_dim, network.state_dim).to(self.device)
-        self.target_bottleneck = copy.deepcopy(self.bottleneck).to(self.device).eval()
         self.actor = TanhGaussianActor(
             network.state_dim,
             network.chunk_dim,
@@ -64,18 +58,13 @@ class DSRLAgent:
             network.log_std_min,
             network.log_std_max,
         ).to(self.device)
-        self.target_actor = copy.deepcopy(self.actor).to(self.device).eval()
         self.qa = TwinQ(network.state_dim, network.chunk_dim, network.hidden_dims).to(self.device)
         self.target_qa = copy.deepcopy(self.qa).to(self.device).eval()
-        self.qw = TwinQ(network.state_dim, network.chunk_dim, network.hidden_dims).to(self.device)
 
-        for target in (self.target_bottleneck, self.target_actor, self.target_qa):
-            target.requires_grad_(False)
+        self.target_qa.requires_grad_(False)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=config.learning_rate)
         self.qa_optimizer = torch.optim.Adam(self.qa.parameters(), lr=config.learning_rate)
-        self.qw_optimizer = torch.optim.Adam(self.qw.parameters(), lr=config.learning_rate)
-        self.bottleneck_optimizer = torch.optim.Adam(self.bottleneck.parameters(), lr=config.learning_rate)
         self.log_alpha = torch.tensor(
             math.log(config.initial_alpha), device=self.device, dtype=torch.float32, requires_grad=True
         )
@@ -83,7 +72,6 @@ class DSRLAgent:
         self.qa_updates = 0
         self.actor_updates = 0
         self.alpha_updates = 0
-        self.qw_updates = 0
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -96,16 +84,10 @@ class DSRLAgent:
             device=self.device,
         )
 
-    def _decode(self, context: Any, latent_flat: torch.Tensor) -> torch.Tensor:
-        latent = latent_flat.reshape(
-            latent_flat.shape[0], self.config.network.action_horizon, self.config.network.action_dim
-        )
-        with torch.no_grad():
-            actions = self.flow_decoder(context, latent)
-        expected = latent.shape
-        if actions.device != self.device or actions.shape != expected:
-            raise ValueError(f"Flow decoder output must have shape {tuple(expected)} on {self.device}.")
-        return actions.detach()
+    def _state(self, visual_features: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
+        if visual_features.device != self.device or proprio.device != self.device:
+            raise ValueError(f"Actor inputs must be on {self.device}.")
+        return flatten_state(visual_features, proprio, self.config.network.state_dim)
 
     def sample_latent(
         self, visual_features: torch.Tensor, proprio: torch.Tensor, *, deterministic: bool = False
@@ -113,48 +95,37 @@ class DSRLAgent:
         if visual_features.device != self.device or proprio.device != self.device:
             raise ValueError(f"Actor inputs must be on {self.device}.")
         with torch.no_grad():
-            state = self.bottleneck(visual_features, proprio)
+            state = self._state(visual_features, proprio)
             latent, _ = self.actor.sample(state, deterministic=deterministic)
         return latent.reshape(-1, self.config.network.action_horizon, self.config.network.action_dim)
 
-    def act(
-        self,
-        visual_features: torch.Tensor,
-        proprio: torch.Tensor,
-        flow_context: Any,
-        *,
-        deterministic: bool = False,
-    ) -> torch.Tensor:
-        latent = self.sample_latent(visual_features, proprio, deterministic=deterministic)
-        return self._decode(flow_context, latent.flatten(start_dim=1))
+    def act(self, visual_features: torch.Tensor, proprio: torch.Tensor, *, deterministic: bool = False) -> torch.Tensor:
+        return self.sample_latent(visual_features, proprio, deterministic=deterministic)
 
-    def update_qa_actor(self, batch: DSRLBatch) -> dict[str, float]:
+    def update(self, batch: DSRLBatch) -> dict[str, float]:
         self._validate_batch(batch)
         config = self.config
         entropy_coefficient = self.alpha.detach()
 
         with torch.no_grad():
-            next_state = self.target_bottleneck(batch.next_dino_features, batch.next_proprio)
-            next_latent, next_log_prob = self.target_actor.sample(next_state)
-            next_actions = self._decode(batch.next_flow_context, next_latent)
-            next_q = self.target_qa.minimum(next_state, next_actions)
+            next_state = self._state(batch.next_visual_features, batch.next_proprio)
+            next_latent, next_log_prob = self.actor.sample(next_state)
+            next_q = self.target_qa.minimum(next_state, next_latent)
             target_q = batch.reward_column + config.gamma * (1.0 - batch.done_column) * (
                 next_q - entropy_coefficient * next_log_prob
             )
 
-        state = self.bottleneck(batch.dino_features, batch.proprio)
-        q1, q2 = self.qa(state, batch.actions)
+        state = self._state(batch.visual_features, batch.proprio)
+        q1, q2 = self.qa(state, batch.latents)
         qa_loss = 0.5 * (F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q))
         self._require_finite("qa_loss", qa_loss)
         self.qa_optimizer.zero_grad(set_to_none=True)
-        self.bottleneck_optimizer.zero_grad(set_to_none=True)
         qa_loss.backward()
-        qa_grad_norm = self._clip_gradients((*self.qa.parameters(), *self.bottleneck.parameters()))
+        qa_grad_norm = self._clip_gradients(tuple(self.qa.parameters()))
         self.qa_optimizer.step()
-        self.bottleneck_optimizer.step()
         self.qa_updates += 1
 
-        actor_state = self.bottleneck(batch.dino_features, batch.proprio).detach()
+        actor_state = state.detach()
         latent, log_prob = self.actor.sample(actor_state)
         alpha_loss = -(self.log_alpha * (log_prob + config.target_entropy).detach()).mean()
         self._require_finite("alpha_loss", alpha_loss)
@@ -163,8 +134,8 @@ class DSRLAgent:
         self.alpha_optimizer.step()
         self.alpha_updates += 1
 
-        with _freeze_parameters(self.qw):
-            actor_q = self.qw.minimum(actor_state, latent)
+        with _freeze_parameters(self.qa):
+            actor_q = self.qa.minimum(actor_state, latent)
             actor_loss = (entropy_coefficient * log_prob - actor_q).mean()
             self._require_finite("actor_loss", actor_loss)
             self.actor_optimizer.zero_grad(set_to_none=True)
@@ -173,8 +144,6 @@ class DSRLAgent:
         self.actor_optimizer.step()
         self.actor_updates += 1
 
-        _polyak_update(self.bottleneck, self.target_bottleneck, config.tau)
-        _polyak_update(self.actor, self.target_actor, config.tau)
         _polyak_update(self.qa, self.target_qa, config.tau)
         return {
             "qa_loss": float(qa_loss.detach().item()),
@@ -187,32 +156,7 @@ class DSRLAgent:
             "actor_grad_norm": actor_grad_norm,
         }
 
-    def update_qw(self, batch: DSRLBatch) -> dict[str, float]:
-        self._validate_batch(batch)
-        batch_size = batch.dino_features.shape[0]
-        latent = torch.randn(
-            (batch_size, self.config.network.chunk_dim), device=self.device, dtype=torch.float32
-        )
-        actions = self._decode(batch.flow_context, latent)
-        state = self.bottleneck(batch.dino_features, batch.proprio)
-        with torch.no_grad():
-            target_q1, target_q2 = self.qa(state.detach(), actions)
-        q1, q2 = self.qw(state, latent)
-        qw_loss = 0.5 * (F.mse_loss(q1, target_q1) + F.mse_loss(q2, target_q2))
-        self._require_finite("qw_loss", qw_loss)
-        self.qw_optimizer.zero_grad(set_to_none=True)
-        self.bottleneck_optimizer.zero_grad(set_to_none=True)
-        qw_loss.backward()
-        qw_grad_norm = self._clip_gradients((*self.qw.parameters(), *self.bottleneck.parameters()))
-        self.qw_optimizer.step()
-        self.bottleneck_optimizer.step()
-        self.qw_updates += 1
-        return {
-            "qw_loss": float(qw_loss.detach().item()),
-            "qw_mean": float(torch.minimum(q1, q2).detach().mean().item()),
-            "qw_target_mean": float(torch.minimum(target_q1, target_q2).mean().item()),
-            "qw_grad_norm": qw_grad_norm,
-        }
+    update_qa_actor = update
 
     def _clip_gradients(self, parameters: tuple[nn.Parameter, ...]) -> float:
         if self.config.grad_clip_norm is None:
@@ -229,51 +173,40 @@ class DSRLAgent:
 
     def inference_state_dict(self) -> dict[str, Any]:
         return {
-            "bottleneck": self.bottleneck.state_dict(),
             "actor": self.actor.state_dict(),
         }
 
     def state_dict(self) -> dict[str, Any]:
         return {
             "config": self.config.to_dict(),
-            "bottleneck": self.bottleneck.state_dict(),
-            "target_bottleneck": self.target_bottleneck.state_dict(),
             "actor": self.actor.state_dict(),
-            "target_actor": self.target_actor.state_dict(),
             "qa": self.qa.state_dict(),
             "target_qa": self.target_qa.state_dict(),
-            "qw": self.qw.state_dict(),
             "log_alpha": self.log_alpha.detach().clone(),
             "optimizers": {
-                "bottleneck": self.bottleneck_optimizer.state_dict(),
                 "actor": self.actor_optimizer.state_dict(),
                 "qa": self.qa_optimizer.state_dict(),
-                "qw": self.qw_optimizer.state_dict(),
                 "alpha": self.alpha_optimizer.state_dict(),
             },
             "updates": {
                 "qa": self.qa_updates,
                 "actor": self.actor_updates,
                 "alpha": self.alpha_updates,
-                "qw": self.qw_updates,
             },
         }
 
     def load_state_dict(self, state: dict[str, Any], *, strict: bool = True) -> None:
         if strict and state.get("config") != self.config.to_dict():
             raise ValueError("Checkpoint DSRL configuration does not match the current configuration.")
-        for name in ("bottleneck", "target_bottleneck", "actor", "target_actor", "qa", "target_qa", "qw"):
+        for name in ("actor", "qa", "target_qa"):
             getattr(self, name).load_state_dict(state[name], strict=strict)
         with torch.no_grad():
             self.log_alpha.copy_(state["log_alpha"].to(self.device))
         optimizers = state["optimizers"]
-        self.bottleneck_optimizer.load_state_dict(optimizers["bottleneck"])
         self.actor_optimizer.load_state_dict(optimizers["actor"])
         self.qa_optimizer.load_state_dict(optimizers["qa"])
-        self.qw_optimizer.load_state_dict(optimizers["qw"])
         self.alpha_optimizer.load_state_dict(optimizers["alpha"])
         updates = state.get("updates", {})
         self.qa_updates = int(updates.get("qa", 0))
         self.actor_updates = int(updates.get("actor", 0))
         self.alpha_updates = int(updates.get("alpha", 0))
-        self.qw_updates = int(updates.get("qw", 0))

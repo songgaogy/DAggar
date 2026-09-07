@@ -1,8 +1,8 @@
-from .agent import DSRLAgent, FlowDecoder, require_cuda
+from .agent import DSRLAgent, require_cuda
 from .batch import DSRLBatch
 from .config import DSRLConfig, NetworkConfig
 from .inference import DSRLInferencePolicy
-from .networks import SharedBottleneck, TanhGaussianActor, TwinQ
+from .networks import TanhGaussianActor, TwinQ, flatten_state
 from .trainer import DSRLTrainer
 
 __all__ = [
@@ -11,10 +11,9 @@ __all__ = [
     "DSRLConfig",
     "DSRLInferencePolicy",
     "DSRLTrainer",
-    "FlowDecoder",
     "NetworkConfig",
-    "SharedBottleneck",
     "TanhGaussianActor",
     "TwinQ",
+    "flatten_state",
     "require_cuda",
 ]

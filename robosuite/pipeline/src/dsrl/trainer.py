@@ -19,11 +19,7 @@ class DSRLTrainer:
     def update_cycle(self) -> dict[str, float]:
         metrics: dict[str, list[float]] = defaultdict(list)
         for _ in range(self.agent.config.utd_steps):
-            result = self.agent.update_qa_actor(self.batch_provider(self.agent.config.batch_size))
-            for name, value in result.items():
-                metrics[name].append(value)
-        for _ in range(self.agent.config.qw_steps):
-            result = self.agent.update_qw(self.batch_provider(self.agent.config.batch_size))
+            result = self.agent.update(self.batch_provider(self.agent.config.batch_size))
             for name, value in result.items():
                 metrics[name].append(value)
         self.cycles += 1
@@ -33,11 +29,9 @@ class DSRLTrainer:
                 "qa_updates_this_cycle": float(self.agent.config.utd_steps),
                 "actor_updates_this_cycle": float(self.agent.config.utd_steps),
                 "alpha_updates_this_cycle": float(self.agent.config.utd_steps),
-                "qw_updates_this_cycle": float(self.agent.config.qw_steps),
                 "total_qa_updates": float(self.agent.qa_updates),
                 "total_actor_updates": float(self.agent.actor_updates),
                 "total_alpha_updates": float(self.agent.alpha_updates),
-                "total_qw_updates": float(self.agent.qw_updates),
             }
         )
         return summarized

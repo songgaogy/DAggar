@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import random
 import traceback
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
@@ -46,6 +47,7 @@ def _worker_main(
     env = None
     extractor = None
     try:
+        random.seed(seed + worker_id)
         np.random.seed(seed + worker_id)
         from robosuite.pipeline.src.environment.observations import (
             bind_proprio_extractor,
@@ -65,6 +67,7 @@ def _worker_main(
             control_freq=control_frequency,
             horizon=horizon,
             interactive=False,
+            seed=seed + worker_id,
         )
         env = build_robosuite_env(runtime_config)
         extractor = bind_proprio_extractor(env, env_metadata)
@@ -92,11 +95,28 @@ def _worker_main(
             if command == "reset":
                 connection.send(("ok", reset()))
                 continue
+            if command == "get_rng_state":
+                connection.send(
+                    (
+                        "ok",
+                        {
+                            "python": random.getstate(),
+                            "numpy": np.random.get_state(),
+                            "environment": env.rng.bit_generator.state,
+                        },
+                    )
+                )
+                continue
+            if command == "set_rng_state":
+                random.setstate(payload["python"])
+                np.random.set_state(payload["numpy"])
+                env.rng.bit_generator.state = payload["environment"]
+                connection.send(("ok", None))
+                continue
             if command != "step_chunk":
                 raise ValueError(f"Unknown vector-worker command: {command}")
 
             action_chunk = np.asarray(payload, dtype=np.float32)
-            macro_reward = 0.0
             executed = 0
             success = False
             done = False
@@ -113,7 +133,6 @@ def _worker_main(
                 episode_steps += 1
                 executed += 1
                 success = _success(env, info)
-                macro_reward += 0.0 if success else -1.0
                 horizon_done = episode_steps >= horizon
                 done = bool(success or terminated or truncated or horizon_done)
                 if done:
@@ -140,7 +159,7 @@ def _worker_main(
                     MacroStepResult(
                         worker_id=worker_id,
                         observation=observation,
-                        reward=float(macro_reward),
+                        reward=float(success),
                         done=done,
                         success=success,
                         executed_length=executed,
@@ -242,6 +261,25 @@ class RobosuiteVectorRuntime:
             worker_id: self._check(*self._parents[worker_id].recv(), worker_id)
             for worker_id in selected
         }
+
+    def state_dict(self) -> dict[str, Any]:
+        for parent in self._parents:
+            parent.send(("get_rng_state", None))
+        return {
+            "workers": [
+                self._check(*parent.recv(), worker_id)
+                for worker_id, parent in enumerate(self._parents)
+            ]
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        workers = state.get("workers")
+        if not isinstance(workers, list) or len(workers) != self.num_envs:
+            raise ValueError("Environment RNG state does not match the vector runtime.")
+        for worker_id, worker_state in enumerate(workers):
+            self._parents[worker_id].send(("set_rng_state", worker_state))
+        for worker_id, parent in enumerate(self._parents):
+            self._check(*parent.recv(), worker_id)
 
     def close(self) -> None:
         for parent in self._parents:

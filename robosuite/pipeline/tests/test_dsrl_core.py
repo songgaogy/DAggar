@@ -13,7 +13,6 @@ def _config(**overrides) -> DSRLConfig:
         "network": NetworkConfig(
             visual_dim=12,
             proprio_dim=3,
-            state_dim=8,
             action_horizon=2,
             action_dim=2,
             hidden_dims=(16, 16, 16),
@@ -21,7 +20,6 @@ def _config(**overrides) -> DSRLConfig:
         "learner_device": "cuda:0",
         "batch_size": 4,
         "utd_steps": 2,
-        "qw_steps": 1,
     }
     values.update(overrides)
     return DSRLConfig(**values)
@@ -37,103 +35,110 @@ def _batch(config: DSRLConfig, batch_size: int | None = None) -> DSRLBatch:
     device = torch.device(config.learner_device)
     network = config.network
     return DSRLBatch(
-        dino_features=torch.randn(size, 3, network.visual_dim // 3, device=device),
+        visual_features=torch.randn(size, 3, network.visual_dim // 3, device=device),
         proprio=torch.randn(size, network.proprio_dim, device=device),
-        flow_context=torch.randn(size, 5, device=device),
-        actions=torch.randn(size, network.action_horizon, network.action_dim, device=device),
-        rewards=torch.randn(size, device=device),
+        latents=torch.empty(size, network.action_horizon, network.action_dim, device=device).uniform_(
+            -network.latent_limit, network.latent_limit
+        ),
+        rewards=torch.randint(0, 2, (size,), device=device).float(),
         dones=torch.randint(0, 2, (size,), device=device).float(),
-        next_dino_features=torch.randn(size, 3, network.visual_dim // 3, device=device),
+        next_visual_features=torch.randn(size, 3, network.visual_dim // 3, device=device),
         next_proprio=torch.randn(size, network.proprio_dim, device=device),
-        next_flow_context=torch.randn(size, 5, device=device),
     )
 
 
-def _decoder(_context: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
-    return torch.tanh(latent)
-
-
-def test_cpu_device_is_rejected_without_tensor_work() -> None:
+def test_widowx_defaults_and_cpu_rejection() -> None:
+    config = DSRLConfig()
+    assert config.network.hidden_dims == (1024, 1024, 1024)
+    assert config.network.latent_limit == 2.0
+    assert config.gamma == 0.97
+    assert config.utd_steps == 30
+    assert config.target_entropy == 0.0
     with pytest.raises(ValueError, match="explicit CUDA"):
-        DSRLAgent(_config(learner_device="cpu"), _decoder)
+        DSRLAgent(_config(learner_device="cpu"))
 
 
-def test_network_shapes_and_latent_bounds() -> None:
+def test_network_shapes_direct_state_and_latent_bounds() -> None:
     _require_cuda()
     config = _config()
-    agent = DSRLAgent(config, _decoder)
+    agent = DSRLAgent(config)
     batch = _batch(config)
-    state = agent.bottleneck(batch.dino_features, batch.proprio)
-    half_state = agent.bottleneck(batch.dino_features.half(), batch.proprio.half())
+    state = agent._state(batch.visual_features, batch.proprio)
+    half_state = agent._state(batch.visual_features.half(), batch.proprio.half())
     latent, log_prob = agent.actor.sample(state)
-    q1, q2 = agent.qa(state, batch.actions)
-    assert state.shape == (config.batch_size, config.network.state_dim)
+    q1, q2 = agent.qa(state, batch.latents)
+    assert state.shape == (config.batch_size, config.network.visual_dim + config.network.proprio_dim)
     assert half_state.dtype == torch.float32
     assert latent.shape == (config.batch_size, config.network.chunk_dim)
     assert log_prob.shape == (config.batch_size, 1)
     assert torch.all(latent.abs() <= config.network.latent_limit)
     assert q1.shape == q2.shape == (config.batch_size, 1)
     assert all(not parameter.requires_grad for parameter in agent.target_qa.parameters())
-    decoded = agent.act(batch.dino_features, batch.proprio, batch.flow_context)
-    assert decoded.shape == batch.actions.shape
+    assert agent.act(batch.visual_features, batch.proprio).shape == batch.latents.shape
+    assert not hasattr(agent, "bottleneck")
+    assert not hasattr(agent, "qw")
+    assert not hasattr(agent, "target_actor")
 
 
-def test_gradient_boundaries_for_main_and_qw_updates() -> None:
+def test_sac_update_changes_actor_q_alpha_and_polyak_target() -> None:
+    _require_cuda()
+    config = _config(initial_alpha=0.5)
+    agent = DSRLAgent(config)
+    batch = _batch(config)
+    actor_before = copy.deepcopy(agent.actor.state_dict())
+    q_before = copy.deepcopy(agent.qa.state_dict())
+    target_before = copy.deepcopy(agent.target_qa.state_dict())
+    log_alpha_before = agent.log_alpha.detach().clone()
+    metrics = agent.update(batch)
+
+    assert any(not torch.equal(value, agent.actor.state_dict()[name]) for name, value in actor_before.items())
+    assert any(not torch.equal(value, agent.qa.state_dict()[name]) for name, value in q_before.items())
+    assert any(
+        not torch.equal(value, agent.target_qa.state_dict()[name]) for name, value in target_before.items()
+    )
+    assert not torch.equal(log_alpha_before, agent.log_alpha.detach())
+    assert (agent.qa_updates, agent.actor_updates, agent.alpha_updates) == (1, 1, 1)
+    assert {"qa_loss", "actor_loss", "alpha_loss", "target_q_mean"} <= metrics.keys()
+
+
+def test_batch_rejects_non_binary_reward() -> None:
     _require_cuda()
     config = _config()
-    agent = DSRLAgent(config, _decoder)
     batch = _batch(config)
-    bottleneck_before = copy.deepcopy(agent.bottleneck.state_dict())
-    agent.update_qa_actor(batch)
-    assert any(
-        not torch.equal(value, agent.bottleneck.state_dict()[name]) for name, value in bottleneck_before.items()
-    )
-    assert all(parameter.grad is None for parameter in agent.qw.parameters())
-    bottleneck_before = copy.deepcopy(agent.bottleneck.state_dict())
-    actor_before = copy.deepcopy(agent.actor.state_dict())
-    agent.update_qw(batch)
-    assert any(
-        not torch.equal(value, agent.bottleneck.state_dict()[name]) for name, value in bottleneck_before.items()
-    )
-    assert all(torch.equal(value, agent.actor.state_dict()[name]) for name, value in actor_before.items())
+    batch.rewards[0] = -1.0
+    with pytest.raises(ValueError, match="rewards must contain only zero or one"):
+        batch.validate(
+            action_horizon=config.network.action_horizon,
+            action_dim=config.network.action_dim,
+            device=torch.device(config.learner_device),
+        )
 
 
-def test_trainer_order_counts_and_checkpoint_round_trip() -> None:
+def test_trainer_utd_count_and_checkpoint_round_trip() -> None:
     _require_cuda()
-    config = _config(utd_steps=3, qw_steps=2)
+    config = _config(utd_steps=3)
     calls: list[int] = []
 
     def provider(batch_size: int) -> DSRLBatch:
         calls.append(batch_size)
         return _batch(config, batch_size)
 
-    agent = DSRLAgent(config, _decoder)
+    agent = DSRLAgent(config)
     trainer = DSRLTrainer(agent, provider)
-    order: list[str] = []
-    original_main = agent.update_qa_actor
-    original_qw = agent.update_qw
-
-    def tracked_main(batch: DSRLBatch) -> dict[str, float]:
-        order.append("main")
-        return original_main(batch)
-
-    def tracked_qw(batch: DSRLBatch) -> dict[str, float]:
-        order.append("qw")
-        return original_qw(batch)
-
-    agent.update_qa_actor = tracked_main
-    agent.update_qw = tracked_qw
     metrics = trainer.update_cycle()
-    assert calls == [config.batch_size] * 5
-    assert order == ["main", "main", "main", "qw", "qw"]
-    assert (agent.qa_updates, agent.actor_updates, agent.alpha_updates, agent.qw_updates) == (3, 3, 3, 2)
+    assert calls == [config.batch_size] * 3
+    assert (agent.qa_updates, agent.actor_updates, agent.alpha_updates) == (3, 3, 3)
     assert metrics["qa_updates_this_cycle"] == 3.0
-    assert metrics["qw_updates_this_cycle"] == 2.0
+    assert "qw_updates_this_cycle" not in metrics
 
-    restored = DSRLTrainer(DSRLAgent(config, _decoder), provider)
-    restored.load_state_dict(trainer.state_dict())
+    state = trainer.state_dict()
+    serialized = str(state.keys()) + str(state["agent"].keys())
+    assert "qw" not in serialized
+    assert "bottleneck" not in serialized
+    assert "target_actor" not in serialized
+    restored = DSRLTrainer(DSRLAgent(config), provider)
+    restored.load_state_dict(state)
     assert restored.cycles == 1
     assert restored.agent.qa_updates == 3
-    assert restored.agent.qw_updates == 2
     for name, value in agent.actor.state_dict().items():
         assert torch.equal(value, restored.agent.actor.state_dict()[name])

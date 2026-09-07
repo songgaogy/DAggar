@@ -132,6 +132,9 @@ robosuite/armada/outputs
 .vscode/
 outputs/
 data/
+# Keep the DSRL Python data package; the broad data rule above is for datasets.
+!robosuite/pipeline/src/data/
+!robosuite/pipeline/src/data/*.py
 data2/
 out/
 video/

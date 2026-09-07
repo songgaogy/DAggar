@@ -1,47 +1,57 @@
-# DSRL-NA pipeline
+# WidowX-style DSRL-SAC pipeline
 
-This directory contains the CUDA-only DSRL-NA offline-to-online pipeline for
-the frozen `flow_multi-update` base policy. The current task configuration is
-`PickPlaceCereal`.
+This directory contains the CUDA-only DSRL-SAC pipeline for the frozen
+`flow_multi-update` base policy. `PickPlaceCereal` uses the WidowX
+Pick-and-Place hyperparameters from the DSRL paper while retaining the base
+policy's native 8-step action chunks.
 
-## Data and checkpoints
+## Training setup
 
 - Base policy: `checkpoints/multitask_6/flow_multi_ep0100.pt`
-- Offline replay: `data/PickPlaceCereal/offline_data-vast/vast_offline_transitions.pt`
-- DINOv2: `~/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth`
-- Shared cache: `outputs/baseline/dsrl/cache/PickPlaceCereal/`
-- Runs: `outputs/baseline/dsrl/PickPlaceCereal/PickPlaceCereal_<timestamp>/`
+- State: frozen base-policy ResNet tokens from all policy cameras plus normalized proprioception
+- Reward: sparse binary success (`0` otherwise, `1` on success)
+- Warmup: 20 base-policy episodes with clipped standard-Gaussian latent noise
+- Online budget: 180 episodes, for 200 total including warmup
+- Parallelism: 4 spawned robosuite environments
+- Learner: 30 SAC updates every 2 vector macro-steps
+- Checkpoints: global episodes 20, 40, ..., 200
+- Logging: JSONL, console log, and TensorBoard
 
-The source replay is a large legacy pickle. Its first conversion loads the
-file once and writes compact memory-mapped frozen DINOv2 and flow features.
-Subsequent runs validate the fingerprint and reuse that cache.
+The shared warmup cache is stored under
+`outputs/baseline/dsrl/warmup_cache/<task>/<fingerprint>/`. Its fingerprint
+includes the task, fixed warmup seed, base checkpoint, environment metadata,
+cameras, flow sampling settings, feature schema, and reward schema. Training
+seeds reuse this immutable task cache. `offline_data-vast` and DINOv2 are not
+used by DSRL-SAC.
 
 ## Commands
 
-Build or validate the cache:
+Build or validate the warmup cache:
 
 ```bash
 bash robosuite/pipeline/scripts/build_cache.sh
 ```
 
-Run the approved four-worker, five-episode-per-worker training job:
+This command performs environment data generation on a cache miss. Obtain the
+required experiment approval before running it.
+
+Train after the cache exists (training also builds a missing cache):
 
 ```bash
 bash robosuite/pipeline/scripts/train.sh
 ```
 
-Evaluate a DSRL checkpoint deterministically for 50 episodes, with a maximum
-of 500 primitive steps per episode:
+Evaluate a checkpoint deterministically:
 
 ```bash
-CKPT=/path/to/checkpoints/latest.pt \
-  bash robosuite/pipeline/scripts/eval_policy.sh
+/home/dodo/miniconda3/envs/dagger/bin/python -m robosuite.pipeline.eval_policy \
+  --checkpoint /path/to/checkpoints/latest.pt
 ```
 
-`NUM_EPISODES`, `MAX_STEPS`, and `DEVICE` are optional environment overrides.
-The task and checkpoint episode are read from the checkpoint. Results are
-written to the owning run's `eval/episode_<completed_episodes>/` directory.
+`--num-episodes`, `--max-steps`, and `--device` are optional evaluation
+overrides. The existing user-maintained `scripts/eval_policy.sh` is not
+modified by this migration. Hydra overrides may be appended to cache and
+training commands. Tensor computation never falls back to CPU.
 
-Hydra overrides can be appended to the cache and training commands. Evaluation
-accepts standard CLI arguments after the launcher. Tensor computation is never
-allowed to fall back to CPU.
+Old DSRL-NA checkpoints and VAST/DINO feature caches are intentionally left in
+place, but they are not compatible with the DSRL-SAC checkpoint schema.

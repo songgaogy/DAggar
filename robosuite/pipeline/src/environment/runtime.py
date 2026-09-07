@@ -22,6 +22,7 @@ class RobosuiteRuntimeConfig:
     horizon: int
     control_freq: int = 20
     interactive: bool = False
+    seed: int | None = None
 
 
 def build_runtime_config(
@@ -32,6 +33,7 @@ def build_runtime_config(
     control_freq: int = 20,
     horizon: int = 500,
     interactive: bool = False,
+    seed: int | None = None,
 ) -> RobosuiteRuntimeConfig:
     missing = [key for key in ("env_name", "robots") if key not in env_metadata]
     if missing:
@@ -52,6 +54,7 @@ def build_runtime_config(
         horizon=int(horizon),
         control_freq=int(control_freq),
         interactive=bool(interactive),
+        seed=None if seed is None else int(seed),
     )
 
 
@@ -70,6 +73,7 @@ def build_robosuite_env(config: RobosuiteRuntimeConfig):
         "camera_heights": config.image_height,
         "camera_widths": config.image_width,
         "horizon": config.horizon,
+        "seed": config.seed,
     }
     if config.env_configuration is not None and "TwoArm" in config.env_name:
         kwargs["env_configuration"] = config.env_configuration

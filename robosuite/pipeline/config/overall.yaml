@@ -14,22 +14,13 @@ environment:
   image_width: 128
   control_frequency: 20
   horizon: ${task.horizon}
-  reward_success: 0.0
-  reward_failure: -1.0
+  reward_success: 1.0
+  reward_failure: 0.0
 
 inputs:
   base_policy_checkpoint: "./checkpoints/multitask_6/flow_multi_ep0100.pt"
-  offline_transitions: "./data/${task.name}/offline_data-vast/vast_offline_transitions.pt"
-  offline_metadata: "./data/${task.name}/offline_data-vast/vast_offline_transitions.meta.json"
-  dinov2_checkpoint: "/home/dodo/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth"
 
 vision:
-  model_name: "vit_base"
-  input_size: 224
-  patch_size: 14
-  register_tokens: 0
-  embedding_dim: 768
-  bottleneck_dim: 256
   cache_dtype: "float16"
 
 flow:
@@ -41,38 +32,40 @@ flow:
 algorithm:
   learning_rate: 3.0e-4
   batch_size: 256
-  hidden_dims: [2048, 2048, 2048]
-  gamma: 0.99
+  hidden_dims: [1024, 1024, 1024]
+  gamma: 0.97
   tau: 0.005
-  latent_action_bound: 1.5
+  latent_action_bound: 2.0
   target_entropy: 0.0
-  utd: 20
-  noise_critic_steps: 10
-  replay_capacity: 10000
+  utd: 30
+  update_interval_vector_steps: 2
   log_std_min: -20.0
   log_std_max: 2.0
   grad_clip_norm: null
+
+warmup:
+  episodes: 20
+  seed: 42
 
 runtime:
   learner_device: "cuda:0"
   inference_device: "cuda:1"
   num_envs: 4
-  episodes_per_env: 5
+  total_episodes: 2000
   headless: true
   viewer_enabled: false
   interactive: false
   tensor_precision: "float32"
-  cache_batch_size: 128
   prefetch_batches: 2
   resume: false
   checkpoint: null
 
 storage:
   output_root: "./outputs/baseline/dsrl"
-  cache_root: "./outputs/baseline/dsrl/cache"
+  warmup_cache_root: "./outputs/baseline/dsrl/warmup_cache"
   run_name: null
   checkpoint_directory: "checkpoints"
-  checkpoint_interval_episodes: 20
+  checkpoint_interval_episodes: 200
   online_replay_directory: "online_replay"
   resolved_config_filename: "config_resolved.yaml"
   metadata_filename: "run_metadata.json"

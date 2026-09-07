@@ -192,6 +192,11 @@ class FlowPolicyAdapter(nn.Module):
             raise TypeError("Flow model state must be a mapping")
         self.model.load_state_dict(state, strict=True)
         self.model.to(self.device).eval().requires_grad_(False)
+        image_encoder = getattr(self.model, "image_encoder", None)
+        if image_encoder is None:
+            raise AttributeError("Flow model must expose an image_encoder")
+        self.image_tokens_per_camera = int(getattr(image_encoder, "num_tokens"))
+        self.image_token_dim = int(getattr(self.model, "feature_dim"))
 
         self.register_buffer("act_mean", act_mean.to(self.device), persistent=True)
         self.register_buffer("act_std", act_std.to(self.device), persistent=True)
@@ -285,6 +290,45 @@ class FlowPolicyAdapter(nn.Module):
             raise ValueError(f"Expected proprio [B,{self.proprio_dim}], got {tuple(proprio.shape)}")
         return (proprio.float() - self.prop_mean) / self.prop_std
 
+    @torch.no_grad()
+    def encode_image_tokens(
+        self, images: torch.Tensor, *, images_preprocessed: bool = False
+    ) -> torch.Tensor:
+        """Encode each policy camera with the frozen base-policy ResNet."""
+        self._require_cuda_tensor(images, "images")
+        if not images_preprocessed:
+            images = self.preprocess_images(images)
+        elif (
+            images.ndim != 5
+            or images.shape[1] != len(self.camera_names)
+            or images.shape[2] != 3
+        ):
+            raise ValueError(
+                f"Expected images [B,{len(self.camera_names)},3,H,W], "
+                f"got {tuple(images.shape)}"
+            )
+        batch_size, camera_count = images.shape[:2]
+        flat_images = images.reshape(
+            batch_size * camera_count, *images.shape[2:]
+        ).contiguous(memory_format=torch.channels_last)
+        model_dtype = next(self.model.parameters()).dtype
+        flat_tokens = self.model.image_encoder(flat_images.to(dtype=model_dtype))
+        expected = (
+            batch_size * camera_count,
+            self.image_tokens_per_camera,
+            self.image_token_dim,
+        )
+        if tuple(flat_tokens.shape) != expected:
+            raise ValueError(
+                f"Flow image encoder returned {tuple(flat_tokens.shape)}, expected {expected}"
+            )
+        return flat_tokens.reshape(
+            batch_size,
+            camera_count,
+            self.image_tokens_per_camera,
+            self.image_token_dim,
+        )
+
     def normalize_actions(self, actions: torch.Tensor) -> torch.Tensor:
         self._require_cuda_tensor(actions, "actions")
         if actions.shape[-2:] != (self.action_horizon, self.action_dim):
@@ -313,6 +357,14 @@ class FlowPolicyAdapter(nn.Module):
 
     @torch.no_grad()
     def encode_context(self, observation: FlowObservation) -> FlowContext:
+        context, _ = self.encode_context_with_image_tokens(observation)
+        return context
+
+    @torch.no_grad()
+    def encode_context_with_image_tokens(
+        self, observation: FlowObservation
+    ) -> tuple[FlowContext, torch.Tensor]:
+        """Encode flow context and base image tokens in one frozen forward pass."""
         images = observation.images
         proprio = observation.proprio
         self._require_cuda_tensor(images, "images")
@@ -327,11 +379,37 @@ class FlowPolicyAdapter(nn.Module):
         elif len(language) != int(proprio.shape[0]):
             raise ValueError("Language batch size must match proprio batch size")
         raw = self.model.encode_multimodal_context(images, proprio, language)
-        required = ("task_scene_cond", "context_tokens", "context_padding_mask")
+        required = (
+            "task_scene_cond",
+            "context_tokens",
+            "context_padding_mask",
+            "image_tokens",
+        )
         missing = [key for key in required if key not in raw]
         if missing:
             raise KeyError(f"Flow context output is missing keys: {missing}")
-        return FlowContext(*(raw[key] for key in required))
+        flat_image_tokens = raw["image_tokens"]
+        expected = (
+            int(proprio.shape[0]),
+            len(self.camera_names) * self.image_tokens_per_camera,
+            self.image_token_dim,
+        )
+        if tuple(flat_image_tokens.shape) != expected:
+            raise ValueError(
+                f"Flow image encoder returned {tuple(flat_image_tokens.shape)}, expected {expected}"
+            )
+        image_tokens = flat_image_tokens.reshape(
+            int(proprio.shape[0]),
+            len(self.camera_names),
+            self.image_tokens_per_camera,
+            self.image_token_dim,
+        )
+        context = FlowContext(
+            raw["task_scene_cond"],
+            raw["context_tokens"],
+            raw["context_padding_mask"],
+        )
+        return context, image_tokens
 
     @torch.no_grad()
     def decode_noise(

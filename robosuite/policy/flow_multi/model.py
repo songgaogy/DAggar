@@ -91,6 +91,7 @@ class MultiModalFlowPolicy(nn.Module):
         # pass through pretrained model
         image_tokens = self.image_encoder(flat_images)
         image_tokens = image_tokens.reshape(batch_size, num_cameras * image_tokens.shape[1], image_tokens.shape[2])
+        base_image_tokens = image_tokens
         proprio_tokens = self.proprio_tokenizer(proprio)
         language_tokens, language_global, language_mask = self.language_encoder(language)
 
@@ -124,6 +125,7 @@ class MultiModalFlowPolicy(nn.Module):
             "task_scene_cond": task_scene_cond,
             "context_tokens": context_tokens,
             "context_padding_mask": context_padding_mask,
+            "image_tokens": base_image_tokens,
         }
 
     def encode_context(

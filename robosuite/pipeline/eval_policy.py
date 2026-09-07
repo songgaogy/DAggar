@@ -29,7 +29,6 @@ from robosuite.pipeline.src.environment import (
     observation_batch_to_cuda,
     reset_policy_observation,
 )
-from robosuite.pipeline.src.vision import DinoV2Encoder
 from robosuite.pipeline.utils import file_identity, resolve_cuda_device, set_seed, write_json
 
 
@@ -96,13 +95,15 @@ def _artifact_path(
 
 def _checkpoint_spec(
     checkpoint: str | Path, device_override: str | None
-) -> tuple[Path, Mapping[str, Any], str, int, torch.device, NetworkConfig, Path, Path]:
+) -> tuple[Path, Mapping[str, Any], str, int, torch.device, NetworkConfig, Path]:
     path = Path(checkpoint).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"DSRL checkpoint does not exist: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise TypeError("DSRL checkpoint must contain a mapping.")
+    if payload.get("format") != "dsrl_sac_widowx_v1":
+        raise ValueError("Checkpoint is not compatible with WidowX DSRL-SAC.")
     config = payload.get("config")
     counters = payload.get("counters")
     agent = payload.get("trainer", {}).get("agent")
@@ -124,7 +125,7 @@ def _checkpoint_spec(
     ):
         raise KeyError("DSRL checkpoint is missing the network configuration.")
     missing_inference_state = [
-        name for name in ("bottleneck", "actor") if not isinstance(agent.get(name), Mapping)
+        name for name in ("actor",) if not isinstance(agent.get(name), Mapping)
     ]
     if missing_inference_state:
         raise KeyError(
@@ -139,10 +140,7 @@ def _checkpoint_spec(
     flow_path = _artifact_path(
         payload, fingerprint_key="flow", config_key="base_policy_checkpoint"
     )
-    dino_path = _artifact_path(
-        payload, fingerprint_key="dinov2", config_key="dinov2_checkpoint"
-    )
-    return path, payload, str(task), completed_episodes, device, network, flow_path, dino_path
+    return path, payload, str(task), completed_episodes, device, network, flow_path
 
 
 def _flow_task_settings(
@@ -229,7 +227,7 @@ def rollout_episode(
             info = raw_info if isinstance(raw_info, Mapping) else None
             primitive_steps += 1
             success = _success(env, info)
-            episode_return += 0.0 if success else -1.0
+            episode_return += float(success)
             observation = build_observation(raw_observation)
             if success:
                 reason = "success"
@@ -277,7 +275,7 @@ def _publish_directory(temporary: Path, destination: Path) -> None:
 def evaluate(args: argparse.Namespace) -> Path:
     if int(args.num_episodes) <= 0 or int(args.max_steps) <= 0:
         raise ValueError("num-episodes and max-steps must be positive.")
-    checkpoint, payload, task, checkpoint_episode, device, network, flow_path, dino_path = (
+    checkpoint, payload, task, checkpoint_episode, device, network, flow_path = (
         _checkpoint_spec(args.checkpoint, args.device)
     )
     config = payload["config"]
@@ -360,7 +358,6 @@ def evaluate(args: argparse.Namespace) -> Path:
                 action_low=action_low,
                 action_high=action_high,
             )
-            dino = DinoV2Encoder(dino_path, device)
             policy = DSRLInferencePolicy(network, device)
             policy.load_inference_state(payload["trainer"]["agent"])
 
@@ -368,11 +365,12 @@ def evaluate(args: argparse.Namespace) -> Path:
                 images, proprio = observation_batch_to_cuda(
                     observation, camera_names, "state", device
                 )
-                dino_features = dino(images)
                 normalized_proprio = flow.normalize_proprio(proprio)
-                context = flow.encode_context(FlowObservation(images, proprio, prompt))
+                context, image_tokens = flow.encode_context_with_image_tokens(
+                    FlowObservation(images, proprio, prompt)
+                )
                 latent = policy.latent(
-                    dino_features, normalized_proprio, deterministic=True
+                    image_tokens, normalized_proprio, deterministic=True
                 )
                 return flow.decode_noise(context, latent).cpu().numpy()[0]
 
@@ -434,7 +432,6 @@ def evaluate(args: argparse.Namespace) -> Path:
             "checkpoint": os.fspath(checkpoint),
             "checkpoint_episode": checkpoint_episode,
             "flow_checkpoint": os.fspath(flow_path),
-            "dinov2_checkpoint": os.fspath(dino_path),
             "device": str(device),
             "seed": seed,
             "deterministic": True,

@@ -45,21 +45,42 @@ class TinyFlow(nn.Module):
         super().__init__()
         self.camera_names = camera_names
         self.action_dim = action_dim
+        self.feature_dim = 4
+        self.image_encoder = TinyImageEncoder()
         self.context_projection = nn.Linear(2, 4)
         self.flow_head = ConstantFlowHead()
 
     def encode_multimodal_context(
         self, images: torch.Tensor, proprio: torch.Tensor, language: list[str]
     ) -> dict[str, torch.Tensor]:
-        del images, language
+        del language
         context = self.context_projection(proprio)
+        batch_size, camera_count = images.shape[:2]
+        flat_images = images.flatten(0, 1)
+        image_tokens = self.image_encoder(flat_images).reshape(
+            batch_size, camera_count * self.image_encoder.num_tokens, self.feature_dim
+        )
         return {
             "task_scene_cond": context,
             "context_tokens": context[:, None],
             "context_padding_mask": torch.zeros(
                 (context.shape[0], 1), dtype=torch.bool, device=context.device
             ),
+            "image_tokens": image_tokens,
         }
+
+
+class TinyImageEncoder(nn.Module):
+    num_tokens = 2
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(3, 4, bias=False)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        pooled = images.mean(dim=(-2, -1))
+        token = self.projection(pooled)
+        return torch.stack((token, token + 1.0), dim=1)
 
 
 def _flow_builder(
@@ -140,7 +161,11 @@ def test_flow_external_noise_context_cache_and_action_clamp(tmp_path: Path) -> N
         proprio=torch.tensor([[1.0, 2.0], [3.0, 6.0]], device="cuda:0"),
         language=["first", "second"],
     )
-    context = adapter.encode_context(observation)
+    context, combined_image_tokens = adapter.encode_context_with_image_tokens(observation)
+    image_tokens = adapter.encode_image_tokens(observation.images)
+    preprocessed_tokens = adapter.encode_image_tokens(
+        adapter.preprocess_images(observation.images), images_preprocessed=True
+    )
     restored = FlowContext.from_mapping(context.to_mapping())
     stacked = FlowContext.stack(
         [
@@ -157,6 +182,13 @@ def test_flow_external_noise_context_cache_and_action_clamp(tmp_path: Path) -> N
     torch.testing.assert_close(normalized, torch.ones_like(normalized))
     torch.testing.assert_close(actions, torch.full_like(actions, 4.0))
     torch.testing.assert_close(projected, torch.full_like(projected, 2.0 / 3.0))
+    torch.testing.assert_close(image_tokens, preprocessed_tokens)
+    torch.testing.assert_close(image_tokens, combined_image_tokens)
+    assert image_tokens.shape == (2, 3, 2, 4)
+    assert image_tokens.device.type == "cuda"
+    assert not image_tokens.requires_grad
+    assert adapter.image_tokens_per_camera == 2
+    assert adapter.image_token_dim == 4
     assert all(not parameter.requires_grad for parameter in adapter.model.parameters())
 
 

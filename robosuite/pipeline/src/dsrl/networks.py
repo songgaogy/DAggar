@@ -6,21 +6,15 @@ import torch
 from torch import nn
 
 
-class SharedBottleneck(nn.Module):
-    def __init__(self, visual_dim: int, proprio_dim: int, state_dim: int) -> None:
-        super().__init__()
-        self.input_dim = visual_dim + proprio_dim
-        self.projection = nn.Linear(self.input_dim, state_dim)
-        self.normalization = nn.LayerNorm(state_dim)
-
-    def forward(self, visual_features: torch.Tensor, proprio: torch.Tensor) -> torch.Tensor:
-        if visual_features.ndim not in (2, 3) or proprio.ndim != 2:
-            raise ValueError("DINO features must be rank two or three and proprio must be rank two.")
-        visual_features = visual_features.flatten(start_dim=1)
-        inputs = torch.cat((visual_features, proprio), dim=-1).float()
-        if inputs.shape[-1] != self.input_dim:
-            raise ValueError(f"Expected bottleneck input width {self.input_dim}, got {inputs.shape[-1]}.")
-        return torch.tanh(self.normalization(self.projection(inputs)))
+def flatten_state(visual_features: torch.Tensor, proprio: torch.Tensor, expected_dim: int) -> torch.Tensor:
+    if visual_features.ndim < 2 or proprio.ndim != 2:
+        raise ValueError("Visual features must include a batch dimension and proprio must be rank two.")
+    if visual_features.shape[0] != proprio.shape[0]:
+        raise ValueError("Visual features and proprio must have the same batch dimension.")
+    state = torch.cat((visual_features.flatten(start_dim=1), proprio), dim=-1).float()
+    if state.shape[-1] != expected_dim:
+        raise ValueError(f"Expected state width {expected_dim}, got {state.shape[-1]}.")
+    return state
 
 
 def build_mlp(input_dim: int, output_dim: int, hidden_dims: tuple[int, ...]) -> nn.Sequential:

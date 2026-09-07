@@ -64,11 +64,11 @@ def _rollout(
 @pytest.mark.parametrize(
     ("env", "max_steps", "expected"),
     [
-        (MockEnv(success_step=11), 50, (-10.0, 11, 2, True, "success")),
-        (MockEnv(success_step=3), 50, (-2.0, 3, 1, True, "success")),
-        (MockEnv(), 10, (-10.0, 10, 2, False, "horizon")),
-        (MockEnv(terminated_step=4), 50, (-4.0, 4, 1, False, "environment")),
-        (MockEnv(truncated_step=5), 50, (-5.0, 5, 1, False, "horizon")),
+        (MockEnv(success_step=11), 50, (1.0, 11, 2, True, "success")),
+        (MockEnv(success_step=3), 50, (1.0, 3, 1, True, "success")),
+        (MockEnv(), 10, (0.0, 10, 2, False, "horizon")),
+        (MockEnv(terminated_step=4), 50, (0.0, 4, 1, False, "environment")),
+        (MockEnv(truncated_step=5), 50, (0.0, 5, 1, False, "horizon")),
     ],
 )
 def test_rollout_chunk_termination_and_sparse_reward(
@@ -85,7 +85,7 @@ def test_rollout_chunk_termination_and_sparse_reward(
 def test_rollout_count_is_exactly_fifty() -> None:
     results = [_rollout(MockEnv(success_step=1), 500)[0] for _ in range(50)]
     assert len(results) == 50
-    assert all(item == (0.0, 1, 1, True, "success") for item in results)
+    assert all(item == (1.0, 1, 1, True, "success") for item in results)
 
 
 def test_video_frame_and_encoder_settings(tmp_path: Path, monkeypatch) -> None:
@@ -162,37 +162,32 @@ def test_checkpoint_metadata_and_artifact_identity(tmp_path: Path) -> None:
     checkpoint_directory = run_directory / "checkpoints"
     checkpoint_directory.mkdir(parents=True)
     flow_path = tmp_path / "flow.pt"
-    dino_path = tmp_path / "dino.pt"
     flow_path.write_bytes(b"flow")
-    dino_path.write_bytes(b"dino")
     network = NetworkConfig(
         visual_dim=12,
         proprio_dim=3,
-        state_dim=8,
         action_horizon=8,
         action_dim=7,
         hidden_dims=(16, 16, 16),
     )
     payload = {
+        "format": "dsrl_sac_widowx_v1",
         "config": {
             "task": {"name": "PickPlaceCereal"},
             "runtime": {"inference_device": "cuda:0"},
             "inputs": {
                 "base_policy_checkpoint": str(flow_path),
-                "dinov2_checkpoint": str(dino_path),
             },
         },
         "counters": {"completed_episodes": 20},
         "trainer": {
             "agent": {
                 "config": {"network": asdict(network)},
-                "bottleneck": {},
                 "actor": {},
             }
         },
         "fingerprints": {
             "flow": file_identity(flow_path),
-            "dinov2": file_identity(dino_path),
         },
     }
     checkpoint = checkpoint_directory / "latest.pt"
@@ -203,7 +198,7 @@ def test_checkpoint_metadata_and_artifact_identity(tmp_path: Path) -> None:
     assert _run_directory_for_checkpoint(checkpoint) == run_directory
     assert spec[2:4] == ("PickPlaceCereal", 20)
     assert spec[4] == torch.device("cuda:0")
-    assert spec[6:] == (flow_path.resolve(), dino_path.resolve())
+    assert spec[6:] == (flow_path.resolve(),)
     with pytest.raises(ValueError, match="requires a CUDA device"):
         _checkpoint_spec(checkpoint, "cpu")
     flow_path.write_bytes(b"replaced")
@@ -222,7 +217,6 @@ def test_inference_policy_is_strict_frozen_and_deterministic() -> None:
     config = NetworkConfig(
         visual_dim=12,
         proprio_dim=3,
-        state_dim=8,
         action_horizon=8,
         action_dim=7,
         hidden_dims=(16, 16, 16),
@@ -230,7 +224,7 @@ def test_inference_policy_is_strict_frozen_and_deterministic() -> None:
     source = DSRLInferencePolicy(config, "cuda:0")
     restored = DSRLInferencePolicy(config, "cuda:0")
     restored.load_inference_state(
-        {"bottleneck": source.bottleneck.state_dict(), "actor": source.actor.state_dict()}
+        {"actor": source.actor.state_dict()}
     )
     dino = torch.randn(2, 3, 4, device="cuda:0")
     proprio = torch.randn(2, 3, device="cuda:0")
@@ -245,4 +239,4 @@ def test_inference_policy_is_strict_frozen_and_deterministic() -> None:
     assert torch.all(first.abs() <= config.latent_limit)
     assert all(not parameter.requires_grad for parameter in restored.parameters())
     with pytest.raises(RuntimeError):
-        restored.load_inference_state({"bottleneck": {}, "actor": {}})
+        restored.load_inference_state({"actor": {}})

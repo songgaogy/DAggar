@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-from robosuite.pipeline.src.data import CudaBatchPrefetcher, OnlineReplay, UniformReplay
+from robosuite.pipeline.src.data import (
+    CudaBatchPrefetcher,
+    OnlineReplay,
+    UniformReplay,
+    WarmupReplay,
+    WarmupValidationError,
+    build_warmup_fingerprint,
+    save_warmup_cache,
+)
 
 
 class ArrayReplay:
@@ -24,21 +33,91 @@ class ArrayReplay:
 def _compact(value: float) -> dict:
     feature = np.asarray([value, value + 1], dtype=np.float32)
     return {
-        "dino_features": feature,
+        "visual_features": feature,
         "proprio": feature[:1],
-        "task_scene_cond": feature,
-        "context_tokens": feature[None, :],
-        "context_padding_mask": np.asarray([False]),
-        "next_dino_features": feature + 1,
+        "next_visual_features": feature + 1,
         "next_proprio": feature[:1] + 1,
-        "next_task_scene_cond": feature + 1,
-        "next_context_tokens": (feature + 1)[None, :],
-        "next_context_padding_mask": np.asarray([False]),
         "actions": np.full((2, 2), value, dtype=np.float32),
-        "reward": value,
+        "reward": float(value > 0),
         "done": False,
         "executed_length": 2,
     }
+
+
+def _warmup_arrays(count: int = 4) -> dict[str, np.ndarray]:
+    values = np.arange(count, dtype=np.float32)
+    return {
+        "visual_features": np.stack((values, values + 1), axis=1),
+        "proprio": values[:, None],
+        "next_visual_features": np.stack((values + 1, values + 2), axis=1),
+        "next_proprio": (values + 1)[:, None],
+        "actions": np.zeros((count, 2, 2), dtype=np.float32),
+        "rewards": np.asarray([0, 1, 0, 1], dtype=np.float32)[:count, None],
+        "dones": np.asarray([False, True, False, True], dtype=np.bool_)[:count, None],
+        "executed_length": np.full((count, 1), 2, dtype=np.uint8),
+    }
+
+
+def test_warmup_cache_is_fingerprinted_immutable_and_strict(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "flow.pt"
+    checkpoint.write_bytes(b"frozen flow checkpoint")
+    fingerprint, ingredients = build_warmup_fingerprint(
+        task_name="PickPlaceCereal",
+        warmup_seed=42,
+        base_checkpoint=checkpoint,
+        env_metadata={"robots": "Panda"},
+        camera_names=("agentview", "robot0_eye_in_hand"),
+        action_horizon=2,
+        ode_config={"steps": 10},
+        feature_schema={"visual_features": [2], "proprio": [1]},
+        reward_schema="binary_success",
+    )
+    replay = save_warmup_cache(
+        tmp_path / "warmup",
+        fingerprint=fingerprint,
+        fingerprint_ingredients=ingredients,
+        arrays=_warmup_arrays(),
+        episode_boundaries=(0, 2, 4),
+        metadata={
+            "completed_by_worker": [1, 1],
+            "primitive_steps": 8,
+            "macro_steps": 4,
+            "vector_steps": 2,
+        },
+    )
+    assert isinstance(replay, WarmupReplay)
+    assert len(replay) == 4
+    assert replay.manifest["episode_count"] == 2
+    assert replay.manifest["completed_by_worker"] == [1, 1]
+    np.testing.assert_array_equal(
+        replay.gather(np.asarray([3, 0]))["proprio"], np.asarray([[3.0], [0.0]])
+    )
+
+    replacement = _warmup_arrays()
+    replacement["proprio"][:] = 99
+    reused = save_warmup_cache(
+        tmp_path / "warmup",
+        fingerprint=fingerprint,
+        fingerprint_ingredients=ingredients,
+        arrays=replacement,
+        episode_boundaries=(0, 2, 4),
+    )
+    np.testing.assert_array_equal(reused.gather(np.asarray([0]))["proprio"], [[0.0]])
+    with pytest.raises(WarmupValidationError, match="fingerprint mismatch"):
+        WarmupReplay(replay.path, expected_fingerprint="wrong")
+
+
+def test_warmup_cache_rejects_non_binary_rewards(tmp_path: Path) -> None:
+    arrays = _warmup_arrays()
+    arrays["rewards"][0, 0] = 0.5
+    with pytest.raises(WarmupValidationError, match="binary"):
+        save_warmup_cache(
+            tmp_path,
+            fingerprint=hashlib.sha256(b"{}").hexdigest(),
+            fingerprint_ingredients={},
+            arrays=arrays,
+            episode_boundaries=(0, 2, 4),
+        )
 
 
 def test_online_replay_ring_and_snapshot_round_trip(tmp_path: Path) -> None:
@@ -48,7 +127,8 @@ def test_online_replay_ring_and_snapshot_round_trip(tmp_path: Path) -> None:
     assert len(replay) == 3
     assert replay.position == 2
     np.testing.assert_allclose(
-        np.sort(replay.gather(np.asarray([0, 1, 2]))["rewards"][:, 0]), [2.0, 3.0, 4.0]
+        np.sort(replay.gather(np.asarray([0, 1, 2]))["visual_features"][:, 0]),
+        [2.0, 3.0, 4.0],
     )
 
     manifest = replay.snapshot(tmp_path / "online")

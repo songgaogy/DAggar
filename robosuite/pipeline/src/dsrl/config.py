@@ -5,13 +5,12 @@ from dataclasses import asdict, dataclass, field
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    visual_dim: int = 3 * 768
+    visual_dim: int = 3 * 9 * 256
     proprio_dim: int = 14
-    state_dim: int = 256
     action_horizon: int = 8
     action_dim: int = 7
-    hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
-    latent_limit: float = 1.5
+    hidden_dims: tuple[int, ...] = (1024, 1024, 1024)
+    latent_limit: float = 2.0
     log_std_min: float = -5.0
     log_std_max: float = 2.0
 
@@ -19,11 +18,15 @@ class NetworkConfig:
     def chunk_dim(self) -> int:
         return self.action_horizon * self.action_dim
 
+    @property
+    def state_dim(self) -> int:
+        """Width of the flattened frozen visual tokens and proprioception."""
+        return self.visual_dim + self.proprio_dim
+
     def validate(self) -> None:
         integer_fields = (
             self.visual_dim,
             self.proprio_dim,
-            self.state_dim,
             self.action_horizon,
             self.action_dim,
         )
@@ -44,11 +47,10 @@ class DSRLConfig:
     network: NetworkConfig = field(default_factory=NetworkConfig)
     learner_device: str = "cuda:0"
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 0.97
     tau: float = 0.005
     batch_size: int = 256
-    utd_steps: int = 20
-    qw_steps: int = 10
+    utd_steps: int = 30
     target_entropy: float = 0.0
     initial_alpha: float = 1.0
     grad_clip_norm: float | None = None
@@ -59,8 +61,8 @@ class DSRLConfig:
             raise ValueError("DSRL requires an explicit CUDA device such as 'cuda:0'.")
         if self.learning_rate <= 0 or self.batch_size <= 0:
             raise ValueError("learning_rate and batch_size must be positive.")
-        if self.utd_steps <= 0 or self.qw_steps <= 0:
-            raise ValueError("utd_steps and qw_steps must be positive.")
+        if self.utd_steps <= 0:
+            raise ValueError("utd_steps must be positive.")
         if not 0.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be in [0, 1].")
         if not 0.0 < self.tau <= 1.0:
