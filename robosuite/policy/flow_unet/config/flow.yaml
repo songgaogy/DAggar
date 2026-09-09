@@ -2,7 +2,7 @@ flow:
   image_encoder:
     type: "shared_resnet18_spatial_softmax"
     feature_dim: 256
-    pretrained_path: "/home/dodo/Documents/DAggar/robosuite/robosuite/RL/models/resnet18-f37072fd.pth"
+    pretrained_path: "/home/dodo/Documents/DAggar/robosuite/data/pretrained/resnet18-f37072fd.pth"
     freeze_backbone: false
 
   proprio_encoder:

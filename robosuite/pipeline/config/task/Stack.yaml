@@ -119,7 +119,7 @@ policy:
       image_encoder:
         type: "shared_resnet18_spatial_softmax"
         feature_dim: 256
-        pretrained_path: "robosuite/RL/models/resnet18-f37072fd.pth"
+        pretrained_path: "data/pretrained/resnet18-f37072fd.pth"
         freeze_backbone: true
         trainable_stages: ["layer3", "layer4"]
         train_token_projections: true
